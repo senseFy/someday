@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Someday</string>
+    <string name="on_this_day_notification_channel_name">あの日</string>
+    <string name="on_this_day_notification_channel_description">過去の年のノートがあるときの毎日の通知</string>
+    <string name="on_this_day_notification_title">あの日</string>
+    <string name="workspace_pairing_scan_cancel">キャンセル</string>
+    <plurals name="on_this_day_notification_body">
+        <item quantity="other">過去の年の思い出 %d 件</item>
+    </plurals>
+</resources>

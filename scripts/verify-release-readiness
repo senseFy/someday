@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+GRADLEW="${GRADLEW:-$ROOT_DIR/gradlew}"
+RELEASE_READINESS_WORKERS="${RELEASE_READINESS_WORKERS:-2}"
+REPORT_DIR="$ROOT_DIR/build/reports/release-readiness"
+ANDROID_RUNTIME_REPORT="$REPORT_DIR/android-release-runtime.txt"
+ANDROID_BUILD_CONFIG="$ROOT_DIR/app/android/build/generated/source/buildConfig/release/saien/someday/app/android/BuildConfig.java"
+DESKTOP_BUILD_CONFIG="$ROOT_DIR/app/desktop/build/generated/sources/desktopBuildConfig/jvmMain/kotlin/saien/someday/app/desktop/DesktopBuildConfig.kt"
+IOS_BUILD_CONFIG="$ROOT_DIR/app/ios/build/generated/sources/iosBuildConfig/iosMain/kotlin/saien/someday/app/ios/IosBuildConfig.kt"
+
+die() {
+  printf 'release-readiness error: %s\n' "$*" >&2
+  exit 1
+}
+
+info() {
+  printf '[release-readiness] %s\n' "$*" >&2
+}
+
+[[ "$(uname -s)" == "Darwin" ]] || die "Android/iOS/macOS release readiness must run on macOS."
+[[ -x "$GRADLEW" ]] || die "Gradle wrapper is not executable: $GRADLEW"
+[[ "$RELEASE_READINESS_WORKERS" =~ ^[1-9][0-9]*$ ]] ||
+  die "RELEASE_READINESS_WORKERS must be a positive integer: $RELEASE_READINESS_WORKERS"
+command -v plutil >/dev/null 2>&1 || die "missing required command: plutil"
+command -v rg >/dev/null 2>&1 || die "missing required command: rg"
+
+cd "$ROOT_DIR"
+mkdir -p "$REPORT_DIR"
+
+info "checking release scripts and Xcode project"
+bash -n \
+  scripts/build-ios-framework-for-xcode.sh \
+  scripts/package-macos-release \
+  scripts/release-ios.sh \
+  scripts/upload-google-play.sh \
+  scripts/verify-play-aab.sh \
+  scripts/verify-private-release-material
+plutil -lint iosApp/Someday.xcodeproj/project.pbxproj >/dev/null
+git diff --check
+scripts/verify-private-release-material
+
+info "resolving the Android release runtime classpath with strict verification"
+if ! "$GRADLEW" :app:android:dependencies \
+  --configuration releaseRuntimeClasspath \
+  -Psomeday.systemV2ReleaseEnabled=true \
+  -Psomeday.systemV2DevelopmentEnabled=false \
+  --dependency-verification=strict >"$ANDROID_RUNTIME_REPORT"; then
+  tail -n 200 "$ANDROID_RUNTIME_REPORT" >&2 || true
+  exit 1
+fi
+info "Android dependency report: $ANDROID_RUNTIME_REPORT"
+
+info "compiling Android Release and validating the macOS packaging runtime"
+"$GRADLEW" \
+  :app:android:compileReleaseKotlin \
+  :app:desktop:checkRuntime \
+  :app:desktop:generateDesktopBuildConfig \
+  -Psomeday.desktop.developerOptions=false \
+  -Psomeday.systemV2ReleaseEnabled=true \
+  -Psomeday.systemV2DevelopmentEnabled=false \
+  --dependency-verification=strict \
+  --max-workers="$RELEASE_READINESS_WORKERS" \
+  --stacktrace
+
+[[ -f "$ANDROID_BUILD_CONFIG" ]] || die "missing generated Android Release BuildConfig"
+rg -Fq 'SOMEDAY_SYSTEM_V2_RELEASE_ENABLED = true;' "$ANDROID_BUILD_CONFIG" ||
+  die "Android Release BuildConfig does not enable first-epoch V2 activation"
+[[ -f "$DESKTOP_BUILD_CONFIG" ]] || die "missing generated Desktop Release BuildConfig"
+rg -Fq 'SOMEDAY_SYSTEM_V2_RELEASE_ENABLED: Boolean = true' "$DESKTOP_BUILD_CONFIG" ||
+  die "Desktop Release BuildConfig does not enable first-epoch V2 activation"
+rg -Fq 'SOMEDAY_SYSTEM_V2_DEVELOPMENT_ENABLED: Boolean = false' "$DESKTOP_BUILD_CONFIG" ||
+  die "Desktop Release BuildConfig leaves development activation enabled"
+
+info "building the unsigned iOS Release framework and Compose resources"
+SDK_NAME=iphoneos \
+CONFIGURATION=Release \
+GRADLEW="$GRADLEW" \
+SOMEDAY_IOS_GRADLE_MAX_WORKERS="$RELEASE_READINESS_WORKERS" \
+  scripts/build-ios-framework-for-xcode.sh
+
+[[ -f "$IOS_BUILD_CONFIG" ]] || die "missing generated iOS Release BuildConfig"
+rg -Fq 'SOMEDAY_SYSTEM_V2_RELEASE_ENABLED: Boolean = true' "$IOS_BUILD_CONFIG" ||
+  die "iOS Release BuildConfig does not enable first-epoch V2 activation"
+rg -Fq 'SOMEDAY_SYSTEM_V2_DEVELOPMENT_ENABLED: Boolean = false' "$IOS_BUILD_CONFIG" ||
+  die "iOS Release BuildConfig leaves development activation enabled"
+
+info "passed; signing, notarization, and store uploads were intentionally not performed"

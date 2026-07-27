@@ -1,0 +1,289 @@
+package saien.someday.ui.i18n
+
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
+import org.jetbrains.compose.resources.stringResource
+import saien.someday.ui.resources.Res
+import saien.someday.ui.resources.*
+
+@Composable
+fun rememberNotesUiStrings(): NotesUiStrings {
+    val conflictWaiting = stringResource(Res.string.notes_fb_conflict_waiting)
+    val noteNoLongerExists = stringResource(Res.string.notes_fb_no_longer_exists)
+    val resolveBeforeSwitchNotebook = stringResource(Res.string.notes_fb_resolve_before_switch_notebook)
+    val foundNotes = stringResource(Res.string.notes_fb_found_notes)
+    val resolveBeforeOpen = stringResource(Res.string.notes_fb_resolve_before_open)
+    val createNotebookFirst = stringResource(Res.string.notes_fb_create_notebook_first)
+    val notebookCreated = stringResource(Res.string.notes_fb_notebook_created)
+    val notebookRenamed = stringResource(Res.string.notes_fb_notebook_renamed)
+    val notebookDeleted = stringResource(Res.string.notes_fb_notebook_deleted)
+    val cannotDeleteNotebook = stringResource(Res.string.notes_fb_cannot_delete_notebook)
+    val notebookConflictResolved = stringResource(Res.string.notes_fb_notebook_conflict_resolved)
+    val cannotResolveNotebookConflict = stringResource(Res.string.notes_fb_cannot_resolve_notebook_conflict)
+    val snapshotExpiredDeletion = stringResource(Res.string.notes_fb_snapshot_expired_deletion)
+    val noteUndeleted = stringResource(Res.string.notes_fb_note_undeleted)
+    val notebookRestored = stringResource(Res.string.notes_fb_notebook_restored)
+    val cannotRestoreDeleted = stringResource(Res.string.notes_fb_cannot_restore_deleted)
+    val conflictCopyExposes = stringResource(Res.string.notes_fb_conflict_copy_exposes)
+    val conflictGone = stringResource(Res.string.notes_fb_conflict_gone)
+    val locationAdded = stringResource(Res.string.notes_fb_location_added)
+    val locationPermissionDenied = stringResource(Res.string.notes_fb_location_permission_denied)
+    val locationUnavailable = stringResource(Res.string.notes_fb_location_unavailable)
+    val noteSaved = stringResource(Res.string.notes_fb_note_saved)
+    val saveFailed = stringResource(Res.string.notes_fb_save_failed)
+    val discarded = stringResource(Res.string.notes_fb_discarded)
+    val noteDeleted = stringResource(Res.string.notes_fb_note_deleted)
+    val cannotDeleteNote = stringResource(Res.string.notes_fb_cannot_delete_note)
+    val saveBeforeHistory = stringResource(Res.string.notes_fb_save_before_history)
+    val conflictResolvedAction = stringResource(Res.string.notes_fb_conflict_resolved_action)
+    val conflictResolvedBranch = stringResource(Res.string.notes_fb_conflict_resolved_branch)
+    val cannotResolveConflict = stringResource(Res.string.notes_fb_cannot_resolve_conflict)
+    val saveBeforeRestore = stringResource(Res.string.notes_fb_save_before_restore)
+    val resolveBeforeRestore = stringResource(Res.string.notes_fb_resolve_before_restore)
+    val restoredVersion = stringResource(Res.string.notes_fb_restored_version)
+    val cannotRestoreVersion = stringResource(Res.string.notes_fb_cannot_restore_version)
+    val demoCreated = stringResource(Res.string.notes_fb_demo_created)
+    val cannotCreateDemo = stringResource(Res.string.notes_fb_cannot_create_demo)
+    val demoCleared = stringResource(Res.string.notes_fb_demo_cleared)
+    val cannotClearDemo = stringResource(Res.string.notes_fb_cannot_clear_demo)
+    val titleRequired = stringResource(Res.string.notes_fb_title_required)
+    val chooseNotebook = stringResource(Res.string.notes_fb_choose_notebook)
+    val dateFormat = stringResource(Res.string.notes_fb_date_format)
+    val latNumber = stringResource(Res.string.notes_fb_lat_number)
+    val lonNumber = stringResource(Res.string.notes_fb_lon_number)
+    val latLonTogether = stringResource(Res.string.notes_fb_lat_lon_together)
+    val latRange = stringResource(Res.string.notes_fb_lat_range)
+    val lonRange = stringResource(Res.string.notes_fb_lon_range)
+    val accuracyNumber = stringResource(Res.string.notes_fb_accuracy_number)
+    val altitudeNumber = stringResource(Res.string.notes_fb_altitude_number)
+    val capturedIso = stringResource(Res.string.notes_fb_captured_iso)
+    val metaRequiresCoords = stringResource(Res.string.notes_fb_meta_requires_coords)
+    val unknownError = stringResource(Res.string.common_unknown_error)
+    val conflictActionMerge = stringResource(Res.string.conflict_action_merge)
+    val conflictActionKeepCopy = stringResource(Res.string.conflict_action_keep_copy)
+    val conflictActionRestoreOriginal = stringResource(Res.string.conflict_action_restore_original)
+    val conflictActionDeleteCopy = stringResource(Res.string.conflict_action_delete_copy)
+    return remember(conflictWaiting, noteNoLongerExists, resolveBeforeSwitchNotebook, foundNotes, resolveBeforeOpen, createNotebookFirst, notebookCreated, notebookRenamed, notebookDeleted, cannotDeleteNotebook, notebookConflictResolved, cannotResolveNotebookConflict, snapshotExpiredDeletion, noteUndeleted, notebookRestored, cannotRestoreDeleted, conflictCopyExposes, conflictGone, locationAdded, locationPermissionDenied, locationUnavailable, noteSaved, saveFailed, discarded, noteDeleted, cannotDeleteNote, saveBeforeHistory, conflictResolvedAction, conflictResolvedBranch, cannotResolveConflict, saveBeforeRestore, resolveBeforeRestore, restoredVersion, cannotRestoreVersion, demoCreated, cannotCreateDemo, demoCleared, cannotClearDemo, titleRequired, chooseNotebook, dateFormat, latNumber, lonNumber, latLonTogether, latRange, lonRange, accuracyNumber, altitudeNumber, capturedIso, metaRequiresCoords, unknownError, conflictActionMerge, conflictActionKeepCopy, conflictActionRestoreOriginal, conflictActionDeleteCopy) {
+        NotesUiStrings(
+            conflictWaiting = conflictWaiting,
+            noteNoLongerExists = noteNoLongerExists,
+            resolveBeforeSwitchNotebook = resolveBeforeSwitchNotebook,
+            foundNotes = foundNotes,
+            resolveBeforeOpen = resolveBeforeOpen,
+            createNotebookFirst = createNotebookFirst,
+            notebookCreated = notebookCreated,
+            notebookRenamed = notebookRenamed,
+            notebookDeleted = notebookDeleted,
+            cannotDeleteNotebook = cannotDeleteNotebook,
+            notebookConflictResolved = notebookConflictResolved,
+            cannotResolveNotebookConflict = cannotResolveNotebookConflict,
+            snapshotExpiredDeletion = snapshotExpiredDeletion,
+            noteUndeleted = noteUndeleted,
+            notebookRestored = notebookRestored,
+            cannotRestoreDeleted = cannotRestoreDeleted,
+            conflictCopyExposes = conflictCopyExposes,
+            conflictGone = conflictGone,
+            locationAdded = locationAdded,
+            locationPermissionDenied = locationPermissionDenied,
+            locationUnavailable = locationUnavailable,
+            noteSaved = noteSaved,
+            saveFailed = saveFailed,
+            discarded = discarded,
+            noteDeleted = noteDeleted,
+            cannotDeleteNote = cannotDeleteNote,
+            saveBeforeHistory = saveBeforeHistory,
+            conflictResolvedAction = conflictResolvedAction,
+            conflictResolvedBranch = conflictResolvedBranch,
+            cannotResolveConflict = cannotResolveConflict,
+            saveBeforeRestore = saveBeforeRestore,
+            resolveBeforeRestore = resolveBeforeRestore,
+            restoredVersion = restoredVersion,
+            cannotRestoreVersion = cannotRestoreVersion,
+            demoCreated = demoCreated,
+            cannotCreateDemo = cannotCreateDemo,
+            demoCleared = demoCleared,
+            cannotClearDemo = cannotClearDemo,
+            titleRequired = titleRequired,
+            chooseNotebook = chooseNotebook,
+            dateFormat = dateFormat,
+            latNumber = latNumber,
+            lonNumber = lonNumber,
+            latLonTogether = latLonTogether,
+            latRange = latRange,
+            lonRange = lonRange,
+            accuracyNumber = accuracyNumber,
+            altitudeNumber = altitudeNumber,
+            capturedIso = capturedIso,
+            metaRequiresCoords = metaRequiresCoords,
+            unknownError = unknownError,
+            conflictActionMerge = conflictActionMerge,
+            conflictActionKeepCopy = conflictActionKeepCopy,
+            conflictActionRestoreOriginal = conflictActionRestoreOriginal,
+            conflictActionDeleteCopy = conflictActionDeleteCopy,
+        )
+    }
+}
+
+@Composable
+fun rememberMemoriesUiStrings(): MemoriesUiStrings {
+    val showingMonth = stringResource(Res.string.memories_showing_month)
+    val chooseDateInMonth = stringResource(Res.string.memories_choose_date_in_month)
+    val selectedDate = stringResource(Res.string.memories_selected_date)
+    return remember(showingMonth, chooseDateInMonth, selectedDate) {
+        MemoriesUiStrings(
+            showingMonth = showingMonth,
+            chooseDateInMonth = chooseDateInMonth,
+            selectedDate = selectedDate,
+        )
+    }
+}
+
+@Composable
+fun rememberSettingsUiStrings(): SettingsUiStrings {
+    val themeUpdated = stringResource(Res.string.settings_fb_theme_updated)
+    val languageUpdated = stringResource(Res.string.settings_fb_language_updated)
+    val previewUpdated = stringResource(Res.string.settings_fb_preview_updated)
+    val toolbarUpdated = stringResource(Res.string.settings_fb_toolbar_updated)
+    val missingNotebook = stringResource(Res.string.settings_fb_missing_notebook)
+    val defaultNotebookCleared = stringResource(Res.string.settings_fb_default_notebook_cleared)
+    val defaultNotebookUpdated = stringResource(Res.string.settings_fb_default_notebook_updated)
+    val prefsConflictUnavailable = stringResource(Res.string.settings_fb_prefs_conflict_unavailable)
+    val prefsConflictResolved = stringResource(Res.string.settings_fb_prefs_conflict_resolved)
+    val cannotResolvePrefs = stringResource(Res.string.settings_fb_cannot_resolve_prefs)
+    val syncModeUpdated = stringResource(Res.string.settings_fb_sync_mode_updated)
+    val autoBackupEnabled = stringResource(Res.string.settings_fb_auto_backup_enabled)
+    val autoBackupDisabled = stringResource(Res.string.settings_fb_auto_backup_disabled)
+    val cadenceSet = stringResource(Res.string.settings_fb_cadence_set)
+    val webdavSaved = stringResource(Res.string.settings_fb_webdav_saved)
+    val credentialSavedSuffix = stringResource(Res.string.settings_fb_credential_saved_suffix)
+    val webdavConnectionFailed = stringResource(Res.string.settings_fb_webdav_connection_failed)
+    val webdavConnectionOkSaved = stringResource(Res.string.settings_fb_webdav_connection_ok_saved)
+    val webdavConnectionOk = stringResource(Res.string.settings_fb_webdav_connection_ok)
+    val webdavBackupUnavailable = stringResource(Res.string.settings_fb_webdav_backup_unavailable)
+    val webdavBackupFailed = stringResource(Res.string.settings_fb_webdav_backup_failed)
+    val webdavSaveFailed = stringResource(Res.string.settings_fb_webdav_save_failed)
+    val backupHistoryUnavailable = stringResource(Res.string.settings_fb_backup_history_unavailable)
+    val backupHistoryFailed = stringResource(Res.string.settings_fb_backup_history_failed)
+    val restoreUnavailable = stringResource(Res.string.settings_fb_restore_unavailable)
+    val restoreFailed = stringResource(Res.string.settings_fb_restore_failed)
+    val credentialRemoveFailed = stringResource(Res.string.settings_fb_credential_remove_failed)
+    val credentialRemoved = stringResource(Res.string.settings_fb_credential_removed)
+    val selfHostedHttps = stringResource(Res.string.settings_fb_selfhosted_https)
+    val selfHostedSaved = stringResource(Res.string.settings_fb_selfhosted_saved)
+    val selfHostedSetupFailed = stringResource(Res.string.settings_fb_selfhosted_setup_failed)
+    val sessionRemoveFailed = stringResource(Res.string.settings_fb_session_remove_failed)
+    val sessionCleared = stringResource(Res.string.settings_fb_session_cleared)
+    val syncStarted = stringResource(Res.string.settings_fb_sync_started)
+    val syncFailed = stringResource(Res.string.settings_fb_sync_failed)
+    val v2MaintenanceFailed = stringResource(Res.string.settings_fb_v2_maintenance_failed)
+    val syncStatusCleared = stringResource(Res.string.settings_fb_sync_status_cleared)
+    val syncStatusUpdated = stringResource(Res.string.settings_fb_sync_status_updated)
+    val exportPrepared = stringResource(Res.string.settings_fb_export_prepared)
+    val exportSaved = stringResource(Res.string.settings_fb_export_saved)
+    val exportFailed = stringResource(Res.string.settings_fb_export_failed)
+    val pairingInvitationFailed = stringResource(Res.string.settings_fb_pairing_invitation_failed)
+    val enterPairingToken = stringResource(Res.string.settings_fb_enter_pairing_token)
+    val pairingFailed = stringResource(Res.string.settings_fb_pairing_failed)
+    val credentialSaveFailed = stringResource(Res.string.settings_fb_credential_save_failed)
+    val settingsSaveFailed = stringResource(Res.string.settings_fb_settings_save_failed)
+    val chooseWebdavOrSelf = stringResource(Res.string.settings_fb_choose_webdav_or_self)
+    val signInBeforeSync = stringResource(Res.string.settings_fb_sign_in_before_sync)
+    val configureBeforeSync = stringResource(Res.string.settings_fb_configure_before_sync)
+    val usernameBeforeSync = stringResource(Res.string.settings_fb_username_before_sync)
+    val credentialBeforeSync = stringResource(Res.string.settings_fb_credential_before_sync)
+    val enterUsername = stringResource(Res.string.settings_fb_enter_username)
+    val enterCredential = stringResource(Res.string.settings_fb_enter_credential)
+    val dayOneImportUnavailable = stringResource(Res.string.import_day_one_unavailable)
+    val chooseDayOne = stringResource(Res.string.import_choose_day_one)
+    val dayOneImportFailed = stringResource(Res.string.import_day_one_failed)
+    val dayOneSourceName = stringResource(Res.string.import_day_one)
+    val webdavTestUnavailable = stringResource(Res.string.stub_webdav_test_short)
+    val selfHostedSetupUnavailable = stringResource(Res.string.stub_selfhosted_setup)
+    val manualSyncUnavailable = stringResource(Res.string.stub_manual_sync)
+    val v2MaintenanceUnavailable = stringResource(Res.string.stub_v2_maintenance_short)
+    val pairingUnavailable = stringResource(Res.string.stub_pairing_unavailable)
+    val unknownError = stringResource(Res.string.common_unknown_error)
+    val themeSystem = stringResource(Res.string.theme_system)
+    val themeLight = stringResource(Res.string.theme_light)
+    val themeDark = stringResource(Res.string.theme_dark)
+    val modeOff = stringResource(Res.string.sync_mode_off)
+    val modeWebDav = stringResource(Res.string.sync_mode_webdav)
+    val modeSelfHosted = stringResource(Res.string.sync_mode_self_hosted)
+    val freqDaily = stringResource(Res.string.backup_frequency_daily)
+    val freqWeekly = stringResource(Res.string.backup_frequency_weekly)
+    return remember(themeUpdated, languageUpdated, previewUpdated, toolbarUpdated, missingNotebook, defaultNotebookCleared, defaultNotebookUpdated, prefsConflictUnavailable, prefsConflictResolved, cannotResolvePrefs, syncModeUpdated, autoBackupEnabled, autoBackupDisabled, cadenceSet, webdavSaved, credentialSavedSuffix, webdavConnectionFailed, webdavConnectionOkSaved, webdavConnectionOk, webdavBackupUnavailable, webdavBackupFailed, webdavSaveFailed, backupHistoryUnavailable, backupHistoryFailed, restoreUnavailable, restoreFailed, credentialRemoveFailed, credentialRemoved, selfHostedHttps, selfHostedSaved, selfHostedSetupFailed, sessionRemoveFailed, sessionCleared, syncStarted, syncFailed, v2MaintenanceFailed, syncStatusCleared, syncStatusUpdated, exportPrepared, exportSaved, exportFailed, pairingInvitationFailed, enterPairingToken, pairingFailed, credentialSaveFailed, settingsSaveFailed, chooseWebdavOrSelf, signInBeforeSync, configureBeforeSync, usernameBeforeSync, credentialBeforeSync, enterUsername, enterCredential, dayOneImportUnavailable, chooseDayOne, dayOneImportFailed, dayOneSourceName, webdavTestUnavailable, selfHostedSetupUnavailable, manualSyncUnavailable, v2MaintenanceUnavailable, pairingUnavailable, unknownError, themeSystem, themeLight, themeDark, modeOff, modeWebDav, modeSelfHosted, freqDaily, freqWeekly) {
+        SettingsUiStrings(
+            themeUpdated = themeUpdated,
+            languageUpdated = languageUpdated,
+            previewUpdated = previewUpdated,
+            toolbarUpdated = toolbarUpdated,
+            missingNotebook = missingNotebook,
+            defaultNotebookCleared = defaultNotebookCleared,
+            defaultNotebookUpdated = defaultNotebookUpdated,
+            prefsConflictUnavailable = prefsConflictUnavailable,
+            prefsConflictResolved = prefsConflictResolved,
+            cannotResolvePrefs = cannotResolvePrefs,
+            syncModeUpdated = syncModeUpdated,
+            autoBackupEnabled = autoBackupEnabled,
+            autoBackupDisabled = autoBackupDisabled,
+            cadenceSet = cadenceSet,
+            webdavSaved = webdavSaved,
+            credentialSavedSuffix = credentialSavedSuffix,
+            webdavConnectionFailed = webdavConnectionFailed,
+            webdavConnectionOkSaved = webdavConnectionOkSaved,
+            webdavConnectionOk = webdavConnectionOk,
+            webdavBackupUnavailable = webdavBackupUnavailable,
+            webdavBackupFailed = webdavBackupFailed,
+            webdavSaveFailed = webdavSaveFailed,
+            backupHistoryUnavailable = backupHistoryUnavailable,
+            backupHistoryFailed = backupHistoryFailed,
+            restoreUnavailable = restoreUnavailable,
+            restoreFailed = restoreFailed,
+            credentialRemoveFailed = credentialRemoveFailed,
+            credentialRemoved = credentialRemoved,
+            selfHostedHttps = selfHostedHttps,
+            selfHostedSaved = selfHostedSaved,
+            selfHostedSetupFailed = selfHostedSetupFailed,
+            sessionRemoveFailed = sessionRemoveFailed,
+            sessionCleared = sessionCleared,
+            syncStarted = syncStarted,
+            syncFailed = syncFailed,
+            v2MaintenanceFailed = v2MaintenanceFailed,
+            syncStatusCleared = syncStatusCleared,
+            syncStatusUpdated = syncStatusUpdated,
+            exportPrepared = exportPrepared,
+            exportSaved = exportSaved,
+            exportFailed = exportFailed,
+            pairingInvitationFailed = pairingInvitationFailed,
+            enterPairingToken = enterPairingToken,
+            pairingFailed = pairingFailed,
+            credentialSaveFailed = credentialSaveFailed,
+            settingsSaveFailed = settingsSaveFailed,
+            chooseWebdavOrSelf = chooseWebdavOrSelf,
+            signInBeforeSync = signInBeforeSync,
+            configureBeforeSync = configureBeforeSync,
+            usernameBeforeSync = usernameBeforeSync,
+            credentialBeforeSync = credentialBeforeSync,
+            enterUsername = enterUsername,
+            enterCredential = enterCredential,
+            dayOneImportUnavailable = dayOneImportUnavailable,
+            chooseDayOne = chooseDayOne,
+            dayOneImportFailed = dayOneImportFailed,
+            dayOneSourceName = dayOneSourceName,
+            webdavTestUnavailable = webdavTestUnavailable,
+            selfHostedSetupUnavailable = selfHostedSetupUnavailable,
+            manualSyncUnavailable = manualSyncUnavailable,
+            v2MaintenanceUnavailable = v2MaintenanceUnavailable,
+            pairingUnavailable = pairingUnavailable,
+            unknownError = unknownError,
+            themeSystem = themeSystem,
+            themeLight = themeLight,
+            themeDark = themeDark,
+            modeOff = modeOff,
+            modeWebDav = modeWebDav,
+            modeSelfHosted = modeSelfHosted,
+            freqDaily = freqDaily,
+            freqWeekly = freqWeekly,
+        )
+    }
+}

@@ -1,0 +1,1783 @@
+CREATE TABLE notebooks (
+  id TEXT NOT NULL PRIMARY KEY,
+  title TEXT NOT NULL,
+  sort_order INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  deleted_at INTEGER,
+  revision INTEGER NOT NULL,
+  sync_state TEXT NOT NULL,
+  content_hash TEXT NOT NULL
+);
+
+CREATE INDEX notebooks_active_sort_idx ON notebooks(deleted_at, sort_order, title);
+
+CREATE TABLE notes (
+  id TEXT NOT NULL PRIMARY KEY,
+  notebook_id TEXT NOT NULL REFERENCES notebooks(id),
+  title TEXT NOT NULL,
+  markdown_body TEXT NOT NULL,
+  excerpt TEXT NOT NULL,
+  search_text TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  deleted_at INTEGER,
+  content_hash TEXT NOT NULL,
+  revision INTEGER NOT NULL,
+  sync_state TEXT NOT NULL,
+  current_version_id TEXT,
+  time_zone_id TEXT
+);
+
+CREATE INDEX notes_active_notebook_idx ON notes(notebook_id, deleted_at, created_at);
+CREATE INDEX notes_active_created_idx ON notes(deleted_at, created_at);
+
+CREATE TABLE note_versions (
+  version_id TEXT NOT NULL PRIMARY KEY,
+  note_id TEXT NOT NULL REFERENCES notes(id),
+  parent_version_id TEXT,
+  base_version_id TEXT,
+  revision INTEGER NOT NULL,
+  title TEXT NOT NULL,
+  markdown_body TEXT NOT NULL,
+  content_hash TEXT NOT NULL,
+  device_id TEXT NOT NULL,
+  merge_metadata_json TEXT,
+  created_at INTEGER NOT NULL
+);
+
+CREATE INDEX note_versions_note_revision_idx ON note_versions(note_id, revision);
+
+CREATE TABLE tombstones (
+  entity_id TEXT NOT NULL,
+  entity_type TEXT NOT NULL,
+  deleted_at INTEGER NOT NULL,
+  deleted_by_device_id TEXT NOT NULL,
+  last_known_revision INTEGER NOT NULL,
+  purge_after INTEGER,
+  dirty INTEGER NOT NULL,
+  PRIMARY KEY(entity_id, entity_type)
+);
+
+CREATE INDEX tombstones_dirty_idx ON tombstones(dirty, deleted_at);
+
+CREATE TABLE locations (
+  note_id TEXT NOT NULL PRIMARY KEY REFERENCES notes(id),
+  latitude REAL,
+  longitude REAL,
+  accuracy_meters REAL,
+  altitude_meters REAL,
+  place_text TEXT,
+  captured_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  revision INTEGER NOT NULL,
+  sync_state TEXT NOT NULL
+);
+
+CREATE TABLE sync_metadata (
+  entity_id TEXT NOT NULL,
+  entity_type TEXT NOT NULL,
+  local_revision INTEGER NOT NULL,
+  remote_revision INTEGER,
+  remote_etag TEXT,
+  vector_clock_json TEXT NOT NULL,
+  dirty INTEGER NOT NULL,
+  conflict_state TEXT NOT NULL,
+  last_synced_at INTEGER,
+  last_error TEXT,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY(entity_id, entity_type)
+);
+
+CREATE INDEX sync_metadata_dirty_idx ON sync_metadata(dirty, entity_type);
+
+CREATE TABLE settings (
+  id TEXT NOT NULL PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at INTEGER NOT NULL,
+  dirty INTEGER NOT NULL
+);
+
+CREATE TABLE devices (
+  id TEXT NOT NULL PRIMARY KEY,
+  name TEXT NOT NULL,
+  platform TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  last_seen_at INTEGER NOT NULL,
+  is_active INTEGER NOT NULL,
+  sync_cursor TEXT,
+  public_key TEXT,
+  workspace_key_metadata TEXT
+);
+
+CREATE TABLE sync_epochs_v2 (
+  remote_profile TEXT NOT NULL,
+  epoch_id TEXT NOT NULL,
+  lifecycle TEXT NOT NULL CHECK (lifecycle IN ('preparing', 'active', 'read_only', 'blocked', 'abandoned')),
+  health TEXT NOT NULL CHECK (health IN ('healthy', 'degraded', 'blocked')),
+  semantic_protocol_version INTEGER NOT NULL CHECK (semantic_protocol_version = 2),
+  minimum_writer_version INTEGER NOT NULL CHECK (minimum_writer_version >= 2),
+  key_set_version TEXT NOT NULL,
+  supported_offline_window_seconds INTEGER NOT NULL CHECK (supported_offline_window_seconds > 0),
+  descriptor_json TEXT NOT NULL,
+  descriptor_digest TEXT NOT NULL,
+  checkpoint_id TEXT NOT NULL,
+  checkpoint_digest TEXT NOT NULL,
+  previous_epoch_id TEXT,
+  created_at INTEGER NOT NULL,
+  activated_at INTEGER,
+  read_only_at INTEGER,
+  retain_until INTEGER,
+  safe_error_code TEXT,
+  safe_error_message TEXT,
+  authority_binding_id TEXT,
+  PRIMARY KEY(remote_profile, epoch_id),
+  CHECK (
+    (health = 'blocked' AND safe_error_code IS NOT NULL AND safe_error_message IS NOT NULL)
+    OR health <> 'blocked'
+  )
+);
+
+CREATE UNIQUE INDEX sync_epochs_v2_one_authority_idx
+ON sync_epochs_v2((1))
+WHERE lifecycle IN ('active', 'blocked');
+
+CREATE TABLE sync_local_authority_system_v2 (
+  singleton_id INTEGER NOT NULL PRIMARY KEY CHECK (singleton_id = 1),
+  remote_profile TEXT NOT NULL,
+  epoch_id TEXT NOT NULL,
+  local_writer_device_id TEXT NOT NULL,
+  authority_binding_id TEXT NOT NULL,
+  pointer_digest TEXT NOT NULL,
+  updated_at INTEGER NOT NULL,
+  FOREIGN KEY(remote_profile, epoch_id)
+    REFERENCES sync_epochs_v2(remote_profile, epoch_id) ON DELETE RESTRICT
+);
+
+CREATE TABLE sync_reconciliation_state_system_v2 (
+  singleton_id INTEGER NOT NULL PRIMARY KEY CHECK (singleton_id = 1),
+  reason TEXT NOT NULL CHECK (reason = 'restored_backup_pending_reconciliation'),
+  marked_at INTEGER NOT NULL
+);
+
+CREATE TABLE sync_dead_letters_v2 (
+  remote_profile TEXT NOT NULL,
+  epoch_id TEXT NOT NULL,
+  stream_id TEXT NOT NULL,
+  unit_id TEXT NOT NULL,
+  cursor_value TEXT,
+  unit_digest TEXT,
+  object_id TEXT,
+  object_digest TEXT,
+  authenticated_unit TEXT,
+  failure_class TEXT NOT NULL CHECK (failure_class IN ('retryable_dependency', 'persistent_integrity', 'incompatible_epoch', 'transport')),
+  lifecycle TEXT NOT NULL CHECK (lifecycle IN ('active', 'repaired', 'rebootstrap')),
+  safe_error_code TEXT NOT NULL,
+  safe_error_message TEXT NOT NULL,
+  first_seen_at INTEGER NOT NULL,
+  last_seen_at INTEGER NOT NULL,
+  last_retry_at INTEGER,
+  retry_count INTEGER NOT NULL CHECK (retry_count >= 0),
+  PRIMARY KEY(remote_profile, epoch_id, stream_id, unit_id)
+);
+
+CREATE INDEX sync_dead_letters_v2_active_idx
+ON sync_dead_letters_v2(remote_profile, epoch_id, lifecycle, first_seen_at);
+
+CREATE TABLE sync_run_history_v2 (
+  run_id TEXT NOT NULL PRIMARY KEY,
+  remote_profile TEXT NOT NULL,
+  epoch_id TEXT,
+  started_at INTEGER NOT NULL,
+  finished_at INTEGER,
+  status TEXT NOT NULL CHECK (status IN ('running', 'success', 'blocked', 'failed')),
+  pulled_units INTEGER NOT NULL DEFAULT 0,
+  pulled_objects INTEGER NOT NULL DEFAULT 0,
+  pushed_objects INTEGER NOT NULL DEFAULT 0,
+  auto_merged_entities INTEGER NOT NULL DEFAULT 0,
+  active_conflicts INTEGER NOT NULL DEFAULT 0,
+  safe_error_code TEXT,
+  safe_error_message TEXT,
+  contract_id TEXT NOT NULL DEFAULT 'someday-system-v2' CHECK (contract_id = 'someday-system-v2'),
+  stored_versions INTEGER NOT NULL DEFAULT 0 CHECK (stored_versions >= 0),
+  replays INTEGER NOT NULL DEFAULT 0 CHECK (replays >= 0),
+  fast_forwards INTEGER NOT NULL DEFAULT 0 CHECK (fast_forwards >= 0),
+  equivalent_merges INTEGER NOT NULL DEFAULT 0 CHECK (equivalent_merges >= 0),
+  deletion_merges INTEGER NOT NULL DEFAULT 0 CHECK (deletion_merges >= 0),
+  field_merges INTEGER NOT NULL DEFAULT 0 CHECK (field_merges >= 0),
+  active_note_conflicts INTEGER NOT NULL DEFAULT 0 CHECK (active_note_conflicts >= 0),
+  active_notebook_conflicts INTEGER NOT NULL DEFAULT 0 CHECK (active_notebook_conflicts >= 0),
+  active_preference_conflicts INTEGER NOT NULL DEFAULT 0 CHECK (active_preference_conflicts >= 0),
+  superseded_conflicts INTEGER NOT NULL DEFAULT 0 CHECK (superseded_conflicts >= 0),
+  projection_warnings INTEGER NOT NULL DEFAULT 0 CHECK (projection_warnings >= 0),
+  dead_letters INTEGER NOT NULL DEFAULT 0 CHECK (dead_letters >= 0),
+  pushed_mutations INTEGER NOT NULL DEFAULT 0 CHECK (pushed_mutations >= 0),
+  checkpoint_horizon INTEGER,
+  repair_state TEXT NOT NULL DEFAULT 'healthy'
+    CHECK (repair_state IN ('healthy', 'repair_required', 'rebootstrap_required'))
+);
+
+CREATE INDEX sync_run_history_v2_profile_started_idx
+ON sync_run_history_v2(remote_profile, started_at DESC);
+
+CREATE TABLE workspace_entity_versions_v2 (
+  epoch_id TEXT NOT NULL,
+  version_id TEXT NOT NULL,
+  contract_id TEXT NOT NULL CHECK (contract_id = 'someday-system-v2'),
+  schema_set_version TEXT NOT NULL CHECK (schema_set_version = 'workspace-entity-schema-set-v2'),
+  envelope_schema_version INTEGER NOT NULL CHECK (envelope_schema_version = 1),
+  entity_type TEXT NOT NULL CHECK (entity_type IN ('note', 'notebook', 'workspace_preferences')),
+  entity_schema_version INTEGER NOT NULL CHECK (entity_schema_version = 1),
+  entity_id TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('content', 'deletion')),
+  canonical_payload BLOB NOT NULL,
+  deleted_at_seconds INTEGER,
+  deleted_at_nanos INTEGER CHECK (deleted_at_nanos IS NULL OR deleted_at_nanos BETWEEN 0 AND 999999999),
+  provenance_type TEXT CHECK (provenance_type IS NULL OR provenance_type IN ('epoch_checkpoint', 'source_import')),
+  provenance_source_profile TEXT,
+  provenance_source_epoch TEXT,
+  provenance_source_writer_id TEXT,
+  provenance_source_mutation_id TEXT,
+  provenance_source_object_id TEXT,
+  provenance_source_digest TEXT,
+  author_actor_id TEXT NOT NULL,
+  authored_at_seconds INTEGER NOT NULL,
+  authored_at_nanos INTEGER NOT NULL CHECK (authored_at_nanos BETWEEN 0 AND 999999999),
+  generation INTEGER NOT NULL CHECK (generation >= 1),
+  payload_digest TEXT NOT NULL,
+  object_digest TEXT NOT NULL,
+  merge_algorithm_version TEXT CHECK (
+    merge_algorithm_version IS NULL OR merge_algorithm_version IN (
+      'equivalent-v2', 'deletion-v2', 'field-merge-v2', 'manual-resolution-v2'
+    )
+  ),
+  PRIMARY KEY(epoch_id, version_id),
+  UNIQUE(epoch_id, version_id, entity_type, entity_id),
+  CHECK (
+    (kind = 'content' AND deleted_at_seconds IS NULL AND deleted_at_nanos IS NULL)
+    OR
+    (kind = 'deletion' AND deleted_at_seconds IS NOT NULL AND deleted_at_nanos IS NOT NULL)
+  ),
+  CHECK (entity_type <> 'workspace_preferences' OR (entity_id = 'workspace-preferences' AND kind = 'content')),
+  CHECK (
+    provenance_type IS NOT NULL OR (
+      provenance_source_profile IS NULL AND
+      provenance_source_epoch IS NULL AND
+      provenance_source_writer_id IS NULL AND
+      provenance_source_mutation_id IS NULL AND
+      provenance_source_object_id IS NULL AND
+      provenance_source_digest IS NULL
+    )
+  )
+);
+
+CREATE INDEX workspace_entity_versions_v2_entity_generation_idx
+ON workspace_entity_versions_v2(epoch_id, entity_type, entity_id, generation, version_id);
+
+CREATE TABLE workspace_entity_version_parents_v2 (
+  epoch_id TEXT NOT NULL,
+  entity_type TEXT NOT NULL,
+  entity_id TEXT NOT NULL,
+  version_id TEXT NOT NULL,
+  parent_version_id TEXT NOT NULL,
+  PRIMARY KEY(epoch_id, version_id, parent_version_id),
+  FOREIGN KEY(epoch_id, version_id, entity_type, entity_id)
+    REFERENCES workspace_entity_versions_v2(epoch_id, version_id, entity_type, entity_id)
+    ON DELETE RESTRICT,
+  FOREIGN KEY(epoch_id, parent_version_id, entity_type, entity_id)
+    REFERENCES workspace_entity_versions_v2(epoch_id, version_id, entity_type, entity_id)
+    ON DELETE RESTRICT,
+  CHECK(version_id <> parent_version_id)
+);
+
+CREATE INDEX workspace_entity_version_parents_v2_parent_idx
+ON workspace_entity_version_parents_v2(epoch_id, parent_version_id, version_id);
+
+CREATE TABLE workspace_entity_heads_v2 (
+  epoch_id TEXT NOT NULL,
+  entity_type TEXT NOT NULL,
+  entity_id TEXT NOT NULL,
+  version_id TEXT NOT NULL,
+  PRIMARY KEY(epoch_id, entity_type, entity_id, version_id),
+  FOREIGN KEY(epoch_id, version_id, entity_type, entity_id)
+    REFERENCES workspace_entity_versions_v2(epoch_id, version_id, entity_type, entity_id)
+    ON DELETE RESTRICT
+);
+
+CREATE TABLE workspace_entity_conflicts_v2 (
+  epoch_id TEXT NOT NULL,
+  conflict_id TEXT NOT NULL,
+  entity_type TEXT NOT NULL,
+  entity_id TEXT NOT NULL,
+  base_version_id TEXT,
+  reason TEXT NOT NULL CHECK (reason IN ('field_conflict', 'concurrent_delete_edit', 'no_usable_merge_base')),
+  conflicting_fields TEXT NOT NULL,
+  detected_at INTEGER NOT NULL,
+  lifecycle TEXT NOT NULL CHECK (lifecycle IN ('active', 'superseded', 'resolved')),
+  superseded_by_conflict_id TEXT,
+  resolved_by_version_id TEXT,
+  PRIMARY KEY(epoch_id, conflict_id),
+  CHECK (
+    (lifecycle = 'active' AND superseded_by_conflict_id IS NULL AND resolved_by_version_id IS NULL)
+    OR (lifecycle = 'superseded' AND superseded_by_conflict_id IS NOT NULL AND resolved_by_version_id IS NULL)
+    OR (lifecycle = 'resolved' AND superseded_by_conflict_id IS NULL AND resolved_by_version_id IS NOT NULL)
+  ),
+  FOREIGN KEY(epoch_id, base_version_id)
+    REFERENCES workspace_entity_versions_v2(epoch_id, version_id) ON DELETE RESTRICT,
+  FOREIGN KEY(epoch_id, resolved_by_version_id)
+    REFERENCES workspace_entity_versions_v2(epoch_id, version_id) ON DELETE RESTRICT
+);
+
+CREATE UNIQUE INDEX workspace_entity_conflicts_v2_one_active_idx
+ON workspace_entity_conflicts_v2(epoch_id, entity_type, entity_id)
+WHERE lifecycle = 'active';
+
+CREATE INDEX workspace_entity_conflicts_v2_entity_idx
+ON workspace_entity_conflicts_v2(epoch_id, entity_type, entity_id, detected_at, conflict_id);
+
+CREATE TABLE workspace_entity_conflict_heads_v2 (
+  epoch_id TEXT NOT NULL,
+  conflict_id TEXT NOT NULL,
+  head_version_id TEXT NOT NULL,
+  PRIMARY KEY(epoch_id, conflict_id, head_version_id),
+  FOREIGN KEY(epoch_id, conflict_id)
+    REFERENCES workspace_entity_conflicts_v2(epoch_id, conflict_id) ON DELETE RESTRICT,
+  FOREIGN KEY(epoch_id, head_version_id)
+    REFERENCES workspace_entity_versions_v2(epoch_id, version_id) ON DELETE RESTRICT
+);
+
+CREATE TABLE note_projections_system_v2 (
+  epoch_id TEXT NOT NULL,
+  note_id TEXT NOT NULL,
+  preferred_head_version_id TEXT,
+  state TEXT NOT NULL CHECK (state IN ('content', 'deletion', 'conflict')),
+  referenced_notebook_id TEXT,
+  effective_notebook_id TEXT,
+  title TEXT,
+  markdown_body TEXT,
+  note_created_at_seconds INTEGER,
+  note_created_at_nanos INTEGER CHECK (note_created_at_nanos IS NULL OR note_created_at_nanos BETWEEN 0 AND 999999999),
+  time_zone_id TEXT,
+  location_latitude REAL,
+  location_longitude REAL,
+  location_place_text TEXT,
+  location_accuracy_meters REAL,
+  location_altitude_meters REAL,
+  location_captured_at_seconds INTEGER,
+  location_captured_at_nanos INTEGER CHECK (
+    location_captured_at_nanos IS NULL OR location_captured_at_nanos BETWEEN 0 AND 999999999
+  ),
+  deleted_at_seconds INTEGER,
+  deleted_at_nanos INTEGER CHECK (deleted_at_nanos IS NULL OR deleted_at_nanos BETWEEN 0 AND 999999999),
+  warning TEXT CHECK (warning IS NULL OR warning IN ('conflict', 'unresolved_notebook_reference', 'time_zone_fallback')),
+  authored_at_seconds INTEGER,
+  authored_at_nanos INTEGER CHECK (authored_at_nanos IS NULL OR authored_at_nanos BETWEEN 0 AND 999999999),
+  PRIMARY KEY(epoch_id, note_id),
+  FOREIGN KEY(epoch_id, preferred_head_version_id)
+    REFERENCES workspace_entity_versions_v2(epoch_id, version_id) ON DELETE RESTRICT
+);
+
+CREATE TABLE notebook_projections_v2 (
+  epoch_id TEXT NOT NULL,
+  notebook_id TEXT NOT NULL,
+  preferred_head_version_id TEXT,
+  state TEXT NOT NULL CHECK (state IN ('content', 'deletion', 'conflict')),
+  title TEXT,
+  sort_order INTEGER,
+  notebook_created_at_seconds INTEGER,
+  notebook_created_at_nanos INTEGER CHECK (
+    notebook_created_at_nanos IS NULL OR notebook_created_at_nanos BETWEEN 0 AND 999999999
+  ),
+  deleted_at_seconds INTEGER,
+  deleted_at_nanos INTEGER CHECK (deleted_at_nanos IS NULL OR deleted_at_nanos BETWEEN 0 AND 999999999),
+  warning TEXT CHECK (warning IS NULL OR warning = 'conflict'),
+  authored_at_seconds INTEGER,
+  authored_at_nanos INTEGER CHECK (authored_at_nanos IS NULL OR authored_at_nanos BETWEEN 0 AND 999999999),
+  PRIMARY KEY(epoch_id, notebook_id),
+  FOREIGN KEY(epoch_id, preferred_head_version_id)
+    REFERENCES workspace_entity_versions_v2(epoch_id, version_id) ON DELETE RESTRICT
+);
+
+CREATE TABLE workspace_preferences_projection_v2 (
+  epoch_id TEXT NOT NULL PRIMARY KEY,
+  preferred_head_version_id TEXT,
+  state TEXT NOT NULL CHECK (state IN ('content', 'conflict')),
+  theme TEXT CHECK (theme IS NULL OR theme IN ('system', 'light', 'dark')),
+  preview_by_default INTEGER CHECK (preview_by_default IS NULL OR preview_by_default IN (0, 1)),
+  markdown_toolbar_visible INTEGER CHECK (markdown_toolbar_visible IS NULL OR markdown_toolbar_visible IN (0, 1)),
+  referenced_default_notebook_id TEXT,
+  effective_default_notebook_id TEXT,
+  warning TEXT CHECK (warning IS NULL OR warning IN ('conflict', 'unresolved_default_notebook_reference')),
+  authored_at_seconds INTEGER,
+  authored_at_nanos INTEGER CHECK (authored_at_nanos IS NULL OR authored_at_nanos BETWEEN 0 AND 999999999),
+  FOREIGN KEY(epoch_id, preferred_head_version_id)
+    REFERENCES workspace_entity_versions_v2(epoch_id, version_id) ON DELETE RESTRICT
+);
+
+CREATE TABLE projection_warnings_v2 (
+  epoch_id TEXT NOT NULL,
+  entity_type TEXT NOT NULL,
+  entity_id TEXT NOT NULL,
+  warning_code TEXT NOT NULL,
+  related_entity_type TEXT,
+  related_entity_id TEXT,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY(epoch_id, entity_type, entity_id, warning_code)
+);
+
+CREATE TABLE sync_pending_mutations_system_v2 (
+  remote_profile TEXT NOT NULL,
+  epoch_id TEXT NOT NULL,
+  mutation_id TEXT NOT NULL,
+  object_id TEXT NOT NULL,
+  object_digest TEXT NOT NULL,
+  writer_device_id TEXT NOT NULL,
+  encoded_outer TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  last_attempt_at INTEGER,
+  attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+  PRIMARY KEY(remote_profile, epoch_id, mutation_id),
+  UNIQUE(remote_profile, epoch_id, object_id),
+  FOREIGN KEY(epoch_id, object_id)
+    REFERENCES workspace_entity_versions_v2(epoch_id, version_id) ON DELETE RESTRICT
+);
+
+CREATE INDEX sync_pending_mutations_system_v2_order_idx
+ON sync_pending_mutations_system_v2(remote_profile, epoch_id, created_at, mutation_id);
+
+CREATE TABLE sync_applied_mutations_system_v2 (
+  remote_profile TEXT NOT NULL,
+  epoch_id TEXT NOT NULL,
+  mutation_id TEXT NOT NULL,
+  object_id TEXT NOT NULL,
+  object_digest TEXT NOT NULL,
+  applied_at INTEGER NOT NULL,
+  first_writer_device_id TEXT NOT NULL DEFAULT '00000000-0000-4000-8000-000000000000',
+  PRIMARY KEY(remote_profile, epoch_id, mutation_id),
+  UNIQUE(remote_profile, epoch_id, object_id, object_digest)
+);
+
+CREATE TABLE sync_remote_cursors_system_v2 (
+  remote_profile TEXT NOT NULL,
+  epoch_id TEXT NOT NULL,
+  stream_id TEXT NOT NULL,
+  cursor_value TEXT NOT NULL,
+  unit_id TEXT NOT NULL,
+  unit_digest TEXT NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY(remote_profile, epoch_id, stream_id)
+);
+
+CREATE TABLE sync_checkpoints_system_v2 (
+  remote_profile TEXT NOT NULL,
+  epoch_id TEXT NOT NULL,
+  checkpoint_id TEXT NOT NULL,
+  manifest_digest TEXT NOT NULL,
+  encoded_manifest TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('preparing', 'published', 'active', 'expired')),
+  created_at INTEGER NOT NULL,
+  published_at INTEGER,
+  PRIMARY KEY(remote_profile, epoch_id, checkpoint_id)
+);
+
+CREATE TABLE sync_checkpoint_objects_system_v2 (
+  remote_profile TEXT NOT NULL,
+  epoch_id TEXT NOT NULL,
+  checkpoint_id TEXT NOT NULL,
+  chunk_index INTEGER NOT NULL CHECK (chunk_index >= 0),
+  object_index INTEGER NOT NULL CHECK (object_index >= 0),
+  object_id TEXT NOT NULL,
+  object_digest TEXT NOT NULL,
+  encoded_outer TEXT NOT NULL,
+  PRIMARY KEY(remote_profile, epoch_id, checkpoint_id, chunk_index, object_index),
+  FOREIGN KEY(remote_profile, epoch_id, checkpoint_id)
+    REFERENCES sync_checkpoints_system_v2(remote_profile, epoch_id, checkpoint_id) ON DELETE RESTRICT
+);
+
+CREATE TABLE sync_control_objects_system_v2 (
+  remote_profile TEXT NOT NULL,
+  epoch_id TEXT NOT NULL,
+  object_type TEXT NOT NULL CHECK (object_type IN (
+    'sync_epoch_pointer_v2', 'sync_checkpoint_manifest_v2', 'sync_checkpoint_chunk_v2',
+    'webdav_writer_manifest_v2', 'webdav_log_segment_v2'
+  )),
+  object_id TEXT NOT NULL,
+  object_digest TEXT NOT NULL,
+  encoded_outer TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('prepared', 'published', 'active', 'superseded')),
+  created_at INTEGER NOT NULL,
+  published_at INTEGER,
+  PRIMARY KEY(remote_profile, epoch_id, object_type, object_id)
+);
+
+CREATE TABLE sync_transport_units_system_v2 (
+  remote_profile TEXT NOT NULL,
+  epoch_id TEXT NOT NULL,
+  stream_id TEXT NOT NULL,
+  unit_id TEXT NOT NULL,
+  unit_digest TEXT NOT NULL,
+  previous_unit_digest TEXT,
+  ordinal_value INTEGER NOT NULL CHECK (ordinal_value >= 1),
+  encoded_unit_outer TEXT NOT NULL,
+  ordered_mutation_tuples TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('sealed', 'object_published', 'committed', 'superseded')),
+  created_at INTEGER NOT NULL,
+  published_at INTEGER,
+  PRIMARY KEY(remote_profile, epoch_id, stream_id, unit_id),
+  UNIQUE(remote_profile, epoch_id, stream_id, ordinal_value)
+);
+
+CREATE TABLE sync_quarantined_objects_v2 (
+  remote_profile TEXT NOT NULL,
+  epoch_id TEXT NOT NULL,
+  stream_id TEXT NOT NULL,
+  unit_id TEXT NOT NULL,
+  object_id TEXT NOT NULL,
+  claimed_object_digest TEXT,
+  encoded_outer TEXT NOT NULL,
+  failure_code TEXT NOT NULL,
+  first_seen_at INTEGER NOT NULL,
+  last_seen_at INTEGER NOT NULL,
+  lifecycle TEXT NOT NULL CHECK (lifecycle IN ('active', 'repaired', 'rebootstrap')),
+  PRIMARY KEY(remote_profile, epoch_id, stream_id, unit_id, object_id)
+);
+
+CREATE TABLE sync_repair_replicas_v2 (
+  remote_profile TEXT NOT NULL,
+  epoch_id TEXT NOT NULL,
+  object_id TEXT NOT NULL,
+  object_digest TEXT NOT NULL,
+  replica_writer_device_id TEXT NOT NULL,
+  ciphertext_digest TEXT NOT NULL,
+  encoded_outer TEXT NOT NULL,
+  validation_state TEXT NOT NULL CHECK (validation_state IN ('unverified', 'valid', 'invalid')),
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY(remote_profile, epoch_id, object_id, object_digest, replica_writer_device_id)
+);
+
+CREATE TABLE sync_source_imports_system_v2 (
+  remote_profile TEXT NOT NULL,
+  epoch_id TEXT NOT NULL,
+  source_profile TEXT NOT NULL,
+  source_epoch TEXT,
+  source_writer_id TEXT,
+  source_mutation_id TEXT,
+  source_object_id TEXT NOT NULL,
+  source_digest TEXT NOT NULL,
+  entity_type TEXT NOT NULL,
+  source_entity_id TEXT NOT NULL,
+  mapped_entity_id TEXT NOT NULL,
+  version_id TEXT NOT NULL,
+  mutation_id TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('prepared', 'queued', 'committed', 'published', 'recovery_required')),
+  created_at INTEGER NOT NULL,
+  published_at INTEGER,
+  PRIMARY KEY(remote_profile, epoch_id, source_profile, source_object_id, source_digest),
+  UNIQUE(remote_profile, epoch_id, mutation_id),
+  FOREIGN KEY(epoch_id, version_id)
+    REFERENCES workspace_entity_versions_v2(epoch_id, version_id) ON DELETE RESTRICT
+);
+
+insertNotebook:
+INSERT INTO notebooks(
+  id,
+  title,
+  sort_order,
+  created_at,
+  updated_at,
+  deleted_at,
+  revision,
+  sync_state,
+  content_hash
+)
+VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?);
+
+updateNotebookForDelete:
+UPDATE notebooks
+SET updated_at = ?,
+    deleted_at = ?,
+    revision = ?,
+    sync_state = ?,
+    content_hash = ?
+WHERE id = ?;
+
+updateNotebookTitle:
+UPDATE notebooks
+SET title = ?,
+    updated_at = ?,
+    revision = ?,
+    sync_state = ?,
+    content_hash = ?
+WHERE id = ? AND deleted_at IS NULL;
+
+insertRemoteNotebookSnapshot:
+INSERT INTO notebooks(
+  id,
+  title,
+  sort_order,
+  created_at,
+  updated_at,
+  deleted_at,
+  revision,
+  sync_state,
+  content_hash
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+updateRemoteNotebookSnapshot:
+UPDATE notebooks
+SET title = ?,
+    sort_order = ?,
+    created_at = ?,
+    updated_at = ?,
+    deleted_at = ?,
+    revision = ?,
+    sync_state = ?,
+    content_hash = ?
+WHERE id = ?;
+
+selectActiveNotebooks:
+SELECT id, title, sort_order, created_at, updated_at, deleted_at, revision, sync_state, content_hash
+FROM notebooks
+WHERE deleted_at IS NULL
+ORDER BY sort_order, title;
+
+selectNotebookById:
+SELECT id, title, sort_order, created_at, updated_at, deleted_at, revision, sync_state, content_hash
+FROM notebooks
+WHERE id = ? AND deleted_at IS NULL;
+
+selectNotebookByIdIncludingDeleted:
+SELECT id, title, sort_order, created_at, updated_at, deleted_at, revision, sync_state, content_hash
+FROM notebooks
+WHERE id = ?;
+
+countActiveNotesForNotebook:
+SELECT count(*)
+FROM notes
+WHERE notebook_id = ? AND deleted_at IS NULL;
+
+insertNote:
+INSERT INTO notes(
+  id,
+  notebook_id,
+  title,
+  markdown_body,
+  excerpt,
+  search_text,
+  time_zone_id,
+  created_at,
+  updated_at,
+  deleted_at,
+  content_hash,
+  revision,
+  sync_state,
+  current_version_id
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?);
+
+updateNoteSnapshot:
+UPDATE notes
+SET notebook_id = ?,
+    title = ?,
+    markdown_body = ?,
+    excerpt = ?,
+    search_text = ?,
+    time_zone_id = ?,
+    created_at = ?,
+    updated_at = ?,
+    deleted_at = NULL,
+    content_hash = ?,
+    revision = ?,
+    sync_state = ?,
+    current_version_id = ?
+WHERE id = ?;
+
+markNoteDeleted:
+UPDATE notes
+SET updated_at = ?,
+    deleted_at = ?,
+    revision = ?,
+    sync_state = ?
+WHERE id = ?;
+
+selectActiveNotesByNotebook:
+SELECT id,
+       notebook_id,
+       title,
+       markdown_body,
+       excerpt,
+       search_text,
+       time_zone_id,
+       created_at,
+       updated_at,
+       deleted_at,
+       content_hash,
+       revision,
+       sync_state,
+       current_version_id
+FROM notes
+WHERE notebook_id = ? AND deleted_at IS NULL
+ORDER BY created_at DESC, title;
+
+selectActiveNotes:
+SELECT id,
+       notebook_id,
+       title,
+       markdown_body,
+       excerpt,
+       search_text,
+       time_zone_id,
+       created_at,
+       updated_at,
+       deleted_at,
+       content_hash,
+       revision,
+       sync_state,
+       current_version_id
+FROM notes
+WHERE deleted_at IS NULL
+ORDER BY created_at DESC, title;
+
+searchActiveNotes:
+SELECT id,
+       notebook_id,
+       title,
+       markdown_body,
+       excerpt,
+       search_text,
+       time_zone_id,
+       created_at,
+       updated_at,
+       deleted_at,
+       content_hash,
+       revision,
+       sync_state,
+       current_version_id
+FROM notes
+WHERE deleted_at IS NULL
+  AND instr(search_text, ?) > 0
+ORDER BY created_at DESC, updated_at DESC, title;
+
+selectActiveNoteById:
+SELECT id,
+       notebook_id,
+       title,
+       markdown_body,
+       excerpt,
+       search_text,
+       time_zone_id,
+       created_at,
+       updated_at,
+       deleted_at,
+       content_hash,
+       revision,
+       sync_state,
+       current_version_id
+FROM notes
+WHERE id = ? AND deleted_at IS NULL;
+
+selectNoteByIdIncludingDeleted:
+SELECT id,
+       notebook_id,
+       title,
+       markdown_body,
+       excerpt,
+       search_text,
+       time_zone_id,
+       created_at,
+       updated_at,
+       deleted_at,
+       content_hash,
+       revision,
+       sync_state,
+       current_version_id
+FROM notes
+WHERE id = ?;
+
+insertNoteVersion:
+INSERT INTO note_versions(
+  version_id,
+  note_id,
+  parent_version_id,
+  base_version_id,
+  revision,
+  title,
+  markdown_body,
+  content_hash,
+  device_id,
+  merge_metadata_json,
+  created_at
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+selectNoteVersions:
+SELECT version_id,
+       note_id,
+       parent_version_id,
+       base_version_id,
+       revision,
+       title,
+       markdown_body,
+       content_hash,
+       device_id,
+       merge_metadata_json,
+       created_at
+FROM note_versions
+WHERE note_id = ?
+ORDER BY revision ASC, created_at ASC;
+
+selectNoteVersion:
+SELECT version_id,
+       note_id,
+       parent_version_id,
+       base_version_id,
+       revision,
+       title,
+       markdown_body,
+       content_hash,
+       device_id,
+       merge_metadata_json,
+       created_at
+FROM note_versions
+WHERE note_id = ? AND version_id = ?;
+
+selectNoteVersionById:
+SELECT version_id,
+       note_id,
+       parent_version_id,
+       base_version_id,
+       revision,
+       title,
+       markdown_body,
+       content_hash,
+       device_id,
+       merge_metadata_json,
+       created_at
+FROM note_versions
+WHERE version_id = ?;
+
+upsertTombstone:
+INSERT OR REPLACE INTO tombstones(
+  entity_id,
+  entity_type,
+  deleted_at,
+  deleted_by_device_id,
+  last_known_revision,
+  purge_after,
+  dirty
+)
+VALUES (?, ?, ?, ?, ?, ?, ?);
+
+selectTombstone:
+SELECT entity_id, entity_type, deleted_at, deleted_by_device_id, last_known_revision, purge_after, dirty
+FROM tombstones
+WHERE entity_id = ? AND entity_type = ?;
+
+deleteTombstone:
+DELETE FROM tombstones
+WHERE entity_id = ? AND entity_type = ?;
+
+selectDirtyTombstones:
+SELECT entity_id, entity_type, deleted_at, deleted_by_device_id, last_known_revision, purge_after, dirty
+FROM tombstones
+WHERE dirty = 1
+ORDER BY deleted_at ASC, entity_type ASC, entity_id ASC;
+
+selectAllTombstones:
+SELECT entity_id, entity_type, deleted_at, deleted_by_device_id, last_known_revision, purge_after, dirty
+FROM tombstones
+ORDER BY deleted_at ASC, entity_type ASC, entity_id ASC;
+
+updateTombstoneDirty:
+UPDATE tombstones
+SET dirty = ?
+WHERE entity_id = ? AND entity_type = ?;
+
+insertOrReplaceLocation:
+INSERT OR REPLACE INTO locations(
+  note_id,
+  latitude,
+  longitude,
+  accuracy_meters,
+  altitude_meters,
+  place_text,
+  captured_at,
+  updated_at,
+  revision,
+  sync_state
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+selectLocationByNote:
+SELECT note_id,
+       latitude,
+       longitude,
+       accuracy_meters,
+       altitude_meters,
+       place_text,
+       captured_at,
+       updated_at,
+       revision,
+       sync_state
+FROM locations
+WHERE note_id = ?;
+
+deleteLocationForNote:
+DELETE FROM locations
+WHERE note_id = ?;
+
+upsertSyncMetadata:
+INSERT OR REPLACE INTO sync_metadata(
+  entity_id,
+  entity_type,
+  local_revision,
+  remote_revision,
+  remote_etag,
+  vector_clock_json,
+  dirty,
+  conflict_state,
+  last_synced_at,
+  last_error,
+  updated_at
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+selectSyncMetadata:
+SELECT entity_id,
+       entity_type,
+       local_revision,
+       remote_revision,
+       remote_etag,
+       vector_clock_json,
+       dirty,
+       conflict_state,
+       last_synced_at,
+       last_error,
+       updated_at
+FROM sync_metadata
+WHERE entity_id = ? AND entity_type = ?;
+
+selectDirtySyncMetadata:
+SELECT entity_id,
+       entity_type,
+       local_revision,
+       remote_revision,
+       remote_etag,
+       vector_clock_json,
+       dirty,
+       conflict_state,
+       last_synced_at,
+       last_error,
+       updated_at
+FROM sync_metadata
+WHERE dirty = 1
+ORDER BY updated_at ASC, entity_type ASC, entity_id ASC;
+
+selectConflictingSyncMetadata:
+SELECT entity_id,
+       entity_type,
+       local_revision,
+       remote_revision,
+       remote_etag,
+       vector_clock_json,
+       dirty,
+       conflict_state,
+       last_synced_at,
+       last_error,
+       updated_at
+FROM sync_metadata
+WHERE conflict_state != 'none'
+ORDER BY updated_at ASC, entity_type ASC, entity_id ASC;
+
+updateNoteSyncState:
+UPDATE notes
+SET sync_state = ?
+WHERE id = ?;
+
+updateNotebookSyncState:
+UPDATE notebooks
+SET sync_state = ?
+WHERE id = ?;
+
+updateLocationSyncState:
+UPDATE locations
+SET sync_state = ?
+WHERE note_id = ?;
+
+updateSettingDirty:
+UPDATE settings
+SET dirty = ?
+WHERE id = ?;
+
+insertOrReplaceSetting:
+INSERT OR REPLACE INTO settings(id, value, updated_at, dirty)
+VALUES (?, ?, ?, ?);
+
+selectSetting:
+SELECT id, value, updated_at, dirty
+FROM settings
+WHERE id = ?;
+
+deleteSetting:
+DELETE FROM settings
+WHERE id = ?;
+
+insertOrReplaceDevice:
+INSERT OR REPLACE INTO devices(
+  id,
+  name,
+  platform,
+  created_at,
+  last_seen_at,
+  is_active,
+  sync_cursor,
+  public_key,
+  workspace_key_metadata
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+selectDevice:
+SELECT id,
+       name,
+       platform,
+       created_at,
+       last_seen_at,
+       is_active,
+       sync_cursor,
+       public_key,
+       workspace_key_metadata
+FROM devices
+WHERE id = ?;
+
+insertSyncEpochV2:
+INSERT INTO sync_epochs_v2(
+  remote_profile,
+  epoch_id,
+  lifecycle,
+  health,
+  semantic_protocol_version,
+  minimum_writer_version,
+  key_set_version,
+  supported_offline_window_seconds,
+  descriptor_json,
+  descriptor_digest,
+  checkpoint_id,
+  checkpoint_digest,
+  previous_epoch_id,
+  created_at,
+  activated_at,
+  read_only_at,
+  retain_until,
+  safe_error_code,
+  safe_error_message
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+selectSyncEpochV2:
+SELECT *
+FROM sync_epochs_v2
+WHERE remote_profile = ? AND epoch_id = ?;
+
+selectActiveSyncEpochV2:
+SELECT *
+FROM sync_epochs_v2
+WHERE remote_profile = ? AND lifecycle IN ('active', 'blocked');
+
+selectAuthoritativeSyncEpochV2:
+SELECT *
+FROM sync_epochs_v2
+WHERE lifecycle IN ('active', 'blocked');
+
+selectAllSyncEpochsV2:
+SELECT *
+FROM sync_epochs_v2
+ORDER BY created_at DESC, remote_profile ASC, epoch_id DESC;
+
+upsertLocalAuthoritySystemV2:
+INSERT OR REPLACE INTO sync_local_authority_system_v2(
+  singleton_id, remote_profile, epoch_id, local_writer_device_id,
+  authority_binding_id, pointer_digest, updated_at
+)
+VALUES (1, ?, ?, ?, ?, ?, ?);
+
+selectLocalAuthoritySystemV2:
+SELECT *
+FROM sync_local_authority_system_v2
+WHERE singleton_id = 1;
+
+markBackupReconciliationPendingSystemV2:
+INSERT OR REPLACE INTO sync_reconciliation_state_system_v2(singleton_id, reason, marked_at)
+VALUES (1, 'restored_backup_pending_reconciliation', ?);
+
+selectReconciliationStateSystemV2:
+SELECT *
+FROM sync_reconciliation_state_system_v2
+WHERE singleton_id = 1;
+
+clearBackupReconciliationSystemV2:
+DELETE FROM sync_reconciliation_state_system_v2
+WHERE singleton_id = 1 AND reason = 'restored_backup_pending_reconciliation';
+
+selectSyncEpochsV2ByProfile:
+SELECT *
+FROM sync_epochs_v2
+WHERE remote_profile = ?
+ORDER BY created_at DESC, epoch_id DESC;
+
+updateSyncEpochLifecycleV2:
+UPDATE sync_epochs_v2
+SET lifecycle = ?,
+    health = ?,
+    activated_at = ?,
+    read_only_at = ?,
+    retain_until = ?,
+    safe_error_code = ?,
+    safe_error_message = ?
+WHERE remote_profile = ? AND epoch_id = ?;
+
+updateSyncEpochAuthorityBindingV2:
+UPDATE sync_epochs_v2
+SET authority_binding_id = ?
+WHERE remote_profile = ? AND epoch_id = ?;
+
+insertOrReplaceSyncDeadLetterV2:
+INSERT OR REPLACE INTO sync_dead_letters_v2(
+  remote_profile,
+  epoch_id,
+  stream_id,
+  unit_id,
+  cursor_value,
+  unit_digest,
+  object_id,
+  object_digest,
+  authenticated_unit,
+  failure_class,
+  lifecycle,
+  safe_error_code,
+  safe_error_message,
+  first_seen_at,
+  last_seen_at,
+  last_retry_at,
+  retry_count
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+selectSyncDeadLetterV2:
+SELECT *
+FROM sync_dead_letters_v2
+WHERE remote_profile = ? AND epoch_id = ? AND stream_id = ? AND unit_id = ?;
+
+selectActiveSyncDeadLettersV2:
+SELECT *
+FROM sync_dead_letters_v2
+WHERE remote_profile = ? AND epoch_id = ? AND lifecycle = 'active'
+ORDER BY first_seen_at ASC, stream_id ASC, unit_id ASC;
+
+updateSyncDeadLetterLifecycleV2:
+UPDATE sync_dead_letters_v2
+SET lifecycle = ?, last_seen_at = ?
+WHERE remote_profile = ? AND epoch_id = ? AND stream_id = ? AND unit_id = ?;
+
+insertSyncRunHistoryV2:
+INSERT INTO sync_run_history_v2(
+  run_id,
+  remote_profile,
+  epoch_id,
+  started_at,
+  finished_at,
+  status,
+  pulled_units,
+  pulled_objects,
+  pushed_objects,
+  auto_merged_entities,
+  active_conflicts,
+  safe_error_code,
+  safe_error_message,
+  contract_id,
+  stored_versions,
+  replays,
+  fast_forwards,
+  equivalent_merges,
+  deletion_merges,
+  field_merges,
+  active_note_conflicts,
+  active_notebook_conflicts,
+  active_preference_conflicts,
+  superseded_conflicts,
+  projection_warnings,
+  dead_letters,
+  pushed_mutations,
+  checkpoint_horizon,
+  repair_state
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+updateSyncRunHistoryV2:
+UPDATE sync_run_history_v2
+SET finished_at = ?,
+    epoch_id = ?,
+    status = ?,
+    pulled_units = ?,
+    pulled_objects = ?,
+    pushed_objects = ?,
+    auto_merged_entities = ?,
+    active_conflicts = ?,
+    safe_error_code = ?,
+    safe_error_message = ?,
+    stored_versions = ?,
+    replays = ?,
+    fast_forwards = ?,
+    equivalent_merges = ?,
+    deletion_merges = ?,
+    field_merges = ?,
+    active_note_conflicts = ?,
+    active_notebook_conflicts = ?,
+    active_preference_conflicts = ?,
+    superseded_conflicts = ?,
+    projection_warnings = ?,
+    dead_letters = ?,
+    pushed_mutations = ?,
+    checkpoint_horizon = ?,
+    repair_state = ?
+WHERE run_id = ?;
+
+selectSyncRunHistoryV2:
+SELECT *
+FROM sync_run_history_v2
+WHERE remote_profile = ?
+ORDER BY started_at DESC
+LIMIT ?;
+
+pruneSyncRunHistoryV2:
+DELETE FROM sync_run_history_v2
+WHERE finished_at IS NOT NULL
+  AND started_at < ?
+  AND run_id NOT IN (
+    SELECT run_id
+    FROM sync_run_history_v2
+    ORDER BY started_at DESC
+    LIMIT 50
+  );
+
+insertWorkspaceEntityVersionV2:
+INSERT INTO workspace_entity_versions_v2(
+  epoch_id, version_id, contract_id, schema_set_version, envelope_schema_version,
+  entity_type, entity_schema_version, entity_id, kind, canonical_payload,
+  deleted_at_seconds, deleted_at_nanos, provenance_type,
+  provenance_source_profile, provenance_source_epoch, provenance_source_writer_id,
+  provenance_source_mutation_id, provenance_source_object_id, provenance_source_digest,
+  author_actor_id, authored_at_seconds, authored_at_nanos, generation,
+  payload_digest, object_digest, merge_algorithm_version
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+selectWorkspaceEntityVersionV2:
+SELECT *
+FROM workspace_entity_versions_v2
+WHERE epoch_id = ? AND version_id = ?;
+
+selectWorkspaceEntityVersionsByEntityV2:
+SELECT *
+FROM workspace_entity_versions_v2
+WHERE epoch_id = ? AND entity_type = ? AND entity_id = ?
+ORDER BY generation ASC, version_id ASC;
+
+selectWorkspaceEntityVersionsByEpochV2:
+SELECT *
+FROM workspace_entity_versions_v2
+WHERE epoch_id = ?
+ORDER BY entity_type ASC, entity_id ASC, generation ASC, version_id ASC;
+
+selectWorkspaceEntityKeysV2:
+SELECT DISTINCT entity_type, entity_id
+FROM workspace_entity_versions_v2
+WHERE epoch_id = ?
+ORDER BY entity_type ASC, entity_id ASC;
+
+insertWorkspaceEntityParentV2:
+INSERT INTO workspace_entity_version_parents_v2(
+  epoch_id, entity_type, entity_id, version_id, parent_version_id
+)
+VALUES (?, ?, ?, ?, ?);
+
+selectWorkspaceEntityParentsV2:
+SELECT parent_version_id
+FROM workspace_entity_version_parents_v2
+WHERE epoch_id = ? AND version_id = ?
+ORDER BY parent_version_id ASC;
+
+deleteWorkspaceEntityHeadsV2:
+DELETE FROM workspace_entity_heads_v2
+WHERE epoch_id = ? AND entity_type = ? AND entity_id = ?;
+
+insertWorkspaceEntityHeadV2:
+INSERT INTO workspace_entity_heads_v2(epoch_id, entity_type, entity_id, version_id)
+VALUES (?, ?, ?, ?);
+
+selectWorkspaceEntityHeadsV2:
+SELECT version_id
+FROM workspace_entity_heads_v2
+WHERE epoch_id = ? AND entity_type = ? AND entity_id = ?
+ORDER BY version_id ASC;
+
+selectAllWorkspaceEntityHeadsV2:
+SELECT *
+FROM workspace_entity_heads_v2
+WHERE epoch_id = ?
+ORDER BY entity_type ASC, entity_id ASC, version_id ASC;
+
+insertWorkspaceEntityConflictV2:
+INSERT INTO workspace_entity_conflicts_v2(
+  epoch_id, conflict_id, entity_type, entity_id, base_version_id, reason,
+  conflicting_fields, detected_at, lifecycle, superseded_by_conflict_id,
+  resolved_by_version_id
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+selectWorkspaceEntityConflictsV2:
+SELECT *
+FROM workspace_entity_conflicts_v2
+WHERE epoch_id = ? AND entity_type = ? AND entity_id = ?
+ORDER BY detected_at ASC, conflict_id ASC;
+
+selectActiveWorkspaceEntityConflictsV2:
+SELECT *
+FROM workspace_entity_conflicts_v2
+WHERE epoch_id = ? AND lifecycle = 'active'
+ORDER BY entity_type ASC, entity_id ASC, conflict_id ASC;
+
+updateWorkspaceEntityConflictV2:
+UPDATE workspace_entity_conflicts_v2
+SET lifecycle = ?, superseded_by_conflict_id = ?, resolved_by_version_id = ?
+WHERE epoch_id = ? AND conflict_id = ?;
+
+insertWorkspaceEntityConflictHeadV2:
+INSERT INTO workspace_entity_conflict_heads_v2(epoch_id, conflict_id, head_version_id)
+VALUES (?, ?, ?);
+
+selectWorkspaceEntityConflictHeadsV2:
+SELECT head_version_id
+FROM workspace_entity_conflict_heads_v2
+WHERE epoch_id = ? AND conflict_id = ?
+ORDER BY head_version_id ASC;
+
+upsertNoteProjectionSystemV2:
+INSERT OR REPLACE INTO note_projections_system_v2(
+  epoch_id, note_id, preferred_head_version_id, state,
+  referenced_notebook_id, effective_notebook_id, title, markdown_body,
+  note_created_at_seconds, note_created_at_nanos, time_zone_id,
+  location_latitude, location_longitude, location_place_text,
+  location_accuracy_meters, location_altitude_meters,
+  location_captured_at_seconds, location_captured_at_nanos,
+  deleted_at_seconds, deleted_at_nanos, warning,
+  authored_at_seconds, authored_at_nanos
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+selectNoteProjectionSystemV2:
+SELECT *
+FROM note_projections_system_v2
+WHERE epoch_id = ? AND note_id = ?;
+
+selectAllNoteProjectionsSystemV2:
+SELECT *
+FROM note_projections_system_v2
+WHERE epoch_id = ?
+ORDER BY note_id ASC;
+
+deleteNoteProjectionsSystemV2:
+DELETE FROM note_projections_system_v2
+WHERE epoch_id = ?;
+
+upsertNotebookProjectionV2:
+INSERT OR REPLACE INTO notebook_projections_v2(
+  epoch_id, notebook_id, preferred_head_version_id, state, title, sort_order,
+  notebook_created_at_seconds, notebook_created_at_nanos,
+  deleted_at_seconds, deleted_at_nanos, warning,
+  authored_at_seconds, authored_at_nanos
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+selectNotebookProjectionV2:
+SELECT *
+FROM notebook_projections_v2
+WHERE epoch_id = ? AND notebook_id = ?;
+
+selectAllNotebookProjectionsV2:
+SELECT *
+FROM notebook_projections_v2
+WHERE epoch_id = ?
+ORDER BY sort_order ASC, notebook_id ASC;
+
+deleteNotebookProjectionsV2:
+DELETE FROM notebook_projections_v2
+WHERE epoch_id = ?;
+
+upsertWorkspacePreferencesProjectionV2:
+INSERT OR REPLACE INTO workspace_preferences_projection_v2(
+  epoch_id, preferred_head_version_id, state, theme,
+  preview_by_default, markdown_toolbar_visible,
+  referenced_default_notebook_id, effective_default_notebook_id,
+  warning, authored_at_seconds, authored_at_nanos
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+selectWorkspacePreferencesProjectionV2:
+SELECT *
+FROM workspace_preferences_projection_v2
+WHERE epoch_id = ?;
+
+deleteWorkspacePreferencesProjectionV2:
+DELETE FROM workspace_preferences_projection_v2
+WHERE epoch_id = ?;
+
+insertProjectionWarningV2:
+INSERT OR REPLACE INTO projection_warnings_v2(
+  epoch_id, entity_type, entity_id, warning_code,
+  related_entity_type, related_entity_id, created_at
+)
+VALUES (?, ?, ?, ?, ?, ?, ?);
+
+deleteProjectionWarningsForEntityV2:
+DELETE FROM projection_warnings_v2
+WHERE epoch_id = ? AND entity_type = ? AND entity_id = ?;
+
+selectProjectionWarningsV2:
+SELECT *
+FROM projection_warnings_v2
+WHERE epoch_id = ?
+ORDER BY entity_type ASC, entity_id ASC, warning_code ASC;
+
+insertPendingMutationSystemV2:
+INSERT INTO sync_pending_mutations_system_v2(
+  remote_profile, epoch_id, mutation_id, object_id, object_digest,
+  writer_device_id, encoded_outer, created_at, last_attempt_at, attempt_count
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 0);
+
+selectPendingMutationSystemV2:
+SELECT *
+FROM sync_pending_mutations_system_v2
+WHERE remote_profile = ? AND epoch_id = ? AND mutation_id = ?;
+
+selectPendingMutationByObjectSystemV2:
+SELECT *
+FROM sync_pending_mutations_system_v2
+WHERE remote_profile = ? AND epoch_id = ? AND object_id = ?;
+
+selectPendingMutationsSystemV2:
+SELECT *
+FROM sync_pending_mutations_system_v2
+WHERE remote_profile = ? AND epoch_id = ?
+ORDER BY created_at ASC, mutation_id ASC;
+
+updatePendingMutationAttemptSystemV2:
+UPDATE sync_pending_mutations_system_v2
+SET last_attempt_at = ?, attempt_count = attempt_count + 1
+WHERE remote_profile = ? AND epoch_id = ? AND mutation_id = ?;
+
+deletePendingMutationSystemV2:
+DELETE FROM sync_pending_mutations_system_v2
+WHERE remote_profile = ? AND epoch_id = ? AND mutation_id = ?
+  AND object_id = ? AND object_digest = ?;
+
+insertAppliedMutationSystemV2:
+INSERT INTO sync_applied_mutations_system_v2(
+  remote_profile, epoch_id, mutation_id, object_id, object_digest, first_writer_device_id, applied_at
+)
+VALUES (?, ?, ?, ?, ?, ?, ?);
+
+selectAppliedMutationSystemV2:
+SELECT *
+FROM sync_applied_mutations_system_v2
+WHERE remote_profile = ? AND epoch_id = ? AND mutation_id = ?;
+
+upsertRemoteCursorSystemV2:
+INSERT OR REPLACE INTO sync_remote_cursors_system_v2(
+  remote_profile, epoch_id, stream_id, cursor_value, unit_id, unit_digest, updated_at
+)
+VALUES (?, ?, ?, ?, ?, ?, ?);
+
+selectRemoteCursorSystemV2:
+SELECT *
+FROM sync_remote_cursors_system_v2
+WHERE remote_profile = ? AND epoch_id = ? AND stream_id = ?;
+
+selectRemoteCursorsSystemV2:
+SELECT *
+FROM sync_remote_cursors_system_v2
+WHERE remote_profile = ? AND epoch_id = ?
+ORDER BY stream_id ASC;
+
+insertCheckpointSystemV2:
+INSERT INTO sync_checkpoints_system_v2(
+  remote_profile, epoch_id, checkpoint_id, manifest_digest,
+  encoded_manifest, state, created_at, published_at
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+
+selectCheckpointSystemV2:
+SELECT *
+FROM sync_checkpoints_system_v2
+WHERE remote_profile = ? AND epoch_id = ? AND checkpoint_id = ?;
+
+updateCheckpointStateSystemV2:
+UPDATE sync_checkpoints_system_v2
+SET state = ?, published_at = ?
+WHERE remote_profile = ? AND epoch_id = ? AND checkpoint_id = ?;
+
+insertCheckpointObjectSystemV2:
+INSERT INTO sync_checkpoint_objects_system_v2(
+  remote_profile, epoch_id, checkpoint_id, chunk_index, object_index,
+  object_id, object_digest, encoded_outer
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+
+selectCheckpointObjectsSystemV2:
+SELECT *
+FROM sync_checkpoint_objects_system_v2
+WHERE remote_profile = ? AND epoch_id = ? AND checkpoint_id = ?
+ORDER BY chunk_index ASC, object_index ASC;
+
+insertControlObjectSystemV2:
+INSERT INTO sync_control_objects_system_v2(
+  remote_profile, epoch_id, object_type, object_id, object_digest,
+  encoded_outer, state, created_at, published_at
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+selectControlObjectSystemV2:
+SELECT *
+FROM sync_control_objects_system_v2
+WHERE remote_profile = ? AND epoch_id = ? AND object_type = ? AND object_id = ?;
+
+selectControlObjectsSystemV2:
+SELECT *
+FROM sync_control_objects_system_v2
+WHERE remote_profile = ? AND epoch_id = ?
+ORDER BY object_type ASC, object_id ASC;
+
+updateControlObjectStateSystemV2:
+UPDATE sync_control_objects_system_v2
+SET state = ?, published_at = ?
+WHERE remote_profile = ? AND epoch_id = ? AND object_type = ? AND object_id = ?;
+
+insertTransportUnitSystemV2:
+INSERT INTO sync_transport_units_system_v2(
+  remote_profile, epoch_id, stream_id, unit_id, unit_digest,
+  previous_unit_digest, ordinal_value, encoded_unit_outer,
+  ordered_mutation_tuples, state, created_at, published_at
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+selectTransportUnitSystemV2:
+SELECT *
+FROM sync_transport_units_system_v2
+WHERE remote_profile = ? AND epoch_id = ? AND stream_id = ? AND unit_id = ?;
+
+selectTransportUnitsSystemV2:
+SELECT *
+FROM sync_transport_units_system_v2
+WHERE remote_profile = ? AND epoch_id = ? AND stream_id = ?
+ORDER BY ordinal_value ASC;
+
+selectOpenTransportUnitsSystemV2:
+SELECT *
+FROM sync_transport_units_system_v2
+WHERE remote_profile = ? AND epoch_id = ? AND stream_id = ?
+  AND state IN ('sealed', 'object_published')
+ORDER BY ordinal_value ASC;
+
+updateTransportUnitStateSystemV2:
+UPDATE sync_transport_units_system_v2
+SET state = ?, published_at = ?
+WHERE remote_profile = ? AND epoch_id = ? AND stream_id = ? AND unit_id = ?;
+
+insertQuarantinedObjectV2:
+INSERT OR REPLACE INTO sync_quarantined_objects_v2(
+  remote_profile, epoch_id, stream_id, unit_id, object_id,
+  claimed_object_digest, encoded_outer, failure_code,
+  first_seen_at, last_seen_at, lifecycle
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+selectActiveQuarantinedObjectsV2:
+SELECT *
+FROM sync_quarantined_objects_v2
+WHERE remote_profile = ? AND epoch_id = ? AND lifecycle = 'active'
+ORDER BY first_seen_at ASC, stream_id ASC, unit_id ASC, object_id ASC;
+
+updateQuarantinedObjectLifecycleV2:
+UPDATE sync_quarantined_objects_v2
+SET lifecycle = ?, last_seen_at = ?
+WHERE remote_profile = ? AND epoch_id = ? AND stream_id = ? AND unit_id = ? AND object_id = ?;
+
+markEpochQuarantinesRebootstrapV2:
+UPDATE sync_quarantined_objects_v2
+SET lifecycle = 'rebootstrap', last_seen_at = ?
+WHERE remote_profile = ? AND epoch_id = ? AND lifecycle = 'active';
+
+markEpochDeadLettersRebootstrapV2:
+UPDATE sync_dead_letters_v2
+SET lifecycle = 'rebootstrap', last_seen_at = ?
+WHERE remote_profile = ? AND epoch_id = ? AND lifecycle = 'active';
+
+markEpochSourceImportsPublishedV2:
+UPDATE sync_source_imports_system_v2
+SET state = 'published', published_at = ?
+WHERE remote_profile = ? AND epoch_id = ? AND state <> 'published';
+
+insertRepairReplicaV2:
+INSERT OR REPLACE INTO sync_repair_replicas_v2(
+  remote_profile, epoch_id, object_id, object_digest,
+  replica_writer_device_id, ciphertext_digest, encoded_outer,
+  validation_state, created_at
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+selectRepairReplicasV2:
+SELECT *
+FROM sync_repair_replicas_v2
+WHERE remote_profile = ? AND epoch_id = ? AND object_id = ? AND object_digest = ?
+ORDER BY replica_writer_device_id ASC;
+
+insertSourceImportSystemV2:
+INSERT INTO sync_source_imports_system_v2(
+  remote_profile, epoch_id, source_profile, source_epoch, source_writer_id,
+  source_mutation_id, source_object_id, source_digest, entity_type,
+  source_entity_id, mapped_entity_id, version_id, mutation_id,
+  state, created_at, published_at
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+selectSourceImportSystemV2:
+SELECT *
+FROM sync_source_imports_system_v2
+WHERE remote_profile = ? AND epoch_id = ? AND source_profile = ?
+  AND source_object_id = ? AND source_digest = ?;
+
+selectSourceImportByMutationSystemV2:
+SELECT *
+FROM sync_source_imports_system_v2
+WHERE remote_profile = ? AND epoch_id = ? AND mutation_id = ?;
+
+selectEpochRetentionPinCountsSystemV2:
+SELECT
+  (SELECT COUNT(*) FROM sync_pending_mutations_system_v2
+    WHERE remote_profile = :remoteProfile AND epoch_id = :epochId) AS pending_mutations,
+  (SELECT COUNT(*) FROM sync_transport_units_system_v2
+    WHERE remote_profile = :remoteProfile AND epoch_id = :epochId AND state IN ('sealed', 'object_published')) AS open_transport_units,
+  (SELECT COUNT(*) FROM sync_dead_letters_v2
+    WHERE remote_profile = :remoteProfile AND epoch_id = :epochId AND lifecycle = 'active') AS active_dead_letters,
+  (SELECT COUNT(*) FROM sync_quarantined_objects_v2
+    WHERE remote_profile = :remoteProfile AND epoch_id = :epochId AND lifecycle = 'active') AS active_quarantines,
+  (SELECT COUNT(*) FROM sync_repair_replicas_v2
+    WHERE remote_profile = :remoteProfile AND epoch_id = :epochId AND validation_state <> 'invalid') AS repair_pins,
+  (SELECT COUNT(*) FROM sync_source_imports_system_v2
+    WHERE remote_profile = :remoteProfile AND epoch_id = :epochId AND state <> 'published') AS unpublished_imports,
+  (SELECT COUNT(*) FROM sync_local_authority_system_v2
+    WHERE remote_profile = :remoteProfile AND epoch_id = :epochId) AS local_authority_pins;
+
+deleteEpochCheckpointObjectsSystemV2:
+DELETE FROM sync_checkpoint_objects_system_v2
+WHERE remote_profile = ? AND epoch_id = ?;
+
+deleteEpochCheckpointsSystemV2:
+DELETE FROM sync_checkpoints_system_v2
+WHERE remote_profile = ? AND epoch_id = ?;
+
+deleteEpochConflictHeadsSystemV2:
+DELETE FROM workspace_entity_conflict_heads_v2
+WHERE epoch_id = ?;
+
+deleteEpochConflictsSystemV2:
+DELETE FROM workspace_entity_conflicts_v2
+WHERE epoch_id = ?;
+
+deleteEpochHeadsSystemV2:
+DELETE FROM workspace_entity_heads_v2
+WHERE epoch_id = ?;
+
+deleteEpochNoteProjectionsSystemV2:
+DELETE FROM note_projections_system_v2
+WHERE epoch_id = ?;
+
+deleteEpochNotebookProjectionsSystemV2:
+DELETE FROM notebook_projections_v2
+WHERE epoch_id = ?;
+
+deleteEpochPreferencesProjectionSystemV2:
+DELETE FROM workspace_preferences_projection_v2
+WHERE epoch_id = ?;
+
+deleteEpochProjectionWarningsSystemV2:
+DELETE FROM projection_warnings_v2
+WHERE epoch_id = ?;
+
+deleteEpochPendingMutationsSystemV2:
+DELETE FROM sync_pending_mutations_system_v2
+WHERE remote_profile = ? AND epoch_id = ?;
+
+deleteEpochAppliedMutationsSystemV2:
+DELETE FROM sync_applied_mutations_system_v2
+WHERE remote_profile = ? AND epoch_id = ?;
+
+deleteEpochRemoteCursorsSystemV2:
+DELETE FROM sync_remote_cursors_system_v2
+WHERE remote_profile = ? AND epoch_id = ?;
+
+deleteEpochSourceImportsSystemV2:
+DELETE FROM sync_source_imports_system_v2
+WHERE remote_profile = ? AND epoch_id = ?;
+
+deleteEpochParentsSystemV2:
+DELETE FROM workspace_entity_version_parents_v2
+WHERE epoch_id = ?;
+
+deleteEpochVersionsSystemV2:
+DELETE FROM workspace_entity_versions_v2
+WHERE epoch_id = ?;
+
+deleteEpochControlObjectsSystemV2:
+DELETE FROM sync_control_objects_system_v2
+WHERE remote_profile = ? AND epoch_id = ?;
+
+deleteEpochTransportUnitsSystemV2:
+DELETE FROM sync_transport_units_system_v2
+WHERE remote_profile = ? AND epoch_id = ?;
+
+deleteEpochQuarantinesSystemV2:
+DELETE FROM sync_quarantined_objects_v2
+WHERE remote_profile = ? AND epoch_id = ?;
+
+deleteEpochRepairReplicasSystemV2:
+DELETE FROM sync_repair_replicas_v2
+WHERE remote_profile = ? AND epoch_id = ?;
+
+deleteEpochDeadLettersSystemV2:
+DELETE FROM sync_dead_letters_v2
+WHERE remote_profile = ? AND epoch_id = ?;
+
+deleteEpochRunHistorySystemV2:
+DELETE FROM sync_run_history_v2
+WHERE remote_profile = ? AND epoch_id = ?;
+
+deleteSyncEpochSystemV2:
+DELETE FROM sync_epochs_v2
+WHERE remote_profile = ? AND epoch_id = ? AND lifecycle = 'read_only';
+
+-- Explicit remote-folder reset only: drops authority then any lifecycle for one profile.
+deleteLocalAuthoritySystemV2:
+DELETE FROM sync_local_authority_system_v2
+WHERE remote_profile = ?;
+
+deleteSyncEpochAnyLifecycleSystemV2:
+DELETE FROM sync_epochs_v2
+WHERE remote_profile = ? AND epoch_id = ?;
+
+updateSourceImportStateSystemV2:
+UPDATE sync_source_imports_system_v2
+SET state = ?, published_at = ?
+WHERE remote_profile = ? AND epoch_id = ? AND source_profile = ?
+  AND source_object_id = ? AND source_digest = ?;

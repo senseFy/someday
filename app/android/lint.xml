@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<lint>
+    <!-- API 37 is used for compilation; target 36 remains the tested release contract. -->
+    <issue id="OldTargetApi">
+        <ignore path="build.gradle.kts" />
+    </issue>
+
+    <!--
+      Adaptive icons require the v26 resource type even though minSdk is 26.
+      The matching v33 overlay adds the monochrome layer for supporting OSes.
+    -->
+    <issue id="ObsoleteSdkInt">
+        <ignore path="src/main/res/mipmap-anydpi-v26" />
+    </issue>
+    <issue id="MonochromeLauncherIcon">
+        <ignore path="src/main/res/mipmap-anydpi-v26/ic_launcher.xml" />
+    </issue>
+</lint>

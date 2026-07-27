@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Someday</string>
+    <string name="on_this_day_notification_channel_name">On This Day</string>
+    <string name="on_this_day_notification_channel_description">Daily reminders when past-year notes exist</string>
+    <string name="on_this_day_notification_title">On This Day</string>
+    <string name="workspace_pairing_scan_cancel">Cancel</string>
+    <plurals name="on_this_day_notification_body">
+        <item quantity="one">%d memory from past years</item>
+        <item quantity="other">%d memories from past years</item>
+    </plurals>
+</resources>

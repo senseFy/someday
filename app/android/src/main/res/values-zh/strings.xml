@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Someday</string>
+    <string name="on_this_day_notification_channel_name">往年今日</string>
+    <string name="on_this_day_notification_channel_description">有往年笔记时每天提醒</string>
+    <string name="on_this_day_notification_title">往年今日</string>
+    <string name="workspace_pairing_scan_cancel">取消</string>
+    <plurals name="on_this_day_notification_body">
+        <item quantity="other">%d 条往年回忆</item>
+    </plurals>
+</resources>

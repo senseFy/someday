@@ -1,0 +1,2 @@
+"NSLocationWhenInUseUsageDescription" = "位置の取得を明示的に要求したとき、Someday は現在の座標をノートに添付できます。";
+"NSCameraUsageDescription" = "Someday は、ワークスペースのペアリング QR コードをスキャンするときだけカメラを使用します。";

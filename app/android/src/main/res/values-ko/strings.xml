@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Someday</string>
+    <string name="on_this_day_notification_channel_name">오늘의 추억</string>
+    <string name="on_this_day_notification_channel_description">지난 해 노트가 있을 때 매일 알림</string>
+    <string name="on_this_day_notification_title">오늘의 추억</string>
+    <string name="workspace_pairing_scan_cancel">취소</string>
+    <plurals name="on_this_day_notification_body">
+        <item quantity="other">지난 해 추억 %d개</item>
+    </plurals>
+</resources>

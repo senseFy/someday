@@ -1,0 +1,2 @@
+"NSLocationWhenInUseUsageDescription" = "当你明确请求捕获位置时，Someday 可将当前坐标附加到笔记。";
+"NSCameraUsageDescription" = "Someday 仅在你选择扫描工作区配对二维码时使用相机。";

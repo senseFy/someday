@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+cd "$ROOT_DIR"
+
+blocked_files=()
+while IFS= read -r -d '' file; do
+  lowercase_file="$(printf '%s' "$file" | tr '[:upper:]' '[:lower:]')"
+  case "$lowercase_file" in
+    *.p8 | *.p12 | *.pfx | *.cer | *.mobileprovision | *.provisionprofile | \
+      *.developerprofile | *.ipa | *.xcarchive | *.xcarchive/* | \
+      exportoptions*.plist | */exportoptions*.plist)
+      blocked_files+=("$file")
+      ;;
+  esac
+done < <(git ls-files -z)
+
+private_key_files=()
+while IFS= read -r file; do
+  [[ -n "$file" ]] && private_key_files+=("$file")
+done < <(
+  git grep -I -l -E \
+    -e '-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----' \
+    -e '"private_key"[[:space:]]*:[[:space:]]*"-----BEGIN' \
+    -- . ':(exclude)scripts/verify-private-release-material' || true
+)
+
+if [[ "${#blocked_files[@]}" -gt 0 || "${#private_key_files[@]}" -gt 0 ]]; then
+  printf 'Private release material must not be tracked.\n' >&2
+  for file in "${blocked_files[@]}"; do
+    printf '  blocked file: %s\n' "$file" >&2
+  done
+  for file in "${private_key_files[@]}"; do
+    printf '  private-key content: %s\n' "$file" >&2
+  done
+  exit 1
+fi
+
+printf 'Private release material check passed.\n'
