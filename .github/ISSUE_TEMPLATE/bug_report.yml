@@ -1,0 +1,75 @@
+name: Bug report
+description: Report a reproducible problem in Someday
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve Someday. Do not report security vulnerabilities here; use the Security Policy instead.
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight
+      options:
+        - label: I searched existing issues for the same problem.
+          required: true
+        - label: This report does not contain credentials, recovery material, private notes, or another person's data.
+          required: true
+        - label: This is not a security vulnerability.
+          required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Affected surface
+      options:
+        - Android
+        - iOS
+        - Desktop
+        - Self-hosted server
+        - WebDAV sync
+        - Build or developer tooling
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: App version, release tag, or full commit SHA.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Give the smallest reliable sequence that triggers the problem.
+      placeholder: |
+        1. …
+        2. …
+        3. …
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS/device, server deployment mode, sync transport, and relevant versions. Redact private endpoints and identifiers.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized diagnostics
+      description: Attach only logs or screenshots you have checked for notes, tokens, passwords, email addresses, and recovery material.

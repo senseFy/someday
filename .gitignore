@@ -1,0 +1,47 @@
+# macOS
+.DS_Store
+
+# IDEs
+.idea/
+.vscode/
+*.iml
+
+# Gradle / Kotlin
+.gradle/
+.kotlin/
+.konan/
+build/
+**/build/
+**/bin/
+
+# Android
+local.properties
+captures/
+.externalNativeBuild/
+.cxx/
+*.apk
+*.ap_
+*.aab
+*.dex
+*.hprof
+*.jks
+*.keystore
+
+# Xcode / iOS
+DerivedData/
+**/xcuserdata/
+*.xcuserstate
+*.xccheckout
+*.xcscmblueprint
+*.moved-aside
+
+# Local environment and runtime output
+.env
+.env.*
+!.env.example
+!.env.*.example
+artifacts/
+*.log
+
+# Local AI / operator skills and private release runbooks
+.factory/

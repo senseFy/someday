@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+GRADLEW="${GRADLEW:-$ROOT_DIR/gradlew}"
+
+DMG_DIR="$ROOT_DIR/app/desktop/build/compose/binaries/main-release/dmg"
+APP_PATH="$ROOT_DIR/app/desktop/build/compose/binaries/main-release/app/Someday.app"
+
+usage() {
+    cat <<'EOF'
+Usage:
+  scripts/package-macos-release
+
+Environment:
+  GRADLEW=<path>          Gradle wrapper to use. Defaults to ./gradlew.
+
+Builds the Compose Desktop macOS release DMG with desktop developer options disabled.
+EOF
+}
+
+die() {
+    printf 'error: %s\n' "$*" >&2
+    exit 1
+}
+
+info() {
+    printf '%s\n' "$*" >&2
+}
+
+case "${1:-}" in
+    -h | --help)
+        usage
+        exit 0
+        ;;
+    "")
+        ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+esac
+
+[[ "$(uname -s)" == "Darwin" ]] || die "macOS release DMG packaging must run on macOS."
+[[ -x "$GRADLEW" ]] || die "Gradle wrapper is not executable: $GRADLEW"
+
+cd "$ROOT_DIR"
+
+info "Building macOS release DMG with developer options disabled."
+"$GRADLEW" :app:desktop:packageReleaseDmg \
+    -Psomeday.desktop.developerOptions=false \
+    -Psomeday.systemV2ReleaseEnabled=false \
+    -Psomeday.systemV2DevelopmentEnabled=false \
+    --dependency-verification=strict \
+    --stacktrace
+
+[[ -d "$APP_PATH" ]] || die "Expected app bundle was not created: $APP_PATH"
+[[ -d "$DMG_DIR" ]] || die "Expected DMG output directory was not created: $DMG_DIR"
+
+dmgs=()
+while IFS= read -r -d '' dmg; do
+    dmgs+=("$dmg")
+done < <(find "$DMG_DIR" -maxdepth 1 -type f -name '*.dmg' -print0)
+
+((${#dmgs[@]} > 0)) || die "No DMG files were created in: $DMG_DIR"
+
+if [[ -d /Volumes/Someday ]]; then
+    hdiutil detach /Volumes/Someday >/dev/null 2>&1 || true
+fi
+
+info "macOS release app: $APP_PATH"
+info "macOS release DMG:"
+printf '  %s\n' "${dmgs[@]}" >&2

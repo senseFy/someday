@@ -1,0 +1,646 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+GRADLEW="$ROOT_DIR/gradlew"
+
+ANDROID_APP_ID="${ANDROID_APP_ID:-saien.someday}"
+IOS_BUNDLE_ID="${IOS_BUNDLE_ID:-saien.someday}"
+IOS_SIMULATOR_APP_PATH="${IOS_SIMULATOR_APP_PATH:-${IOS_APP_PATH:-$ROOT_DIR/iosApp/build/Build/Products/Debug-iphonesimulator/Someday.app}}"
+IOS_DEVICE_APP_PATH="${IOS_DEVICE_APP_PATH:-${IOS_APP_PATH:-$ROOT_DIR/iosApp/build/Build/Products/Debug-iphoneos/Someday.app}}"
+ID_SUFFIX_LENGTH="${ID_SUFFIX_LENGTH:-8}"
+PHYSICAL_DEVICE_ICON="${PHYSICAL_DEVICE_ICON:-📱}"
+VIRTUAL_DEVICE_ICON="${VIRTUAL_DEVICE_ICON:-▣}"
+
+usage() {
+    cat <<'EOF'
+Usage:
+  scripts/run [desktop|android|ios] [--device <id-or-name>]
+  scripts/run --platform <desktop|android|ios> [--device <id-or-name>]
+
+Examples:
+  scripts/run
+  scripts/run desktop
+  scripts/run android
+  scripts/run android --device emulator-5554
+  scripts/run ios
+  scripts/run ios --device "iPhone 17"
+
+The script does not clean build outputs. Gradle and Xcode reuse their normal caches.
+Interactive menus use Up/Down arrows and Enter. Device menus show physical devices before emulators/simulators and shorten device IDs for display.
+For physical iOS signing, team id can come from the environment or ~/.zshrc.
+EOF
+}
+
+die() {
+    printf 'error: %s\n' "$*" >&2
+    exit 1
+}
+
+info() {
+    printf '%s\n' "$*" >&2
+}
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"
+}
+
+normalize_platform() {
+    case "$1" in
+        d | desktop | mac | macos) printf 'desktop' ;;
+        a | android) printf 'android' ;;
+        i | ios | simulator) printf 'ios' ;;
+        *) die "Unknown platform: $1" ;;
+    esac
+}
+
+choose_index() {
+    local title="$1"
+    shift
+    local choices=("$@")
+    local count="${#choices[@]}"
+    local selected=0
+    local rendered=0
+    local key=""
+    local extra=""
+    local old_stty=""
+
+    ((count > 0)) || die "No choices available for $title"
+
+    if ((count == 1)); then
+        printf '1'
+        return
+    fi
+
+    [[ -t 0 ]] || die "Multiple choices are available for $title; pass an explicit value or run interactively."
+
+    render_menu() {
+        local index=0
+
+        if ((rendered)); then
+            printf '\033[%dA' "$((count + 1))" >&2
+        fi
+
+        printf '\033[2K%s (Up/Down, Enter)\n' "$title" >&2
+        for ((index = 0; index < count; index++)); do
+            printf '\033[2K' >&2
+            if ((index == selected)); then
+                printf '> %s\n' "${choices[$index]}" >&2
+            else
+                printf '  %s\n' "${choices[$index]}" >&2
+            fi
+        done
+        rendered=1
+    }
+
+    old_stty="$(stty -g)"
+    restore_terminal() {
+        trap - RETURN INT TERM
+        stty "$old_stty"
+        printf '\033[?25h' >&2
+    }
+    interrupt_selection() {
+        restore_terminal
+        exit 130
+    }
+    trap restore_terminal RETURN
+    trap interrupt_selection INT TERM
+
+    stty -echo -icanon
+    printf '\033[?25l' >&2
+    render_menu
+
+    while true; do
+        key=""
+        IFS= read -rsn1 key || true
+
+        if [[ -z "$key" || "$key" == $'\n' || "$key" == $'\r' ]]; then
+            printf '%s' "$((selected + 1))"
+            return
+        fi
+
+        case "$key" in
+            $'\x1b')
+                extra=""
+                IFS= read -rsn2 -t 0.1 extra || true
+                case "$extra" in
+                    '[A')
+                        selected=$(((selected - 1 + count) % count))
+                        render_menu
+                        ;;
+                    '[B')
+                        selected=$(((selected + 1) % count))
+                        render_menu
+                        ;;
+                esac
+                ;;
+            k)
+                selected=$(((selected - 1 + count) % count))
+                render_menu
+                ;;
+            j)
+                selected=$(((selected + 1) % count))
+                render_menu
+                ;;
+            [1-9])
+                if ((key >= 1 && key <= count)); then
+                    selected=$((key - 1))
+                    render_menu
+                fi
+                ;;
+        esac
+    done
+}
+
+append_android_device() {
+    local serial="$1"
+    local label="$2"
+    local kind="$3"
+
+    if [[ "$kind" == "physical" ]]; then
+        android_physical_serials+=("$serial")
+        android_physical_labels+=("$label")
+    else
+        android_emulator_serials+=("$serial")
+        android_emulator_labels+=("$label")
+    fi
+}
+
+join_android_devices() {
+    android_serials=("${android_physical_serials[@]}" "${android_emulator_serials[@]}")
+    android_labels=("${android_physical_labels[@]}" "${android_emulator_labels[@]}")
+}
+
+matches_requested_device() {
+    local requested="$1"
+    shift
+    local value=""
+
+    for value in "$@"; do
+        if [[ "$value" == "$requested" ]]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+short_id() {
+    local id="$1"
+    local suffix_length="$ID_SUFFIX_LENGTH"
+
+    if ((${#id} <= suffix_length)); then
+        printf '%s' "$id"
+    else
+        printf '...%s' "${id: -$suffix_length}"
+    fi
+}
+
+adb_detail_value() {
+    local key="$1"
+    local rest="$2"
+    local token=""
+
+    for token in $rest; do
+        case "$token" in
+            "$key":*)
+                printf '%s' "${token#*:}"
+                return
+                ;;
+        esac
+    done
+}
+
+adb_display_name() {
+    local rest="$1"
+    local model=""
+    local device=""
+
+    model="$(adb_detail_value "model" "$rest")"
+    device="$(adb_detail_value "device" "$rest")"
+
+    if [[ -n "$model" ]]; then
+        printf '%s' "${model//_/ }"
+    elif [[ -n "$device" ]]; then
+        printf '%s' "$device"
+    else
+        printf 'Android device'
+    fi
+}
+
+zshrc_value() {
+    local variable_name="$1"
+    local marker="__SOMEDAY_RUN_ENV_VALUE__"
+    local value=""
+
+    [[ -f "$HOME/.zshrc" ]] || return 0
+    command -v zsh >/dev/null 2>&1 || return 0
+
+    value="$(
+        zsh -ic '
+            variable_name="$1"
+            marker="$2"
+            print -r -- "${marker}${(P)variable_name}"
+        ' -- "$variable_name" "$marker" 2>/dev/null |
+            awk -v marker="$marker" 'index($0, marker) == 1 { print substr($0, length(marker) + 1) }' |
+            tail -n 1
+    )"
+
+    printf '%s' "$value"
+}
+
+ios_development_team() {
+    local team=""
+    local variable_name=""
+    local variable_names=(
+        IOS_DEVELOPMENT_TEAM
+        IOS_TEAM_ID
+        DEVELOPMENT_TEAM
+        APPLE_DEVELOPMENT_TEAM
+        APPLE_TEAM_ID
+        EXPO_APPLE_TEAM_ID
+    )
+
+    for variable_name in "${variable_names[@]}"; do
+        team="${!variable_name:-}"
+        if [[ -n "$team" ]]; then
+            printf '%s' "$team"
+            return
+        fi
+    done
+
+    for variable_name in "${variable_names[@]}"; do
+        team="$(zshrc_value "$variable_name")"
+        if [[ -n "$team" ]]; then
+            printf '%s' "$team"
+            return
+        fi
+    done
+
+    printf ''
+}
+
+select_platform() {
+    local requested="$1"
+    local selected_index
+
+    if [[ -n "$requested" ]]; then
+        normalize_platform "$requested"
+        return
+    fi
+
+    selected_index="$(choose_index "Choose platform:" "desktop" "android" "ios")"
+    case "$selected_index" in
+        1) printf 'desktop' ;;
+        2) printf 'android' ;;
+        3) printf 'ios' ;;
+        *) die "Invalid platform selection: $selected_index" ;;
+    esac
+}
+
+select_android_device() {
+    local requested="$1"
+    local serial=""
+    local state=""
+    local rest=""
+    local selected_index
+    local android_serials=()
+    local android_labels=()
+    local android_physical_serials=()
+    local android_physical_labels=()
+    local android_emulator_serials=()
+    local android_emulator_labels=()
+    local label=""
+    local kind=""
+    local display_name=""
+
+    require_command adb
+
+    while read -r serial state rest; do
+        [[ -n "${serial:-}" ]] || continue
+        [[ "$serial" == "List" ]] && continue
+        if [[ "${state:-}" == "device" ]]; then
+            display_name="$(adb_display_name "${rest:-}")"
+            if [[ "$serial" == emulator-* ]]; then
+                kind="emulator"
+                label="$VIRTUAL_DEVICE_ICON $display_name (id $(short_id "$serial"))"
+            else
+                kind="physical"
+                label="$PHYSICAL_DEVICE_ICON $display_name (id $(short_id "$serial"))"
+            fi
+            append_android_device "$serial" "$label" "$kind"
+        fi
+    done < <(adb devices -l)
+
+    join_android_devices
+
+    if [[ -n "$requested" ]]; then
+        for ((index = 0; index < ${#android_serials[@]}; index++)); do
+            if [[ "${android_serials[$index]}" == "$requested" ]]; then
+                printf '%s' "$requested"
+                return
+            fi
+        done
+        die "Android device is not ready or not connected: $requested"
+    fi
+
+    ((${#android_serials[@]} > 0)) || die "No ready Android device found. Start an emulator or connect a device, then check adb devices -l."
+
+    selected_index="$(choose_index "Choose Android device:" "${android_labels[@]}")"
+    printf '%s' "${android_serials[$((selected_index - 1))]}"
+}
+
+list_ios_physical_devices() {
+    local devices_json=""
+
+    require_command xcrun
+    require_command python3
+
+    devices_json="$(mktemp)"
+    if xcrun devicectl list devices --json-output "$devices_json" --timeout 5 >/dev/null 2>&1; then
+        python3 - "$devices_json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as handle:
+    data = json.load(handle)
+
+items = []
+for device in data.get("result", {}).get("devices", []):
+    hardware = device.get("hardwareProperties", {})
+    properties = device.get("deviceProperties", {})
+    connection = device.get("connectionProperties", {})
+    capabilities = {
+        capability.get("featureIdentifier", "")
+        for capability in device.get("capabilities", [])
+    }
+
+    if hardware.get("platform") != "iOS":
+        continue
+    if hardware.get("reality") != "physical":
+        continue
+    if "com.apple.coredevice.feature.installapp" not in capabilities:
+        continue
+    if "com.apple.coredevice.feature.launchapplication" not in capabilities:
+        continue
+
+    udid = hardware.get("udid") or device.get("identifier", "")
+    name = properties.get("name") or hardware.get("marketingName") or udid
+    state = properties.get("bootState", "connected")
+    os_version = properties.get("osVersionNumber", "")
+    transport = connection.get("transportType", "connected")
+    if not udid:
+        continue
+    items.append((name, udid, state, os_version, transport))
+
+for name, udid, state, os_version, transport in sorted(items):
+    detail = "iOS " + os_version if os_version else "iOS"
+    print("\t".join(["physical", udid, name, state, detail + ", " + transport]))
+PY
+    fi
+    rm -f "$devices_json"
+}
+
+list_ios_simulators() {
+    local simctl_json
+
+    require_command xcrun
+    require_command python3
+
+    simctl_json="$(xcrun simctl list devices available --json)"
+    printf '%s' "$simctl_json" | python3 -c '
+import json
+import sys
+
+data = json.load(sys.stdin)
+items = []
+
+for runtime_id, devices in data.get("devices", {}).items():
+    marker = "com.apple.CoreSimulator.SimRuntime.iOS-"
+    if not runtime_id.startswith(marker):
+        continue
+    version_text = runtime_id[len(marker):]
+    version = tuple(int(part) for part in version_text.split("-") if part.isdigit())
+    runtime_label = "iOS " + version_text.replace("-", ".")
+    for device in devices:
+        if not device.get("isAvailable"):
+            continue
+        name = device.get("name", "")
+        state = device.get("state", "")
+        udid = device.get("udid", "")
+        boot_rank = 0 if state == "Booted" else 1
+        iphone_rank = 0 if name.startswith("iPhone") else 1
+        items.append((boot_rank, iphone_rank, tuple(-part for part in version), name, udid, state, runtime_label))
+
+for _, _, _, name, udid, state, runtime_label in sorted(items):
+    print("\t".join(["simulator", udid, name, state, runtime_label]))
+'
+}
+
+select_ios_device() {
+    local requested="$1"
+    local kind=""
+    local udid=""
+    local name=""
+    local state=""
+    local detail=""
+    local selected_index
+    local selected_value=""
+    local ios_kinds=()
+    local ios_udids=()
+    local ios_names=()
+    local ios_labels=()
+    local matched_kinds=()
+    local matched_udids=()
+    local matched_labels=()
+
+    while IFS=$'\t' read -r kind udid name state detail; do
+        [[ -n "${udid:-}" ]] || continue
+        ios_kinds+=("$kind")
+        ios_udids+=("$udid")
+        ios_names+=("$name")
+        if [[ "$kind" == "physical" ]]; then
+            ios_labels+=("$PHYSICAL_DEVICE_ICON $name ($state, $detail, id $(short_id "$udid"))")
+        else
+            ios_labels+=("$VIRTUAL_DEVICE_ICON $name ($state, $detail, id $(short_id "$udid"))")
+        fi
+    done < <(
+        list_ios_physical_devices
+        list_ios_simulators
+    )
+
+    ((${#ios_udids[@]} > 0)) || die "No available iOS device or Simulator found."
+
+    if [[ -n "$requested" ]]; then
+        for ((index = 0; index < ${#ios_udids[@]}; index++)); do
+            if matches_requested_device "$requested" "${ios_udids[$index]}" "${ios_names[$index]}"; then
+                matched_kinds+=("${ios_kinds[$index]}")
+                matched_udids+=("${ios_udids[$index]}")
+                matched_labels+=("${ios_labels[$index]}")
+            fi
+        done
+
+        ((${#matched_udids[@]} > 0)) || die "iOS device or Simulator not found: $requested"
+
+        selected_index="$(choose_index "Choose iOS device:" "${matched_labels[@]}")"
+        selected_value=$((selected_index - 1))
+        printf '%s\t%s' "${matched_kinds[$selected_value]}" "${matched_udids[$selected_value]}"
+        return
+    fi
+
+    selected_index="$(choose_index "Choose iOS device:" "${ios_labels[@]}")"
+    selected_value=$((selected_index - 1))
+    printf '%s\t%s' "${ios_kinds[$selected_value]}" "${ios_udids[$selected_value]}"
+}
+
+ios_simulator_target_suffix() {
+    case "$(uname -m)" in
+        arm64) printf 'IosSimulatorArm64' ;;
+        x86_64) die "Intel iOS Simulator hosts are not supported because Backdrop 2.0.0 does not publish an iosX64 artifact." ;;
+        *) die "Unsupported simulator host architecture: $(uname -m)" ;;
+    esac
+}
+
+run_desktop() {
+    info "Running Desktop app with Gradle cache."
+    exec "$GRADLEW" :app:desktop:run
+}
+
+run_android() {
+    local device_serial
+
+    device_serial="$(select_android_device "$DEVICE")"
+    info "Installing Android debug app on $device_serial with Gradle cache."
+    ANDROID_SERIAL="$device_serial" "$GRADLEW" :app:android:installDebug
+
+    info "Launching $ANDROID_APP_ID on $device_serial."
+    if ! adb -s "$device_serial" shell am start -W \
+        -a android.intent.action.MAIN \
+        -c android.intent.category.LAUNCHER \
+        -p "$ANDROID_APP_ID"; then
+        info "Launcher intent failed; trying fallback launch."
+        adb -s "$device_serial" shell monkey \
+            -p "$ANDROID_APP_ID" \
+            -c android.intent.category.LAUNCHER \
+            1
+    fi
+}
+
+run_ios() {
+    local selected_device
+    local device_kind
+    local device_id
+    local target_suffix
+    local app_path
+    local destination_platform
+    local xcodebuild_args=()
+    local development_team=""
+    local signing_xcconfig=""
+    local xcodebuild_status=0
+
+    require_command xcodebuild
+
+    selected_device="$(select_ios_device "$DEVICE")"
+    IFS=$'\t' read -r device_kind device_id <<<"$selected_device"
+
+    if [[ "$device_kind" == "physical" ]]; then
+        target_suffix="IosArm64"
+        app_path="$IOS_DEVICE_APP_PATH"
+        destination_platform="iOS"
+        development_team="$(ios_development_team)"
+        if [[ -n "$development_team" ]]; then
+            info "Using iOS development team from environment or ~/.zshrc."
+            signing_xcconfig="$(mktemp "${TMPDIR:-/tmp}/someday-ios-signing.XXXXXX")"
+            printf 'DEVELOPMENT_TEAM = %s\n' "$development_team" >"$signing_xcconfig"
+            xcodebuild_args+=(-xcconfig "$signing_xcconfig")
+        else
+            info "iOS physical devices require a valid Xcode signing team/provisioning profile."
+        fi
+    else
+        target_suffix="$(ios_simulator_target_suffix)"
+        app_path="$IOS_SIMULATOR_APP_PATH"
+        destination_platform="iOS Simulator"
+    fi
+
+    info "Building iOS shared framework for $target_suffix with Gradle cache."
+    "$GRADLEW" ":app:ios:linkDebugFramework$target_suffix" --max-workers=1
+
+    info "Building iOS host app with Xcode DerivedData at iosApp/build."
+    set +e
+    xcodebuild \
+        -project iosApp/Someday.xcodeproj \
+        -scheme Someday \
+        -configuration Debug \
+        -destination "platform=$destination_platform,id=$device_id" \
+        -derivedDataPath iosApp/build \
+        "${xcodebuild_args[@]}" \
+        build
+    xcodebuild_status=$?
+    set -e
+    if [[ -n "$signing_xcconfig" ]]; then
+        rm -f "$signing_xcconfig"
+    fi
+    if ((xcodebuild_status != 0)); then
+        return "$xcodebuild_status"
+    fi
+
+    if [[ "$device_kind" == "physical" ]]; then
+        xcrun devicectl device install app --device "$device_id" "$app_path"
+        xcrun devicectl device process launch --device "$device_id" --terminate-existing "$IOS_BUNDLE_ID"
+    else
+        open -a Simulator >/dev/null 2>&1 || true
+        xcrun simctl boot "$device_id" >/dev/null 2>&1 || true
+        xcrun simctl bootstatus "$device_id" -b
+        info "Installing iOS simulator app at $app_path."
+        xcrun simctl install "$device_id" "$app_path"
+        info "Launching iOS simulator app $IOS_BUNDLE_ID."
+        xcrun simctl launch --terminate-running-process "$device_id" "$IOS_BUNDLE_ID"
+    fi
+}
+
+PLATFORM=""
+DEVICE=""
+
+while (($# > 0)); do
+    case "$1" in
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        -p | --platform)
+            shift
+            [[ $# -gt 0 ]] || die "--platform requires a value"
+            PLATFORM="$1"
+            ;;
+        --platform=*)
+            PLATFORM="${1#*=}"
+            ;;
+        -d | --device)
+            shift
+            [[ $# -gt 0 ]] || die "--device requires a value"
+            DEVICE="$1"
+            ;;
+        --device=*)
+            DEVICE="${1#*=}"
+            ;;
+        desktop | android | ios | mac | macos | simulator | d | a | i)
+            [[ -z "$PLATFORM" ]] || die "Platform was provided more than once"
+            PLATFORM="$1"
+            ;;
+        *)
+            die "Unknown argument: $1"
+            ;;
+    esac
+    shift
+done
+
+cd "$ROOT_DIR"
+PLATFORM="$(select_platform "$PLATFORM")"
+
+case "$PLATFORM" in
+    desktop) run_desktop ;;
+    android) run_android ;;
+    ios) run_ios ;;
+    *) die "Unsupported platform: $PLATFORM" ;;
+esac

@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+SCHEMA_DIR="$ROOT_DIR/shared/data/src/commonMain/sqldelight/databases"
+MIGRATION_DIR="$ROOT_DIR/shared/data/src/commonMain/sqldelight/saien/someday/data/local/db"
+BASELINE="$SCHEMA_DIR/1.db"
+
+command -v sqlite3 >/dev/null 2>&1 || {
+    printf 'error: sqlite3 is required for schema verification.\n' >&2
+    exit 1
+}
+
+[[ -f "$BASELINE" ]] || {
+    printf 'error: missing V2-only SQLDelight baseline: %s\n' "$BASELINE" >&2
+    exit 1
+}
+
+snapshot_count="$(find "$SCHEMA_DIR" -maxdepth 1 -type f -name '*.db' | wc -l | tr -d '[:space:]')"
+[[ "$snapshot_count" == "1" ]] || {
+    printf 'error: expected one squashed schema snapshot, found %s.\n' "$snapshot_count" >&2
+    exit 1
+}
+
+if find "$MIGRATION_DIR" -maxdepth 1 -type f -name '*.sqm' | grep -q .; then
+    find "$MIGRATION_DIR" -maxdepth 1 -type f -name '*.sqm' >&2
+    printf 'error: pre-release migration history must remain squashed.\n' >&2
+    exit 1
+fi
+
+[[ "$(sqlite3 "$BASELINE" 'PRAGMA integrity_check;')" == "ok" ]] || {
+    printf 'error: baseline failed SQLite integrity_check.\n' >&2
+    exit 1
+}
+[[ -z "$(sqlite3 "$BASELINE" 'PRAGMA foreign_key_check;')" ]] || {
+    printf 'error: baseline failed SQLite foreign_key_check.\n' >&2
+    exit 1
+}
+
+expected_tables="$(
+    printf '%s\n' \
+        devices \
+        locations \
+        note_projections_system_v2 \
+        note_versions \
+        notebook_projections_v2 \
+        notebooks \
+        notes \
+        projection_warnings_v2 \
+        settings \
+        sync_applied_mutations_system_v2 \
+        sync_checkpoint_objects_system_v2 \
+        sync_checkpoints_system_v2 \
+        sync_control_objects_system_v2 \
+        sync_dead_letters_v2 \
+        sync_epochs_v2 \
+        sync_local_authority_system_v2 \
+        sync_metadata \
+        sync_pending_mutations_system_v2 \
+        sync_quarantined_objects_v2 \
+        sync_reconciliation_state_system_v2 \
+        sync_remote_cursors_system_v2 \
+        sync_repair_replicas_v2 \
+        sync_run_history_v2 \
+        sync_source_imports_system_v2 \
+        sync_transport_units_system_v2 \
+        tombstones \
+        workspace_entity_conflict_heads_v2 \
+        workspace_entity_conflicts_v2 \
+        workspace_entity_heads_v2 \
+        workspace_entity_version_parents_v2 \
+        workspace_entity_versions_v2 \
+        workspace_preferences_projection_v2 |
+        sort
+)"
+actual_tables="$(
+    sqlite3 "$BASELINE" \
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name;"
+)"
+[[ "$actual_tables" == "$expected_tables" ]] || {
+    diff -u <(printf '%s\n' "$expected_tables") <(printf '%s\n' "$actual_tables") >&2 || true
+    printf 'error: baseline table inventory differs from the V2-only contract.\n' >&2
+    exit 1
+}
+
+schema_sql="$(sqlite3 "$BASELINE" "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL;")"
+for required in \
+    someday-system-v2 \
+    workspace-entity-schema-set-v2 \
+    equivalent-v2 \
+    deletion-v2 \
+    field-merge-v2 \
+    manual-resolution-v2 \
+    source_import; do
+    printf '%s\n' "$schema_sql" | grep -Fq "$required" || {
+        printf 'error: baseline is missing required V2 wire value: %s\n' "$required" >&2
+        exit 1
+    }
+done
+
+retired_major='v''1'
+retired_history='leg''acy'
+if printf '%s\n' "$schema_sql" | grep -Eiq "${retired_major}|${retired_history}"; then
+    printf 'error: baseline contains a retired sync wire value.\n' >&2
+    exit 1
+fi
+
+printf 'SQLDelight V2-only baseline verified: %s\n' "$BASELINE"

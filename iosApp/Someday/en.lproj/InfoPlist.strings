@@ -1,0 +1,2 @@
+"NSLocationWhenInUseUsageDescription" = "Someday can attach your current coordinates to a note when you explicitly request location capture.";
+"NSCameraUsageDescription" = "Someday uses the camera only when you choose to scan a workspace pairing QR code.";
