@@ -41,12 +41,12 @@ jobs:
           test -x "$sdkmanager_path"
 
           set +o pipefail
-          yes | "$sdkmanager_path" --licenses >/dev/null
+          yes 2>/dev/null | "$sdkmanager_path" --licenses --channel=3 >/dev/null
           set -o pipefail
 
-          "$sdkmanager_path" \
+          "$sdkmanager_path" --channel=3 \
             "platform-tools" \
-            "platforms;android-37" \
+            "platforms;android-37.0" \
             "build-tools;36.0.0"
 
       - name: Build Android debug APK
