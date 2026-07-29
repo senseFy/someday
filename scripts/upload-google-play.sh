@@ -8,7 +8,7 @@ PACKAGE_NAME="${ANDROID_PLAY_PACKAGE_NAME:-saien.someday}"
 TRACK="${ANDROID_PLAY_TRACK:-internal}"
 RELEASE_STATUS="${ANDROID_PLAY_RELEASE_STATUS:-completed}"
 RELEASE_NAME="${ANDROID_PLAY_RELEASE_NAME:-}"
-CREDENTIALS_PATH="${ANDROID_PLAY_SERVICE_ACCOUNT_JSON:-${GOOGLE_PLAY_SERVICE_ACCOUNT_JSON:-}}"
+CREDENTIALS_PATH="${ANDROID_PLAY_SERVICE_ACCOUNT_JSON:-${GOOGLE_APPLICATION_CREDENTIALS:-}}"
 ACCESS_TOKEN="${GOOGLE_PLAY_ACCESS_TOKEN:-}"
 VERIFY_SCRIPT="$ROOT_DIR/scripts/verify-play-aab.sh"
 CURL_BIN="${CURL_BIN:-curl}"
@@ -46,7 +46,7 @@ Options:
                               Also ANDROID_PLAY_RELEASE_NAME.
   --credentials <path>        Google service account JSON kept outside the repository.
                               Also ANDROID_PLAY_SERVICE_ACCOUNT_JSON or
-                              GOOGLE_PLAY_SERVICE_ACCOUNT_JSON.
+                              GOOGLE_APPLICATION_CREDENTIALS.
   --confirm-production        Required for production or *:production tracks.
                               Also ANDROID_PLAY_CONFIRM_PRODUCTION=yes.
   --dry-run                   Verify the AAB and print the plan without API calls.
@@ -156,7 +156,7 @@ mint_service_account_access_token() {
   )" || die "Unable to sign the service account OAuth assertion."
   assertion="$unsigned_token.$signature"
 
-  printf 'Authenticating Google Play publisher: %s\n' "$client_email" >&2
+  printf 'Authenticating Google Play publisher with configured service account.\n' >&2
   if ! http_code="$(
     "$CURL_BIN" \
       --silent \
@@ -342,8 +342,8 @@ trap cleanup EXIT
 
 if [[ -z "$ACCESS_TOKEN" ]]; then
   [[ -n "$CREDENTIALS_PATH" ]] \
-    || die "Pass --credentials or export GOOGLE_PLAY_ACCESS_TOKEN."
-  [[ -f "$CREDENTIALS_PATH" ]] || die "Service account JSON not found: $CREDENTIALS_PATH"
+    || die "Pass --credentials, set ANDROID_PLAY_SERVICE_ACCOUNT_JSON or GOOGLE_APPLICATION_CREDENTIALS, or export GOOGLE_PLAY_ACCESS_TOKEN."
+  [[ -f "$CREDENTIALS_PATH" ]] || die "Configured service account JSON path does not point to a file."
   require_command openssl
   ACCESS_TOKEN="$(mint_service_account_access_token "$CREDENTIALS_PATH")"
 fi

@@ -27,10 +27,10 @@ val releaseSigningRequested = gradle.startParameter.taskNames.any { taskName ->
         listOf("assemble", "bundle", "package", "sign", "publish").any(simpleName::contains)
 }
 val releaseSigning = AndroidSigningEnvironment(
-    storeFile = "SAIEN_KEYSTORE_PATH",
-    storePassword = "SAIEN_KEYSTORE_PASSWORD",
-    keyAlias = "SAIEN_KEY_ALIAS",
-    keyPassword = "SAIEN_KEY_PASSWORD",
+    storeFile = "SOMEDAY_ANDROID_KEYSTORE_PATH",
+    storePassword = "SOMEDAY_ANDROID_KEYSTORE_PASSWORD",
+    keyAlias = "SOMEDAY_ANDROID_KEY_ALIAS",
+    keyPassword = "SOMEDAY_ANDROID_KEY_PASSWORD",
 )
 val releaseSigningValues = listOf(
     releaseSigning.storeFile,
@@ -47,7 +47,7 @@ if (releaseSigningRequested || releaseSigningValues.values.any { it != null }) {
     }
     val keystorePath = releaseSigningValues.getValue(releaseSigning.storeFile).orEmpty()
     check(file(keystorePath).isFile) {
-        "SAIEN_KEYSTORE_PATH points to a missing keystore: $keystorePath"
+        "SOMEDAY_ANDROID_KEYSTORE_PATH does not point to a file."
     }
 }
 
@@ -71,7 +71,7 @@ android {
     }
 
     signingConfigs {
-        create("saien") {
+        create("release") {
             if (releaseSigningConfigured) {
                 storeFile = file(releaseSigningValues.getValue(releaseSigning.storeFile).orEmpty())
                 storePassword = releaseSigningValues.getValue(releaseSigning.storePassword)
@@ -84,7 +84,7 @@ android {
     buildTypes {
         release {
             if (releaseSigningConfigured) {
-                signingConfig = signingConfigs.getByName("saien")
+                signingConfig = signingConfigs.getByName("release")
             }
         }
     }
