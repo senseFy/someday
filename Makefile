@@ -243,11 +243,16 @@ bump-mobile-build-version: ## Bump iOS build number and Android versionCode only
 
 ##@ Desktop
 .PHONY: desktop-run desktop-smoke desktop-package-smoke desktop-release-macos desktop-test
-desktop-run: ## Run the desktop app through Gradle
-	$(GRADLE) :app:desktop:run
+desktop-run: ## Run the desktop app through Gradle (V2 development activation on)
+	$(GRADLE) :app:desktop:run \
+		-Psomeday.systemV2DevelopmentEnabled=true \
+		-Psomeday.systemV2ReleaseEnabled=false
 
 desktop-smoke: ## Run non-interactive desktop startup smoke
-	$(GRADLE) :app:desktop:runUiSmoke --stacktrace
+	$(GRADLE) :app:desktop:runUiSmoke \
+		-Psomeday.systemV2DevelopmentEnabled=true \
+		-Psomeday.systemV2ReleaseEnabled=false \
+		--stacktrace
 
 desktop-package-smoke: ## Run desktop Windows/Linux package-readiness smoke
 	$(GRADLE) :app:desktop:desktopWindowsLinuxPackageSmoke --stacktrace

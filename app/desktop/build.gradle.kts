@@ -1,4 +1,6 @@
 import org.gradle.api.tasks.testing.logging.TestLogEvent
+import org.gradle.jvm.toolchain.JavaLanguageVersion
+import org.gradle.jvm.toolchain.JavaLauncher
 import org.jetbrains.compose.desktop.application.dsl.TargetFormat
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
@@ -6,6 +8,16 @@ plugins {
     alias(libs.plugins.kotlin.multiplatform)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.compose)
+}
+
+/** Runtime used by Compose Desktop run/package and JavaExec smoke tasks (must match jvmTarget). */
+val somedayJvmLanguageVersion: JavaLanguageVersion =
+    JavaLanguageVersion.of(libs.versions.jvm.get().toInt())
+val somedayJvmLauncher: Provider<JavaLauncher> = javaToolchains.launcherFor {
+    languageVersion.set(somedayJvmLanguageVersion)
+}
+val somedayJvmHome: Provider<String> = somedayJvmLauncher.map {
+    it.metadata.installationPath.asFile.absolutePath
 }
 
 val generatedDesktopBuildConfigDir = layout.buildDirectory.dir("generated/sources/desktopBuildConfig/jvmMain/kotlin")
@@ -64,9 +76,12 @@ val generateDesktopBuildConfig by tasks.registering {
 }
 
 kotlin {
+    jvmToolchain {
+        languageVersion.set(somedayJvmLanguageVersion)
+    }
     jvm("jvm") {
         compilerOptions {
-            jvmTarget.set(JvmTarget.JVM_17)
+            jvmTarget.set(JvmTarget.JVM_21)
         }
     }
 
@@ -91,6 +106,9 @@ kotlin {
 compose.desktop {
     application {
         mainClass = "saien.someday.app.desktop.MainKt"
+        // Compose Desktop run/package defaults to Gradle's java.home (often JBR 17).
+        // Pin the app process to the monorepo JVM baseline so class file 65 deps load.
+        javaHome = somedayJvmHome.get()
 
         nativeDistributions {
             targetFormats(TargetFormat.Dmg, TargetFormat.Msi, TargetFormat.Deb)
@@ -112,10 +130,15 @@ compose.desktop {
 }
 
 tasks.withType<Test>().configureEach {
+    javaLauncher.set(somedayJvmLauncher)
     testLogging {
         events(TestLogEvent.FAILED, TestLogEvent.PASSED, TestLogEvent.SKIPPED)
         showStandardStreams = true
     }
+}
+
+tasks.withType<JavaExec>().configureEach {
+    javaLauncher.set(somedayJvmLauncher)
 }
 
 tasks.named("compileKotlinJvm") {
@@ -126,6 +149,7 @@ tasks.register<JavaExec>("runUiSmoke") {
     group = "verification"
     description = "Runs a non-interactive Desktop startup smoke through the shared UI module."
     dependsOn("jvmMainClasses")
+    javaLauncher.set(somedayJvmLauncher)
     classpath = files(
         kotlin.targets.getByName("jvm").compilations.getByName("main").output.allOutputs,
         configurations.named("jvmRuntimeClasspath"),

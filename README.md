@@ -39,7 +39,9 @@ You may run, study, share, and modify it under the terms of that license. If you
 
 ## Requirements
 
-- JDK suitable for the Gradle wrapper and Kotlin/Compose toolchain.
+- JDK 21 (Temurin/JBR/OpenJDK) for the Gradle wrapper, Kotlin/Compose toolchain,
+  Desktop run/package, and server. The monorepo `jvmTarget` and Java toolchains
+  are 21-wide; older JDKs cannot load dependencies such as backdrop 2.x.
 - Docker and Docker Compose for PostgreSQL and WebDAV integration services.
 - Android SDK/emulator for Android smoke or instrumented tests.
 - Xcode/iOS Simulator on macOS for iOS simulator tests.
@@ -111,12 +113,17 @@ The runner prompts for a platform when one is not provided, prompts for Android/
 Manual equivalents:
 
 ```bash
-# Desktop app
-./gradlew :app:desktop:run
+# Desktop app (local debug enables Sync V2 first-epoch activation)
+./gradlew :app:desktop:run \
+  -Psomeday.systemV2DevelopmentEnabled=true \
+  -Psomeday.systemV2ReleaseEnabled=false
 
 # Server only
 SOMEDAY_PORT=3180 SOMEDAY_DB_URL=jdbc:postgresql://127.0.0.1:54329/someday ./gradlew :server:run
 ```
+
+`make run-desktop` and `./scripts/run desktop` pass the same V2 development flags.
+Release packaging keeps both flags off unless the release scripts set them explicitly.
 
 For Android Studio, open the project and use the `app:android` module. Desktop produces a JVM app and package-readiness checks for Windows/Linux; signing, notarization, and store packaging are outside the first release scope.
 

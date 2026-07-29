@@ -1,3 +1,8 @@
+import org.gradle.api.plugins.JavaPluginExtension
+import org.gradle.jvm.toolchain.JavaLanguageVersion
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import org.jetbrains.kotlin.gradle.tasks.KotlinJvmCompile
+
 plugins {
     alias(libs.plugins.kotlin.multiplatform) apply false
     alias(libs.plugins.kotlin.android) apply false
@@ -8,6 +13,23 @@ plugins {
     alias(libs.plugins.android.application) apply false
     alias(libs.plugins.android.library) apply false
     alias(libs.plugins.sqldelight) apply false
+}
+
+/** Monorepo JVM baseline: bytecode, toolchains, and runtime for desktop/server/tests. */
+val somedayJvmLanguageVersion: JavaLanguageVersion =
+    JavaLanguageVersion.of(libs.versions.jvm.get().toInt())
+
+subprojects {
+    pluginManager.withPlugin("java-base") {
+        extensions.configure<JavaPluginExtension> {
+            toolchain {
+                languageVersion.set(somedayJvmLanguageVersion)
+            }
+        }
+    }
+    tasks.withType<KotlinJvmCompile>().configureEach {
+        compilerOptions.jvmTarget.set(JvmTarget.JVM_21)
+    }
 }
 
 val syncV2ReliabilityGateRequested = providers
