@@ -53,8 +53,7 @@ class SystemV2NotesRepository(
         val notebooks = context.store.loadProjections(WorkspaceEntityTypeV2.NOTEBOOK)
             .mapNotNull { notebookView(context, it) }
             .sortedWith(compareBy<NotebookSummary> { it.sortOrder }.thenBy { it.id })
-        val hasRecovery = context.store.loadProjections(WorkspaceEntityTypeV2.NOTE)
-            .any { it.warning == "unresolved_notebook_reference" }
+        val hasRecovery = context.store.hasUnresolvedNotebookNoteProjections()
         return if (hasRecovery) {
             notebooks + NotebookSummary(
                 id = RECOVERY_INBOX_EFFECTIVE_NOTEBOOK_ID_V2,
@@ -244,16 +243,15 @@ class SystemV2NotesRepository(
 
     override fun listNotes(notebookId: String): List<NoteSummary> {
         val context = contexts.openOrNull() ?: return emptyList()
-        return projectedNoteViews(context)
-            .filter { view ->
-                if (notebookId == RECOVERY_INBOX_EFFECTIVE_NOTEBOOK_ID_V2) {
-                    view.unresolvedNotebook
-                } else {
-                    !view.unresolvedNotebook && view.content.notebookId == notebookId
-                }
-            }
-            .map(SystemV2NoteView::toSummary)
-            .sortedWith(compareByDescending<NoteSummary> { it.updatedAt }.thenBy { it.id })
+        val effectiveNotebookId = if (notebookId == RECOVERY_INBOX_EFFECTIVE_NOTEBOOK_ID_V2) {
+            RECOVERY_INBOX_EFFECTIVE_NOTEBOOK_ID_V2
+        } else {
+            notebookId
+        }
+        return noteSummariesFromListProjections(
+            context = context,
+            projections = context.store.loadContentNoteListProjectionsForEffectiveNotebook(effectiveNotebookId),
+        )
     }
 
     override fun getNoteDetails(noteId: String): NoteDetails? {
@@ -434,7 +432,8 @@ class SystemV2NotesRepository(
     }
 
     override fun listMemoryDayCounts(month: MemoryMonth): List<MemoryDayCount> =
-        projectedNotes().map { noteCalendarDate(it.content.noteCreatedAt, it.content.timeZoneId) }
+        contentNoteListProjections()
+            .map { noteCalendarDate(it.noteCreatedAt, it.timeZoneId) }
             .filter(month::contains)
             .groupingBy { it }
             .eachCount()
@@ -442,45 +441,95 @@ class SystemV2NotesRepository(
             .sortedBy { it.date.toString() }
 
     override fun listActiveNoteDates(): List<LocalDate> =
-        projectedNotes().map { noteCalendarDate(it.content.noteCreatedAt, it.content.timeZoneId) }
+        contentNoteListProjections()
+            .map { noteCalendarDate(it.noteCreatedAt, it.timeZoneId) }
 
-    override fun listNotesForDate(date: LocalDate): List<NoteSummary> =
-        projectedNotes()
-            .filter { noteCalendarDate(it.content.noteCreatedAt, it.content.timeZoneId) == date }
-            .map(SystemV2NoteView::toSummary)
-            .sortedWith(compareByDescending<NoteSummary> { it.updatedAt }.thenBy { it.id })
+    override fun listNotesForDate(date: LocalDate): List<NoteSummary> {
+        val context = contexts.openOrNull() ?: return emptyList()
+        return noteSummariesFromListProjections(
+            context = context,
+            projections = context.store.loadContentNoteListProjections().filter {
+                noteCalendarDate(it.noteCreatedAt, it.timeZoneId) == date
+            },
+        )
+    }
 
-    override fun listPriorYearNotesForDate(date: LocalDate): List<NoteSummary> =
-        projectedNotes()
-            .filter {
-                val candidate = noteCalendarDate(it.content.noteCreatedAt, it.content.timeZoneId)
+    override fun listPriorYearNotesForDate(date: LocalDate): List<NoteSummary> {
+        val context = contexts.openOrNull() ?: return emptyList()
+        return noteSummariesFromListProjections(
+            context = context,
+            projections = context.store.loadContentNoteListProjections().filter {
+                val candidate = noteCalendarDate(it.noteCreatedAt, it.timeZoneId)
                 candidate < date && candidate.month == date.month && candidate.day == date.day
-            }
-            .map(SystemV2NoteView::toSummary)
-            .sortedByDescending { it.createdAt }
+            },
+        )
+    }
 
     override fun searchNotes(query: String): List<NoteSummary> {
         val normalized = query.trim().lowercase()
         if (normalized.isEmpty()) return emptyList()
-        return projectedNotes()
-            .filter {
-                it.content.title.lowercase().contains(normalized) ||
-                    it.content.markdownBody.lowercase().contains(normalized) ||
-                    it.content.location?.placeText?.lowercase()?.contains(normalized) == true
-            }
-            .map(SystemV2NoteView::toSummary)
-            .sortedWith(compareByDescending<NoteSummary> { it.updatedAt }.thenBy { it.id })
-    }
-
-    private fun projectedNotes(): List<SystemV2NoteView> {
         val context = contexts.openOrNull() ?: return emptyList()
-        return projectedNoteViews(context)
+        return noteSummariesFromListProjections(
+            context = context,
+            projections = context.store.loadContentNoteListProjections().filter {
+                it.title.lowercase().contains(normalized) ||
+                    it.markdownBody.lowercase().contains(normalized) ||
+                    it.locationPlaceText?.lowercase()?.contains(normalized) == true
+            },
+        )
     }
 
-    private fun projectedNoteViews(context: ActiveWorkspaceSystemV2): List<SystemV2NoteView> =
-        context.store.loadEntityKeys()
-            .filter { it.entityType == WorkspaceEntityTypeV2.NOTE }
-            .mapNotNull { projectedNoteView(context, it.entityId) }
+    private fun contentNoteListProjections(): List<StoredNoteListProjectionV2> {
+        val context = contexts.openOrNull() ?: return emptyList()
+        return context.store.loadContentNoteListProjections()
+    }
+
+    /**
+     * Diary list order is journal [NoteSummary.createdAt] (noteCreatedAt), newest first.
+     * Version authoredAt remains available as [NoteSummary.updatedAt] for sync/display of last write,
+     * but must not drive the notebook timeline.
+     */
+    private fun noteSummariesFromListProjections(
+        context: ActiveWorkspaceSystemV2,
+        projections: List<StoredNoteListProjectionV2>,
+    ): List<NoteSummary> {
+        if (projections.isEmpty()) return emptyList()
+        val pendingObjectIds = context.store.loadPendingObjectIds(context.remoteProfile)
+        val conflictReasons = context.store.loadActiveConflicts()
+            .asSequence()
+            .filter { it.descriptor.entityType == WorkspaceEntityTypeV2.NOTE }
+            .associate { it.descriptor.entityId to it.descriptor.reason.wireValue }
+        return projections
+            .map { projection ->
+                projection.toSummary(
+                    pending = projection.preferredHeadVersionId != null &&
+                        projection.preferredHeadVersionId in pendingObjectIds,
+                    conflictReason = conflictReasons[projection.noteId],
+                )
+            }
+            .sortedWith(NOTE_LIST_COMPARATOR_V2)
+    }
+
+    private fun StoredNoteListProjectionV2.toSummary(
+        pending: Boolean,
+        conflictReason: String?,
+    ): NoteSummary = NoteSummary(
+        id = noteId,
+        notebookId = effectiveNotebookId
+            ?: referencedNotebookId
+            ?: RECOVERY_INBOX_EFFECTIVE_NOTEBOOK_ID_V2,
+        title = title,
+        excerpt = markdownBody.lineSequence().joinToString(" ").trim().take(180),
+        createdAt = noteCreatedAt,
+        updatedAt = authoredAt ?: noteCreatedAt,
+        syncBadge = when {
+            conflictReason != null -> NoteSyncBadge.Conflict(conflictReason)
+            pending -> NoteSyncBadge.Pending
+            warning != null -> NoteSyncBadge.Error(warning)
+            else -> NoteSyncBadge.Synced
+        },
+        timeZoneId = timeZoneId,
+    )
 
     private fun retainedEpochContexts(): List<ActiveWorkspaceSystemV2> =
         protocolStore.loadAllEpochs()
@@ -831,6 +880,11 @@ private fun NoteLocationV2?.toDomainLocation(): NotesLocationInput? = this?.let 
         capturedAt = it.capturedAt,
     )
 }
+
+/** Notebook timeline: journal createdAt desc, then stable id asc (not version authoredAt). */
+private val NOTE_LIST_COMPARATOR_V2 =
+    compareByDescending<NoteSummary> { it.createdAt }
+        .thenBy { it.id }
 
 private fun WorkspaceEntityVersionV2.toNoteVersionSummary(retainedEpochId: String? = null): NoteVersionSummary {
     val content = contentPayload as NoteContentV2

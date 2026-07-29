@@ -2,6 +2,7 @@
 
 package saien.someday.sync.causality.v2
 
+import saien.someday.data.local.db.Note_projections_system_v2
 import saien.someday.data.local.db.SomedayDatabase
 import saien.someday.data.local.db.Sync_applied_mutations_system_v2
 import saien.someday.data.local.db.Sync_pending_mutations_system_v2
@@ -99,6 +100,24 @@ data class WorkspaceProjectionSnapshotV2(
     val deletion: WorkspaceDeletionV2?,
     val referencedEntityId: String?,
     val effectiveEntityId: String?,
+    val warning: String?,
+    val authoredAt: Instant?,
+)
+
+/**
+ * Denormalized note row for diary list/search paths.
+ * Built from [note_projections_system_v2], which is rebuilt on every local/remote commit.
+ */
+data class StoredNoteListProjectionV2(
+    val noteId: String,
+    val preferredHeadVersionId: String?,
+    val referencedNotebookId: String?,
+    val effectiveNotebookId: String?,
+    val title: String,
+    val markdownBody: String,
+    val noteCreatedAt: Instant,
+    val timeZoneId: String?,
+    val locationPlaceText: String?,
     val warning: String?,
     val authoredAt: Instant?,
 )
@@ -204,6 +223,29 @@ class SqlDelightWorkspaceEntityStoreV2(
             .filter { entityType == null || it.entityType == entityType }
             .mapNotNull(::loadProjection)
             .toList()
+
+    /**
+     * Content note projections ordered by journal date (newest first).
+     * Prefer this over [loadProjections] for product list/search surfaces.
+     */
+    fun loadContentNoteListProjections(): List<StoredNoteListProjectionV2> =
+        queries.selectContentNoteProjectionsSystemV2(syncEpochId)
+            .executeAsList()
+            .mapNotNull(::mapStoredNoteListProjection)
+
+    fun loadContentNoteListProjectionsForEffectiveNotebook(
+        effectiveNotebookId: String,
+    ): List<StoredNoteListProjectionV2> =
+        queries.selectContentNoteProjectionsByEffectiveNotebookSystemV2(syncEpochId, effectiveNotebookId)
+            .executeAsList()
+            .mapNotNull(::mapStoredNoteListProjection)
+
+    fun hasUnresolvedNotebookNoteProjections(): Boolean =
+        queries.selectHasUnresolvedNotebookNoteProjectionSystemV2(syncEpochId)
+            .executeAsOneOrNull() != null
+
+    fun loadPendingObjectIds(remoteProfile: String): Set<String> =
+        loadPending(remoteProfile).mapTo(linkedSetOf()) { it.objectId }
 
     fun loadHeads(key: WorkspaceEntityKeyV2): List<WorkspaceEntityVersionV2> =
         queries.selectWorkspaceEntityHeadsV2(syncEpochId, key.entityType.wireValue, key.entityId)
@@ -886,6 +928,28 @@ class SqlDelightWorkspaceEntityStoreV2(
         val key = WorkspaceEntityKeyV2(WorkspaceEntityTypeV2.NOTEBOOK, notebookId)
         val heads = loadHeads(key)
         return heads.size == 1 && heads.single().kind == WorkspaceEntityVersionKindV2.CONTENT
+    }
+
+    private fun mapStoredNoteListProjection(row: Note_projections_system_v2): StoredNoteListProjectionV2? {
+        val createdSeconds = row.note_created_at_seconds ?: return null
+        val createdNanos = row.note_created_at_nanos ?: 0L
+        val title = row.title ?: return null
+        val markdownBody = row.markdown_body ?: return null
+        return StoredNoteListProjectionV2(
+            noteId = row.note_id,
+            preferredHeadVersionId = row.preferred_head_version_id,
+            referencedNotebookId = row.referenced_notebook_id,
+            effectiveNotebookId = row.effective_notebook_id,
+            title = title,
+            markdownBody = markdownBody,
+            noteCreatedAt = Instant.fromEpochSeconds(createdSeconds, createdNanos),
+            timeZoneId = row.time_zone_id,
+            locationPlaceText = row.location_place_text,
+            warning = row.warning,
+            authoredAt = row.authored_at_seconds?.let { seconds ->
+                Instant.fromEpochSeconds(seconds, row.authored_at_nanos ?: 0L)
+            },
+        )
     }
 
     private fun decodeStoredVersion(row: Workspace_entity_versions_v2): WorkspaceEntityVersionV2 {
