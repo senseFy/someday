@@ -106,7 +106,7 @@ make run-android DEVICE=emulator-5554
 make run-ios DEVICE="iPhone 17"
 ```
 
-The runner prompts for a platform when one is not provided, prompts for Android/iOS devices when more than one is available, and uses Up/Down arrows plus Enter for selection. Device menus show physical devices before emulators/simulators, distinguish them with icons, and shorten device IDs to their last few characters for display. It reuses the normal Gradle and Xcode caches and does not run `clean`; remove build directories manually if a fresh build is needed. Running on a physical iOS device requires a valid Xcode signing team/provisioning profile; set `IOS_DEVELOPMENT_TEAM=<team-id>` or `IOS_TEAM_ID=<team-id>` in the environment or `~/.zshrc` when you want the runner to pass a team id to Xcode.
+The runner prompts for a platform when one is not provided, prompts for Android/iOS devices when more than one is available, and uses Up/Down arrows plus Enter for selection. Device menus show physical devices before emulators/simulators, distinguish them with icons, and shorten device IDs to their last few characters for display. It reuses the normal Gradle and Xcode caches and does not run `clean`; remove build directories manually if a fresh build is needed. Running on a physical iOS device requires a valid Xcode signing team/provisioning profile; export `IOS_DEVELOPMENT_TEAM=<team-id>` or `IOS_TEAM_ID=<team-id>` in the current environment when you want the runner to pass a team id to Xcode.
 
 Manual equivalents:
 
@@ -188,13 +188,16 @@ make android-ci-download RUN_ID=<run-id>
 
 ### Android Google Play release
 
-Android release bundles use the `saien.someday` application ID and the same organization-owned signing key as other SAIEN Android distribution. The keystore and passwords stay outside the repository:
+Android release bundles use the `saien.someday` application ID. Release signing credentials must be provided explicitly and must stay outside the repository:
 
 ```bash
-export SAIEN_KEYSTORE_PATH=/absolute/path/to/saien-release.jks
-export SAIEN_KEYSTORE_PASSWORD=<store-password>
-export SAIEN_KEY_ALIAS=<key-alias>
-export SAIEN_KEY_PASSWORD=<key-password>
+export SOMEDAY_ANDROID_KEYSTORE_PATH=/absolute/path/to/someday-release.jks
+export SOMEDAY_ANDROID_KEYSTORE_PASSWORD=<store-password>
+export SOMEDAY_ANDROID_KEY_ALIAS=<key-alias>
+export SOMEDAY_ANDROID_KEY_PASSWORD=<key-password>
+
+# Required for upload unless GOOGLE_APPLICATION_CREDENTIALS or GOOGLE_PLAY_ACCESS_TOKEN is set
+export ANDROID_PLAY_SERVICE_ACCOUNT_JSON=/absolute/path/to/google-play-service-account.json
 
 # Build, sign, and verify without uploading
 make android-release-play
@@ -206,9 +209,9 @@ make android-release-play UPLOAD=yes
 make android-upload-play
 ```
 
-The organization-wide publisher service account JSON defaults to `~/.config/saien/google-play-publisher.json`; override it with `ANDROID_PLAY_SERVICE_ACCOUNT_JSON`. A short-lived `GOOGLE_PLAY_ACCESS_TOKEN` with the `androidpublisher` scope is also accepted. Uploads default to the `internal` track and `completed` status. Production requires `ANDROID_PLAY_TRACK=production ANDROID_PLAY_CONFIRM_PRODUCTION=yes`; use `ANDROID_PLAY_DRY_RUN=yes` to verify the artifact and release plan without Google API calls.
+The upload tooling never searches a home-directory default for credentials. Provide `ANDROID_PLAY_SERVICE_ACCOUNT_JSON`, use the standard `GOOGLE_APPLICATION_CREDENTIALS`, or pass a short-lived `GOOGLE_PLAY_ACCESS_TOKEN` with the `androidpublisher` scope. Uploads default to the `internal` track and `completed` status. Production requires `ANDROID_PLAY_TRACK=production ANDROID_PLAY_CONFIRM_PRODUCTION=yes`; use `ANDROID_PLAY_DRY_RUN=yes` to verify the artifact and release plan without Google API calls.
 
-Before the first upload, create the app in Play Console and choose the option to provide an existing app signing key. Import the SAIEN signing key as Someday's **app signing key**, not only as its upload key, so APKs distributed outside Google Play have the same signing certificate as Play-delivered APKs. Keep the private key backed up securely; do not accept a Google-generated app signing key for this app if cross-channel APK updates must remain compatible.
+Before the first upload, create the app in Play Console and choose the option to provide an existing app signing key when cross-channel APK updates must remain compatible. Import that key as Someday's **app signing key**, not only as its upload key, so externally distributed and Play-delivered APKs share the same signing certificate. Keep the private key backed up securely and never commit it.
 
 iOS CI is intentionally not enabled as a required GitHub-hosted job yet. GitHub-hosted macOS runners can build iOS simulator targets with preinstalled Xcode, but physical-device packaging needs signing certificates, provisioning profiles, and team configuration in repository secrets. Add a separate macOS workflow when those release credentials and cost expectations are ready.
 

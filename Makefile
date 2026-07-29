@@ -20,12 +20,12 @@ ANDROID_ARTIFACT_NAME ?= someday-android-debug-apk
 ANDROID_ARTIFACT_DIR ?= artifacts/android-$(RUN_ID)
 UPLOAD ?=
 ANDROID_PLAY_AAB ?= app/android/build/outputs/bundle/release/android-release.aab
-ANDROID_PLAY_DEFAULT_SERVICE_ACCOUNT_JSON := $(HOME)/.config/saien/google-play-publisher.json
 ANDROID_PLAY_PACKAGE_NAME ?= saien.someday
 ANDROID_PLAY_TRACK ?= internal
 ANDROID_PLAY_RELEASE_STATUS ?= completed
 ANDROID_PLAY_RELEASE_NAME ?=
-ANDROID_PLAY_SERVICE_ACCOUNT_JSON ?= $(or $(GOOGLE_PLAY_SERVICE_ACCOUNT_JSON),$(ANDROID_PLAY_DEFAULT_SERVICE_ACCOUNT_JSON))
+ANDROID_PLAY_SERVICE_ACCOUNT_JSON ?= $(GOOGLE_APPLICATION_CREDENTIALS)
+export ANDROID_PLAY_SERVICE_ACCOUNT_JSON
 ANDROID_PLAY_CONFIRM_PRODUCTION ?=
 ANDROID_PLAY_DRY_RUN ?=
 
@@ -82,7 +82,6 @@ ANDROID_PLAY_UPLOAD_ARGS += --package-name "$(ANDROID_PLAY_PACKAGE_NAME)"
 ANDROID_PLAY_UPLOAD_ARGS += --track "$(ANDROID_PLAY_TRACK)"
 ANDROID_PLAY_UPLOAD_ARGS += --status "$(ANDROID_PLAY_RELEASE_STATUS)"
 ANDROID_PLAY_UPLOAD_ARGS += $(if $(ANDROID_PLAY_RELEASE_NAME),--release-name "$(ANDROID_PLAY_RELEASE_NAME)",)
-ANDROID_PLAY_UPLOAD_ARGS += $(if $(ANDROID_PLAY_SERVICE_ACCOUNT_JSON),--credentials "$(abspath $(ANDROID_PLAY_SERVICE_ACCOUNT_JSON))",)
 ANDROID_PLAY_UPLOAD_ARGS += $(if $(filter yes y true 1,$(ANDROID_PLAY_CONFIRM_PRODUCTION)),--confirm-production,)
 ANDROID_PLAY_UPLOAD_ARGS += $(if $(ANDROID_PLAY_DRY_RUN_ENABLED),--dry-run,)
 
@@ -154,24 +153,24 @@ android-connected-test: ## Run Android connected instrumentation tests
 	$(GRADLE) :app:android:connectedDebugAndroidTest --max-workers=1
 
 check-android-play-release-env:
-	@test -n "$$SAIEN_KEYSTORE_PATH" || (echo "ERROR: SAIEN_KEYSTORE_PATH is required."; exit 1)
-	@test -f "$$SAIEN_KEYSTORE_PATH" || (echo "ERROR: SAIEN_KEYSTORE_PATH does not point to a file."; exit 1)
-	@test -n "$$SAIEN_KEYSTORE_PASSWORD" || (echo "ERROR: SAIEN_KEYSTORE_PASSWORD is required."; exit 1)
-	@test -n "$$SAIEN_KEY_ALIAS" || (echo "ERROR: SAIEN_KEY_ALIAS is required."; exit 1)
-	@test -n "$$SAIEN_KEY_PASSWORD" || (echo "ERROR: SAIEN_KEY_PASSWORD is required."; exit 1)
+	@test -n "$$SOMEDAY_ANDROID_KEYSTORE_PATH" || (echo "ERROR: SOMEDAY_ANDROID_KEYSTORE_PATH is required."; exit 1)
+	@test -f "$$SOMEDAY_ANDROID_KEYSTORE_PATH" || (echo "ERROR: SOMEDAY_ANDROID_KEYSTORE_PATH does not point to a file."; exit 1)
+	@test -n "$$SOMEDAY_ANDROID_KEYSTORE_PASSWORD" || (echo "ERROR: SOMEDAY_ANDROID_KEYSTORE_PASSWORD is required."; exit 1)
+	@test -n "$$SOMEDAY_ANDROID_KEY_ALIAS" || (echo "ERROR: SOMEDAY_ANDROID_KEY_ALIAS is required."; exit 1)
+	@test -n "$$SOMEDAY_ANDROID_KEY_PASSWORD" || (echo "ERROR: SOMEDAY_ANDROID_KEY_PASSWORD is required."; exit 1)
 
 check-android-play-publisher-env:
 	@if [[ -z "$(ANDROID_PLAY_DRY_RUN_ENABLED)" ]]; then \
 		if [[ -n "$$GOOGLE_PLAY_ACCESS_TOKEN" ]]; then \
 			echo "Google Play authentication: GOOGLE_PLAY_ACCESS_TOKEN"; \
-		elif [[ -z "$(ANDROID_PLAY_SERVICE_ACCOUNT_JSON)" ]]; then \
-			echo "ERROR: ANDROID_PLAY_SERVICE_ACCOUNT_JSON or GOOGLE_PLAY_ACCESS_TOKEN is required."; \
+		elif [[ -z "$$ANDROID_PLAY_SERVICE_ACCOUNT_JSON" ]]; then \
+			echo "ERROR: ANDROID_PLAY_SERVICE_ACCOUNT_JSON, GOOGLE_APPLICATION_CREDENTIALS, or GOOGLE_PLAY_ACCESS_TOKEN is required."; \
 			exit 1; \
-		elif [[ ! -f "$(abspath $(ANDROID_PLAY_SERVICE_ACCOUNT_JSON))" ]]; then \
-			echo "ERROR: Google Play service account JSON not found: $(abspath $(ANDROID_PLAY_SERVICE_ACCOUNT_JSON))"; \
+		elif [[ ! -f "$$ANDROID_PLAY_SERVICE_ACCOUNT_JSON" ]]; then \
+			echo "ERROR: Configured Google Play service account JSON path does not point to a file."; \
 			exit 1; \
 		else \
-			echo "Google Play service account JSON: $(abspath $(ANDROID_PLAY_SERVICE_ACCOUNT_JSON))"; \
+			echo "Google Play service account JSON configured."; \
 		fi; \
 	fi
 
@@ -191,7 +190,7 @@ android-release-play: check-android-play-release-env check-android-play-release-
 	fi
 
 android-upload-play: check-android-play-publisher-env ## Verify and upload an existing AAB to Google Play
-	$(ANDROID_PLAY_UPLOAD_SCRIPT) $(ANDROID_PLAY_UPLOAD_ARGS)
+	@$(ANDROID_PLAY_UPLOAD_SCRIPT) $(ANDROID_PLAY_UPLOAD_ARGS)
 
 ##@ iOS
 .PHONY: ios-smoke ios-simulator-test ios-framework ios-framework-release check-ios-team
