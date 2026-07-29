@@ -29,7 +29,7 @@ qrcode-kotlin = "4.5.0"
 zxing = "3.5.4"
 postgresql = "42.7.8"
 sqldelight = "2.1.0"
-sqlite-jdbc = "3.49.1.0"
+sqlite-jdbc = "3.53.2.1"
 
 [libraries]
 argon2-jvm = { module = "de.mkammerer:argon2-jvm", version.ref = "argon2" }
