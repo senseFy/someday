@@ -113,7 +113,7 @@ compose.desktop {
         nativeDistributions {
             targetFormats(TargetFormat.Dmg, TargetFormat.Msi, TargetFormat.Deb)
             packageName = "Someday"
-            packageVersion = "1.0.12"
+            packageVersion = "1.0.13"
             modules("java.sql")
 
             macOS {
