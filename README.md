@@ -215,7 +215,7 @@ export ANDROID_PLAY_SERVICE_ACCOUNT_JSON=/absolute/path/to/google-play-service-a
 make android-release-play
 
 # Build and upload to Google Play internal testing
-make android-release-play UPLOAD=yes
+make android-release-play-upload
 
 # Verify and upload an existing release AAB
 make android-upload-play
@@ -229,7 +229,7 @@ iOS CI is intentionally not enabled as a required GitHub-hosted job yet. GitHub-
 
 ### iOS App Store / TestFlight release
 
-Local App Store packaging lives in `scripts/release-ios.sh` and is wrapped by Makefile targets. The script prebuilds the Release `SomedayIos.framework` with developer options disabled, archives the `Someday` Xcode scheme, and exports an App Store Connect IPA. Interactive runs can optionally bump the iOS build number and choose direct TestFlight upload before export, so Xcode exports the archive only once.
+Local App Store packaging lives in `scripts/release-ios.sh` and is wrapped by Makefile targets. The script prebuilds the Release `SomedayIos.framework` with developer options disabled, archives the `Someday` Xcode scheme, and exports an App Store Connect IPA. Release targets never change or commit source versions. Direct TestFlight uploads use the explicit `ios-upload-testflight` target, so Xcode exports the archive only once.
 
 ```bash
 export IOS_TEAM_ID=YOUR_TEAM_ID
@@ -263,11 +263,9 @@ Useful optional variables:
 ```bash
 export IOS_BUILD_NUMBER=12
 export IOS_MARKETING_VERSION=1.0.1
-export IOS_BUMP_VERSION=yes # or no
 export IOS_ARCHIVE_PATH="/absolute/path/to/Someday-Release.xcarchive"
 export IOS_EXPORT_PATH="/absolute/path/to/ipa-output"
 export IOS_PROVISIONING_PROFILE_SPECIFIER="<App Store profile name>"
-export IOS_UPLOAD=yes
 ```
 
 Upload auth defaults to App Store Connect API key mode. Keep the private key outside the repository, restrict it to the current user, and export only its path and identifiers:

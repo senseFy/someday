@@ -18,7 +18,6 @@ WEBDAV_PORT ?= 3182
 SERVER_DB_URL ?= jdbc:postgresql://127.0.0.1:$(DB_PORT)/someday
 ANDROID_ARTIFACT_NAME ?= someday-android-debug-apk
 ANDROID_ARTIFACT_DIR ?= artifacts/android-$(RUN_ID)
-UPLOAD ?=
 ANDROID_PLAY_AAB ?= app/android/build/outputs/bundle/release/android-release.aab
 ANDROID_PLAY_PACKAGE_NAME ?= saien.someday
 ANDROID_PLAY_TRACK ?= internal
@@ -32,7 +31,6 @@ ANDROID_PLAY_DRY_RUN ?=
 IOS_TEAM_ID ?=
 IOS_BUILD_NUMBER ?=
 IOS_MARKETING_VERSION ?=
-IOS_BUMP_VERSION ?=
 IOS_ARCHIVE_PATH ?=
 IOS_EXPORT_PATH ?=
 APP_STORE_CONNECT_API_KEY_PATH ?=
@@ -43,13 +41,11 @@ IOS_EXPORT_BUNDLE_ID ?=
 IOS_SIGNING_CERTIFICATE ?=
 IOS_UPLOAD_AUTH_MODE ?=
 IOS_ALLOW_PROVISIONING_UPDATES ?= false
-IOS_UPLOAD ?=
 VERSION_NAME ?=
 
 export IOS_TEAM_ID
 export IOS_BUILD_NUMBER
 export IOS_MARKETING_VERSION
-export IOS_BUMP_VERSION
 export IOS_ARCHIVE_PATH
 export IOS_EXPORT_PATH
 export APP_STORE_CONNECT_API_KEY_PATH
@@ -65,8 +61,6 @@ IOS_RELEASE_SCRIPT := ./scripts/release-ios.sh
 ANDROID_PLAY_VERIFY_SCRIPT := ./scripts/verify-play-aab.sh
 ANDROID_PLAY_UPLOAD_SCRIPT := ./scripts/upload-google-play.sh
 APP_VERSION_ARGS := $(if $(VERSION_NAME),--version-name "$(VERSION_NAME)",)
-IOS_RELEASE_UPLOAD_ARG := $(if $(filter yes y true 1,$(IOS_UPLOAD)),--upload,)
-UPLOAD_ENABLED := $(if $(filter yes y true 1,$(UPLOAD)),yes,)
 ANDROID_PLAY_DRY_RUN_ENABLED := $(if $(filter yes y true 1,$(ANDROID_PLAY_DRY_RUN)),yes,)
 SYSTEM_V2_SHIPPING_ARGS := -Psomeday.systemV2ReleaseEnabled=true -Psomeday.systemV2DevelopmentEnabled=false
 ANDROID_PLAY_UPLOAD_ARGS = --aab "$(abspath $(ANDROID_PLAY_AAB))"
@@ -127,8 +121,9 @@ run-ios: ## Build, install, and launch iOS app; optional DEVICE=<id-or-name>
 
 ##@ Android
 .PHONY: android-debug android-install android-test android-smoke android-connected-test
-.PHONY: android-release-play android-upload-play check-android-play-release-env
-.PHONY: check-android-play-publisher-env check-android-play-release-upload-env
+.PHONY: android-release-play android-release-play-upload android-upload-play
+.PHONY: build-android-play-aab check-release-control-options
+.PHONY: check-android-play-release-env check-android-play-publisher-env
 android-debug: ## Build Android debug APK
 	$(GRADLE) :app:android:assembleDebug --dependency-verification=strict --stacktrace
 
@@ -144,14 +139,24 @@ android-smoke: ## Build Android shell and run host-side smoke tests
 android-connected-test: ## Run Android connected instrumentation tests
 	$(GRADLE) :app:android:connectedDebugAndroidTest --max-workers=1
 
-check-android-play-release-env:
+check-release-control-options:
+	@if [[ "$(origin BUMP_VERSION)" != "undefined" || "$(origin IOS_BUMP_VERSION)" != "undefined" ]]; then \
+		echo "ERROR: Release targets no longer accept BUMP_VERSION. Run bump-ios-version, bump-android-version, or bump-mobile-build-version explicitly."; \
+		exit 2; \
+	fi
+	@if [[ "$(origin UPLOAD)" != "undefined" || "$(origin IOS_UPLOAD)" != "undefined" ]]; then \
+		echo "ERROR: Release targets no longer accept UPLOAD. Unset it and choose an explicit upload target; run make help for the available targets."; \
+		exit 2; \
+	fi
+
+check-android-play-release-env: check-release-control-options
 	@test -n "$$SOMEDAY_ANDROID_KEYSTORE_PATH" || (echo "ERROR: SOMEDAY_ANDROID_KEYSTORE_PATH is required."; exit 1)
 	@test -f "$$SOMEDAY_ANDROID_KEYSTORE_PATH" || (echo "ERROR: SOMEDAY_ANDROID_KEYSTORE_PATH does not point to a file."; exit 1)
 	@test -n "$$SOMEDAY_ANDROID_KEYSTORE_PASSWORD" || (echo "ERROR: SOMEDAY_ANDROID_KEYSTORE_PASSWORD is required."; exit 1)
 	@test -n "$$SOMEDAY_ANDROID_KEY_ALIAS" || (echo "ERROR: SOMEDAY_ANDROID_KEY_ALIAS is required."; exit 1)
 	@test -n "$$SOMEDAY_ANDROID_KEY_PASSWORD" || (echo "ERROR: SOMEDAY_ANDROID_KEY_PASSWORD is required."; exit 1)
 
-check-android-play-publisher-env:
+check-android-play-publisher-env: check-release-control-options
 	@if [[ -z "$(ANDROID_PLAY_DRY_RUN_ENABLED)" ]]; then \
 		if [[ -n "$$GOOGLE_PLAY_ACCESS_TOKEN" ]]; then \
 			echo "Google Play authentication: GOOGLE_PLAY_ACCESS_TOKEN"; \
@@ -166,20 +171,15 @@ check-android-play-publisher-env:
 		fi; \
 	fi
 
-check-android-play-release-upload-env:
-	@if [[ -n "$(UPLOAD_ENABLED)" ]]; then \
-		$(MAKE) --no-print-directory check-android-play-publisher-env; \
-	fi
-
-android-release-play: check-android-play-release-env check-android-play-release-upload-env ## Build and verify a signed Play AAB; set UPLOAD=yes to upload
+build-android-play-aab: check-android-play-release-env
 	$(GRADLE) :app:android:bundleRelease $(SYSTEM_V2_SHIPPING_ARGS) --dependency-verification=strict --stacktrace
 	@test -f "$(ANDROID_PLAY_AAB)" || (echo "ERROR: Google Play AAB was not produced: $(ANDROID_PLAY_AAB)"; exit 1)
-	@if [[ -n "$(UPLOAD_ENABLED)" ]]; then \
-		$(ANDROID_PLAY_UPLOAD_SCRIPT) $(ANDROID_PLAY_UPLOAD_ARGS); \
-	else \
-		ANDROID_PLAY_PACKAGE_NAME="$(ANDROID_PLAY_PACKAGE_NAME)" $(ANDROID_PLAY_VERIFY_SCRIPT) "$(abspath $(ANDROID_PLAY_AAB))"; \
-		echo "Google Play upload skipped. Re-run with UPLOAD=yes to upload."; \
-	fi
+
+android-release-play: build-android-play-aab ## Build and verify a signed Play AAB without uploading
+	@ANDROID_PLAY_PACKAGE_NAME="$(ANDROID_PLAY_PACKAGE_NAME)" $(ANDROID_PLAY_VERIFY_SCRIPT) "$(abspath $(ANDROID_PLAY_AAB))"
+
+android-release-play-upload: check-android-play-publisher-env build-android-play-aab ## Build, verify, and upload a signed AAB to Google Play
+	@$(ANDROID_PLAY_UPLOAD_SCRIPT) $(ANDROID_PLAY_UPLOAD_ARGS)
 
 android-upload-play: check-android-play-publisher-env ## Verify and upload an existing AAB to Google Play
 	@$(ANDROID_PLAY_UPLOAD_SCRIPT) $(ANDROID_PLAY_UPLOAD_ARGS)
@@ -209,11 +209,11 @@ check-ios-private-env:
 		exit 1; \
 	fi
 
-check-ios-team: check-ios-private-env ## Require IOS_TEAM_ID for App Store packaging targets
+check-ios-team: check-release-control-options check-ios-private-env ## Require IOS_TEAM_ID for App Store packaging targets
 	@test -n "$$IOS_TEAM_ID" || (echo "ERROR: IOS_TEAM_ID must be exported for App Store packaging."; exit 1)
 
-ios-release: check-ios-team ## Archive and export a local App Store Connect IPA; set IOS_UPLOAD=yes to upload
-	@$(IOS_RELEASE_SCRIPT) $(IOS_RELEASE_UPLOAD_ARG)
+ios-release: check-ios-team ## Archive and export a local App Store Connect IPA
+	@$(IOS_RELEASE_SCRIPT)
 
 ios-upload-testflight: check-ios-team ## Archive and upload directly to TestFlight
 	@$(IOS_RELEASE_SCRIPT) --upload
