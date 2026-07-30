@@ -381,6 +381,12 @@
     <string name="status_notes_in_notebook">%2$s 中有 %1$d 条笔记</string>
     <string name="status_sync_mode">同步模式：%1$s</string>
     <string name="stub_manual_sync">此构建未连接手动同步。</string>
+    <string name="sync_in_progress">正在同步更改。</string>
+    <string name="sync_uploading_checkpoint">正在上传首次同步快照。</string>
+    <string name="sync_uploading_checkpoint_chunks">正在上传首次同步快照（%1$s/%2$s）。</string>
+    <string name="sync_uploading_manifest">正在完成同步快照。</string>
+    <string name="sync_verifying_remote">正在校验远端快照。</string>
+    <string name="sync_committing_epoch">正在此设备上激活同步。</string>
     <string name="stub_pairing_unavailable">此构建不支持工作区配对。</string>
     <string name="stub_selfhosted_setup">此构建不支持自建服务设置。</string>
     <string name="stub_selfhosted_signin">此构建不支持自建服务登录。</string>

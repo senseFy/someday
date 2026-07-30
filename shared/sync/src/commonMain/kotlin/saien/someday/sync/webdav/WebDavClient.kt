@@ -147,6 +147,47 @@ class WebDavClient(
         return WebDavRawStoredObject(path, response.etag(), response.body)
     }
 
+    /**
+     * Deletes one exact immutable object and fails closed if its bytes changed
+     * or the server does not provide an ETag for a conditional DELETE.
+     */
+    fun deleteRawObjectIfUnchanged(
+        path: String,
+        expectedBytes: ByteArray,
+    ): WebDavRawDeleteResult {
+        val current = getRawObject(path) ?: return WebDavRawDeleteResult.Deleted(alreadyAbsent = true)
+        if (!current.bytes.contentEquals(expectedBytes)) {
+            return WebDavRawDeleteResult.Rejected(
+                "Remote WebDAV object changed before exact checkpoint cleanup.",
+            )
+        }
+        val etag = current.etag ?: return WebDavRawDeleteResult.Rejected(
+            "Remote WebDAV server omitted the ETag required for exact checkpoint cleanup.",
+        )
+        if (etag.startsWith("W/", ignoreCase = true)) {
+            return WebDavRawDeleteResult.Rejected(
+                "Remote WebDAV server supplied only a weak ETag for exact checkpoint cleanup.",
+            )
+        }
+        val response = execute(
+            WebDavRequest(
+                method = "DELETE",
+                path = path,
+                headers = mapOf("If-Match" to etag),
+            ),
+        )
+        return when {
+            response.status.isSuccessfulWrite() -> WebDavRawDeleteResult.Deleted(alreadyAbsent = false)
+            response.status == 404 -> WebDavRawDeleteResult.Deleted(alreadyAbsent = true)
+            response.status == 412 -> WebDavRawDeleteResult.Rejected(
+                "Remote WebDAV object changed during exact checkpoint cleanup.",
+            )
+            else -> WebDavRawDeleteResult.Rejected(
+                webDavHttpFailureMessage(response.status, "cleaning an obsolete V2 checkpoint", configuration.normalizedAppDirectory),
+            )
+        }
+    }
+
     fun pathResolver(): WebDavPathResolver = pathResolver
 
     private fun ensureAppDirectory() {

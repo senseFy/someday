@@ -224,6 +224,20 @@ class KtorSelfHostedSyncTransport(
             acceptedStatuses = setOf(409),
         )
 
+    override fun v2CleanupCheckpointDraft(
+        endpoint: String,
+        accessToken: String,
+        request: SelfHostedV2CheckpointCleanupRequest,
+    ): SelfHostedV2CheckpointCleanupResponse =
+        post(
+            endpoint = endpoint,
+            path = "/sync/v2/checkpoint/cleanup",
+            bearerToken = accessToken,
+            encodedBody = json.encodeToString(request),
+            responseSerializer = SelfHostedV2CheckpointCleanupResponse.serializer(),
+            acceptedStatuses = setOf(409),
+        )
+
     override fun v2Push(
         endpoint: String,
         accessToken: String,

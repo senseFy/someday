@@ -14,6 +14,7 @@ import saien.someday.data.importing.dayone.DayOneJsonDocument
 import saien.someday.data.local.EntityType
 import saien.someday.data.local.LocationInput
 import saien.someday.data.local.SqlDelightLocalDataRepository
+import saien.someday.data.local.SqlDelightNotesRepository
 import saien.someday.data.local.createSomedayJdbcDriver
 import saien.someday.data.local.db.SomedayDatabase
 import saien.someday.data.settings.ClientSettingsRepository
@@ -23,6 +24,9 @@ import saien.someday.domain.settings.SyncConfiguration
 import saien.someday.domain.settings.SyncMode
 import saien.someday.domain.notes.NoteInput
 import saien.someday.sync.WorkspaceAuthorityMutationCoordinator
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -55,6 +59,7 @@ class SyncV2RuntimeServiceTest {
                 fixture.writerDeviceId,
                 remote,
                 remote,
+                fixture.authorityMutationCoordinator,
                 fixture.protocolStore,
                 { NOW },
             )
@@ -345,13 +350,213 @@ class SyncV2RuntimeServiceTest {
 
             val activated = runtime.run()
 
-            assertTrue(activated.success)
+            assertTrue(activated.success, activated.message)
             assertNotNull(remote.loadEpochPointer())
             assertEquals(
                 SyncEpochLifecycleV2.ACTIVE,
                 assertNotNull(fixture.protocolStore.loadActiveEpoch(remote.remoteProfile)).lifecycle,
             )
             assertTrue(runtime.run().success)
+        }
+    }
+
+    @Test
+    fun dayOneImportDoesNotCreateKeyBoundPreparingEpoch() {
+        val remote = InMemoryWorkspaceSyncRemoteV2(SyncRemoteProfileV2.WEB_DAV.wireValue)
+        withRuntimeFixture(remote) { fixture ->
+            fixture.localRepository.createNotebook("Imported")
+            assertFalse(fixture.protocolStore.hasKeyBoundLocalV2State())
+            // Product rows stay non-key-bound until the user runs Sync.
+            assertNull(fixture.protocolStore.loadAuthoritativeEpoch())
+            assertTrue(fixture.protocolStore.loadAllEpochs().isEmpty())
+
+            val activated = fixture.runtime().run()
+            assertTrue(activated.success, activated.message)
+            assertNotNull(remote.loadEpochPointer())
+            assertTrue(fixture.protocolStore.hasKeyBoundLocalV2State())
+        }
+    }
+
+    @Test
+    fun stalePreparedGenesisIsAbandonedCollectedAndRebuiltOnActivation() {
+        val remote = InMemoryWorkspaceSyncRemoteV2(SyncRemoteProfileV2.WEB_DAV.wireValue)
+        withRuntimeFixture(remote) { fixture ->
+            fixture.localRepository.createNotebook("Before prepare")
+            val genesis = WorkspaceGenesisCheckpointServiceV2(
+                localRepository = fixture.localRepository,
+                settingsRepository = fixture.settings,
+                workspaceKey = WORKSPACE_KEY,
+                writerDeviceId = fixture.writerDeviceId,
+                remoteProfile = remote.remoteProfile,
+                clock = { NOW },
+            )
+            val prepared = assertIs<WorkspaceGenesisCheckpointResultV2.Prepared>(genesis.prepare())
+            assertIs<WorkspaceCheckpointPersistResultV2.Ready>(
+                WorkspaceCheckpointPersistenceV2(
+                    fixture.localRepository,
+                    WORKSPACE_KEY,
+                    fixture.writerDeviceId,
+                    fixture.protocolStore,
+                ).persist(prepared.checkpoint),
+            )
+            val preparingEpochId = prepared.checkpoint.descriptor.syncEpochId
+            assertEquals(
+                SyncEpochLifecycleV2.PREPARING,
+                assertNotNull(fixture.protocolStore.loadEpoch(remote.remoteProfile, preparingEpochId)).lifecycle,
+            )
+
+            // Product change after freeze (delete is invisible to timestamp heuristics).
+            val notebookId = fixture.localRepository.listActiveNotebooks().single().id
+            fixture.localRepository.deleteNotebook(notebookId)
+            fixture.localRepository.createNotebook("After prepare")
+
+            val progress = java.util.Collections.synchronizedList(mutableListOf<WorkspaceCheckpointPublishProgressV2>())
+            val activated = SyncV2RuntimeService(
+                mode = SyncMode.WebDav,
+                localRepository = fixture.localRepository,
+                settingsRepository = fixture.settings,
+                workspaceKeyProvider = { WORKSPACE_KEY },
+                writerDeviceIdProvider = { fixture.writerDeviceId },
+                transportFactory = SyncRemoteTransportFactoryV2 { remote },
+                activationEnabled = true,
+                authorityMutationCoordinator = fixture.authorityMutationCoordinator,
+                clock = { NOW },
+                onPublishProgress = { progress += it },
+            ).run()
+
+            assertTrue(activated.success, activated.message)
+            assertNotNull(remote.loadEpochPointer())
+            val active = assertNotNull(fixture.protocolStore.loadActiveEpoch(remote.remoteProfile))
+            assertTrue(active.descriptor.syncEpochId != preparingEpochId)
+            // Stale draft must not remain as ABANDONED storage for large corpora.
+            assertNull(fixture.protocolStore.loadEpoch(remote.remoteProfile, preparingEpochId))
+            assertFalse(remote.hasCheckpointDraftForTest(preparingEpochId))
+            assertTrue(progress.any { it is WorkspaceCheckpointPublishProgressV2.UploadingChunks })
+            assertTrue(progress.any { it is WorkspaceCheckpointPublishProgressV2.CommittingPointer })
+        }
+    }
+
+    @Test
+    fun productMutationAtPointerCommitWaitsAndRoutesToActivatedV2() {
+        val remote = InMemoryWorkspaceSyncRemoteV2(SyncRemoteProfileV2.WEB_DAV.wireValue)
+        withRuntimeFixture(remote) { fixture ->
+            val casEntered = CountDownLatch(1)
+            val releaseCas = CountDownLatch(1)
+            val mutationStarted = CountDownLatch(1)
+            val mutationFinished = CountDownLatch(1)
+            val executor = Executors.newFixedThreadPool(2)
+            val blockingRemote = BlockingPointerCommitRemote(remote, casEntered, releaseCas)
+            val routedNotes = ProtocolRoutingNotesRepository(
+                localNotes = SqlDelightNotesRepository(fixture.localRepository),
+                systemV2 = fixture.notes(NOW),
+                v2AuthorityAvailable = { fixture.protocolStore.loadAuthoritativeEpoch() != null },
+                authorityMutationCoordinator = fixture.authorityMutationCoordinator,
+            )
+            try {
+                val activation = executor.submit<ManualSyncResult> {
+                    fixture.runtime(transportRemote = blockingRemote).run()
+                }
+                assertTrue(casEntered.await(5, TimeUnit.SECONDS))
+                val mutation = executor.submit {
+                    mutationStarted.countDown()
+                    try {
+                        routedNotes.createNotebook("Created at commit")
+                    } finally {
+                        mutationFinished.countDown()
+                    }
+                }
+                assertTrue(mutationStarted.await(5, TimeUnit.SECONDS))
+                assertFalse(
+                    mutationFinished.await(150, TimeUnit.MILLISECONDS),
+                    "Product mutation crossed the pointer-commit barrier.",
+                )
+
+                releaseCas.countDown()
+                val activated = activation.get(10, TimeUnit.SECONDS)
+                mutation.get(10, TimeUnit.SECONDS)
+
+                assertTrue(activated.success, activated.message)
+                assertTrue(fixture.localRepository.listActiveNotebooks().isEmpty())
+                val active = WorkspaceSystemV2ContextProvider(
+                    fixture.localRepository,
+                    { WORKSPACE_KEY },
+                    { fixture.writerDeviceId },
+                    { remote.remoteProfile },
+                ).requireActive()
+                assertTrue(
+                    active.store.loadProjections(WorkspaceEntityTypeV2.NOTEBOOK).any {
+                        (it.content as? NotebookContentV2)?.title == "Created at commit"
+                    },
+                )
+                assertTrue(active.store.loadActiveConflicts().isEmpty())
+            } finally {
+                releaseCas.countDown()
+                executor.shutdownNow()
+            }
+        }
+    }
+
+    @Test
+    fun rolloverRejectsSourceChangeAfterUploadAndRetryIncludesIt() {
+        val remote = InMemoryWorkspaceSyncRemoteV2(SyncRemoteProfileV2.WEB_DAV.wireValue)
+        withRuntimeFixture(remote) { fixture ->
+            fixture.localRepository.createNotebook("Initial local notebook")
+            val initialized = fixture.runtime().run()
+            assertTrue(initialized.success, initialized.message)
+            val firstEpochId = assertNotNull(
+                fixture.protocolStore.loadActiveEpoch(remote.remoteProfile),
+            ).descriptor.syncEpochId
+            val mutatingRemote = MutateAfterCheckpointFetchRemote(remote) {
+                fixture.notes(NOW).createNotebook("Written during rollover upload")
+            }
+
+            val rejected = fixture.runtime(transportRemote = mutatingRemote).rollEpoch()
+
+            assertFalse(rejected.success)
+            assertTrue(rejected.message.contains("Local source state changed"))
+            assertEquals(
+                firstEpochId,
+                assertNotNull(fixture.protocolStore.loadActiveEpoch(remote.remoteProfile)).descriptor.syncEpochId,
+            )
+            assertTrue(
+                fixture.notes(NOW).listNotebooks().any { it.title == "Written during rollover upload" },
+            )
+
+            val retried = fixture.runtime().rollEpoch()
+
+            assertTrue(retried.success, retried.message)
+            val active = WorkspaceSystemV2ContextProvider(
+                fixture.localRepository,
+                { WORKSPACE_KEY },
+                { fixture.writerDeviceId },
+                { remote.remoteProfile },
+            ).requireActive()
+            assertTrue(active.syncEpochId != firstEpochId)
+            assertTrue(
+                active.store.loadProjections(WorkspaceEntityTypeV2.NOTEBOOK).any {
+                    (it.content as? NotebookContentV2)?.title == "Written during rollover upload"
+                },
+            )
+            assertTrue(
+                fixture.protocolStore.loadEpochs(remote.remoteProfile).none {
+                    it.lifecycle == SyncEpochLifecycleV2.ABANDONED
+                },
+            )
+        }
+    }
+
+    @Test
+    fun unauthenticatedCompetingPointerDoesNotDiscardPreparedDraft() {
+        val remote = InMemoryWorkspaceSyncRemoteV2(SyncRemoteProfileV2.WEB_DAV.wireValue)
+        withRuntimeFixture(remote) { fixture ->
+            val result = fixture.runtime(
+                transportRemote = UnauthenticatedCompetingPointerRemote(remote),
+            ).run()
+
+            assertFalse(result.success)
+            val draft = fixture.protocolStore.loadEpochs(remote.remoteProfile).single()
+            assertEquals(SyncEpochLifecycleV2.PREPARING, draft.lifecycle)
+            assertTrue(remote.hasCheckpointDraftForTest(draft.descriptor.syncEpochId))
         }
     }
 
@@ -556,11 +761,95 @@ class SyncV2RuntimeServiceTest {
             assertNull(remote.loadEpochPointer())
             val prepared = fixture.protocolStore.loadEpochs(remote.remoteProfile).single()
             assertEquals(SyncEpochLifecycleV2.PREPARING, prepared.lifecycle)
+            assertTrue(interrupted.message.contains("resume") || interrupted.message.contains("pointer"))
+
+            // Second transient empty CAS failure must not create another PREPARING draft.
+            remote.faults.failNextPointerCompareAndSet = true
+            val stillInterrupted = runtime.run()
+            assertFalse(stillInterrupted.success)
+            assertEquals(
+                listOf(prepared.descriptor.syncEpochId),
+                fixture.protocolStore.loadEpochs(remote.remoteProfile).map { it.descriptor.syncEpochId },
+            )
 
             val resumed = runtime.run()
 
-            assertTrue(resumed.success)
+            assertTrue(resumed.success, resumed.message)
             assertEquals(prepared.descriptor.syncEpochId, remote.loadEpochPointer()?.syncEpochId)
+        }
+    }
+
+    @Test
+    fun successorPreparingDraftIsNotDiscardedByGenesisInventoryCheck() {
+        val remote = InMemoryWorkspaceSyncRemoteV2(SyncRemoteProfileV2.WEB_DAV.wireValue)
+        withRuntimeFixture(remote) { fixture ->
+            val runtime = fixture.runtime()
+            assertTrue(runtime.run().success)
+            val notebook = fixture.localRepository.createNotebook("Rollover")
+            fixture.localRepository.createNote(
+                notebookId = notebook.id,
+                title = "Note",
+                markdownBody = "body",
+            )
+            assertTrue(runtime.run().success)
+
+            val active = assertNotNull(fixture.protocolStore.loadActiveEpoch(remote.remoteProfile))
+            val context = WorkspaceSystemV2ContextProvider(
+                fixture.localRepository,
+                { WORKSPACE_KEY },
+                { fixture.writerDeviceId },
+                { remote.remoteProfile },
+            ).requireActive()
+            val sources = context.store.loadEntityKeys()
+                .flatMap { context.store.loadHeads(it) }
+                .map { head ->
+                    WorkspaceCheckpointSourceHeadV2(
+                        entityType = head.entityType,
+                        entityId = head.entityId,
+                        content = head.contentPayload,
+                        deletion = head.deletionPayload,
+                        sourceProfile = remote.remoteProfile,
+                        sourceEpoch = active.descriptor.syncEpochId,
+                        sourceWriterId = null,
+                        sourceMutationId = null,
+                        sourceObjectId = head.versionId,
+                        sourceObjectDigest = head.objectDigest,
+                        sourceAuthoredAt = head.authoredAt,
+                    )
+                }
+                .sortedWith(CHECKPOINT_SOURCE_COMPARATOR_SYSTEM_V2)
+            val successor = WorkspaceCheckpointBuilderV2(WORKSPACE_KEY, fixture.writerDeviceId).build(
+                remoteProfile = remote.remoteProfile,
+                sourceHeads = sources,
+                createdAt = NOW,
+                previousPointerDigest = active.descriptorDigest,
+                previousEpochId = active.descriptor.syncEpochId,
+                previousEpochFrontiers = remote.epochFrontiers(active.descriptor.syncEpochId),
+            )
+            assertIs<WorkspaceCheckpointPersistResultV2.Ready>(
+                WorkspaceCheckpointPersistenceV2(
+                    fixture.localRepository,
+                    WORKSPACE_KEY,
+                    fixture.writerDeviceId,
+                    fixture.protocolStore,
+                ).persist(successor),
+            )
+            assertNotNull(successor.descriptor.previousEpochId)
+            assertFalse(
+                successor.entities.any {
+                    it.version.provenance?.sourceProfile?.startsWith("local-product:") == true
+                },
+            )
+
+            // Local product mutation that would stale a genesis inventory fingerprint.
+            fixture.localRepository.createNotebook("After successor prepare")
+
+            val resumed = runtime.run()
+            assertTrue(resumed.success, resumed.message)
+            assertEquals(
+                successor.descriptor.syncEpochId,
+                fixture.protocolStore.loadActiveEpoch(remote.remoteProfile)?.descriptor?.syncEpochId,
+            )
         }
     }
 
@@ -764,6 +1053,90 @@ class SyncV2RuntimeServiceTest {
     }
 
     @Test
+    fun migrationRejectsWhenLocalSourceAuthorityChangesBeforeTargetCommit() {
+        val source = InMemoryWorkspaceSyncRemoteV2(
+            SyncRemoteProfileV2.WEB_DAV.wireValue,
+            bindingId = "webdav-log-v2|https://source.example|/someday/",
+        )
+        val target = InMemoryWorkspaceSyncRemoteV2(
+            SyncRemoteProfileV2.SELF_HOSTED.wireValue,
+            bindingId = "self-hosted-v2|https://target.example",
+        )
+        withRuntimeFixture(source, writerDeviceId = WRITER_A) { fixture ->
+            assertTrue(fixture.runtime().run().success)
+            val sourceEpoch = assertNotNull(fixture.protocolStore.loadAuthoritativeEpoch())
+            val sourceContext = WorkspaceSystemV2ContextProvider(
+                fixture.localRepository,
+                { WORKSPACE_KEY },
+                { fixture.writerDeviceId },
+                { source.remoteProfile },
+            ).requireActive()
+            val competingSources = sourceContext.store.loadEntityKeys()
+                .flatMap(sourceContext.store::loadHeads)
+                .map { head ->
+                    WorkspaceCheckpointSourceHeadV2(
+                        entityType = head.entityType,
+                        entityId = head.entityId,
+                        content = head.contentPayload,
+                        deletion = head.deletionPayload,
+                        sourceProfile = source.remoteProfile,
+                        sourceEpoch = sourceEpoch.descriptor.syncEpochId,
+                        sourceWriterId = null,
+                        sourceMutationId = null,
+                        sourceObjectId = head.versionId,
+                        sourceObjectDigest = head.objectDigest,
+                        sourceAuthoredAt = head.authoredAt,
+                    )
+                }
+                .sortedWith(CHECKPOINT_SOURCE_COMPARATOR_SYSTEM_V2)
+            val competing = WorkspaceCheckpointBuilderV2(WORKSPACE_KEY, WRITER_A).build(
+                remoteProfile = source.remoteProfile,
+                sourceHeads = competingSources,
+                createdAt = NOW,
+                previousPointerDigest = sourceEpoch.descriptorDigest,
+                previousEpochId = sourceEpoch.descriptor.syncEpochId,
+                previousEpochPointerDigest = sourceEpoch.descriptorDigest,
+            )
+            assertIs<WorkspaceCheckpointPersistResultV2.Ready>(
+                WorkspaceCheckpointPersistenceV2(
+                    fixture.localRepository,
+                    WORKSPACE_KEY,
+                    WRITER_A,
+                    fixture.protocolStore,
+                ).persist(competing),
+            )
+            val racingTarget = MutateAfterCheckpointFetchRemote(target) {
+                fixture.protocolStore.activateEpoch(
+                    source.remoteProfile,
+                    competing.descriptor.syncEpochId,
+                    NOW,
+                    WRITER_A,
+                    source.authorityBindingId,
+                )
+            }
+
+            val migrated = WorkspaceRemoteMigrationServiceV2(
+                fixture.localRepository,
+                WORKSPACE_KEY,
+                WRITER_B,
+                source,
+                racingTarget,
+                fixture.authorityMutationCoordinator,
+                fixture.protocolStore,
+                { NOW },
+            ).migrate()
+
+            val blocked = assertIs<WorkspaceRemoteMigrationResultV2.Blocked>(migrated)
+            assertEquals("prepared_checkpoint_stale", blocked.safeErrorCode)
+            assertNull(target.loadEpochPointer())
+            assertEquals(
+                competing.descriptor.syncEpochId,
+                fixture.protocolStore.loadAuthoritativeEpoch()?.descriptor?.syncEpochId,
+            )
+        }
+    }
+
+    @Test
     fun explicitCrossProfileMigrationPublishesOneTargetCheckpointWithoutDualWrite() {
         val source = InMemoryWorkspaceSyncRemoteV2(
             SyncRemoteProfileV2.WEB_DAV.wireValue,
@@ -788,12 +1161,12 @@ class SyncV2RuntimeServiceTest {
                 WRITER_B,
                 source,
                 target,
+                fixture.authorityMutationCoordinator,
                 fixture.protocolStore,
                 { NOW },
             ).migrate()
 
             assertTrue(migrated is WorkspaceRemoteMigrationResultV2.Migrated)
-            migrated as WorkspaceRemoteMigrationResultV2.Migrated
             assertEquals(sourceEpochId, migrated.sourceEpochId)
             assertEquals(target.loadEpochPointer()?.syncEpochId, migrated.targetEpochId)
             assertEquals(SyncRemoteProfileV2.SELF_HOSTED.wireValue, fixture.protocolStore.loadAuthoritativeEpoch()?.remoteProfile)
@@ -840,12 +1213,12 @@ class SyncV2RuntimeServiceTest {
                 WRITER_B,
                 source,
                 target,
+                fixture.authorityMutationCoordinator,
                 fixture.protocolStore,
                 { NOW },
             ).migrate()
 
             assertTrue(migrated is WorkspaceRemoteMigrationResultV2.Migrated)
-            migrated as WorkspaceRemoteMigrationResultV2.Migrated
             assertEquals(sourceEpochId, migrated.sourceEpochId)
             assertEquals(target.authorityBindingId, fixture.protocolStore.loadLocalAuthority()?.authorityBindingId)
             assertEquals(SyncEpochLifecycleV2.READ_ONLY, fixture.protocolStore.loadEpoch(
@@ -921,12 +1294,12 @@ class SyncV2RuntimeServiceTest {
                 WRITER_A,
                 source,
                 target,
+                fixture.authorityMutationCoordinator,
                 fixture.protocolStore,
                 { NOW },
             ).migrate()
 
             assertTrue(migrated is WorkspaceRemoteMigrationResultV2.Migrated)
-            migrated as WorkspaceRemoteMigrationResultV2.Migrated
             assertEquals(winner.descriptor.syncEpochId, migrated.targetEpochId)
             assertTrue(migrated.importedLateObjects >= 2)
             val targetContext = WorkspaceSystemV2ContextProvider(
@@ -1082,6 +1455,59 @@ class SyncV2RuntimeServiceTest {
             }
             pushCalls += 1
             return delegate.push(syncEpochId, objects)
+        }
+    }
+
+    private class MutateAfterCheckpointFetchRemote(
+        private val delegate: WorkspaceSyncRemoteV2,
+        private val mutation: () -> Unit,
+    ) : WorkspaceSyncRemoteV2 by delegate {
+        private var fired = false
+
+        override fun fetchCheckpoint(
+            pointer: EncryptedWorkspaceObjectV2,
+            descriptor: SyncEpochDescriptorV2,
+        ): WorkspaceRemoteCheckpointBundleV2 =
+            delegate.fetchCheckpoint(pointer, descriptor).also {
+                if (!fired) {
+                    fired = true
+                    mutation()
+                }
+            }
+    }
+
+    private class BlockingPointerCommitRemote(
+        private val delegate: WorkspaceSyncRemoteV2,
+        private val entered: CountDownLatch,
+        private val release: CountDownLatch,
+    ) : WorkspaceSyncRemoteV2 by delegate {
+        override fun compareAndSetEpochPointer(
+            descriptor: SyncEpochDescriptorV2,
+            expectedCurrentDigest: String?,
+            pointer: EncryptedWorkspaceObjectV2,
+        ): WorkspacePointerPublishResultV2 {
+            entered.countDown()
+            check(release.await(5, TimeUnit.SECONDS))
+            return delegate.compareAndSetEpochPointer(descriptor, expectedCurrentDigest, pointer)
+        }
+    }
+
+    private class UnauthenticatedCompetingPointerRemote(
+        private val delegate: WorkspaceSyncRemoteV2,
+    ) : WorkspaceSyncRemoteV2 by delegate {
+        private var unauthenticatedPointer: EncryptedWorkspaceObjectV2? = null
+
+        override fun loadEpochPointer(): EncryptedWorkspaceObjectV2? =
+            unauthenticatedPointer ?: delegate.loadEpochPointer()
+
+        override fun compareAndSetEpochPointer(
+            descriptor: SyncEpochDescriptorV2,
+            expectedCurrentDigest: String?,
+            pointer: EncryptedWorkspaceObjectV2,
+        ): WorkspacePointerPublishResultV2 {
+            val corrupt = pointer.copy(ciphertextBase64 = "AA==")
+            unauthenticatedPointer = corrupt
+            return WorkspacePointerPublishResultV2.CompareAndSetFailed(corrupt)
         }
     }
 

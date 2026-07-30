@@ -381,6 +381,12 @@
     <string name="status_notes_in_notebook">%2$s에 노트 %1$d개</string>
     <string name="status_sync_mode">동기화 모드: %1$s</string>
     <string name="stub_manual_sync">이 빌드에서는 수동 동기화가 연결되지 않았습니다.</string>
+    <string name="sync_in_progress">변경 사항을 동기화하는 중입니다.</string>
+    <string name="sync_uploading_checkpoint">첫 동기화 스냅샷을 업로드하는 중입니다.</string>
+    <string name="sync_uploading_checkpoint_chunks">첫 동기화 스냅샷을 업로드하는 중입니다(%1$s/%2$s).</string>
+    <string name="sync_uploading_manifest">동기화 스냅샷을 마무리하는 중입니다.</string>
+    <string name="sync_verifying_remote">원격 스냅샷을 확인하는 중입니다.</string>
+    <string name="sync_committing_epoch">이 기기에서 동기화를 활성화하는 중입니다.</string>
     <string name="stub_pairing_unavailable">이 빌드에서는 작업 공간 페어링을 사용할 수 없습니다.</string>
     <string name="stub_selfhosted_setup">이 빌드에서는 셀프호스트 설정을 사용할 수 없습니다.</string>
     <string name="stub_selfhosted_signin">이 빌드에서는 셀프호스트 로그인을 사용할 수 없습니다.</string>

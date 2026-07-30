@@ -4,6 +4,8 @@ import saien.someday.domain.notifications.OnThisDayNotificationScheduler
 import saien.someday.domain.settings.AppLanguage
 import saien.someday.domain.settings.ClientSettings
 import saien.someday.domain.settings.ClientTheme
+import saien.someday.domain.settings.ManualSyncPhase
+import saien.someday.domain.settings.ManualSyncProgressListener
 import saien.someday.domain.settings.ManualSyncResult
 import saien.someday.domain.settings.OnThisDayNotificationPreferences
 import saien.someday.domain.settings.SelfHostedSessionCredentialStore
@@ -37,7 +39,9 @@ import saien.someday.domain.settings.WorkspacePairingInvitation
 import saien.someday.domain.settings.WorkspacePairingInvitationCreator
 import saien.someday.domain.settings.WorkspacePairingInvitationJoiner
 import saien.someday.domain.settings.WorkspacePairingInvitationResult
+import saien.someday.ui.i18n.SettingsUiStrings
 import saien.someday.ui.notes.InMemoryNotesRepository
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
 import kotlinx.datetime.LocalDate
 import kotlin.test.Test
@@ -804,6 +808,53 @@ class SettingsUiControllerTest {
 
         assertTrue(controller.clearWebDavCredential())
         assertEquals(null, credentialStore.load())
+    }
+
+    @Test
+    fun manualSyncProgressUsesLocalizedCopyAndUnbindsListener() = runBlocking {
+        var progressListener: ManualSyncProgressListener? = null
+        var initialMessage = ""
+        var chunkMessage = ""
+        lateinit var controller: SettingsUiController
+        controller = SettingsUiController(
+            initialSettings = ClientSettings(
+                syncConfiguration = SyncConfiguration(
+                    mode = SyncMode.WebDav,
+                    webDavEndpoint = "https://dav.example.com/remote.php/dav/files/alice",
+                    webDavUsername = "alice",
+                    webDavAppDirectory = "/someday/",
+                ),
+            ),
+            webDavCredentialStore = FakeWebDavCredentialStore(initialSecret = "saved-secret"),
+            manualSyncRunner = {
+                initialMessage = controller.state.manualSyncProgress.message
+                checkNotNull(progressListener).onProgress(
+                    ManualSyncPhase.UploadingChunks(completed = 2, total = 5),
+                )
+                chunkMessage = controller.state.manualSyncProgress.message
+                ManualSyncResult.success(
+                    mode = SyncMode.WebDav,
+                    pushedObjects = 0,
+                    pulledObjects = 0,
+                    conflicts = 0,
+                    message = "done",
+                )
+            },
+            bindManualSyncProgressListener = { progressListener = it },
+            uiStrings = SettingsUiStrings(
+                syncInProgress = "正在同步更改。",
+                syncUploadingCheckpointChunks = "正在上传快照（%1\$s/%2\$s）。",
+            ),
+            backgroundDispatcher = Dispatchers.Default,
+            uiDispatcher = Dispatchers.Unconfined,
+        )
+        controller.refresh()
+
+        assertTrue(controller.runManualSync())
+
+        assertEquals("正在同步更改。", initialMessage)
+        assertEquals("正在上传快照（2/5）。", chunkMessage)
+        assertEquals(null, progressListener)
     }
 
     @Test

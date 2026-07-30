@@ -4,6 +4,7 @@ package saien.someday.sync.causality.v2
 
 import saien.someday.data.crypto.WorkspaceMasterKey
 import saien.someday.data.local.SqlDelightLocalDataRepository
+import saien.someday.sync.WorkspaceAuthorityMutationCoordinator
 import kotlin.time.Clock
 import kotlin.time.Instant
 
@@ -51,6 +52,7 @@ class WorkspaceMasterKeyRotationServiceV2(
     private val writerDeviceId: String,
     private val oldKeyRemote: WorkspaceSyncRemoteV2,
     private val newKeyRemote: WorkspaceSyncRemoteV2,
+    private val authorityMutationCoordinator: WorkspaceAuthorityMutationCoordinator,
     private val protocolStore: SqlDelightSyncProtocolStoreV2 =
         SqlDelightSyncProtocolStoreV2(localRepository.database),
     private val clock: () -> Instant = { Clock.System.now() },
@@ -282,15 +284,26 @@ class WorkspaceMasterKeyRotationServiceV2(
             localRepository,
             newKeyRemote,
             protocolStore,
+            localSnapshotStillMatches = {
+                sourceStateStillMatches(prepared, sourceEpoch)
+            },
+            commitPointerBarrier = authorityMutationCoordinator::productAccess,
         ).publish(prepared)) {
             is WorkspaceCheckpointPublishResultV2.LostRace -> blocked(
                 "key_rotation_pointer_race",
                 "Another pointer transition won. No branch was discarded; authenticate the winner before retrying.",
             )
-            is WorkspaceCheckpointPublishResultV2.Rejected -> blocked(
-                published.safeErrorCode,
-                published.safeMessage,
-            )
+            is WorkspaceCheckpointPublishResultV2.Rejected -> {
+                if (published.safeErrorCode == "prepared_checkpoint_stale") {
+                    protocolStore.abandonPreparingEpoch(
+                        prepared.remoteProfile,
+                        prepared.descriptor.syncEpochId,
+                        published.safeErrorCode,
+                        published.safeMessage,
+                    )
+                }
+                blocked(published.safeErrorCode, published.safeMessage)
+            }
             is WorkspaceCheckpointPublishResultV2.Published -> {
                 val active = published.epoch
                 if (active.descriptor.previousEpochId != sourceEpoch.descriptor.syncEpochId ||
@@ -313,6 +326,33 @@ class WorkspaceMasterKeyRotationServiceV2(
             }
         }
     }
+
+    private fun sourceStateStillMatches(
+        prepared: PreparedWorkspaceEpochCheckpointV2,
+        sourceEpoch: StoredSyncEpochV2,
+    ): Boolean = runCatching {
+        if (protocolStore.loadAuthoritativeEpoch()?.let {
+                it.remoteProfile == sourceEpoch.remoteProfile &&
+                    it.descriptor.syncEpochId == sourceEpoch.descriptor.syncEpochId &&
+                    it.descriptorDigest == sourceEpoch.descriptorDigest &&
+                    it.authorityBindingId == sourceEpoch.authorityBindingId
+            } != true
+        ) {
+            return@runCatching false
+        }
+        val sourceContext = WorkspaceSystemV2ContextProvider(
+            localRepository,
+            { oldWorkspaceKey },
+            { writerDeviceId },
+            { sourceEpoch.remoteProfile },
+        ).requireActive()
+        checkpointSourceStateStillMatchesV2(
+            sourceContext.store,
+            sourceEpoch.remoteProfile,
+            prepared.checkpointSourceIdentitiesV2(),
+            requireNoPending = true,
+        )
+    }.getOrDefault(false)
 
     private fun canDecodePointerWith(key: WorkspaceMasterKey, epoch: StoredSyncEpochV2): Boolean {
         val outer = runCatching(newKeyRemote::loadEpochPointer).getOrNull() ?: return false

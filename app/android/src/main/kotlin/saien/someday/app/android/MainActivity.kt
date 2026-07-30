@@ -229,6 +229,7 @@ class MainActivity : ComponentActivity() {
                 selfHostedSetupClient = loaded.repositories.selfHostedSetupClient,
                 selfHostedSessionCredentialStore = loaded.repositories.selfHostedSessionCredentialStore,
                 manualSyncRunner = loaded.repositories.manualSyncRunner,
+                bindManualSyncProgressListener = loaded.repositories.bindManualSyncProgressListener,
                 syncV2MaintenanceRunner = loaded.repositories.syncV2MaintenanceRunner,
                 workspacePairingInvitationCreator = loaded.repositories.workspacePairingInvitationCreator,
                 workspacePairingInvitationJoiner = loaded.repositories.workspacePairingInvitationJoiner,

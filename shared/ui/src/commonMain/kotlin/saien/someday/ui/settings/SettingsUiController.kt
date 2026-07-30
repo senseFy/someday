@@ -5,13 +5,20 @@ package saien.someday.ui.settings
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import saien.someday.domain.notes.NotebookSummary
 import saien.someday.domain.notifications.OnThisDayNotificationScheduler
 import saien.someday.domain.notifications.UnavailableOnThisDayNotificationScheduler
 import saien.someday.domain.settings.AppLanguage
 import saien.someday.domain.settings.ClientSettings
 import saien.someday.domain.settings.ClientTheme
+import saien.someday.domain.settings.ManualSyncPhase
 import saien.someday.domain.settings.ManualSyncProgress
+import saien.someday.domain.settings.ManualSyncProgressListener
 import saien.someday.domain.settings.ManualSyncResult
 import saien.someday.domain.settings.ManualSyncRunner
 import saien.someday.domain.settings.OnThisDayNotificationPreferences
@@ -55,11 +62,8 @@ import saien.someday.domain.settings.isSecureSyncEndpoint
 import saien.someday.domain.settings.normalizeSelfHostedEndpoint
 import saien.someday.domain.settings.normalizeWebDavAppDirectory
 import saien.someday.domain.settings.webDavV2AuthorityBindingId
-import kotlinx.coroutines.CoroutineDispatcher
-import kotlinx.coroutines.Dispatchers
 import saien.someday.ui.i18n.SettingsUiStrings
 import saien.someday.ui.i18n.formatUiString
-import kotlinx.coroutines.withContext
 
 data class OnThisDayNotificationStrings(
     val unavailable: String = "On This Day notifications are not available on this platform.",
@@ -124,6 +128,7 @@ class SettingsUiController(
             message = "Manual sync is not connected in this build.",
         )
     },
+    private val bindManualSyncProgressListener: (ManualSyncProgressListener?) -> Unit = {},
     private val syncV2MaintenanceRunner: SyncV2MaintenanceRunner = object : SyncV2MaintenanceRunner {
         override fun rollEpoch(): ManualSyncResult = ManualSyncResult.failure(
             SyncMode.Off,
@@ -151,6 +156,7 @@ class SettingsUiController(
     private val uiStrings: SettingsUiStrings = SettingsUiStrings(),
     private val currentEpochMillis: () -> Long = { kotlin.time.Clock.System.now().toEpochMilliseconds() },
     private val backgroundDispatcher: CoroutineDispatcher = Dispatchers.Default,
+    private val uiDispatcher: CoroutineDispatcher = Dispatchers.Main,
 ) {
     val onThisDayNotificationsSupported: Boolean = onThisDayNotificationScheduler.isSupported
 
@@ -931,7 +937,7 @@ class SettingsUiController(
             exportSummary = state.exportSummary,
             feedbackMessage = if (showFeedback) uiStrings.syncStarted else state.feedbackMessage,
             feedbackEventId = if (showFeedback) null else state.feedbackEventId,
-            manualSyncProgress = ManualSyncProgress.inProgress(mode),
+            manualSyncProgress = ManualSyncProgress.inProgress(mode, uiStrings.syncInProgress),
         )
         return true
     }
@@ -973,16 +979,44 @@ class SettingsUiController(
         if (!beginManualSync()) {
             return false
         }
+        return completeManualSync(executeManualSyncRunner())
+    }
+
+    private suspend fun executeManualSyncRunner(): ManualSyncResult {
         val mode = state.settings.syncConfiguration.mode
-        val result = runCatching {
-            withContext(backgroundDispatcher) { manualSyncRunner.run() }
+        return runCatching {
+            coroutineScope {
+                bindManualSyncProgressListener(
+                    ManualSyncProgressListener { phase ->
+                        val message = formatManualSyncPhase(phase)
+                        launch(uiDispatcher) {
+                            if (state.manualSyncProgress.running &&
+                                state.manualSyncProgress.mode == mode
+                            ) {
+                                state = buildState(
+                                    settings = state.settings,
+                                    exportSummary = state.exportSummary,
+                                    feedbackMessage = state.feedbackMessage,
+                                    feedbackEventId = state.feedbackEventId,
+                                    manualSyncProgress = ManualSyncProgress.inProgress(mode, message),
+                                )
+                            }
+                        }
+                    },
+                )
+                try {
+                    withContext(backgroundDispatcher) { manualSyncRunner.run() }
+                } finally {
+                    bindManualSyncProgressListener(null)
+                }
+            }
         }.getOrElse { failure ->
+            bindManualSyncProgressListener(null)
             ManualSyncResult.failure(
                 mode = mode,
                 message = formatUiString(uiStrings.syncFailed, failure.message ?: uiStrings.unknownError),
             )
         }
-        return completeManualSync(result)
     }
 
     suspend fun rollSyncV2Epoch(): Boolean = runV2Maintenance { syncV2MaintenanceRunner.rollEpoch() }
@@ -1021,15 +1055,7 @@ class SettingsUiController(
         if (!canRunAutomaticSync() || !beginManualSync(showFeedback = false)) {
             return false
         }
-        val mode = state.settings.syncConfiguration.mode
-        val result = runCatching {
-            withContext(backgroundDispatcher) { manualSyncRunner.run() }
-        }.getOrElse { failure ->
-            ManualSyncResult.failure(
-                mode = mode,
-                message = formatUiString(uiStrings.syncFailed, failure.message ?: uiStrings.unknownError),
-            )
-        }
+        val result = executeManualSyncRunner()
         val shouldShowFeedback = !result.success || result.pulledObjects > 0 || result.conflicts > 0
         return completeManualSync(result, showFeedback = shouldShowFeedback)
     }
@@ -1410,6 +1436,23 @@ class SettingsUiController(
         webDavEndpoint == input.endpoint &&
             webDavUsername == input.username &&
             normalizeWebDavAppDirectory(webDavAppDirectory) == input.appDirectory
+
+    private fun formatManualSyncPhase(phase: ManualSyncPhase): String =
+        when (phase) {
+            is ManualSyncPhase.UploadingChunks ->
+                if (phase.total <= 0) {
+                    uiStrings.syncUploadingCheckpoint
+                } else {
+                    formatUiString(
+                        uiStrings.syncUploadingCheckpointChunks,
+                        phase.completed.toString(),
+                        phase.total.toString(),
+                    )
+                }
+            ManualSyncPhase.UploadingManifest -> uiStrings.syncUploadingManifest
+            ManualSyncPhase.VerifyingRemote -> uiStrings.syncVerifyingRemote
+            ManualSyncPhase.CommittingPointer -> uiStrings.syncCommittingEpoch
+        }
 
     private suspend fun persist(
         updated: ClientSettings,

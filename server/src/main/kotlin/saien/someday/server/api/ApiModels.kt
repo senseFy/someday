@@ -236,6 +236,22 @@ data class SyncV2CheckpointFetchResponse(
 )
 
 @Serializable
+data class SyncV2CheckpointCleanupRequest(
+    val epochId: String,
+    val checkpointId: String,
+    val checkpointDigest: String,
+    val previousPointerDigest: String? = null,
+    val chunks: List<SyncV2CheckpointChunkRef>,
+)
+
+@Serializable
+data class SyncV2CheckpointCleanupResponse(
+    val deleted: Boolean,
+    val alreadyAbsent: Boolean = false,
+    val error: String? = null,
+)
+
+@Serializable
 data class SyncV2PushRequest(
     val epochId: String,
     val writerProtocolVersion: Int,

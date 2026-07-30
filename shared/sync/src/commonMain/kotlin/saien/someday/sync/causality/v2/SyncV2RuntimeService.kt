@@ -39,8 +39,10 @@ class SyncV2RuntimeService(
     private val activationEnabled: Boolean,
     private val authorityMutationCoordinator: WorkspaceAuthorityMutationCoordinator,
     private val clock: () -> Instant = { Clock.System.now() },
+    private val onPublishProgress: (WorkspaceCheckpointPublishProgressV2) -> Unit = {},
 ) : ManualSyncRunner, SyncV2MaintenanceRunner {
     private val protocolStore = SqlDelightSyncProtocolStoreV2(localRepository.database)
+    private val epochRetention = WorkspaceEpochRetentionServiceV2(localRepository, protocolStore)
 
     override fun run(): ManualSyncResult {
         val configured = settingsRepository.load().syncConfiguration
@@ -107,51 +109,96 @@ class SyncV2RuntimeService(
                 workspaceKey,
                 protocolStore,
             ).loadCompatible(remote.remoteProfile, null)) {
-                is WorkspacePreparedCheckpointLoadResultV2.Rejected -> return failedInitialization(recovered.safeMessage)
-                is WorkspacePreparedCheckpointLoadResultV2.Loaded -> {
-                    when (val published = WorkspaceCheckpointPublisherV2(
-                        localRepository, remote, protocolStore,
-                    ).publish(recovered.prepared)) {
-                        is WorkspaceCheckpointPublishResultV2.Rejected -> return failedInitialization(published.safeMessage)
-                        is WorkspaceCheckpointPublishResultV2.LostRace,
-                        is WorkspaceCheckpointPublishResultV2.Published,
-                        -> Unit
-                    }
-                    pointer = runCatching(remote::loadEpochPointer)
-                        .getOrElse { return failedInitialization(it.safeRuntimeMessage()) }
+                is WorkspacePreparedCheckpointLoadResultV2.Rejected -> {
+                    discardNeverAuthoritativeEpoch(
+                        remote.remoteProfile,
+                        recovered.epochId,
+                        recovered.safeErrorCode,
+                        recovered.safeMessage,
+                    )
                 }
-                WorkspacePreparedCheckpointLoadResultV2.None -> {
-                    // First epoch: checkpoint from local product state.
-                    val genesis = WorkspaceGenesisCheckpointServiceV2(
-                        localRepository = localRepository,
-                        settingsRepository = settingsRepository,
+                is WorkspacePreparedCheckpointLoadResultV2.Loaded -> {
+                    when (
+                        val attempt = publishRecoveredOrFreshDraft(
+                            remote = remote,
+                            workspaceKey = workspaceKey,
+                            writerDeviceId = writerDeviceId,
+                            prepared = recovered.prepared,
+                        )
+                    ) {
+                        FirstEpochPublishAttemptV2.Published -> {
+                            pointer = runCatching(remote::loadEpochPointer)
+                                .getOrElse { return failedInitialization(it.safeRuntimeMessage()) }
+                        }
+                        FirstEpochPublishAttemptV2.RemoteWon -> {
+                            pointer = runCatching(remote::loadEpochPointer)
+                                .getOrElse { return failedInitialization(it.safeRuntimeMessage()) }
+                        }
+                        FirstEpochPublishAttemptV2.RebuildAfterStale -> Unit
+                        is FirstEpochPublishAttemptV2.KeepPreparingAndStop ->
+                            return failedInitialization(attempt.safeMessage)
+                        is FirstEpochPublishAttemptV2.Failed ->
+                            return failedInitialization(attempt.safeMessage)
+                    }
+                }
+                WorkspacePreparedCheckpointLoadResultV2.None -> Unit
+            }
+            if (pointer == null) {
+                // Do not create a second genesis while a PREPARING draft still exists
+                // (e.g. transient empty-remote CAS failure). Next Sync resumes it.
+                val stillPreparing = protocolStore.loadAllEpochs().any {
+                    it.remoteProfile == remote.remoteProfile &&
+                        it.lifecycle == SyncEpochLifecycleV2.PREPARING
+                }
+                if (stillPreparing) {
+                    return failedInitialization(
+                        "A prepared first-epoch checkpoint is waiting for pointer commit; run Sync again to resume.",
+                    )
+                }
+                // First epoch: checkpoint from local product state (or rebuild after stale prepare).
+                // Still inside authorityMutationCoordinator.exclusive from run().
+                when (
+                    val attempt = prepareAndPublishGenesis(
+                        remote = remote,
                         workspaceKey = workspaceKey,
                         writerDeviceId = writerDeviceId,
-                        remoteProfile = remote.remoteProfile,
-                        clock = clock,
                     )
-                    when (val prepared = genesis.prepare()) {
-                        is WorkspaceGenesisCheckpointResultV2.Blocked ->
-                            return failedInitialization(prepared.safeMessage)
-                        is WorkspaceGenesisCheckpointResultV2.Prepared -> {
-                            when (val persisted = WorkspaceCheckpointPersistenceV2(
-                                localRepository, workspaceKey, writerDeviceId, protocolStore,
-                            ).persist(prepared.checkpoint)) {
-                                is WorkspaceCheckpointPersistResultV2.Rejected ->
-                                    return failedInitialization(persisted.safeMessage)
-                                is WorkspaceCheckpointPersistResultV2.Ready -> Unit
+                ) {
+                    FirstEpochPublishAttemptV2.Published,
+                    FirstEpochPublishAttemptV2.RemoteWon,
+                    -> {
+                        pointer = runCatching(remote::loadEpochPointer)
+                            .getOrElse { return failedInitialization(it.safeRuntimeMessage()) }
+                    }
+                    FirstEpochPublishAttemptV2.RebuildAfterStale -> {
+                        // One immediate rebuild inside the same exclusive lock.
+                        when (
+                            val retry = prepareAndPublishGenesis(
+                                remote = remote,
+                                workspaceKey = workspaceKey,
+                                writerDeviceId = writerDeviceId,
+                            )
+                        ) {
+                            FirstEpochPublishAttemptV2.Published,
+                            FirstEpochPublishAttemptV2.RemoteWon,
+                            -> {
+                                pointer = runCatching(remote::loadEpochPointer)
+                                    .getOrElse { return failedInitialization(it.safeRuntimeMessage()) }
                             }
-                            when (val published = WorkspaceCheckpointPublisherV2(
-                                localRepository, remote, protocolStore,
-                            ).publish(prepared.checkpoint)) {
-                                is WorkspaceCheckpointPublishResultV2.Rejected ->
-                                    return failedInitialization(published.safeMessage)
-                                is WorkspaceCheckpointPublishResultV2.LostRace,
-                                is WorkspaceCheckpointPublishResultV2.Published,
-                                -> Unit
-                            }
+                            FirstEpochPublishAttemptV2.RebuildAfterStale ->
+                                return failedInitialization(
+                                    "Local product state kept changing during first-epoch publish; try Sync again.",
+                                )
+                            is FirstEpochPublishAttemptV2.KeepPreparingAndStop ->
+                                return failedInitialization(retry.safeMessage)
+                            is FirstEpochPublishAttemptV2.Failed ->
+                                return failedInitialization(retry.safeMessage)
                         }
                     }
+                    is FirstEpochPublishAttemptV2.KeepPreparingAndStop ->
+                        return failedInitialization(attempt.safeMessage)
+                    is FirstEpochPublishAttemptV2.Failed ->
+                        return failedInitialization(attempt.safeMessage)
                 }
             }
         }
@@ -169,6 +216,10 @@ class SyncV2RuntimeService(
                 pulledObjects = pulledObjects,
             )
         }
+        collectObsoleteCheckpointDraftsAfterAuthenticatedPointer(
+            remote = remote,
+            workspaceKey = workspaceKey,
+        )
 
         val importResult = WorkspaceJoiningDeviceImporterV2(
             localRepository = localRepository,
@@ -280,10 +331,24 @@ class SyncV2RuntimeService(
                     return ManualSyncResult.failure(mode, persisted.safeMessage)
                 is WorkspaceCheckpointPersistResultV2.Ready -> Unit
             }
-            return when (val published = WorkspaceCheckpointPublisherV2(
-                localRepository, remote, protocolStore,
+            return when (val published = checkpointPublisher(
+                remote = remote,
+                workspaceKey = workspaceKey,
+                writerDeviceId = writerDeviceId,
+                prepared = prepared,
+                requireNoPendingSource = true,
             ).publish(prepared)) {
-                is WorkspaceCheckpointPublishResultV2.Rejected -> ManualSyncResult.failure(mode, published.safeMessage)
+                is WorkspaceCheckpointPublishResultV2.Rejected -> {
+                    if (published.safeErrorCode == "prepared_checkpoint_stale") {
+                        discardNeverAuthoritativeEpoch(
+                            remote.remoteProfile,
+                            prepared.descriptor.syncEpochId,
+                            published.safeErrorCode,
+                            published.safeMessage,
+                        )
+                    }
+                    ManualSyncResult.failure(mode, published.safeMessage)
+                }
                 is WorkspaceCheckpointPublishResultV2.LostRace -> runV2(workspaceKey, writerDeviceId, remote)
                 is WorkspaceCheckpointPublishResultV2.Published -> {
                     val imported = WorkspacePriorEpochImporterV2(
@@ -455,12 +520,23 @@ class SyncV2RuntimeService(
             is WorkspaceCheckpointPersistResultV2.Rejected -> return ManualSyncResult.failure(mode, persisted.safeMessage)
             is WorkspaceCheckpointPersistResultV2.Ready -> Unit
         }
-        return when (val published = WorkspaceCheckpointPublisherV2(
-            localRepository,
-            remote,
-            protocolStore,
+        return when (val published = checkpointPublisher(
+            remote = remote,
+            workspaceKey = workspaceKey,
+            writerDeviceId = writerDeviceId,
+            prepared = prepared,
         ).publish(prepared)) {
-            is WorkspaceCheckpointPublishResultV2.Rejected -> ManualSyncResult.failure(mode, published.safeMessage)
+            is WorkspaceCheckpointPublishResultV2.Rejected -> {
+                if (published.safeErrorCode == "prepared_checkpoint_stale") {
+                    discardNeverAuthoritativeEpoch(
+                        remote.remoteProfile,
+                        prepared.descriptor.syncEpochId,
+                        published.safeErrorCode,
+                        published.safeMessage,
+                    )
+                }
+                ManualSyncResult.failure(mode, published.safeMessage)
+            }
             is WorkspaceCheckpointPublishResultV2.LostRace -> runV2(workspaceKey, writerDeviceId, remote)
             is WorkspaceCheckpointPublishResultV2.Published -> {
                 protocolStore.archiveAfterAuthorizedRebootstrap(
@@ -534,7 +610,6 @@ class SyncV2RuntimeService(
             "restored_backup_pending_reconciliation"
         val pointer = runCatching(remote::loadEpochPointer)
             .getOrElse { return ManualSyncResult.failure(mode, it.safeRuntimeMessage()) }
-        var attemptedPreparedEpochId: String? = null
         when (val recovered = WorkspacePreparedCheckpointRecoveryV2(
             localRepository,
             workspaceKey,
@@ -548,7 +623,7 @@ class SyncV2RuntimeService(
                         "The committed V2 checkpoint cannot be reconstructed locally: ${recovered.safeMessage}",
                     )
                 }
-                protocolStore.abandonPreparingEpoch(
+                discardNeverAuthoritativeEpoch(
                     remote.remoteProfile,
                     recovered.epochId,
                     recovered.safeErrorCode,
@@ -556,19 +631,48 @@ class SyncV2RuntimeService(
                 )
             }
             is WorkspacePreparedCheckpointLoadResultV2.Loaded -> {
-                attemptedPreparedEpochId = recovered.prepared.descriptor.syncEpochId
-                when (val published = WorkspaceCheckpointPublisherV2(
-                    localRepository,
-                    remote,
-                    protocolStore,
-                ).publish(recovered.prepared)) {
-                    is WorkspaceCheckpointPublishResultV2.Rejected -> return ManualSyncResult.failure(
-                        mode,
-                        published.safeMessage,
+                when (
+                    val attempt = publishRecoveredOrFreshDraft(
+                        remote = remote,
+                        workspaceKey = workspaceKey,
+                        writerDeviceId = writerDeviceId,
+                        prepared = recovered.prepared,
                     )
-                    is WorkspaceCheckpointPublishResultV2.LostRace,
-                    is WorkspaceCheckpointPublishResultV2.Published,
-                    -> Unit
+                ) {
+                    FirstEpochPublishAttemptV2.Published -> Unit
+                    FirstEpochPublishAttemptV2.RemoteWon -> Unit
+                    FirstEpochPublishAttemptV2.RebuildAfterStale -> {
+                        // Ordinary sync must not invent a new successor genesis here;
+                        // first-epoch rebuild only happens in initializeWorkspace.
+                        if (isGenesisLocalProductDraft(recovered.prepared) &&
+                            protocolStore.loadAuthoritativeEpoch() == null &&
+                            runCatching(remote::loadEpochPointer).getOrNull() == null
+                        ) {
+                            when (
+                                val rebuilt = prepareAndPublishGenesis(
+                                    remote = remote,
+                                    workspaceKey = workspaceKey,
+                                    writerDeviceId = writerDeviceId,
+                                )
+                            ) {
+                                FirstEpochPublishAttemptV2.Published -> Unit
+                                FirstEpochPublishAttemptV2.RemoteWon -> Unit
+                                FirstEpochPublishAttemptV2.RebuildAfterStale ->
+                                    return ManualSyncResult.failure(
+                                        mode,
+                                        "Local product state kept changing during first-epoch publish; try Sync again.",
+                                    )
+                                is FirstEpochPublishAttemptV2.KeepPreparingAndStop ->
+                                    return ManualSyncResult.failure(mode, rebuilt.safeMessage)
+                                is FirstEpochPublishAttemptV2.Failed ->
+                                    return ManualSyncResult.failure(mode, rebuilt.safeMessage)
+                            }
+                        }
+                    }
+                    is FirstEpochPublishAttemptV2.KeepPreparingAndStop ->
+                        return ManualSyncResult.failure(mode, attempt.safeMessage)
+                    is FirstEpochPublishAttemptV2.Failed ->
+                        return ManualSyncResult.failure(mode, attempt.safeMessage)
                 }
             }
         }
@@ -629,14 +733,10 @@ class SyncV2RuntimeService(
         }
         var summary = coordinator(workspaceKey, writerDeviceId, remote).syncOnce()
         if (summary.status == SyncCoordinatorStatusV2.SUCCESS) {
-            attemptedPreparedEpochId?.takeIf { it != summary.epochId }?.let { losingEpochId ->
-                protocolStore.abandonPreparingEpoch(
-                    remote.remoteProfile,
-                    losingEpochId,
-                    "epoch_pointer_compare_and_set_lost",
-                    "Another authenticated checkpoint won the pointer compare-and-set.",
-                )
-            }
+            collectObsoleteCheckpointDraftsAfterAuthenticatedPointer(
+                remote = remote,
+                workspaceKey = workspaceKey,
+            )
             val activeEpochId = summary.epochId
             val oldEpochsWithPending = protocolStore.loadAllEpochs()
                 .filter {
@@ -703,14 +803,64 @@ class SyncV2RuntimeService(
         workspaceKey: WorkspaceMasterKey,
         writerDeviceId: String,
         remote: WorkspaceSyncRemoteV2,
-    ) = WorkspaceSyncCoordinatorV2(
-        localRepository = localRepository,
-        workspaceKey = workspaceKey,
-        localWriterDeviceId = writerDeviceId,
-        remote = remote,
-        protocolStore = protocolStore,
-        clock = clock,
-    )
+    ): WorkspaceSyncCoordinatorV2 {
+        val authorityBeforeBootstrap = protocolStore.loadAuthoritativeEpoch()
+        return WorkspaceSyncCoordinatorV2(
+            localRepository = localRepository,
+            workspaceKey = workspaceKey,
+            localWriterDeviceId = writerDeviceId,
+            remote = remote,
+            protocolStore = protocolStore,
+            clock = clock,
+            authorityMutationCoordinator = authorityMutationCoordinator,
+            bootstrapCommitHook = {
+                preserveLocalStateAtBootstrapCommit(
+                    workspaceKey,
+                    writerDeviceId,
+                    remote.remoteProfile,
+                    authorityBeforeBootstrap,
+                )
+            },
+        )
+    }
+
+    private fun preserveLocalStateAtBootstrapCommit(
+        workspaceKey: WorkspaceMasterKey,
+        writerDeviceId: String,
+        targetRemoteProfile: String,
+        priorAuthority: StoredSyncEpochV2?,
+    ): Pair<String, String>? =
+        if (priorAuthority == null) {
+            when (val imported = WorkspaceJoiningDeviceImporterV2(
+                localRepository = localRepository,
+                settingsRepository = settingsRepository,
+                workspaceKey = workspaceKey,
+                writerDeviceId = writerDeviceId,
+                remoteProfile = targetRemoteProfile,
+                protocolStore = protocolStore,
+                clock = clock,
+            ).captureLocalProductState()) {
+                is WorkspaceJoiningImportResultV2.Captured -> null
+                is WorkspaceJoiningImportResultV2.Blocked ->
+                    imported.safeErrorCode to imported.safeMessage
+            }
+        } else {
+            when (val imported = WorkspacePriorEpochImporterV2(
+                localRepository,
+                workspaceKey,
+                writerDeviceId,
+                targetRemoteProfile,
+                protocolStore,
+                clock,
+            ).importUncheckpointed(
+                priorAuthority.descriptor.syncEpochId,
+                priorAuthority.remoteProfile,
+            )) {
+                is WorkspacePriorEpochImportResultV2.Imported -> null
+                is WorkspacePriorEpochImportResultV2.Blocked ->
+                    imported.safeErrorCode to imported.safeMessage
+            }
+        }
 
     private fun activeContext(
         workspaceKey: WorkspaceMasterKey,
@@ -768,6 +918,288 @@ class SyncV2RuntimeService(
 
     private fun createRemoteOrFailure(): Result<WorkspaceSyncRemoteV2> = runCatching(transportFactory::create)
 
+    private fun checkpointPublisher(
+        remote: WorkspaceSyncRemoteV2,
+        workspaceKey: WorkspaceMasterKey? = null,
+        writerDeviceId: String? = null,
+        prepared: PreparedWorkspaceEpochCheckpointV2? = null,
+        requireNoPendingSource: Boolean = false,
+    ): WorkspaceCheckpointPublisherV2 {
+        val genesisDraft = prepared?.takeIf(::isGenesisLocalProductDraft)
+        val sourceDraft = prepared?.takeIf { genesisDraft == null }
+        val snapshotValidator: () -> Boolean = when {
+            genesisDraft != null && workspaceKey != null && writerDeviceId != null ->
+                fun(): Boolean =
+                    !isGenesisLocalProductDraftStale(workspaceKey, writerDeviceId, genesisDraft)
+            sourceDraft != null && workspaceKey != null && writerDeviceId != null ->
+                fun(): Boolean =
+                    !isV2SourceCheckpointDraftStale(
+                        workspaceKey,
+                        writerDeviceId,
+                        sourceDraft,
+                        requireNoPendingSource,
+                    )
+            else -> fun(): Boolean = true
+        }
+        return WorkspaceCheckpointPublisherV2(
+            localRepository = localRepository,
+            remote = remote,
+            protocolStore = protocolStore,
+            onProgress = onPublishProgress,
+            localSnapshotStillMatches = snapshotValidator,
+            commitPointerBarrier = { commit ->
+                authorityMutationCoordinator.productAccess(commit)
+            },
+        )
+    }
+
+    private fun prepareAndPublishGenesis(
+        remote: WorkspaceSyncRemoteV2,
+        workspaceKey: WorkspaceMasterKey,
+        writerDeviceId: String,
+    ): FirstEpochPublishAttemptV2 {
+        val genesis = WorkspaceGenesisCheckpointServiceV2(
+            localRepository = localRepository,
+            settingsRepository = settingsRepository,
+            workspaceKey = workspaceKey,
+            writerDeviceId = writerDeviceId,
+            remoteProfile = remote.remoteProfile,
+            clock = clock,
+        )
+        return when (val prepared = genesis.prepare()) {
+            is WorkspaceGenesisCheckpointResultV2.Blocked ->
+                FirstEpochPublishAttemptV2.Failed(prepared.safeMessage)
+            is WorkspaceGenesisCheckpointResultV2.Prepared -> {
+                when (
+                    val persisted = WorkspaceCheckpointPersistenceV2(
+                        localRepository, workspaceKey, writerDeviceId, protocolStore,
+                    ).persist(prepared.checkpoint)
+                ) {
+                    is WorkspaceCheckpointPersistResultV2.Rejected ->
+                        FirstEpochPublishAttemptV2.Failed(persisted.safeMessage)
+                    is WorkspaceCheckpointPersistResultV2.Ready ->
+                        publishRecoveredOrFreshDraft(
+                            remote = remote,
+                            workspaceKey = workspaceKey,
+                            writerDeviceId = writerDeviceId,
+                            prepared = prepared.checkpoint,
+                        )
+                }
+            }
+        }
+    }
+
+    private fun publishRecoveredOrFreshDraft(
+        remote: WorkspaceSyncRemoteV2,
+        workspaceKey: WorkspaceMasterKey,
+        writerDeviceId: String,
+        prepared: PreparedWorkspaceEpochCheckpointV2,
+    ): FirstEpochPublishAttemptV2 {
+        if (isGenesisLocalProductDraft(prepared) &&
+            isGenesisLocalProductDraftStale(workspaceKey, writerDeviceId, prepared)
+        ) {
+            discardNeverAuthoritativeEpoch(
+                remote.remoteProfile,
+                prepared.descriptor.syncEpochId,
+                "prepared_checkpoint_stale",
+                "Local product state changed after the prepared first-epoch checkpoint.",
+            )
+            return FirstEpochPublishAttemptV2.RebuildAfterStale
+        }
+        return when (
+            val published = checkpointPublisher(
+                remote = remote,
+                workspaceKey = workspaceKey,
+                writerDeviceId = writerDeviceId,
+                prepared = prepared,
+            ).publish(prepared)
+        ) {
+            is WorkspaceCheckpointPublishResultV2.Published -> FirstEpochPublishAttemptV2.Published
+            is WorkspaceCheckpointPublishResultV2.LostRace -> {
+                if (published.currentPointer == null ||
+                    published.currentPointer.objectDigest == prepared.pointer.previousPointerDigest
+                ) {
+                    FirstEpochPublishAttemptV2.KeepPreparingAndStop(
+                        "Checkpoint pointer commit failed transiently; run Sync again to resume the same prepared checkpoint.",
+                    )
+                } else {
+                    FirstEpochPublishAttemptV2.RemoteWon
+                }
+            }
+            is WorkspaceCheckpointPublishResultV2.Rejected -> {
+                if (published.safeErrorCode == "prepared_checkpoint_stale") {
+                    discardNeverAuthoritativeEpoch(
+                        remote.remoteProfile,
+                        prepared.descriptor.syncEpochId,
+                        published.safeErrorCode,
+                        published.safeMessage,
+                    )
+                    FirstEpochPublishAttemptV2.RebuildAfterStale
+                } else {
+                    FirstEpochPublishAttemptV2.Failed(published.safeMessage)
+                }
+            }
+        }
+    }
+
+    /**
+     * True only for a first-epoch draft built from local product rows
+     * (not rollover / recovery / remote-migration successors).
+     */
+    private fun isGenesisLocalProductDraft(prepared: PreparedWorkspaceEpochCheckpointV2): Boolean {
+        if (prepared.descriptor.previousEpochId != null) return false
+        if (prepared.pointer.previousPointerDigest != null) return false
+        val localProductPrefix = "local-product:"
+        return prepared.entities.any { entity ->
+            val provenance = entity.version.provenance ?: return@any false
+            provenance.type == WorkspaceVersionProvenanceTypeV2.EPOCH_CHECKPOINT &&
+                provenance.sourceProfile?.startsWith(localProductPrefix) == true
+        }
+    }
+
+    /**
+     * Genesis drafts are stale when the current local-product inventory fingerprint
+     * no longer matches the frozen EPOCH_CHECKPOINT source digests.
+     * Non-genesis drafts always return false (callers must use other validation).
+     */
+    private fun isGenesisLocalProductDraftStale(
+        workspaceKey: WorkspaceMasterKey,
+        writerDeviceId: String,
+        prepared: PreparedWorkspaceEpochCheckpointV2,
+    ): Boolean {
+        if (!isGenesisLocalProductDraft(prepared)) return false
+        val preparedFingerprint = preparedGenesisSourceFingerprint(prepared)
+        val currentFingerprint = runCatching {
+            WorkspaceGenesisCheckpointServiceV2(
+                localRepository = localRepository,
+                settingsRepository = settingsRepository,
+                workspaceKey = workspaceKey,
+                writerDeviceId = writerDeviceId,
+                remoteProfile = prepared.remoteProfile,
+                clock = clock,
+            ).inventory().sourceHeads
+                .map { head -> genesisSourceFingerprint(head.entityType, head.entityId, head.sourceObjectDigest) }
+                .toSet()
+        }.getOrElse { return true }
+        return preparedFingerprint != currentFingerprint
+    }
+
+    private fun preparedGenesisSourceFingerprint(prepared: PreparedWorkspaceEpochCheckpointV2): Set<String> =
+        prepared.entities.mapNotNull { entity ->
+            val provenance = entity.version.provenance ?: return@mapNotNull null
+            if (provenance.type != WorkspaceVersionProvenanceTypeV2.EPOCH_CHECKPOINT) return@mapNotNull null
+            if (provenance.sourceProfile?.startsWith("local-product:") != true) return@mapNotNull null
+            val digest = provenance.sourceDigest ?: return@mapNotNull null
+            genesisSourceFingerprint(entity.version.entityType, entity.version.entityId, digest)
+        }.toSet()
+
+    private fun isV2SourceCheckpointDraftStale(
+        workspaceKey: WorkspaceMasterKey,
+        writerDeviceId: String,
+        prepared: PreparedWorkspaceEpochCheckpointV2,
+        requireNoPendingSource: Boolean,
+    ): Boolean {
+        val sourceEpochId = prepared.descriptor.previousEpochId ?: return false
+        val expected = prepared.checkpointSourceIdentitiesV2()
+        if (expected.isEmpty()) return true
+        return runCatching {
+            val sourceEpoch = protocolStore.loadAllEpochs().singleOrNull {
+                it.descriptor.syncEpochId == sourceEpochId
+            } ?: return@runCatching false
+            val contexts = WorkspaceSystemV2ContextProvider(
+                localRepository,
+                { workspaceKey },
+                { writerDeviceId },
+                { sourceEpoch.remoteProfile },
+            )
+            val context = when (sourceEpoch.lifecycle) {
+                SyncEpochLifecycleV2.READ_ONLY ->
+                    contexts.openRetainedEpochOrNull(sourceEpoch, workspaceKey)
+                else ->
+                    contexts.openOrNull()?.takeIf { it.syncEpochId == sourceEpochId }
+            } ?: return@runCatching false
+            checkpointSourceStateStillMatchesV2(
+                context.store,
+                sourceEpoch.remoteProfile,
+                expected,
+                requireNoPendingSource,
+            )
+        }.getOrDefault(false).not()
+    }
+
+    private fun genesisSourceFingerprint(
+        entityType: WorkspaceEntityTypeV2,
+        entityId: String,
+        sourceObjectDigest: String,
+    ): String = "${entityType.wireValue}|$entityId|$sourceObjectDigest"
+
+    /** Marks a never-authoritative draft abandoned while retaining exact cleanup identities. */
+    private fun discardNeverAuthoritativeEpoch(
+        remoteProfile: String,
+        epochId: String,
+        safeErrorCode: String,
+        safeErrorMessage: String,
+    ) {
+        val epoch = protocolStore.loadEpoch(remoteProfile, epochId) ?: return
+        if (epoch.lifecycle == SyncEpochLifecycleV2.PREPARING ||
+            epoch.lifecycle == SyncEpochLifecycleV2.ABANDONED
+        ) {
+            if (epoch.lifecycle == SyncEpochLifecycleV2.PREPARING) {
+                protocolStore.abandonPreparingEpoch(
+                    remoteProfile,
+                    epochId,
+                    safeErrorCode,
+                    safeErrorMessage,
+                )
+            }
+        }
+    }
+
+    /**
+     * Runs only after the coordinator authenticated and activated the current
+     * pointer. A draft whose expected predecessor is still current remains
+     * resumable; every other never-authoritative draft is remotely collected
+     * before its local cleanup identities are removed.
+     */
+    private fun collectObsoleteCheckpointDraftsAfterAuthenticatedPointer(
+        remote: WorkspaceSyncRemoteV2,
+        workspaceKey: WorkspaceMasterKey,
+    ) {
+        val active = protocolStore.loadActiveEpoch(remote.remoteProfile) ?: return
+        val loader = WorkspaceCheckpointDraftCleanupLoaderV2(localRepository, workspaceKey)
+        protocolStore.loadEpochs(remote.remoteProfile)
+            .filter {
+                it.descriptor.syncEpochId != active.descriptor.syncEpochId &&
+                    it.activatedAtEpochMilliseconds == null &&
+                    (it.lifecycle == SyncEpochLifecycleV2.PREPARING ||
+                        it.lifecycle == SyncEpochLifecycleV2.ABANDONED)
+            }
+            .forEach { epoch ->
+                val draft = loader.load(epoch).getOrNull() ?: return@forEach
+                if (draft.pointer.previousPointerDigest == active.descriptorDigest) {
+                    return@forEach
+                }
+                if (epoch.lifecycle == SyncEpochLifecycleV2.PREPARING) {
+                    protocolStore.abandonPreparingEpoch(
+                        remote.remoteProfile,
+                        epoch.descriptor.syncEpochId,
+                        "epoch_pointer_compare_and_set_lost",
+                        "Another authenticated checkpoint won the pointer compare-and-set.",
+                    )
+                }
+                when (runCatching { remote.cleanupCheckpointDraft(draft) }.getOrNull()) {
+                    is WorkspaceCheckpointDraftCleanupResultV2.Deleted ->
+                        epochRetention.collectAbandonedNeverAuthoritativeEpoch(
+                            remote.remoteProfile,
+                            epoch.descriptor.syncEpochId,
+                        )
+                    is WorkspaceCheckpointDraftCleanupResultV2.Retained,
+                    null,
+                    -> Unit
+                }
+            }
+    }
+
     private fun failedInitialization(
         message: String,
         conflicts: Int = 0,
@@ -784,6 +1216,15 @@ class SyncV2RuntimeService(
     private companion object {
         const val MAX_FRONTIER_STABILIZATION_ROUNDS_V2 = 8
     }
+}
+
+/** Outcome of publishing a recovered or freshly prepared first-epoch (or other) draft. */
+private sealed interface FirstEpochPublishAttemptV2 {
+    data object Published : FirstEpochPublishAttemptV2
+    data object RemoteWon : FirstEpochPublishAttemptV2
+    data object RebuildAfterStale : FirstEpochPublishAttemptV2
+    data class KeepPreparingAndStop(val safeMessage: String) : FirstEpochPublishAttemptV2
+    data class Failed(val safeMessage: String) : FirstEpochPublishAttemptV2
 }
 
 internal fun Throwable.safeRuntimeMessage(): String =

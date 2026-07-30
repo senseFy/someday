@@ -6,6 +6,7 @@ import saien.someday.data.crypto.SodiumWorkspaceCrypto
 import saien.someday.data.local.SqlDelightLocalDataRepository
 import saien.someday.data.local.createSomedayJdbcDriver
 import saien.someday.data.local.db.SomedayDatabase
+import saien.someday.sync.WorkspaceAuthorityMutationCoordinator
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertIs
@@ -186,6 +187,179 @@ class WorkspaceSyncCoordinatorV2Test {
             assertEquals(0, result.pushedObjects)
             assertTrue(remote.allChanges().isEmpty())
             assertEquals(null, SqlDelightSyncProtocolStoreV2(joining.local.database).loadActiveEpoch(remote.remoteProfile))
+        } finally {
+            publisher.close()
+            joining.close()
+        }
+    }
+
+    @Test
+    fun bootstrapCommitHookFailureRollsBackActivationAndRetryCanResume() {
+        val key = SodiumWorkspaceCrypto().workspaceKeyFromBytes(ByteArray(32) { (it + 23).toByte() })
+        val remote = InMemoryWorkspaceSyncRemoteV2()
+        val publisher = fixture(WRITER_A)
+        val joining = fixture(WRITER_B)
+        try {
+            val prepared = WorkspaceCheckpointBuilderV2(key, WRITER_A).build(
+                remoteProfile = remote.remoteProfile,
+                sourceHeads = listOf(WorkspaceCheckpointSourceHeadV2(
+                    WorkspaceEntityTypeV2.WORKSPACE_PREFERENCES,
+                    WORKSPACE_PREFERENCES_ENTITY_ID_V2,
+                    WorkspacePreferencesV2(),
+                    null,
+                    "bootstrap-hook-test",
+                    null,
+                    WRITER_A,
+                    null,
+                    "bootstrap-hook-source",
+                    "bootstrap-hook-source-digest",
+                    T0,
+                )),
+                createdAt = T0,
+            )
+            assertIs<WorkspaceCheckpointPersistResultV2.Ready>(
+                WorkspaceCheckpointPersistenceV2(publisher.local, key, WRITER_A).persist(prepared),
+            )
+            assertIs<WorkspaceCheckpointPublishResultV2.Published>(
+                WorkspaceCheckpointPublisherV2(publisher.local, remote).publish(prepared),
+            )
+
+            val blocked = WorkspaceSyncCoordinatorV2(
+                joining.local,
+                key,
+                WRITER_B,
+                remote,
+                bootstrapCommitHook = {
+                    "local_fallback_import_failed" to "Local fallback state was not committed."
+                },
+            ).syncOnce()
+
+            val protocol = SqlDelightSyncProtocolStoreV2(joining.local.database)
+            assertEquals(SyncCoordinatorStatusV2.BLOCKED, blocked.status)
+            assertEquals("local_fallback_import_failed", blocked.safeErrorCode)
+            assertEquals(null, protocol.loadActiveEpoch(remote.remoteProfile))
+            assertEquals(
+                SyncEpochLifecycleV2.PREPARING,
+                assertNotNull(protocol.loadEpoch(remote.remoteProfile, prepared.descriptor.syncEpochId)).lifecycle,
+            )
+
+            var successfulHookCalls = 0
+            val retried = WorkspaceSyncCoordinatorV2(
+                joining.local,
+                key,
+                WRITER_B,
+                remote,
+                authorityMutationCoordinator = WorkspaceAuthorityMutationCoordinator(),
+                bootstrapCommitHook = {
+                    successfulHookCalls += 1
+                    null
+                },
+            ).syncOnce()
+
+            assertEquals(SyncCoordinatorStatusV2.SUCCESS, retried.status)
+            assertEquals(1, successfulHookCalls)
+            assertEquals(
+                prepared.descriptor.syncEpochId,
+                assertNotNull(protocol.loadActiveEpoch(remote.remoteProfile)).descriptor.syncEpochId,
+            )
+        } finally {
+            publisher.close()
+            joining.close()
+        }
+    }
+
+    @Test
+    fun bootstrapDoesNotOverwriteAuthorityThatChangesAfterPointerAuthentication() {
+        val key = SodiumWorkspaceCrypto().workspaceKeyFromBytes(ByteArray(32) { (it + 24).toByte() })
+        val remote = InMemoryWorkspaceSyncRemoteV2()
+        val publisher = fixture(WRITER_A)
+        val joining = fixture(WRITER_B)
+        try {
+            val remoteCheckpoint = WorkspaceCheckpointBuilderV2(key, WRITER_A).build(
+                remoteProfile = remote.remoteProfile,
+                sourceHeads = listOf(WorkspaceCheckpointSourceHeadV2(
+                    WorkspaceEntityTypeV2.WORKSPACE_PREFERENCES,
+                    WORKSPACE_PREFERENCES_ENTITY_ID_V2,
+                    WorkspacePreferencesV2(),
+                    null,
+                    "remote-bootstrap-test",
+                    null,
+                    WRITER_A,
+                    null,
+                    "remote-bootstrap-source",
+                    "remote-bootstrap-source-digest",
+                    T0,
+                )),
+                createdAt = T0,
+            )
+            assertIs<WorkspaceCheckpointPersistResultV2.Ready>(
+                WorkspaceCheckpointPersistenceV2(publisher.local, key, WRITER_A).persist(remoteCheckpoint),
+            )
+            assertIs<WorkspaceCheckpointPublishResultV2.Published>(
+                WorkspaceCheckpointPublisherV2(publisher.local, remote).publish(remoteCheckpoint),
+            )
+
+            val competing = WorkspaceCheckpointBuilderV2(key, WRITER_B).build(
+                remoteProfile = remote.remoteProfile,
+                sourceHeads = listOf(WorkspaceCheckpointSourceHeadV2(
+                    WorkspaceEntityTypeV2.WORKSPACE_PREFERENCES,
+                    WORKSPACE_PREFERENCES_ENTITY_ID_V2,
+                    WorkspacePreferencesV2(),
+                    null,
+                    "competing-local-authority",
+                    null,
+                    WRITER_B,
+                    null,
+                    "competing-local-source",
+                    "competing-local-source-digest",
+                    T0,
+                )),
+                createdAt = T0,
+            )
+            val protocol = SqlDelightSyncProtocolStoreV2(joining.local.database)
+            var installedCompetingAuthority = false
+            val racingRemote = object : WorkspaceSyncRemoteV2 by remote {
+                override fun fetchCheckpoint(
+                    pointer: EncryptedWorkspaceObjectV2,
+                    descriptor: SyncEpochDescriptorV2,
+                ): WorkspaceRemoteCheckpointBundleV2 =
+                    remote.fetchCheckpoint(pointer, descriptor).also {
+                        if (!installedCompetingAuthority) {
+                            installedCompetingAuthority = true
+                            assertIs<WorkspaceCheckpointPersistResultV2.Ready>(
+                                WorkspaceCheckpointPersistenceV2(
+                                    joining.local,
+                                    key,
+                                    WRITER_B,
+                                    protocol,
+                                ).persist(competing),
+                            )
+                            protocol.activateEpoch(
+                                remote.remoteProfile,
+                                competing.descriptor.syncEpochId,
+                                T0,
+                                WRITER_B,
+                                "competing-local-binding",
+                            )
+                        }
+                    }
+            }
+
+            val result = WorkspaceSyncCoordinatorV2(
+                joining.local,
+                key,
+                WRITER_B,
+                racingRemote,
+                protocol,
+                authorityMutationCoordinator = WorkspaceAuthorityMutationCoordinator(),
+            ).syncOnce()
+
+            assertEquals(SyncCoordinatorStatusV2.BLOCKED, result.status)
+            assertEquals("local_authority_changed", result.safeErrorCode)
+            assertEquals(
+                competing.descriptor.syncEpochId,
+                assertNotNull(protocol.loadAuthoritativeEpoch()).descriptor.syncEpochId,
+            )
         } finally {
             publisher.close()
             joining.close()

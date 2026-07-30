@@ -12,10 +12,24 @@ import kotlinx.coroutines.sync.withLock
  * existing authority does not take this lock.
  */
 class WorkspaceAuthorityMutationCoordinator {
-    private val mutex = Mutex()
+    private val authorityMutex = Mutex()
+    private val productAccessMutex = Mutex()
 
     fun <T> exclusive(block: () -> T): T =
         runBlocking {
-            mutex.withLock { block() }
+            authorityMutex.withLock { block() }
+        }
+
+    /**
+     * Serializes product routing with the short pointer-commit window.
+     *
+     * Checkpoint construction and upload deliberately do not take this lock.
+     * The publisher takes it only for its final snapshot check, remote CAS, and
+     * local authority activation. A product operation that arrives in that
+     * window therefore waits and re-evaluates its route after activation.
+     */
+    fun <T> productAccess(block: () -> T): T =
+        runBlocking {
+            productAccessMutex.withLock { block() }
         }
 }

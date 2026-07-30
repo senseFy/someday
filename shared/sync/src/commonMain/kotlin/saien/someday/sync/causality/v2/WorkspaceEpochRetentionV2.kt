@@ -53,6 +53,33 @@ class WorkspaceEpochRetentionServiceV2(
 ) {
     private val queries = localRepository.database.somedayQueries
 
+    /**
+     * Deletes a never-authoritative local epoch (ABANDONED preparing drafts only).
+     * Fail-closed if the row is missing, still PREPARING, or was ever activated.
+     * Uses the any-lifecycle epoch delete after explicit ABANDONED + never-activated checks
+     * because the read-only collector delete refuses non-read-only rows.
+     */
+    fun collectAbandonedNeverAuthoritativeEpoch(remoteProfile: String, epochId: String): Boolean {
+        require(remoteProfile in setOf(
+            SyncRemoteProfileV2.WEB_DAV.wireValue,
+            SyncRemoteProfileV2.SELF_HOSTED.wireValue,
+        ))
+        var collected = false
+        localRepository.database.transaction {
+            val epoch = protocolStore.loadEpoch(remoteProfile, epochId) ?: return@transaction
+            if (epoch.lifecycle != SyncEpochLifecycleV2.ABANDONED) return@transaction
+            if (epoch.activatedAtEpochMilliseconds != null) return@transaction
+            val pins = loadPins(remoteProfile, epochId)
+            if (pins.total > 0) return@transaction
+            deleteNeverAuthoritativeEpochGraph(remoteProfile, epochId)
+            check(protocolStore.loadEpoch(remoteProfile, epochId) == null) {
+                "Abandoned V2 draft collection did not remove its lifecycle row."
+            }
+            collected = true
+        }
+        return collected
+    }
+
     fun collectExpiredLocalEpochs(remoteProfile: String, now: Instant): WorkspaceEpochRetentionCollectionV2 {
         require(remoteProfile in setOf(
             SyncRemoteProfileV2.WEB_DAV.wireValue,
@@ -110,6 +137,17 @@ class WorkspaceEpochRetentionServiceV2(
     }
 
     private fun deleteEpoch(remoteProfile: String, epochId: String) {
+        deleteEpochGraph(remoteProfile, epochId)
+        // Read-only collector path: only removes epochs still marked read_only.
+        queries.deleteSyncEpochSystemV2(remoteProfile, epochId)
+    }
+
+    private fun deleteNeverAuthoritativeEpochGraph(remoteProfile: String, epochId: String) {
+        deleteEpochGraph(remoteProfile, epochId)
+        queries.deleteSyncEpochAnyLifecycleSystemV2(remoteProfile, epochId)
+    }
+
+    private fun deleteEpochGraph(remoteProfile: String, epochId: String) {
         // Protocol/control rows first.  Checkpoint objects precede their
         // manifest row; every version reference precedes immutable versions.
         queries.deleteEpochCheckpointObjectsSystemV2(remoteProfile, epochId)
@@ -133,7 +171,5 @@ class WorkspaceEpochRetentionServiceV2(
         queries.deleteEpochRepairReplicasSystemV2(remoteProfile, epochId)
         queries.deleteEpochDeadLettersSystemV2(remoteProfile, epochId)
         queries.deleteEpochRunHistorySystemV2(remoteProfile, epochId)
-
-        queries.deleteSyncEpochSystemV2(remoteProfile, epochId)
     }
 }

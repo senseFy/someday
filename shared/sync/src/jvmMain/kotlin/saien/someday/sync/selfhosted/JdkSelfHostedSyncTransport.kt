@@ -192,6 +192,19 @@ class JdkSelfHostedSyncTransport(
         acceptedStatuses = setOf(409),
     )
 
+    override fun v2CleanupCheckpointDraft(
+        endpoint: String,
+        accessToken: String,
+        request: SelfHostedV2CheckpointCleanupRequest,
+    ): SelfHostedV2CheckpointCleanupResponse = post(
+        endpoint,
+        "/sync/v2/checkpoint/cleanup",
+        accessToken,
+        json.encodeToString(request),
+        SelfHostedV2CheckpointCleanupResponse.serializer(),
+        acceptedStatuses = setOf(409),
+    )
+
     override fun v2Push(
         endpoint: String,
         accessToken: String,

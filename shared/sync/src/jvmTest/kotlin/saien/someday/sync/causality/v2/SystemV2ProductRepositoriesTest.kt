@@ -22,15 +22,65 @@ import saien.someday.domain.settings.OnThisDayNotificationPreferences
 import saien.someday.domain.settings.SyncConfiguration
 import saien.someday.domain.settings.SyncMode
 import saien.someday.domain.settings.WorkspacePreferencesSyncStatus
+import saien.someday.sync.WorkspaceAuthorityMutationCoordinator
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import kotlin.time.Instant
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertFailsWith
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class SystemV2ProductRepositoriesTest {
+    @Test
+    fun settingsReadWaitsForProductRouteCommitBarrier() = withFixture { fixture ->
+        val coordinator = WorkspaceAuthorityMutationCoordinator()
+        val settings = SystemV2ClientSettingsRepository(
+            fixture.local,
+            fixture.rawSettings,
+            { fixture.workspaceKey },
+            { WRITER_A },
+            { PROFILE },
+            clock = { T1 },
+            authorityMutationCoordinator = coordinator,
+        )
+        val barrierEntered = CountDownLatch(1)
+        val releaseBarrier = CountDownLatch(1)
+        val readStarted = CountDownLatch(1)
+        val readFinished = CountDownLatch(1)
+        val executor = Executors.newFixedThreadPool(2)
+        try {
+            val barrier = executor.submit {
+                coordinator.productAccess {
+                    barrierEntered.countDown()
+                    check(releaseBarrier.await(5, TimeUnit.SECONDS))
+                }
+            }
+            assertTrue(barrierEntered.await(5, TimeUnit.SECONDS))
+            val read = executor.submit<ClientSettings> {
+                readStarted.countDown()
+                try {
+                    settings.load()
+                } finally {
+                    readFinished.countDown()
+                }
+            }
+            assertTrue(readStarted.await(5, TimeUnit.SECONDS))
+            assertFalse(readFinished.await(150, TimeUnit.MILLISECONDS))
+
+            releaseBarrier.countDown()
+            assertEquals(WRITER_A, read.get(5, TimeUnit.SECONDS).activeDeviceId)
+            barrier.get(5, TimeUnit.SECONDS)
+        } finally {
+            releaseBarrier.countDown()
+            executor.shutdownNow()
+        }
+    }
+
     @Test
     fun deletedItemSurfaceExplicitlyUndeletesCompleteNoteAndNotebookSnapshots() = withFixture { fixture ->
         val notebook = fixture.notes.createNotebook("Retained notebook")

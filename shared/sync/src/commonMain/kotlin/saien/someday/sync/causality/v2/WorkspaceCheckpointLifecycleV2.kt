@@ -2,6 +2,13 @@
 
 package saien.someday.sync.causality.v2
 
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import saien.someday.data.crypto.WorkspaceMasterKey
 import saien.someday.data.local.SqlDelightLocalDataRepository
 import kotlin.time.Instant
@@ -698,31 +705,150 @@ class WorkspacePreparedCheckpointRecoveryV2(
     )
 }
 
+/**
+ * Reconstructs only the authenticated remote control identities needed for
+ * exact orphan cleanup. Semantic entity rows may already be incomplete.
+ */
+class WorkspaceCheckpointDraftCleanupLoaderV2(
+    private val localRepository: SqlDelightLocalDataRepository,
+    private val workspaceKey: WorkspaceMasterKey,
+) {
+    fun load(epoch: StoredSyncEpochV2): Result<WorkspaceCheckpointDraftCleanupV2> = runCatching {
+        require(epoch.lifecycle == SyncEpochLifecycleV2.PREPARING ||
+            epoch.lifecycle == SyncEpochLifecycleV2.ABANDONED)
+        require(epoch.activatedAtEpochMilliseconds == null)
+        val descriptor = epoch.descriptor
+        val materializer = CanonicalWorkspaceCausalityMaterializerV2(
+            SyncEpochKeyDerivationV2().derive(workspaceKey, descriptor.syncEpochId),
+        )
+        val cipher = WorkspaceObjectCipherV2(workspaceKey, materializer)
+        val control = WorkspaceSyncControlCodecV2(cipher)
+        val rows = localRepository.database.somedayQueries.selectControlObjectsSystemV2(
+            epoch.remoteProfile,
+            descriptor.syncEpochId,
+        ).executeAsList()
+
+        fun outer(type: String, id: String): EncryptedWorkspaceObjectV2 {
+            val row = rows.singleOrNull { it.object_type == type && it.object_id == id }
+                ?: error("Checkpoint cleanup control object is missing.")
+            val decoded = cipher.decodeJson(row.encoded_outer).getOrElse {
+                error("Checkpoint cleanup outer framing is invalid.")
+            }
+            require(decoded.objectDigest == row.object_digest)
+            return decoded
+        }
+
+        val pointerObject = outer(SYNC_EPOCH_POINTER_OBJECT_TYPE_V2, SYNC_EPOCH_POINTER_ID_SYSTEM_V2)
+        require(pointerObject.objectDigest == epoch.descriptorDigest)
+        val pointer = when (val decoded = control.decodeEpochPointer(pointerObject)) {
+            is WorkspaceControlDecodeResultV2.Decoded -> decoded.value
+            is WorkspaceControlDecodeResultV2.Rejected -> error(decoded.error.safeMessage)
+        }
+        require(pointer.descriptor == descriptor)
+        val manifestObject = outer(SYNC_CHECKPOINT_MANIFEST_OBJECT_TYPE_V2, descriptor.checkpointId)
+        require(manifestObject.objectDigest == descriptor.checkpointDigest)
+        val manifest = when (val decoded = control.decodeCheckpointManifest(
+            manifestObject,
+            descriptor.syncEpochId,
+            descriptor.checkpointId,
+        )) {
+            is WorkspaceControlDecodeResultV2.Decoded -> decoded.value
+            is WorkspaceControlDecodeResultV2.Rejected -> error(decoded.error.safeMessage)
+        }
+        val chunks = manifest.chunks.map { ref ->
+            val chunkObject = outer(SYNC_CHECKPOINT_CHUNK_OBJECT_TYPE_V2, ref.chunkId)
+            when (val decoded = control.decodeCheckpointChunk(
+                chunkObject,
+                descriptor.syncEpochId,
+                descriptor.checkpointId,
+                ref,
+            )) {
+                is WorkspaceControlDecodeResultV2.Decoded -> Unit
+                is WorkspaceControlDecodeResultV2.Rejected -> error(decoded.error.safeMessage)
+            }
+            WorkspaceCheckpointDraftChunkV2(ref, chunkObject)
+        }
+        WorkspaceCheckpointDraftCleanupV2(
+            epoch.remoteProfile,
+            pointer,
+            pointerObject,
+            manifestObject,
+            chunks,
+        )
+    }
+}
+
+fun PreparedWorkspaceEpochCheckpointV2.toDraftCleanupV2(): WorkspaceCheckpointDraftCleanupV2 =
+    WorkspaceCheckpointDraftCleanupV2(
+        remoteProfile,
+        pointer,
+        pointerObject,
+        manifestObject,
+        chunks.map { WorkspaceCheckpointDraftChunkV2(it.ref, it.encryptedObject) },
+    )
+
+/** Progress events for first-epoch / checkpoint publication (safe for UI; no secrets). */
+sealed interface WorkspaceCheckpointPublishProgressV2 {
+    data class UploadingChunks(val completed: Int, val total: Int) : WorkspaceCheckpointPublishProgressV2
+    data object UploadingManifest : WorkspaceCheckpointPublishProgressV2
+    data object VerifyingRemote : WorkspaceCheckpointPublishProgressV2
+    data object CommittingPointer : WorkspaceCheckpointPublishProgressV2
+}
+
+/** Default WebDAV-friendly concurrency for independent immutable chunk PUTs. */
+const val DEFAULT_CHECKPOINT_CHUNK_PUBLISH_PARALLELISM_V2: Int = 4
+const val MAX_CHECKPOINT_CHUNK_PUBLISH_PARALLELISM_V2: Int = 8
+
 /** Publishes immutable chunks/manifest, verifies them, then commits the sole mutable pointer. */
 class WorkspaceCheckpointPublisherV2(
     private val localRepository: SqlDelightLocalDataRepository,
     private val remote: WorkspaceSyncRemoteV2,
     private val protocolStore: SqlDelightSyncProtocolStoreV2 = SqlDelightSyncProtocolStoreV2(localRepository.database),
+    private val chunkPublishParallelism: Int = DEFAULT_CHECKPOINT_CHUNK_PUBLISH_PARALLELISM_V2,
+    private val onProgress: (WorkspaceCheckpointPublishProgressV2) -> Unit = {},
+    /**
+     * Called immediately before pointer CAS. When false, publish rejects without
+     * committing so callers can rebuild from the current local source state.
+     */
+    private val localSnapshotStillMatches: () -> Boolean = { true },
+    /**
+     * Serializes the final snapshot check, pointer CAS, and local activation
+     * against product routing. Upload and read-back stay outside this short gate.
+     */
+    private val commitPointerBarrier: (
+        (() -> WorkspaceCheckpointPublishResultV2) -> WorkspaceCheckpointPublishResultV2
+    ) = { commit -> commit() },
 ) {
+    init {
+        require(chunkPublishParallelism in 1..MAX_CHECKPOINT_CHUNK_PUBLISH_PARALLELISM_V2) {
+            "chunkPublishParallelism must be in 1..$MAX_CHECKPOINT_CHUNK_PUBLISH_PARALLELISM_V2"
+        }
+    }
+
     fun publish(prepared: PreparedWorkspaceEpochCheckpointV2): WorkspaceCheckpointPublishResultV2 {
         val descriptor = prepared.descriptor
         if (remote.remoteProfile != prepared.remoteProfile) {
             return WorkspaceCheckpointPublishResultV2.Rejected("remote_profile_mismatch", "Checkpoint targets another remote profile.")
         }
-        prepared.chunks.forEach { chunk ->
-            when (val result = remote.putCheckpointChunk(descriptor, chunk.ref, chunk.encryptedObject)) {
-                is WorkspaceImmutablePutResultV2.Rejected -> return WorkspaceCheckpointPublishResultV2.Rejected(
-                    result.safeErrorCode, result.safeMessage,
-                )
-                is WorkspaceImmutablePutResultV2.Stored -> markControl(prepared, chunk.encryptedObject, "published")
-            }
+        when (val chunkResult = publishChunks(descriptor, prepared.chunks)) {
+            is ChunkPublishBatchResultV2.Rejected -> return WorkspaceCheckpointPublishResultV2.Rejected(
+                chunkResult.safeErrorCode,
+                chunkResult.safeMessage,
+            )
+            ChunkPublishBatchResultV2.Ok -> Unit
         }
+        // Local control marks stay single-threaded (SQLDelight); remote PUTs already finished.
+        prepared.chunks.forEach { chunk ->
+            markControl(prepared, chunk.encryptedObject, "published")
+        }
+        emitProgress(WorkspaceCheckpointPublishProgressV2.UploadingManifest)
         when (val result = remote.putCheckpointManifest(descriptor, prepared.manifestObject)) {
             is WorkspaceImmutablePutResultV2.Rejected -> return WorkspaceCheckpointPublishResultV2.Rejected(
                 result.safeErrorCode, result.safeMessage,
             )
             is WorkspaceImmutablePutResultV2.Stored -> markControl(prepared, prepared.manifestObject, "published")
         }
+        emitProgress(WorkspaceCheckpointPublishProgressV2.VerifyingRemote)
         val fetched = runCatching { remote.fetchCheckpoint(prepared.pointerObject, descriptor) }.getOrElse {
             return WorkspaceCheckpointPublishResultV2.Rejected(
                 "checkpoint_remote_verification_failed",
@@ -737,6 +863,20 @@ class WorkspaceCheckpointPublisherV2(
                 "Read-back checkpoint identities do not match the prepared checkpoint.",
             )
         }
+        return commitPointerBarrier { commitPointer(prepared) }
+    }
+
+    private fun commitPointer(
+        prepared: PreparedWorkspaceEpochCheckpointV2,
+    ): WorkspaceCheckpointPublishResultV2 {
+        val descriptor = prepared.descriptor
+        if (!runCatching(localSnapshotStillMatches).getOrDefault(false)) {
+            return WorkspaceCheckpointPublishResultV2.Rejected(
+                "prepared_checkpoint_stale",
+                "Local source state changed after the checkpoint was prepared.",
+            )
+        }
+        emitProgress(WorkspaceCheckpointPublishProgressV2.CommittingPointer)
         return when (val result = remote.compareAndSetEpochPointer(
             descriptor,
             prepared.pointer.previousPointerDigest,
@@ -784,6 +924,77 @@ class WorkspaceCheckpointPublisherV2(
         }
     }
 
+    /**
+     * Uploads independent immutable chunks with bounded parallelism.
+     * Chunks are append-only and path-distinct; order of completion does not matter.
+     * Local DB marks are applied only after the full batch succeeds.
+     */
+    private fun publishChunks(
+        descriptor: SyncEpochDescriptorV2,
+        chunks: List<PreparedWorkspaceCheckpointChunkV2>,
+    ): ChunkPublishBatchResultV2 {
+        if (chunks.isEmpty()) return ChunkPublishBatchResultV2.Ok
+        val total = chunks.size
+        emitProgress(WorkspaceCheckpointPublishProgressV2.UploadingChunks(0, total))
+        if (chunkPublishParallelism == 1 || total == 1) {
+            chunks.forEachIndexed { index, chunk ->
+                when (val result = remote.putCheckpointChunk(descriptor, chunk.ref, chunk.encryptedObject)) {
+                    is WorkspaceImmutablePutResultV2.Rejected -> return ChunkPublishBatchResultV2.Rejected(
+                        result.safeErrorCode,
+                        result.safeMessage,
+                    )
+                    is WorkspaceImmutablePutResultV2.Stored ->
+                        emitProgress(WorkspaceCheckpointPublishProgressV2.UploadingChunks(index + 1, total))
+                }
+            }
+            return ChunkPublishBatchResultV2.Ok
+        }
+        return runBlocking {
+            val progressMutex = Mutex()
+            var completed = 0
+            try {
+                chunks.chunked(chunkPublishParallelism).forEach { batch ->
+                    coroutineScope {
+                        batch.map { chunk ->
+                            async(Dispatchers.Default) {
+                                when (
+                                    val result = remote.putCheckpointChunk(
+                                        descriptor,
+                                        chunk.ref,
+                                        chunk.encryptedObject,
+                                    )
+                                ) {
+                                    is WorkspaceImmutablePutResultV2.Rejected ->
+                                        throw ChunkPublishFailureV2(result.safeErrorCode, result.safeMessage)
+                                    is WorkspaceImmutablePutResultV2.Stored -> {
+                                        // Count and emit in one critical section so progress never regresses.
+                                        progressMutex.withLock {
+                                            completed += 1
+                                            emitProgress(
+                                                WorkspaceCheckpointPublishProgressV2.UploadingChunks(
+                                                    completed,
+                                                    total,
+                                                ),
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }.awaitAll()
+                    }
+                }
+                ChunkPublishBatchResultV2.Ok
+            } catch (failure: ChunkPublishFailureV2) {
+                ChunkPublishBatchResultV2.Rejected(failure.safeErrorCode, failure.safeMessage)
+            }
+        }
+    }
+
+    /** Progress must never fail the publish path. */
+    private fun emitProgress(progress: WorkspaceCheckpointPublishProgressV2) {
+        runCatching { onProgress(progress) }
+    }
+
     private fun markControl(
         prepared: PreparedWorkspaceEpochCheckpointV2,
         outer: EncryptedWorkspaceObjectV2,
@@ -799,6 +1010,16 @@ class WorkspaceCheckpointPublisherV2(
         )
     }
 }
+
+private sealed interface ChunkPublishBatchResultV2 {
+    data object Ok : ChunkPublishBatchResultV2
+    data class Rejected(val safeErrorCode: String, val safeMessage: String) : ChunkPublishBatchResultV2
+}
+
+private class ChunkPublishFailureV2(
+    val safeErrorCode: String,
+    val safeMessage: String,
+) : RuntimeException(safeMessage)
 
 private data class WorkspaceCheckpointComponentsV2(
     val epochId: String,
@@ -829,6 +1050,59 @@ val CHECKPOINT_SOURCE_COMPARATOR_SYSTEM_V2: Comparator<WorkspaceCheckpointSource
 
 val CHECKPOINT_IMPORT_COMPARATOR_SYSTEM_V2: Comparator<WorkspaceCheckpointSourceImportV2> =
     compareBy<WorkspaceCheckpointSourceImportV2>({ it.entityType.wireValue }, { it.entityId }, { it.sourceObjectId }, { it.sourceObjectDigest })
+
+internal data class WorkspaceCheckpointSourceIdentityV2(
+    val entityType: WorkspaceEntityTypeV2,
+    val entityId: String,
+    val sourceObjectId: String,
+    val sourceObjectDigest: String,
+)
+
+internal fun List<WorkspaceCheckpointSourceHeadV2>.checkpointSourceIdentitiesV2():
+    Set<WorkspaceCheckpointSourceIdentityV2> =
+    mapTo(linkedSetOf()) { source ->
+        WorkspaceCheckpointSourceIdentityV2(
+            source.entityType,
+            source.entityId,
+            source.sourceObjectId,
+            source.sourceObjectDigest,
+        )
+    }
+
+internal fun PreparedWorkspaceEpochCheckpointV2.checkpointSourceIdentitiesV2():
+    Set<WorkspaceCheckpointSourceIdentityV2> =
+    entities.mapNotNullTo(linkedSetOf()) { entity ->
+        val provenance = entity.version.provenance ?: return@mapNotNullTo null
+        if (provenance.type != WorkspaceVersionProvenanceTypeV2.EPOCH_CHECKPOINT) {
+            return@mapNotNullTo null
+        }
+        WorkspaceCheckpointSourceIdentityV2(
+            entity.version.entityType,
+            entity.version.entityId,
+            provenance.sourceObjectId ?: return@mapNotNullTo null,
+            provenance.sourceDigest ?: return@mapNotNullTo null,
+        )
+    }
+
+internal fun checkpointSourceStateStillMatchesV2(
+    store: SqlDelightWorkspaceEntityStoreV2,
+    remoteProfile: String,
+    expected: Set<WorkspaceCheckpointSourceIdentityV2>,
+    requireNoPending: Boolean = false,
+): Boolean {
+    if (expected.isEmpty()) return false
+    val current = store.loadEntityKeys()
+        .flatMap(store::loadHeads)
+        .mapTo(linkedSetOf()) { head ->
+            WorkspaceCheckpointSourceIdentityV2(
+                head.entityType,
+                head.entityId,
+                head.versionId,
+                head.objectDigest,
+            )
+        }
+    return current == expected && (!requireNoPending || store.loadPending(remoteProfile).isEmpty())
+}
 
 private val CHECKPOINT_VERSION_COMPARATOR_SYSTEM_V2: Comparator<WorkspaceEntityVersionV2> =
     compareBy<WorkspaceEntityVersionV2>({ it.entityType.wireValue }, { it.entityId }, { it.generation }, { it.versionId })

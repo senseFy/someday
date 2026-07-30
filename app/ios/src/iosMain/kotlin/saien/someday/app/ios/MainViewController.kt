@@ -151,6 +151,7 @@ fun MainViewController(): UIViewController {
             selfHostedSetupClient = clientRepositories.selfHostedSetupClient,
             selfHostedSessionCredentialStore = clientRepositories.selfHostedSessionCredentialStore,
             manualSyncRunner = clientRepositories.manualSyncRunner,
+            bindManualSyncProgressListener = clientRepositories.bindManualSyncProgressListener,
             syncV2MaintenanceRunner = clientRepositories.syncV2MaintenanceRunner,
             workspacePairingInvitationCreator = clientRepositories.workspacePairingInvitationCreator,
             workspacePairingInvitationJoiner = clientRepositories.workspacePairingInvitationJoiner,

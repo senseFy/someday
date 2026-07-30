@@ -17,12 +17,14 @@ import saien.someday.sync.causality.v2.LocalWorkspaceMutationV2
 import saien.someday.sync.causality.v2.NoteContentV2
 import saien.someday.sync.causality.v2.NoteLocationV2
 import saien.someday.sync.causality.v2.NotebookContentV2
+import saien.someday.sync.causality.v2.PreparedWorkspaceEpochCheckpointV2
 import saien.someday.sync.causality.v2.SqlDelightSyncProtocolStoreV2
 import saien.someday.sync.causality.v2.SyncEpochKeyDerivationV2
 import saien.someday.sync.causality.v2.SyncCoordinatorStatusV2
 import saien.someday.sync.causality.v2.SyncRemoteProfileV2
 import saien.someday.sync.causality.v2.WORKSPACE_PREFERENCES_ENTITY_ID_V2
 import saien.someday.sync.causality.v2.WorkspaceCheckpointBuilderV2
+import saien.someday.sync.causality.v2.WorkspaceCheckpointDraftCleanupResultV2
 import saien.someday.sync.causality.v2.WorkspaceCheckpointPersistResultV2
 import saien.someday.sync.causality.v2.WorkspaceCheckpointPersistenceV2
 import saien.someday.sync.causality.v2.WorkspaceCheckpointPublishResultV2
@@ -35,6 +37,7 @@ import saien.someday.sync.causality.v2.WorkspaceEntityWireCodecV2
 import saien.someday.sync.causality.v2.WorkspaceImmutablePutResultV2
 import saien.someday.sync.causality.v2.WorkspaceLocalCommitResultV2
 import saien.someday.sync.causality.v2.WorkspacePreferencesV2
+import saien.someday.sync.causality.v2.WorkspacePointerPublishResultV2
 import saien.someday.sync.causality.v2.WorkspaceSyncControlCodecV2
 import saien.someday.sync.causality.v2.WorkspaceSyncCoordinatorV2
 import saien.someday.sync.causality.v2.WorkspaceSystemV2ContextProvider
@@ -44,6 +47,7 @@ import saien.someday.sync.causality.v2.WorkspaceWebDavWriterManifestV2
 import saien.someday.sync.causality.v2.WorkspaceObjectCipherV2
 import saien.someday.sync.causality.v2.cborInt
 import saien.someday.sync.causality.v2.cborText
+import saien.someday.sync.causality.v2.toDraftCleanupV2
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -55,6 +59,78 @@ import kotlin.test.assertTrue
 import kotlin.time.Instant
 
 class WebDavSyncRemoteV2Test {
+    @Test
+    fun obsoleteCheckpointCleanupUsesExactConditionalDeletesAndRetainsReferencedEpochs() {
+        val workspaceKey = SodiumWorkspaceCrypto().workspaceKeyFromBytes(ByteArray(32) { (it + 29).toByte() })
+        val transport = MemoryV2WebDavTransport()
+        val fixture = fixture(WRITER_A, workspaceKey, transport)
+        try {
+            val obsolete = checkpoint(workspaceKey, idStart = 1)
+            obsolete.chunks.forEach { chunk ->
+                assertIs<WorkspaceImmutablePutResultV2.Stored>(
+                    fixture.remote.putCheckpointChunk(obsolete.descriptor, chunk.ref, chunk.encryptedObject),
+                )
+            }
+            assertIs<WorkspaceImmutablePutResultV2.Stored>(
+                fixture.remote.putCheckpointManifest(obsolete.descriptor, obsolete.manifestObject),
+            )
+
+            val winner = checkpoint(workspaceKey, writerId = WRITER_B, idStart = 100)
+            winner.chunks.forEach { chunk ->
+                assertIs<WorkspaceImmutablePutResultV2.Stored>(
+                    fixture.remote.putCheckpointChunk(winner.descriptor, chunk.ref, chunk.encryptedObject),
+                )
+            }
+            assertIs<WorkspaceImmutablePutResultV2.Stored>(
+                fixture.remote.putCheckpointManifest(winner.descriptor, winner.manifestObject),
+            )
+            assertIs<WorkspacePointerPublishResultV2.Published>(
+                fixture.remote.compareAndSetEpochPointer(winner.descriptor, null, winner.pointerObject),
+            )
+
+            assertIs<WorkspaceCheckpointDraftCleanupResultV2.Retained>(
+                fixture.remote.cleanupCheckpointDraft(winner.toDraftCleanupV2()),
+            )
+            assertTrue(transport.objectCount { winner.descriptor.syncEpochId in it } > 0)
+
+            val successor = checkpoint(
+                workspaceKey,
+                writerId = WRITER_A,
+                idStart = 200,
+                previous = winner,
+            )
+            successor.chunks.forEach { chunk ->
+                assertIs<WorkspaceImmutablePutResultV2.Stored>(
+                    fixture.remote.putCheckpointChunk(successor.descriptor, chunk.ref, chunk.encryptedObject),
+                )
+            }
+            assertIs<WorkspaceImmutablePutResultV2.Stored>(
+                fixture.remote.putCheckpointManifest(successor.descriptor, successor.manifestObject),
+            )
+            assertIs<WorkspacePointerPublishResultV2.Published>(
+                fixture.remote.compareAndSetEpochPointer(
+                    successor.descriptor,
+                    winner.pointerObject.objectDigest,
+                    successor.pointerObject,
+                ),
+            )
+            transport.removeObject(
+                WebDavPathResolver("/someday-v2-test/")
+                    .v2RetainedEpochPointer(winner.descriptor.syncEpochId),
+            )
+            assertIs<WorkspaceCheckpointDraftCleanupResultV2.Retained>(
+                fixture.remote.cleanupCheckpointDraft(winner.toDraftCleanupV2()),
+            )
+
+            assertIs<WorkspaceCheckpointDraftCleanupResultV2.Deleted>(
+                fixture.remote.cleanupCheckpointDraft(obsolete.toDraftCleanupV2()),
+            )
+            assertEquals(0, transport.objectCount { obsolete.descriptor.syncEpochId in it })
+        } finally {
+            fixture.close()
+        }
+    }
+
     @Test
     fun publishedCheckpointIsDiscoverableWithoutAnyRetiredNamespaceProbe() {
         val workspaceKey = SodiumWorkspaceCrypto().workspaceKeyFromBytes(ByteArray(32) { (it + 13).toByte() })
@@ -477,10 +553,15 @@ class WebDavSyncRemoteV2Test {
         assertTrue(workspaceWebDavManifestRequiresEpochRolloverV2(MAX_CHECKPOINT_CHUNK_PLAINTEXT_SYSTEM_V2 + 1))
     }
 
-    private fun checkpoint(workspaceKey: WorkspaceMasterKey) = WorkspaceCheckpointBuilderV2(
+    private fun checkpoint(
+        workspaceKey: WorkspaceMasterKey,
+        writerId: String = WRITER_A,
+        idStart: Long = 1,
+        previous: PreparedWorkspaceEpochCheckpointV2? = null,
+    ) = WorkspaceCheckpointBuilderV2(
         workspaceKey,
-        WRITER_A,
-        SequentialIdsV2(),
+        writerId,
+        SequentialIdsV2(idStart),
     ).build(
         remoteProfile = SyncRemoteProfileV2.WEB_DAV.wireValue,
         sourceHeads = listOf(
@@ -498,7 +579,7 @@ class WebDavSyncRemoteV2Test {
                 null,
                 "fresh-local-v2",
                 null,
-                WRITER_A,
+                writerId,
                 null,
                 "source-note",
                 "source-note-digest",
@@ -510,7 +591,7 @@ class WebDavSyncRemoteV2Test {
                 null,
                 "fresh-local-v2",
                 null,
-                WRITER_A,
+                writerId,
                 null,
                 "source-notebook",
                 "source-notebook-digest",
@@ -522,13 +603,16 @@ class WebDavSyncRemoteV2Test {
                 null,
                 "fresh-local-v2",
                 null,
-                WRITER_A,
+                writerId,
                 null,
                 "source-preferences",
                 "source-preferences-digest",
             ),
         ).sortedWith(CHECKPOINT_SOURCE_COMPARATOR_SYSTEM_V2),
         createdAt = CREATED_AT,
+        previousPointerDigest = previous?.pointerObject?.objectDigest,
+        previousEpochId = previous?.descriptor?.syncEpochId,
+        previousEpochPointerDigest = previous?.pointerObject?.objectDigest,
     )
 
     private fun fixture(
@@ -609,8 +693,9 @@ class WebDavSyncRemoteV2Test {
     }
 }
 
-private class SequentialIdsV2 : CausalityIdGeneratorV2 {
-    private var value = 1L
+private class SequentialIdsV2(
+    private var value: Long = 1L,
+) : CausalityIdGeneratorV2 {
     override fun newId(): String = "90000000-0000-4000-8000-${(value++).toString().padStart(12, '0')}"
 }
 
@@ -624,6 +709,10 @@ private class MemoryV2WebDavTransport : WebDavTransport {
     private var preconditionAlreadyUsed = false
 
     fun objectCount(predicate: (String) -> Boolean): Int = objects.keys.count(predicate)
+
+    fun removeObject(path: String) {
+        objects.remove(path)
+    }
 
     fun seedObject(path: String) {
         seedBytes(path, byteArrayOf(1))
@@ -667,6 +756,7 @@ private class MemoryV2WebDavTransport : WebDavTransport {
                 WebDavResponse(200, mapOf("ETag" to stored.etag), stored.body)
             } ?: WebDavResponse(404)
             "PUT" -> put(request)
+            "DELETE" -> delete(request)
             else -> WebDavResponse(405)
         }
         val shouldFail = request.method == "PUT" &&
@@ -689,6 +779,14 @@ private class MemoryV2WebDavTransport : WebDavTransport {
         val etag = "\"etag-${nextEtag++}\""
         objects[request.path] = Stored(etag, request.body ?: ByteArray(0))
         return WebDavResponse(if (existing == null) 201 else 204, mapOf("ETag" to etag))
+    }
+
+    private fun delete(request: WebDavRequest): WebDavResponse {
+        val existing = objects[request.path] ?: return WebDavResponse(404)
+        val expected = request.headers["If-Match"] ?: return WebDavResponse(428)
+        if (existing.etag != expected) return WebDavResponse(412)
+        objects.remove(request.path)
+        return WebDavResponse(204)
     }
 
     private fun multistatus(root: String): String {

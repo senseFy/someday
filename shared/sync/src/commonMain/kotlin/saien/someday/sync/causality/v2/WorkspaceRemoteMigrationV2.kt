@@ -4,6 +4,7 @@ package saien.someday.sync.causality.v2
 
 import saien.someday.data.crypto.WorkspaceMasterKey
 import saien.someday.data.local.SqlDelightLocalDataRepository
+import saien.someday.sync.WorkspaceAuthorityMutationCoordinator
 import kotlin.time.Clock
 import kotlin.time.Instant
 
@@ -35,6 +36,7 @@ class WorkspaceRemoteMigrationServiceV2(
     private val targetWriterDeviceId: String,
     private val sourceRemote: WorkspaceSyncRemoteV2,
     private val targetRemote: WorkspaceSyncRemoteV2,
+    private val authorityMutationCoordinator: WorkspaceAuthorityMutationCoordinator,
     private val protocolStore: SqlDelightSyncProtocolStoreV2 =
         SqlDelightSyncProtocolStoreV2(localRepository.database),
     private val clock: () -> Instant = { Clock.System.now() },
@@ -158,11 +160,34 @@ class WorkspaceRemoteMigrationServiceV2(
             localRepository,
             targetRemote,
             protocolStore,
+            localSnapshotStillMatches = {
+                val currentAuthority = protocolStore.loadAuthoritativeEpoch()
+                currentAuthority?.let {
+                    it.remoteProfile == sourceEpoch.remoteProfile &&
+                        it.descriptor.syncEpochId == sourceEpoch.descriptor.syncEpochId &&
+                        it.descriptorDigest == sourceEpoch.descriptorDigest &&
+                        it.authorityBindingId == sourceEpoch.authorityBindingId
+                } == true &&
+                    checkpointSourceStateStillMatchesV2(
+                        sourceContext.store,
+                        sourceEpoch.remoteProfile,
+                        prepared.checkpointSourceIdentitiesV2(),
+                        requireNoPending = true,
+                    )
+            },
+            commitPointerBarrier = authorityMutationCoordinator::productAccess,
         ).publish(prepared)) {
-            is WorkspaceCheckpointPublishResultV2.Rejected -> return blocked(
-                published.safeErrorCode,
-                published.safeMessage,
-            )
+            is WorkspaceCheckpointPublishResultV2.Rejected -> {
+                if (published.safeErrorCode == "prepared_checkpoint_stale") {
+                    protocolStore.abandonPreparingEpoch(
+                        targetRemote.remoteProfile,
+                        prepared.descriptor.syncEpochId,
+                        published.safeErrorCode,
+                        published.safeMessage,
+                    )
+                }
+                return blocked(published.safeErrorCode, published.safeMessage)
+            }
             is WorkspaceCheckpointPublishResultV2.LostRace -> {
                 val winner = WorkspaceSyncCoordinatorV2(
                     localRepository,
@@ -172,6 +197,39 @@ class WorkspaceRemoteMigrationServiceV2(
                     protocolStore,
                     clock,
                     authorityHandoffFrom = handoffAuthority,
+                    authorityMutationCoordinator = authorityMutationCoordinator,
+                    bootstrapCommitHook = {
+                        when (val snapshotImport = WorkspaceSourceSnapshotImporterV2(
+                            localRepository,
+                            workspaceKey,
+                            targetWriterDeviceId,
+                            targetRemote.remoteProfile,
+                        ).import(sourceHeads)) {
+                            is WorkspaceSourceSnapshotImportResultV2.Blocked ->
+                                snapshotImport.safeErrorCode to snapshotImport.safeMessage
+                            is WorkspaceSourceSnapshotImportResultV2.Imported -> {
+                                importedLate += snapshotImport.importedVersions
+                                when (val pendingImport = WorkspacePriorEpochImporterV2(
+                                    localRepository,
+                                    workspaceKey,
+                                    targetWriterDeviceId,
+                                    targetRemote.remoteProfile,
+                                    protocolStore,
+                                    clock,
+                                ).importUncheckpointed(
+                                    sourceEpoch.descriptor.syncEpochId,
+                                    sourceEpoch.remoteProfile,
+                                )) {
+                                    is WorkspacePriorEpochImportResultV2.Blocked ->
+                                        pendingImport.safeErrorCode to pendingImport.safeMessage
+                                    is WorkspacePriorEpochImportResultV2.Imported -> {
+                                        importedLate += pendingImport.importedVersions
+                                        null
+                                    }
+                                }
+                            }
+                        }
+                    },
                 ).syncOnce()
                 if (winner.status != SyncCoordinatorStatusV2.SUCCESS || winner.epochId == null) {
                     return blocked(
@@ -236,6 +294,7 @@ class WorkspaceRemoteMigrationServiceV2(
             targetRemote,
             protocolStore,
             clock,
+            authorityMutationCoordinator = authorityMutationCoordinator,
         ).syncOnce()
         if (summary.status != SyncCoordinatorStatusV2.SUCCESS) {
             return blocked(
