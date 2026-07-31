@@ -22,15 +22,65 @@ import saien.someday.domain.settings.OnThisDayNotificationPreferences
 import saien.someday.domain.settings.SyncConfiguration
 import saien.someday.domain.settings.SyncMode
 import saien.someday.domain.settings.WorkspacePreferencesSyncStatus
+import saien.someday.sync.WorkspaceAuthorityMutationCoordinator
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import kotlin.time.Instant
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertFailsWith
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class SystemV2ProductRepositoriesTest {
+    @Test
+    fun settingsReadWaitsForProductRouteCommitBarrier() = withFixture { fixture ->
+        val coordinator = WorkspaceAuthorityMutationCoordinator()
+        val settings = SystemV2ClientSettingsRepository(
+            fixture.local,
+            fixture.rawSettings,
+            { fixture.workspaceKey },
+            { WRITER_A },
+            { PROFILE },
+            clock = { T1 },
+            authorityMutationCoordinator = coordinator,
+        )
+        val barrierEntered = CountDownLatch(1)
+        val releaseBarrier = CountDownLatch(1)
+        val readStarted = CountDownLatch(1)
+        val readFinished = CountDownLatch(1)
+        val executor = Executors.newFixedThreadPool(2)
+        try {
+            val barrier = executor.submit {
+                coordinator.productAccess {
+                    barrierEntered.countDown()
+                    check(releaseBarrier.await(5, TimeUnit.SECONDS))
+                }
+            }
+            assertTrue(barrierEntered.await(5, TimeUnit.SECONDS))
+            val read = executor.submit<ClientSettings> {
+                readStarted.countDown()
+                try {
+                    settings.load()
+                } finally {
+                    readFinished.countDown()
+                }
+            }
+            assertTrue(readStarted.await(5, TimeUnit.SECONDS))
+            assertFalse(readFinished.await(150, TimeUnit.MILLISECONDS))
+
+            releaseBarrier.countDown()
+            assertEquals(WRITER_A, read.get(5, TimeUnit.SECONDS).activeDeviceId)
+            barrier.get(5, TimeUnit.SECONDS)
+        } finally {
+            releaseBarrier.countDown()
+            executor.shutdownNow()
+        }
+    }
+
     @Test
     fun deletedItemSurfaceExplicitlyUndeletesCompleteNoteAndNotebookSnapshots() = withFixture { fixture ->
         val notebook = fixture.notes.createNotebook("Retained notebook")
@@ -145,6 +195,62 @@ class SystemV2ProductRepositoriesTest {
             ),
         )
         assertEquals("Shanghai", undeleted.location?.placeText)
+    }
+
+    @Test
+    fun listNotesOrdersByJournalCreatedAtNotVersionAuthoredAt() = withFixture { fixture ->
+        val notes = fixture.notes
+        val notebook = notes.createNotebook("Journal")
+        // Same authored wall-clock as a bulk import, different journal dates.
+        val olderJournal = Instant.parse("2023-01-15T08:00:00Z")
+        val newerJournal = Instant.parse("2024-06-20T08:00:00Z")
+        val bulkAuthored = Instant.parse("2025-01-01T00:00:00Z")
+        val olderId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        val newerId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        val older = fixture.context().factory.createGenesis(
+            entityType = WorkspaceEntityTypeV2.NOTE,
+            entityId = olderId,
+            content = NoteContentV2(
+                notebookId = notebook.id,
+                title = "Older journal entry",
+                markdownBody = "older journal day",
+                noteCreatedAt = olderJournal,
+                timeZoneId = "UTC",
+                location = null,
+            ),
+            deviceActorId = "device:$WRITER_B",
+            authoredAt = bulkAuthored,
+        )
+        val newer = fixture.context().factory.createGenesis(
+            entityType = WorkspaceEntityTypeV2.NOTE,
+            entityId = newerId,
+            content = NoteContentV2(
+                notebookId = notebook.id,
+                title = "Newer journal entry",
+                markdownBody = "newer journal day",
+                noteCreatedAt = newerJournal,
+                timeZoneId = null,
+                location = null,
+            ),
+            deviceActorId = "device:$WRITER_B",
+            authoredAt = bulkAuthored,
+        )
+        // Apply older first so list order cannot follow insertion/id accident alone.
+        fixture.applyRemote(older, "sort-1")
+        fixture.applyRemote(newer, "sort-2")
+
+        val listed = notes.listNotes(notebook.id)
+        assertEquals(listOf("Newer journal entry", "Older journal entry"), listed.map { it.title })
+        assertEquals(listOf(newerId, olderId), listed.map { it.id })
+        assertEquals(newerJournal, listed[0].createdAt)
+        assertEquals(olderJournal, listed[1].createdAt)
+        // updatedAt may still reflect version authoredAt; it must not reorder the list.
+        assertEquals(bulkAuthored, listed[0].updatedAt)
+        assertEquals(bulkAuthored, listed[1].updatedAt)
+
+        val other = notes.createNotebook("Other")
+        assertTrue(notes.listNotes(other.id).isEmpty())
+        assertEquals(1, notes.listNotes(notebook.id).count { it.id == newerId })
     }
 
     @Test

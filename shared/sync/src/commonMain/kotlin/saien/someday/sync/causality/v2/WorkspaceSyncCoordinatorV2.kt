@@ -4,6 +4,7 @@ package saien.someday.sync.causality.v2
 
 import saien.someday.data.crypto.WorkspaceMasterKey
 import saien.someday.data.local.SqlDelightLocalDataRepository
+import saien.someday.sync.WorkspaceAuthorityMutationCoordinator
 import kotlin.time.Clock
 import kotlin.time.Instant
 import kotlinx.serialization.Serializable
@@ -89,6 +90,53 @@ sealed interface WorkspacePointerPublishResultV2 {
     data class Rejected(val safeErrorCode: String, val safeMessage: String) : WorkspacePointerPublishResultV2
 }
 
+data class WorkspaceCheckpointDraftChunkV2(
+    val ref: WorkspaceCheckpointChunkRefV2,
+    val encryptedObject: EncryptedWorkspaceObjectV2,
+)
+
+/**
+ * Exact remote identities retained locally until an unreferenced checkpoint
+ * draft has been collected. It intentionally excludes semantic entity rows.
+ */
+data class WorkspaceCheckpointDraftCleanupV2(
+    val remoteProfile: String,
+    val pointer: WorkspaceSyncEpochPointerV2,
+    val pointerObject: EncryptedWorkspaceObjectV2,
+    val manifestObject: EncryptedWorkspaceObjectV2,
+    val chunks: List<WorkspaceCheckpointDraftChunkV2>,
+) {
+    val descriptor: SyncEpochDescriptorV2 get() = pointer.descriptor
+
+    init {
+        require(remoteProfile == descriptor.remoteProfile)
+        require(pointerObject.syncEpochId == descriptor.syncEpochId)
+        require(pointerObject.objectDigest.isNotBlank())
+        require(pointerObject.objectType == SYNC_EPOCH_POINTER_OBJECT_TYPE_V2)
+        require(pointerObject.objectId == SYNC_EPOCH_POINTER_ID_SYSTEM_V2)
+        require(manifestObject.syncEpochId == descriptor.syncEpochId)
+        require(manifestObject.objectDigest == descriptor.checkpointDigest)
+        require(manifestObject.objectType == SYNC_CHECKPOINT_MANIFEST_OBJECT_TYPE_V2)
+        require(manifestObject.objectId == descriptor.checkpointId)
+        require(chunks.isNotEmpty())
+        require(chunks.map { it.ref.chunkIndex } == chunks.indices.toList())
+        require(chunks.all {
+            it.encryptedObject.syncEpochId == descriptor.syncEpochId &&
+                it.encryptedObject.objectType == SYNC_CHECKPOINT_CHUNK_OBJECT_TYPE_V2 &&
+                it.encryptedObject.objectId == it.ref.chunkId &&
+                it.encryptedObject.objectDigest == it.ref.chunkDigest
+        })
+    }
+}
+
+sealed interface WorkspaceCheckpointDraftCleanupResultV2 {
+    data class Deleted(val alreadyAbsent: Boolean) : WorkspaceCheckpointDraftCleanupResultV2
+    data class Retained(
+        val safeErrorCode: String,
+        val safeMessage: String,
+    ) : WorkspaceCheckpointDraftCleanupResultV2
+}
+
 /** Transport contract used by the whole-product coordinator only. */
 interface WorkspaceSyncRemoteV2 {
     val remoteProfile: String
@@ -116,6 +164,15 @@ interface WorkspaceSyncRemoteV2 {
         expectedCurrentDigest: String?,
         pointer: EncryptedWorkspaceObjectV2,
     ): WorkspacePointerPublishResultV2
+
+    /**
+     * Deletes only the exact immutable objects of a never-authoritative draft.
+     * Implementations must fail closed while the draft is current, retained, or
+     * still publishable from the authenticated current pointer.
+     */
+    fun cleanupCheckpointDraft(
+        draft: WorkspaceCheckpointDraftCleanupV2,
+    ): WorkspaceCheckpointDraftCleanupResultV2
 
     fun pull(syncEpochId: String, cursors: Map<String, String?>, limit: Int): WorkspaceSyncPullResultV2
     fun push(syncEpochId: String, objects: List<EncryptedWorkspaceObjectV2>): WorkspaceSyncPushResultV2
@@ -151,6 +208,19 @@ class WorkspaceSyncCoordinatorV2(
      * recovery; ordinary sync never supplies it.
      */
     private val authorityHandoffFrom: StoredLocalAuthorityV2? = null,
+    /**
+     * Required by product-facing runtimes so an authenticated remote bootstrap
+     * cannot switch the active epoch while a repository operation is still
+     * routing to the previous local surface.
+     */
+    private val authorityMutationCoordinator: WorkspaceAuthorityMutationCoordinator? = null,
+    /**
+     * Runs after the checkpoint is locally activated but before that activation
+     * transaction and the product-routing barrier commit. A failure rolls the
+     * activation back, leaving the authenticated checkpoint PREPARING so a retry
+     * can preserve local fallback or prior-epoch writes before switching routes.
+     */
+    private val bootstrapCommitHook: (() -> Pair<String, String>?)? = null,
 ) {
     init {
         require(UUID_V4_PATTERN_SYSTEM_V2.matches(localWriterDeviceId))
@@ -199,7 +269,9 @@ class WorkspaceSyncCoordinatorV2(
                         remote.authorityBindingId,
                         clock(),
                     )
-                } else if (authorityHandoffFrom == null || boundAuthority != authorityHandoffFrom) {
+                } else if (authorityHandoffFrom == null ||
+                    !sameAuthorityIdentityV2(boundAuthority, authorityHandoffFrom)
+                ) {
                     return blocked(
                         run.runId,
                         counts,
@@ -237,7 +309,15 @@ class WorkspaceSyncCoordinatorV2(
 
             val store = entityStore(epoch, descriptor.syncEpochId)
             if (localActive?.descriptor?.syncEpochId != descriptor.syncEpochId) {
-                val bootstrapError = bootstrap(pointerOuter, pointer, descriptor, epoch, store, counts)
+                val bootstrapError = bootstrap(
+                    pointerOuter,
+                    pointer,
+                    descriptor,
+                    epoch,
+                    store,
+                    counts,
+                    boundAuthority,
+                )
                 if (bootstrapError != null) {
                     return blocked(run.runId, counts, descriptor.syncEpochId, bootstrapError.first, bootstrapError.second)
                 }
@@ -300,6 +380,7 @@ class WorkspaceSyncCoordinatorV2(
         epoch: WorkspaceEpochCryptoV2,
         store: SqlDelightWorkspaceEntityStoreV2,
         counts: MutableWorkspaceSyncCountsV2,
+        expectedAuthority: StoredLocalAuthorityV2?,
     ): Pair<String, String>? {
         val bundle = runCatching { remote.fetchCheckpoint(pointerOuter, descriptor) }.getOrElse {
             return "missing_remote_object" to (it.message ?: "Checkpoint retrieval failed.").safeSyncMessageV2()
@@ -384,27 +465,68 @@ class WorkspaceSyncCoordinatorV2(
         ) {
             return "checkpoint_integrity_mismatch" to "Checkpoint did not reconstruct its complete declared workspace."
         }
-        val queries = localRepository.database.somedayQueries
-        localRepository.database.transaction {
-            queries.insertCheckpointSystemV2(
-                remote.remoteProfile,
-                descriptor.syncEpochId,
-                descriptor.checkpointId,
-                bundle.manifest.objectDigest,
-                epoch.cipher.encodeJson(bundle.manifest),
-                "active",
-                manifest.createdAt.toEpochMilliseconds(),
-                clock().toEpochMilliseconds(),
-            )
-            protocolStore.activateEpoch(
-                remote.remoteProfile,
-                descriptor.syncEpochId,
-                clock(),
-                localWriterDeviceId,
-                remote.authorityBindingId,
-            )
+        val activate: () -> Pair<String, String>? = {
+            val currentAuthority = protocolStore.loadLocalAuthority()
+            val targetAlreadyActive = currentAuthority?.let {
+                it.remoteProfile == remote.remoteProfile &&
+                    it.epochId == descriptor.syncEpochId &&
+                    it.pointerDigest == pointerOuter.objectDigest
+            } == true
+            if (!targetAlreadyActive && !sameAuthorityIdentityV2(currentAuthority, expectedAuthority)) {
+                "local_authority_changed" to
+                    "The local V2 authority changed before checkpoint activation; retry against the current authority."
+            } else {
+                val queries = localRepository.database.somedayQueries
+                val encodedManifest = epoch.cipher.encodeJson(bundle.manifest)
+                var hookFailure: Pair<String, String>? = null
+                localRepository.database.transaction {
+                    val existingCheckpoint = queries.selectCheckpointSystemV2(
+                        remote.remoteProfile,
+                        descriptor.syncEpochId,
+                        descriptor.checkpointId,
+                    ).executeAsOneOrNull()
+                    if (existingCheckpoint == null) {
+                        queries.insertCheckpointSystemV2(
+                            remote.remoteProfile,
+                            descriptor.syncEpochId,
+                            descriptor.checkpointId,
+                            bundle.manifest.objectDigest,
+                            encodedManifest,
+                            "active",
+                            manifest.createdAt.toEpochMilliseconds(),
+                            clock().toEpochMilliseconds(),
+                        )
+                    } else {
+                        require(existingCheckpoint.manifest_digest == bundle.manifest.objectDigest &&
+                            existingCheckpoint.encoded_manifest == encodedManifest) {
+                            "The local checkpoint identity changed before bootstrap activation."
+                        }
+                        queries.updateCheckpointStateSystemV2(
+                            "active",
+                            clock().toEpochMilliseconds(),
+                            remote.remoteProfile,
+                            descriptor.syncEpochId,
+                            descriptor.checkpointId,
+                        )
+                    }
+                    protocolStore.activateEpoch(
+                        remote.remoteProfile,
+                        descriptor.syncEpochId,
+                        clock(),
+                        localWriterDeviceId,
+                        remote.authorityBindingId,
+                    )
+                    hookFailure = bootstrapCommitHook?.invoke()
+                    if (hookFailure != null) rollback()
+                }
+                hookFailure
+            }
         }
-        return null
+        return if (authorityMutationCoordinator != null) {
+            authorityMutationCoordinator.productAccess(activate)
+        } else {
+            activate()
+        }
     }
 
     private fun pullUntilStable(
@@ -732,6 +854,19 @@ class WorkspaceSyncCoordinatorV2(
         const val MAX_POINTER_ANCESTRY_DEPTH_SYSTEM_V2 = 256
     }
 }
+
+private fun sameAuthorityIdentityV2(
+    left: StoredLocalAuthorityV2?,
+    right: StoredLocalAuthorityV2?,
+): Boolean =
+    when {
+        left == null || right == null -> left == null && right == null
+        else ->
+            left.remoteProfile == right.remoteProfile &&
+                left.epochId == right.epochId &&
+                left.authorityBindingId == right.authorityBindingId &&
+                left.pointerDigest == right.pointerDigest
+    }
 
 private data class WorkspaceEpochCryptoV2(
     val materializer: CanonicalWorkspaceCausalityMaterializerV2,

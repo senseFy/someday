@@ -1386,6 +1386,35 @@ FROM note_projections_system_v2
 WHERE epoch_id = ?
 ORDER BY note_id ASC;
 
+-- Diary list path: denormalized content rows only, newest journal date first.
+selectContentNoteProjectionsSystemV2:
+SELECT *
+FROM note_projections_system_v2
+WHERE epoch_id = ?
+  AND state = 'content'
+  AND deleted_at_seconds IS NULL
+ORDER BY note_created_at_seconds DESC,
+         note_created_at_nanos DESC,
+         note_id ASC;
+
+selectContentNoteProjectionsByEffectiveNotebookSystemV2:
+SELECT *
+FROM note_projections_system_v2
+WHERE epoch_id = ?
+  AND effective_notebook_id = ?
+  AND state = 'content'
+  AND deleted_at_seconds IS NULL
+ORDER BY note_created_at_seconds DESC,
+         note_created_at_nanos DESC,
+         note_id ASC;
+
+selectHasUnresolvedNotebookNoteProjectionSystemV2:
+SELECT 1
+FROM note_projections_system_v2
+WHERE epoch_id = ?
+  AND warning = 'unresolved_notebook_reference'
+LIMIT 1;
+
 deleteNoteProjectionsSystemV2:
 DELETE FROM note_projections_system_v2
 WHERE epoch_id = ?;

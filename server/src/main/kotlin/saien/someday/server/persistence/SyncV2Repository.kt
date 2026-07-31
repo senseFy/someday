@@ -66,6 +66,14 @@ data class SyncV2CheckpointManifestInput(
     val encryptedObjectJson: String,
 )
 
+data class SyncV2CheckpointCleanupInput(
+    val epochId: String,
+    val checkpointId: String,
+    val checkpointDigest: String,
+    val previousPointerDigest: String?,
+    val chunks: List<SyncV2CheckpointChunkRefRecord>,
+)
+
 data class SyncV2MutationAckRecord(
     val mutationId: String,
     val objectId: String,
@@ -104,6 +112,11 @@ sealed interface SyncV2PointerPublishRepositoryResult {
 sealed interface SyncV2ImmutablePutRepositoryResult {
     data class Stored(val idempotentReplay: Boolean) : SyncV2ImmutablePutRepositoryResult
     data class Rejected(val error: String) : SyncV2ImmutablePutRepositoryResult
+}
+
+sealed interface SyncV2CheckpointCleanupRepositoryResult {
+    data class Deleted(val alreadyAbsent: Boolean) : SyncV2CheckpointCleanupRepositoryResult
+    data class Retained(val error: String) : SyncV2CheckpointCleanupRepositoryResult
 }
 
 class SyncV2Repository(private val config: ServerConfig) {
@@ -261,6 +274,119 @@ class SyncV2Repository(private val config: ServerConfig) {
                 SyncV2ImmutablePutRepositoryResult.Stored(false)
             }
         }
+    }
+
+    fun cleanupCheckpointDraft(
+        userId: UUID,
+        input: SyncV2CheckpointCleanupInput,
+    ): SyncV2CheckpointCleanupRepositoryResult = transaction { connection ->
+        lockWorkspace(connection, userId)
+        val current = loadActiveEpoch(connection, userId, true)
+            ?: return@transaction SyncV2CheckpointCleanupRepositoryResult.Retained(
+                "checkpoint_still_publishable",
+            )
+        if (current.metadata.pointerDigest == input.previousPointerDigest) {
+            return@transaction SyncV2CheckpointCleanupRepositoryResult.Retained(
+                "checkpoint_still_publishable",
+            )
+        }
+        if (loadEpochById(connection, userId, input.epochId) != null) {
+            return@transaction SyncV2CheckpointCleanupRepositoryResult.Retained(
+                "checkpoint_referenced",
+            )
+        }
+
+        val expectedFingerprint = chunkRefsFingerprint(input.chunks)
+        val manifest = connection.prepareStatement(
+            """
+            SELECT checkpoint_digest, chunk_count, chunk_refs_fingerprint
+            FROM someday_sync_v2_checkpoint_manifests
+            WHERE user_id = ? AND epoch_id = ? AND checkpoint_id = ?
+            FOR UPDATE
+            """.trimIndent(),
+        ).use { statement ->
+            statement.setObject(1, userId)
+            statement.setString(2, input.epochId)
+            statement.setString(3, input.checkpointId)
+            statement.executeQuery().use { result ->
+                if (!result.next()) null else Triple(
+                    result.getString(1),
+                    result.getInt(2),
+                    result.getString(3),
+                )
+            }
+        }
+        if (
+            manifest != null &&
+            (
+                manifest.first != input.checkpointDigest ||
+                    manifest.second != input.chunks.size ||
+                    manifest.third != expectedFingerprint
+            )
+        ) {
+            return@transaction SyncV2CheckpointCleanupRepositoryResult.Retained(
+                "immutable_object_mismatch",
+            )
+        }
+        val storedChunks = connection.prepareStatement(
+            """
+            SELECT chunk_index, chunk_id, chunk_digest, object_count, plaintext_bytes
+            FROM someday_sync_v2_checkpoint_chunks
+            WHERE user_id = ? AND epoch_id = ? AND checkpoint_id = ?
+            ORDER BY chunk_index
+            FOR UPDATE
+            """.trimIndent(),
+        ).use { statement ->
+            statement.setObject(1, userId)
+            statement.setString(2, input.epochId)
+            statement.setString(3, input.checkpointId)
+            statement.executeQuery().use { result ->
+                buildList {
+                    while (result.next()) {
+                        add(
+                            SyncV2CheckpointChunkRefRecord(
+                                result.getInt(1),
+                                result.getString(2),
+                                result.getString(3),
+                                result.getInt(4),
+                                result.getInt(5),
+                            ),
+                        )
+                    }
+                }
+            }
+        }
+        val expectedByIndex = input.chunks.associateBy { it.chunkIndex }
+        if (storedChunks.any { expectedByIndex[it.chunkIndex] != it }) {
+            return@transaction SyncV2CheckpointCleanupRepositoryResult.Retained(
+                "immutable_object_mismatch",
+            )
+        }
+
+        val alreadyAbsent = manifest == null && storedChunks.isEmpty()
+        connection.prepareStatement(
+            """
+            DELETE FROM someday_sync_v2_checkpoint_manifests
+            WHERE user_id = ? AND epoch_id = ? AND checkpoint_id = ?
+            """.trimIndent(),
+        ).use { statement ->
+            statement.setObject(1, userId)
+            statement.setString(2, input.epochId)
+            statement.setString(3, input.checkpointId)
+            statement.executeUpdate()
+        }
+        connection.prepareStatement(
+            """
+            DELETE FROM someday_sync_v2_checkpoint_chunks
+            WHERE user_id = ? AND epoch_id = ? AND checkpoint_id = ?
+            """.trimIndent(),
+        ).use { statement ->
+            statement.setObject(1, userId)
+            statement.setString(2, input.epochId)
+            statement.setString(3, input.checkpointId)
+            statement.executeUpdate()
+        }
+        SyncV2CheckpointCleanupRepositoryResult.Deleted(alreadyAbsent)
     }
 
     fun compareAndSetEpoch(

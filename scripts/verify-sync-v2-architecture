@@ -209,6 +209,8 @@ pass_id ARCH-PAIRING-GUARD
 
 pairing_protocol="$SYNC_MAIN/kotlin/saien/someday/sync/pairing/WorkspacePairingProtocol.kt"
 webdav_pairing="$SYNC_MAIN/kotlin/saien/someday/sync/webdav/WebDavWorkspacePairingService.kt"
+webdav_client="$SYNC_MAIN/kotlin/saien/someday/sync/webdav/WebDavClient.kt"
+webdav_sync_remote="$SYNC_MAIN/kotlin/saien/someday/sync/webdav/WorkspaceWebDavSyncRemoteV2.kt"
 webdav_paths="$SYNC_MAIN/kotlin/saien/someday/sync/webdav/WebDavPathResolver.kt"
 self_hosted_pairing="$SYNC_MAIN/kotlin/saien/someday/sync/selfhosted/SelfHostedWorkspacePairingService.kt"
 rg -q 'const val SECRET_BYTES: Int = 16' "$pairing_protocol" ||
@@ -231,10 +233,20 @@ for domain in \
 done
 rg -Fq 'collectionPath("workspace-pairing", "1")' "$webdav_paths" ||
     fail "WebDAV pairing path is not protocol-versioned"
-if rg -n 'method = "DELETE"|deletePath\(|deleteTree\(' \
-    "$webdav_pairing" "$SYNC_MAIN/kotlin/saien/someday/sync/webdav/WebDavClient.kt" >/dev/null; then
+if rg -n -i 'method = "DELETE"|delete[A-Za-z0-9_]*\(' "$webdav_pairing" >/dev/null; then
     fail "WebDAV pairing has a remote delete path"
 fi
+webdav_conditional_delete_callers="$(
+    rg -l 'deleteRawObjectIfUnchanged\(' \
+        "$SYNC_MAIN/kotlin/saien/someday/sync/webdav" |
+        sort ||
+        true
+)"
+expected_webdav_conditional_delete_callers="$(
+    printf '%s\n%s\n' "$webdav_client" "$webdav_sync_remote" | sort
+)"
+[[ "$webdav_conditional_delete_callers" == "$expected_webdav_conditional_delete_callers" ]] ||
+    fail "conditional WebDAV delete escaped the exact checkpoint cleanup path"
 for service in "$webdav_pairing" "$self_hosted_pairing"; do
     rg -q 'authorityMutationCoordinator.exclusive' "$service" ||
         fail "$service does not serialize workspace adoption against first activation"

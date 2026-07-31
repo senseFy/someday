@@ -450,22 +450,26 @@ class AuthorityCoordinatedLocalDataTransferV2(
 
     fun exportDocument(exportedAt: Instant): LocalDataExportDocument =
         authorityMutationCoordinator.exclusive {
-            if (!protocolStore.hasKeyBoundLocalV2State()) {
-                LocalDataExporter(
-                    localRepository = localRepository,
-                    clock = { exportedAt },
-                ).exportDocument()
-            } else {
-                checkNotNull(v2Transfer.exportDocument(exportedAt))
+            authorityMutationCoordinator.productAccess {
+                if (!protocolStore.hasKeyBoundLocalV2State()) {
+                    LocalDataExporter(
+                        localRepository = localRepository,
+                        clock = { exportedAt },
+                    ).exportDocument()
+                } else {
+                    checkNotNull(v2Transfer.exportDocument(exportedAt))
+                }
             }
         }
 
     fun importDocument(document: LocalDataExportDocument): LocalDataImportSummary =
         authorityMutationCoordinator.exclusive {
-            if (!protocolStore.hasKeyBoundLocalV2State()) {
-                LocalDataImporter(localRepository).importDocument(document)
-            } else {
-                checkNotNull(v2Transfer.importDocument(document))
+            authorityMutationCoordinator.productAccess {
+                if (!protocolStore.hasKeyBoundLocalV2State()) {
+                    LocalDataImporter(localRepository).importDocument(document)
+                } else {
+                    checkNotNull(v2Transfer.importDocument(document))
+                }
             }
         }
 }

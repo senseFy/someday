@@ -89,6 +89,31 @@ class WebDavClientTest {
         assertContentEquals("manifest-one".encodeToByteArray(), assertNotNull(mismatch.remote).bytes)
     }
 
+    @Test
+    fun exactRawDeleteRejectsDifferentBytesAndUsesStrongIfMatch() {
+        val transport = RecordingWebDavTransport()
+        val client = client(transport)
+        val path = client.pathResolver().v2CheckpointManifest("epoch", "checkpoint")
+        val expected = "manifest-one".encodeToByteArray()
+        assertIs<WebDavRawUploadResult.Uploaded>(client.uploadRawAppendOnly(path, expected))
+
+        assertIs<WebDavRawDeleteResult.Rejected>(
+            client.deleteRawObjectIfUnchanged(path, "manifest-two".encodeToByteArray()),
+        )
+        assertNotNull(client.getRawObject(path))
+
+        assertEquals(
+            WebDavRawDeleteResult.Deleted(alreadyAbsent = false),
+            client.deleteRawObjectIfUnchanged(path, expected),
+        )
+        val delete = transport.requests.last { it.method == "DELETE" }
+        assertEquals("\"etag-1\"", delete.headers["If-Match"])
+        assertEquals(
+            WebDavRawDeleteResult.Deleted(alreadyAbsent = true),
+            client.deleteRawObjectIfUnchanged(path, expected),
+        )
+    }
+
     private fun client(transport: RecordingWebDavTransport): WebDavClient =
         WebDavClient(
             configuration = WebDavConfiguration(
@@ -126,6 +151,7 @@ private class RecordingWebDavTransport : WebDavTransport {
             } ?: WebDavResponse(status = 404)
 
             "PUT" -> put(request)
+            "DELETE" -> delete(request)
             else -> WebDavResponse(status = 405)
         }
     }
@@ -141,6 +167,14 @@ private class RecordingWebDavTransport : WebDavTransport {
         val stored = Stored("\"etag-${nextEtag++}\"", checkNotNull(request.body))
         objects[request.path] = stored
         return WebDavResponse(status = if (existing == null) 201 else 204, headers = mapOf("ETag" to stored.etag))
+    }
+
+    private fun delete(request: WebDavRequest): WebDavResponse {
+        val existing = objects[request.path] ?: return WebDavResponse(status = 404)
+        val expected = request.headers["If-Match"] ?: return WebDavResponse(status = 428)
+        if (expected != existing.etag) return WebDavResponse(status = 412)
+        objects.remove(request.path)
+        return WebDavResponse(status = 204)
     }
 
     private fun multistatus(path: String): String =

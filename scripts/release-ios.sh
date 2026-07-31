@@ -22,11 +22,19 @@ fi
 UPLOAD_EXPORT_PATH="${IOS_UPLOAD_EXPORT_PATH:-$ROOT_DIR/iosApp/build/AppStoreUpload}"
 BUILD_NUMBER="${IOS_BUILD_NUMBER:-}"
 MARKETING_VERSION="${IOS_MARKETING_VERSION:-}"
-BUMP_IOS_VERSION="${IOS_BUMP_VERSION:-auto}"
 PROVISIONING_PROFILE_SPECIFIER="${IOS_PROVISIONING_PROFILE_SPECIFIER:-}"
 EXPORT_BUNDLE_ID="${IOS_EXPORT_BUNDLE_ID:-}"
 SIGNING_CERTIFICATE="${IOS_SIGNING_CERTIFICATE:-Apple Distribution}"
+SIGNING_CERTIFICATE_PROVIDED=0
+if [[ -n "${IOS_SIGNING_CERTIFICATE:-}" ]]; then
+  SIGNING_CERTIFICATE_PROVIDED=1
+fi
 RESOLVED_PROVISIONING_PROFILE_SPECIFIER=""
+RESOLVED_PROVISIONING_PROFILE_NAME=""
+RESOLVED_SIGNING_CERTIFICATE=""
+RESOLVED_EXPORT_BUNDLE_ID=""
+MATCHED_SIGNING_CERTIFICATE=""
+INSTALLED_CODE_SIGNING_IDENTITIES=""
 UPLOAD_AUTH_MODE="${IOS_UPLOAD_AUTH_MODE:-api-key}"
 
 AUTH_KEY_SOURCE_PATH="${APP_STORE_CONNECT_API_KEY_PATH:-}"
@@ -65,16 +73,14 @@ Common options:
   --export-path <path>            Export output path. Also IOS_EXPORT_PATH.
   --build-number <number>         Override CURRENT_PROJECT_VERSION. Also IOS_BUILD_NUMBER.
   --version <version>             Override MARKETING_VERSION. Also IOS_MARKETING_VERSION.
-  --bump-version                  Bump iOS build number and commit before archiving.
-  --no-bump-version               Do not prompt for or run an iOS version bump.
   --provisioning-profile <name>   Export with a specific App Store provisioning profile.
                                   Also IOS_PROVISIONING_PROFILE_SPECIFIER.
   --bundle-id <id>                Bundle ID for manual export profile mapping.
                                   Defaults to the archive bundle ID. Also IOS_EXPORT_BUNDLE_ID.
   --signing-certificate <name>    Signing certificate selector for manual export.
                                   Defaults to "Apple Distribution". Also IOS_SIGNING_CERTIFICATE.
-                                  If omitted, the script tries to find a matching installed
-                                  App Store profile before falling back to automatic signing.
+                                  The script resolves the selector to the exact SHA-1 identity
+                                  included in a compatible installed App Store profile.
   --archive-only                  Stop after creating the .xcarchive.
   --export-only                   Export an existing archive without archiving.
   --upload                        Upload to App Store Connect instead of exporting a local IPA.
@@ -96,7 +102,6 @@ Environment:
 Examples:
   export IOS_TEAM_ID=YOUR_TEAM_ID
   ./scripts/release-ios.sh
-  ./scripts/release-ios.sh --bump-version
   ./scripts/release-ios.sh --upload
   make ios-release
   make ios-upload-testflight
@@ -126,14 +131,6 @@ while [[ $# -gt 0 ]]; do
       MARKETING_VERSION="${2:-}"
       shift 2
       ;;
-    --bump-version)
-      BUMP_IOS_VERSION="yes"
-      shift 1
-      ;;
-    --no-bump-version)
-      BUMP_IOS_VERSION="no"
-      shift 1
-      ;;
     --provisioning-profile|--profile)
       PROVISIONING_PROFILE_SPECIFIER="${2:-}"
       shift 2
@@ -144,6 +141,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     --signing-certificate)
       SIGNING_CERTIFICATE="${2:-}"
+      SIGNING_CERTIFICATE_PROVIDED=1
       shift 2
       ;;
     --archive-only)
@@ -192,6 +190,15 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ "${BUMP_VERSION+x}" == x || "${IOS_BUMP_VERSION+x}" == x ]]; then
+  echo "BUMP_VERSION is no longer supported. Run make bump-ios-version before releasing." >&2
+  exit 2
+fi
+if [[ "${UPLOAD+x}" == x || "${IOS_UPLOAD+x}" == x ]]; then
+  echo "UPLOAD is no longer supported. Pass --upload or use an explicit Make upload target." >&2
+  exit 2
+fi
 
 if [[ -z "$TEAM_ID" ]]; then
   echo "Missing Apple Developer Team ID. Export IOS_TEAM_ID or pass --team." >&2
@@ -404,6 +411,13 @@ print_release_summary() {
   if [[ -n "$PROVISIONING_PROFILE_SPECIFIER" ]]; then
     detail "Profile" "configured"
   fi
+  if [[ "$DO_EXPORT" == 1 && -n "$RESOLVED_SIGNING_CERTIFICATE" ]]; then
+    detail "Export signing" "exact profile/certificate pair verified"
+  elif [[ "$DO_EXPORT" == 1 ]]; then
+    detail "Export signing" "automatic"
+  else
+    detail "Archive signing" "automatic"
+  fi
   detail "Archive" "$(display_path "$ARCHIVE_PATH")"
   if [[ "$ALLOW_PROVISIONING_UPDATES" == 1 ]]; then
     detail "Updates" "Xcode signing updates enabled"
@@ -426,7 +440,9 @@ redact_release_output() {
     -v key_id="$AUTH_KEY_ID" \
     -v issuer_id="$AUTH_KEY_ISSUER_ID" \
     -v profile="$RESOLVED_PROVISIONING_PROFILE_SPECIFIER" \
-    -v certificate="$SIGNING_CERTIFICATE" '
+    -v profile_name="$RESOLVED_PROVISIONING_PROFILE_NAME" \
+    -v certificate="$SIGNING_CERTIFICATE" \
+    -v resolved_certificate="$RESOLVED_SIGNING_CERTIFICATE" '
     function replace_literal(value, needle, replacement, position) {
       if (needle == "") {
         return value
@@ -459,7 +475,9 @@ redact_release_output() {
       line = replace_literal(line, key_id, "<key-id>")
       line = replace_literal(line, issuer_id, "<issuer-id>")
       line = replace_literal(line, profile, "<provisioning-profile>")
+      line = replace_literal(line, profile_name, "<provisioning-profile>")
       line = replace_literal(line, certificate, "<signing-certificate>")
+      line = replace_literal(line, resolved_certificate, "<signing-certificate>")
       print line
     }
   '
@@ -532,50 +550,6 @@ prepare_output_path() {
   exit 1
 }
 
-current_ios_build_number() {
-  sed -n 's/.*CURRENT_PROJECT_VERSION = \([^;]*\);.*/\1/p' "$PROJECT/project.pbxproj" | head -1
-}
-
-current_ios_marketing_version() {
-  sed -n 's/.*MARKETING_VERSION = \([^;]*\);.*/\1/p' "$PROJECT/project.pbxproj" | head -1
-}
-
-run_ios_version_bump_if_needed() {
-  if [[ "$DO_ARCHIVE" != 1 ]]; then
-    return 0
-  fi
-  if [[ -n "$BUILD_NUMBER" || -n "$MARKETING_VERSION" ]]; then
-    return 0
-  fi
-
-  case "$BUMP_IOS_VERSION" in
-    yes|true|1) ;;
-    no|false|0) return 0 ;;
-    auto)
-      if [[ ! -t 0 ]]; then
-        return 0
-      fi
-      local current_version
-      local current_build
-      current_version="$(current_ios_marketing_version)"
-      current_build="$(current_ios_build_number)"
-      local answer
-      printf '\n'
-      read -r -p "🔖 Bump iOS build number? Current: ${current_version:-unknown} (${current_build:-unknown}) [y/N] " answer
-      case "$answer" in
-        y|Y|yes|YES) ;;
-        *) return 0 ;;
-      esac
-      ;;
-    *)
-      echo "IOS_BUMP_VERSION must be auto, yes, or no." >&2
-      exit 1
-      ;;
-  esac
-
-  "$ROOT_DIR/scripts/bump-mobile-version.sh" --platform ios
-}
-
 has_app_store_connect_auth() {
   [[ -n "$AUTH_KEY_PATH" && -n "$AUTH_KEY_ID" && -n "$AUTH_KEY_ISSUER_ID" ]]
 }
@@ -588,7 +562,7 @@ print_upload_command() {
     detail "Auth" "export the canonical App Store Connect API key variables"
   fi
   detail "Retry" "reuse the exported release environment"
-  printf '   make ios-upload-archive IOS_BUMP_VERSION=no\n'
+  printf '   make ios-upload-archive\n'
 }
 
 require_upload_auth() {
@@ -636,11 +610,52 @@ archive_bundle_id() {
   /usr/libexec/PlistBuddy -c 'Print :ApplicationProperties:CFBundleIdentifier' "$info_plist" 2>/dev/null
 }
 
-profile_certificate_matches() {
+normalize_sha1() {
+  printf '%s' "$1" | tr -d '[:space:]:' | tr '[:lower:]' '[:upper:]'
+}
+
+certificate_sha1() {
+  local cert_path="$1"
+  local fingerprint
+
+  fingerprint="$(openssl x509 -inform DER -in "$cert_path" -noout -fingerprint -sha1 2>/dev/null || true)"
+  fingerprint="${fingerprint#*=}"
+  fingerprint="$(normalize_sha1 "$fingerprint")"
+  if [[ ! "$fingerprint" =~ ^[0-9A-F]{40}$ ]]; then
+    return 1
+  fi
+  printf '%s\n' "$fingerprint"
+}
+
+load_installed_code_signing_identities() {
+  if [[ -n "$INSTALLED_CODE_SIGNING_IDENTITIES" ]]; then
+    return 0
+  fi
+  INSTALLED_CODE_SIGNING_IDENTITIES="$(security find-identity -v -p codesigning 2>/dev/null || true)"
+}
+
+signing_certificate_selector_matches() {
+  local fingerprint="$1"
+  local subject="$2"
+  local normalized_selector
+
+  normalized_selector="$(normalize_sha1 "$SIGNING_CERTIFICATE")"
+  if [[ "$normalized_selector" =~ ^[0-9A-F]{40}$ ]]; then
+    [[ "$fingerprint" == "$normalized_selector" ]]
+    return
+  fi
+  [[ "$subject" == *"$SIGNING_CERTIFICATE"* ]]
+}
+
+profile_matching_signing_certificate() {
   local plist_path="$1"
   local index=0
   local cert_path
+  local fingerprint
   local subject
+
+  MATCHED_SIGNING_CERTIFICATE=""
+  load_installed_code_signing_identities
 
   while true; do
     cert_path="$PRIVATE_TEMP_DIR/profile-cert-$index.cer"
@@ -649,9 +664,15 @@ profile_certificate_matches() {
       break
     fi
 
+    fingerprint="$(certificate_sha1 "$cert_path" || true)"
     subject="$(openssl x509 -inform DER -in "$cert_path" -noout -subject 2>/dev/null || true)"
     rm -f "$cert_path"
-    if [[ "$subject" == *"$SIGNING_CERTIFICATE"* ]]; then
+    # A certificate embedded in the profile is usable only when its private key is
+    # present in a valid local code-signing identity.
+    if [[ -n "$fingerprint" ]] &&
+      signing_certificate_selector_matches "$fingerprint" "$subject" &&
+      [[ "$INSTALLED_CODE_SIGNING_IDENTITIES" == *"$fingerprint"* ]]; then
+      MATCHED_SIGNING_CERTIFICATE="$fingerprint"
       return 0
     fi
 
@@ -659,6 +680,16 @@ profile_certificate_matches() {
   done
 
   return 1
+}
+
+profile_is_current() {
+  local plist_path="$1"
+  local expiration
+  local now
+
+  expiration="$(plutil -extract ExpirationDate raw -o - "$plist_path" 2>/dev/null || true)"
+  now="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  [[ -n "$expiration" && "$expiration" > "$now" ]]
 }
 
 entitlement_value_matches() {
@@ -807,6 +838,7 @@ profile_matches_export() {
   local profile_team
   local get_task_allow
 
+  MATCHED_SIGNING_CERTIFICATE=""
   if ! openssl smime -inform DER -verify -noverify -in "$profile_path" -out "$plist_path" >/dev/null 2>&1; then
     rm -f "$plist_path"
     return 1
@@ -831,12 +863,17 @@ profile_matches_export() {
     return 1
   fi
 
-  if ! profile_certificate_matches "$plist_path"; then
+  if ! profile_is_current "$plist_path"; then
     rm -f "$plist_path"
     return 1
   fi
 
   if ! profile_supports_required_entitlements "$plist_path" "$bundle_id"; then
+    rm -f "$plist_path"
+    return 1
+  fi
+
+  if ! profile_matching_signing_certificate "$plist_path"; then
     rm -f "$plist_path"
     return 1
   fi
@@ -863,10 +900,42 @@ profile_name() {
   printf '%s\n' "$name"
 }
 
-find_installed_provisioning_profile() {
+profile_uuid() {
+  local profile_path="$1"
+  local plist_path="$PRIVATE_TEMP_DIR/profile-uuid.plist"
+  local uuid
+
+  if ! openssl smime -inform DER -verify -noverify -in "$profile_path" -out "$plist_path" >/dev/null 2>&1; then
+    rm -f "$plist_path"
+    return 1
+  fi
+  uuid="$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$plist_path" 2>/dev/null || true)"
+  rm -f "$plist_path"
+
+  if [[ -z "$uuid" ]]; then
+    return 1
+  fi
+  printf '%s\n' "$uuid"
+}
+
+profile_specifier_matches() {
+  local profile_path="$1"
+  local requested="$2"
+  local name
+  local uuid
+
+  name="$(profile_name "$profile_path" || true)"
+  uuid="$(profile_uuid "$profile_path" || true)"
+  [[ "$requested" == "$name" || "$requested" == "$uuid" ]]
+}
+
+resolve_installed_provisioning_profile() {
   local bundle_id="$1"
+  local requested="${2:-}"
   local dir
+  local name
   local profile_path
+  local uuid
 
   for dir in \
     "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles" \
@@ -874,8 +943,18 @@ find_installed_provisioning_profile() {
     [[ -d "$dir" ]] || continue
     for profile_path in "$dir"/*.mobileprovision "$dir"/*.provisionprofile; do
       [[ -f "$profile_path" ]] || continue
+      if [[ -n "$requested" ]] && ! profile_specifier_matches "$profile_path" "$requested"; then
+        continue
+      fi
       if profile_matches_export "$profile_path" "$bundle_id"; then
-        profile_name "$profile_path"
+        name="$(profile_name "$profile_path" || true)"
+        uuid="$(profile_uuid "$profile_path" || true)"
+        if [[ -z "$name" || -z "$uuid" || -z "$MATCHED_SIGNING_CERTIFICATE" ]]; then
+          continue
+        fi
+        RESOLVED_PROVISIONING_PROFILE_NAME="$name"
+        RESOLVED_PROVISIONING_PROFILE_SPECIFIER="$uuid"
+        RESOLVED_SIGNING_CERTIFICATE="$MATCHED_SIGNING_CERTIFICATE"
         return 0
       fi
     done
@@ -884,37 +963,94 @@ find_installed_provisioning_profile() {
   return 1
 }
 
+project_release_bundle_id() {
+  local build_settings
+  local bundle_ids
+
+  if ! build_settings="$(
+    xcodebuild \
+      -project "$PROJECT" \
+      -scheme "$SCHEME" \
+      -configuration "$CONFIGURATION" \
+      -destination "generic/platform=iOS" \
+      "${build_overrides[@]}" \
+      -showBuildSettings 2>/dev/null
+  )"; then
+    return 1
+  fi
+  bundle_ids="$(
+    printf '%s\n' "$build_settings" |
+      sed -n 's/^[[:space:]]*PRODUCT_BUNDLE_IDENTIFIER = //p' |
+      sort -u
+  )"
+  if [[ -z "$bundle_ids" || "$bundle_ids" == *$'\n'* ]]; then
+    return 1
+  fi
+  printf '%s\n' "$bundle_ids"
+}
+
+resolve_release_bundle_id() {
+  local actual_bundle_id
+
+  if [[ "$DO_ARCHIVE" == 1 ]]; then
+    actual_bundle_id="$(project_release_bundle_id || true)"
+  else
+    actual_bundle_id="$(archive_bundle_id || true)"
+  fi
+  if [[ -z "$actual_bundle_id" ]]; then
+    echo "Unable to determine the iOS app bundle ID for signing." >&2
+    exit 1
+  fi
+  if [[ -n "$EXPORT_BUNDLE_ID" && "$EXPORT_BUNDLE_ID" != "$actual_bundle_id" ]]; then
+    echo "IOS_EXPORT_BUNDLE_ID does not match the app bundle ID." >&2
+    exit 1
+  fi
+  RESOLVED_EXPORT_BUNDLE_ID="$actual_bundle_id"
+}
+
+resolve_release_signing() {
+  RESOLVED_PROVISIONING_PROFILE_SPECIFIER=""
+  RESOLVED_PROVISIONING_PROFILE_NAME=""
+  RESOLVED_SIGNING_CERTIFICATE=""
+  resolve_release_bundle_id
+
+  if resolve_installed_provisioning_profile \
+    "$RESOLVED_EXPORT_BUNDLE_ID" \
+    "$PROVISIONING_PROFILE_SPECIFIER"; then
+    return 0
+  fi
+
+  if [[ -n "$PROVISIONING_PROFILE_SPECIFIER" || "$SIGNING_CERTIFICATE_PROVIDED" == 1 ]]; then
+    echo "The configured App Store signing profile/certificate is unavailable, incompatible, expired, or not installed with its private key." >&2
+    exit 1
+  fi
+  if [[ "$ALLOW_PROVISIONING_UPDATES" == 1 ]]; then
+    return 0
+  fi
+
+  echo "No compatible App Store provisioning profile and installed signing identity pair was found." >&2
+  echo "Install a matching Apple Distribution certificate/profile pair, or explicitly enable IOS_ALLOW_PROVISIONING_UPDATES=true." >&2
+  exit 1
+}
+
 write_export_options() {
   local path="$1"
   local destination="$2"
   local signing_options
   local icloud_options=""
-  local bundle_id="$EXPORT_BUNDLE_ID"
-  local profile_specifier="$PROVISIONING_PROFILE_SPECIFIER"
+  local bundle_id="$RESOLVED_EXPORT_BUNDLE_ID"
 
-  if [[ -z "$bundle_id" ]]; then
-    bundle_id="$(archive_bundle_id || true)"
-  fi
-
-  if [[ -z "$profile_specifier" && -n "$bundle_id" ]]; then
-    profile_specifier="$(find_installed_provisioning_profile "$bundle_id" || true)"
-  fi
-
-  RESOLVED_PROVISIONING_PROFILE_SPECIFIER="$profile_specifier"
-
-  if [[ -n "$profile_specifier" ]]; then
-    if [[ -z "$bundle_id" ]]; then
-      echo "Unable to determine bundle ID for manual export. Pass --bundle-id or IOS_EXPORT_BUNDLE_ID." >&2
-      exit 1
-    fi
+  if [[ -n "$RESOLVED_PROVISIONING_PROFILE_SPECIFIER" ]]; then
+    # Pin both values so Xcode cannot independently select the newest certificate
+    # behind a generic "Apple Distribution" selector.
     signing_options=$(cat <<EOF
 	<key>provisioningProfiles</key>
 	<dict>
 		<key>$(xml_escape "$bundle_id")</key>
-		<string>$(xml_escape "$profile_specifier")</string>
+		<string>$(xml_escape "$RESOLVED_PROVISIONING_PROFILE_SPECIFIER")</string>
 	</dict>
 	<key>signingCertificate</key>
-	<string>$(xml_escape "$SIGNING_CERTIFICATE")</string>
+	<string>$(xml_escape "$RESOLVED_SIGNING_CERTIFICATE")</string>
 	<key>signingStyle</key>
 	<string>manual</string>
 EOF
@@ -1011,34 +1147,13 @@ run_export() {
   fi
 }
 
-choose_export_destination() {
-  if [[ "$DESTINATION" != "export" || "$DO_ARCHIVE" != 1 ]]; then
-    return 0
-  fi
-
-  if [[ ! -t 0 ]]; then
-    return 0
-  fi
-
-  local answer
-  printf '\n'
-  read -r -p "☁️  Upload the archive directly instead of exporting a local IPA? [y/N] " answer
-  case "$answer" in
-    y|Y|yes|YES)
-      DESTINATION="upload"
-      if [[ "$EXPORT_PATH_PROVIDED" == 0 ]]; then
-        EXPORT_PATH="$UPLOAD_EXPORT_PATH"
-      fi
-      ;;
-  esac
-}
-
-choose_export_destination
 if [[ "$DO_EXPORT" == 1 && "$DESTINATION" == "upload" ]]; then
   require_upload_auth "$DESTINATION"
 fi
+if [[ "$DO_EXPORT" == 1 ]]; then
+  resolve_release_signing
+fi
 print_release_summary
-run_ios_version_bump_if_needed
 
 if [[ "$DO_ARCHIVE" == 1 ]]; then
   build_someday_ios_for_archive

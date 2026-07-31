@@ -4,6 +4,8 @@ import saien.someday.server.ServerContext
 import saien.someday.server.api.SyncV2CapabilitiesResponse
 import saien.someday.server.api.SyncV2CheckpointChunkRef
 import saien.someday.server.api.SyncV2CheckpointChunkRequest
+import saien.someday.server.api.SyncV2CheckpointCleanupRequest
+import saien.someday.server.api.SyncV2CheckpointCleanupResponse
 import saien.someday.server.api.SyncV2CheckpointFetchRequest
 import saien.someday.server.api.SyncV2CheckpointFetchResponse
 import saien.someday.server.api.SyncV2CheckpointManifestRequest
@@ -29,6 +31,8 @@ import saien.someday.server.api.SyncV2StatusResponse
 import saien.someday.server.api.SyncV2StreamFrontier
 import saien.someday.server.persistence.SyncV2CheckpointChunkInput
 import saien.someday.server.persistence.SyncV2CheckpointChunkRefRecord
+import saien.someday.server.persistence.SyncV2CheckpointCleanupInput
+import saien.someday.server.persistence.SyncV2CheckpointCleanupRepositoryResult
 import saien.someday.server.persistence.SyncV2CheckpointManifestInput
 import saien.someday.server.persistence.SyncV2EpochMetadataRecord
 import saien.someday.server.persistence.SyncV2EpochRecord
@@ -141,6 +145,42 @@ fun Route.syncV2Routes(context: ServerContext) {
                 SyncV2CheckpointFetchResponse(chunk = JSON.decodeFromString(chunk))
             }
             call.respondV2JsonBounded(response)
+        }
+
+        post("/checkpoint/cleanup") {
+            val auth = call.requireAuthenticated(context, requiredScope = "sync", requireDevice = true) ?: return@post
+            val deviceId = auth.tokenDeviceId ?: return@post call.respondError(HttpStatusCode.Forbidden, "device_required")
+            if (!call.requestWithinV2Bound() || !call.requireSyncV2RateLimit(context, deviceId)) return@post
+            val request = call.receiveJsonOrNull<SyncV2CheckpointCleanupRequest>(MAX_ENCODED_BODY_BYTES.toInt())
+                ?: return@post
+            if (!request.validForCleanup()) {
+                return@post call.respondError(HttpStatusCode.BadRequest, "invalid_checkpoint_cleanup")
+            }
+            val result = context.syncV2Repository.cleanupCheckpointDraft(
+                auth.userId,
+                SyncV2CheckpointCleanupInput(
+                    request.epochId,
+                    request.checkpointId,
+                    request.checkpointDigest,
+                    request.previousPointerDigest,
+                    request.chunks.map(SyncV2CheckpointChunkRef::toRecord),
+                ),
+            )
+            when (result) {
+                is SyncV2CheckpointCleanupRepositoryResult.Deleted -> call.respond(
+                    SyncV2CheckpointCleanupResponse(
+                        deleted = true,
+                        alreadyAbsent = result.alreadyAbsent,
+                    ),
+                )
+                is SyncV2CheckpointCleanupRepositoryResult.Retained -> call.respond(
+                    HttpStatusCode.Conflict,
+                    SyncV2CheckpointCleanupResponse(
+                        deleted = false,
+                        error = result.error,
+                    ),
+                )
+            }
         }
 
         post("/epoch/compare-and-set") {
@@ -307,6 +347,12 @@ private fun SyncV2CheckpointManifestRequest.validFor(deviceId: UUID): Boolean =
         objectValue.objectType == "sync_checkpoint_manifest_v2" && objectValue.objectId == checkpointId &&
         objectValue.objectDigest == checkpointDigest && objectValue.mutationId == null &&
         objectValue.writerDeviceId == deviceId.toString()
+
+private fun SyncV2CheckpointCleanupRequest.validForCleanup(): Boolean =
+    epochId.isUuidV4() && checkpointId.isUuidV4() && CONTROL_DIGEST.matches(checkpointDigest) &&
+        previousPointerDigest?.let(CONTROL_DIGEST::matches) != false &&
+        chunks.isNotEmpty() && chunks.size <= MAX_CHECKPOINT_CHUNKS &&
+        chunks.indices.all { chunks[it].chunkIndex == it && chunks[it].valid() }
 
 private fun SyncV2EpochCompareAndSetRequest.validFor(deviceId: UUID): Boolean =
     metadata.contractId == CONTRACT && metadata.schemaSetVersion == SCHEMA_SET &&

@@ -1,5 +1,9 @@
 package saien.someday.sync.causality.v2
 
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+
 /** Fault switches used by coordinator transaction and recovery tests. */
 data class WorkspaceSyncFaultPlanV2(
     var failNextPull: Boolean = false,
@@ -41,11 +45,21 @@ class InMemoryWorkspaceSyncRemoteV2(
     private val retainedPointers = linkedMapOf<String, EncryptedWorkspaceObjectV2>()
     private val checkpointManifests = linkedMapOf<Pair<String, String>, EncryptedWorkspaceObjectV2>()
     private val checkpointChunks = linkedMapOf<Triple<String, String, String>, EncryptedWorkspaceObjectV2>()
+    /** chunkIndex -> chunkId so read-back stays ordered under concurrent puts. */
+    private val checkpointChunkOrder =
+        linkedMapOf<Pair<String, String>, MutableMap<Int, String>>()
     private val semanticObjects = linkedMapOf<Pair<String, String>, StoredSemanticObjectV2>()
     private val mutationIdentities = linkedMapOf<Pair<String, String>, Pair<String, String>>()
     private val changes = mutableListOf<StoredWorkspaceChangeV2>()
     private val repairReplicas = linkedMapOf<Triple<String, String, String>, LinkedHashMap<String, EncryptedWorkspaceObjectV2>>()
     private val collectedEpochs = mutableSetOf<String>()
+    /** Guards concurrent first-epoch chunk puts against non-thread-safe map mutation. */
+    private val checkpointMutationMutex = Mutex()
+
+    private fun <T> withCheckpointLock(block: () -> T): T =
+        runBlocking {
+            checkpointMutationMutex.withLock { block() }
+        }
 
     override fun capabilities(): WorkspaceSyncCapabilitiesV2 = WorkspaceSyncCapabilitiesV2(
         profile = remoteProfile,
@@ -60,45 +74,63 @@ class InMemoryWorkspaceSyncRemoteV2(
         supportsCheckpoints = true,
     )
 
-    override fun loadEpochPointer(): EncryptedWorkspaceObjectV2? = pointer
+    override fun loadEpochPointer(): EncryptedWorkspaceObjectV2? = withCheckpointLock { pointer }
 
     override fun loadRetainedEpochPointer(syncEpochId: String): EncryptedWorkspaceObjectV2? =
-        pointer?.takeIf { it.syncEpochId == syncEpochId } ?: retainedPointers[syncEpochId]
+        withCheckpointLock {
+            pointer?.takeIf { it.syncEpochId == syncEpochId } ?: retainedPointers[syncEpochId]
+        }
 
     override fun fetchCheckpoint(
         pointer: EncryptedWorkspaceObjectV2,
         descriptor: SyncEpochDescriptorV2,
     ): WorkspaceRemoteCheckpointBundleV2 {
         require(pointer.syncEpochId == descriptor.syncEpochId) { "Requested checkpoint belongs to another epoch." }
-        val manifest = checkpointManifests[descriptor.syncEpochId to descriptor.checkpointId]
-            ?: error("Checkpoint manifest is missing.")
-        val chunks = checkpointChunks
-            .filterKeys { (epochId, checkpointId, _) ->
-                epochId == descriptor.syncEpochId && checkpointId == descriptor.checkpointId
+        return withCheckpointLock {
+            val manifest = checkpointManifests[descriptor.syncEpochId to descriptor.checkpointId]
+                ?: error("Checkpoint manifest is missing.")
+            val orderKey = descriptor.syncEpochId to descriptor.checkpointId
+            // KMP-safe sort (avoid JVM-only toSortedMap).
+            val orderedIds = checkpointChunkOrder[orderKey]
+                ?.entries
+                ?.sortedBy { entry -> entry.key }
+                ?.map { entry -> entry.value }
+                ?: error("Checkpoint chunk order is missing.")
+            val chunks = orderedIds.map { chunkId ->
+                checkpointChunks[Triple(descriptor.syncEpochId, descriptor.checkpointId, chunkId)]
+                    ?: error("Checkpoint chunk is missing: $chunkId")
             }
-            .values
-            .toList()
-        return WorkspaceRemoteCheckpointBundleV2(pointer, manifest, chunks)
+            WorkspaceRemoteCheckpointBundleV2(pointer, manifest, chunks)
+        }
     }
 
     override fun putCheckpointChunk(
         descriptor: SyncEpochDescriptorV2,
         ref: WorkspaceCheckpointChunkRefV2,
         chunk: EncryptedWorkspaceObjectV2,
-    ): WorkspaceImmutablePutResultV2 = immutablePut(
-        checkpointChunks,
-        Triple(descriptor.syncEpochId, descriptor.checkpointId, ref.chunkId),
-        chunk,
-    )
+    ): WorkspaceImmutablePutResultV2 = withCheckpointLock {
+        val result = immutablePut(
+            checkpointChunks,
+            Triple(descriptor.syncEpochId, descriptor.checkpointId, ref.chunkId),
+            chunk,
+        )
+        if (result is WorkspaceImmutablePutResultV2.Stored) {
+            val orderKey = descriptor.syncEpochId to descriptor.checkpointId
+            checkpointChunkOrder.getOrPut(orderKey) { linkedMapOf() }[ref.chunkIndex] = ref.chunkId
+        }
+        result
+    }
 
     override fun putCheckpointManifest(
         descriptor: SyncEpochDescriptorV2,
         manifest: EncryptedWorkspaceObjectV2,
-    ): WorkspaceImmutablePutResultV2 = immutablePut(
-        checkpointManifests,
-        descriptor.syncEpochId to descriptor.checkpointId,
-        manifest,
-    )
+    ): WorkspaceImmutablePutResultV2 = withCheckpointLock {
+        immutablePut(
+            checkpointManifests,
+            descriptor.syncEpochId to descriptor.checkpointId,
+            manifest,
+        )
+    }
 
     override fun compareAndSetEpochPointer(
         descriptor: SyncEpochDescriptorV2,
@@ -111,29 +143,94 @@ class InMemoryWorkspaceSyncRemoteV2(
         }
         if (faults.failNextPointerCompareAndSet) {
             faults.failNextPointerCompareAndSet = false
-            return WorkspacePointerPublishResultV2.CompareAndSetFailed(this.pointer)
-        }
-        val current = this.pointer
-        if (current?.objectDigest != expectedCurrentDigest) {
-            if (current?.objectDigest == pointer.objectDigest) {
-                return WorkspacePointerPublishResultV2.Published(idempotentReplay = true)
+            return withCheckpointLock {
+                WorkspacePointerPublishResultV2.CompareAndSetFailed(this.pointer)
             }
-            return WorkspacePointerPublishResultV2.CompareAndSetFailed(current)
         }
-        val manifest = checkpointManifests[descriptor.syncEpochId to descriptor.checkpointId]
-            ?: return WorkspacePointerPublishResultV2.Rejected(
-                "checkpoint_manifest_missing",
-                "The referenced checkpoint manifest is not stored.",
-            )
-        if (manifest.objectDigest != descriptor.checkpointDigest || pointer.syncEpochId != descriptor.syncEpochId) {
-            return WorkspacePointerPublishResultV2.Rejected(
-                "checkpoint_integrity_mismatch",
-                "The pointer does not identify its stored checkpoint.",
+        return withCheckpointLock {
+            val current = this.pointer
+            if (current?.objectDigest != expectedCurrentDigest) {
+                if (current?.objectDigest == pointer.objectDigest) {
+                    return@withCheckpointLock WorkspacePointerPublishResultV2.Published(idempotentReplay = true)
+                }
+                return@withCheckpointLock WorkspacePointerPublishResultV2.CompareAndSetFailed(current)
+            }
+            val manifest = checkpointManifests[descriptor.syncEpochId to descriptor.checkpointId]
+                ?: return@withCheckpointLock WorkspacePointerPublishResultV2.Rejected(
+                    "checkpoint_manifest_missing",
+                    "The referenced checkpoint manifest is not stored.",
+                )
+            if (manifest.objectDigest != descriptor.checkpointDigest || pointer.syncEpochId != descriptor.syncEpochId) {
+                return@withCheckpointLock WorkspacePointerPublishResultV2.Rejected(
+                    "checkpoint_integrity_mismatch",
+                    "The pointer does not identify its stored checkpoint.",
+                )
+            }
+            current?.let { retainedPointers[it.syncEpochId] = it }
+            this.pointer = pointer
+            WorkspacePointerPublishResultV2.Published(idempotentReplay = false)
+        }
+    }
+
+    override fun cleanupCheckpointDraft(
+        draft: WorkspaceCheckpointDraftCleanupV2,
+    ): WorkspaceCheckpointDraftCleanupResultV2 = withCheckpointLock {
+        if (draft.remoteProfile != remoteProfile) {
+            return@withCheckpointLock WorkspaceCheckpointDraftCleanupResultV2.Retained(
+                "remote_profile_mismatch",
+                "Checkpoint cleanup targets another remote profile.",
             )
         }
-        current?.let { retainedPointers[it.syncEpochId] = it }
-        this.pointer = pointer
-        return WorkspacePointerPublishResultV2.Published(idempotentReplay = false)
+        val current = pointer
+            ?: return@withCheckpointLock WorkspaceCheckpointDraftCleanupResultV2.Retained(
+                "checkpoint_still_publishable",
+                "An empty remote cannot prove that this checkpoint draft is obsolete.",
+            )
+        if (current.syncEpochId == draft.descriptor.syncEpochId ||
+            retainedPointers.containsKey(draft.descriptor.syncEpochId)
+        ) {
+            return@withCheckpointLock WorkspaceCheckpointDraftCleanupResultV2.Retained(
+                "checkpoint_referenced",
+                "The checkpoint is current or retained by authenticated pointer history.",
+            )
+        }
+        if (current.objectDigest == draft.pointer.previousPointerDigest) {
+            return@withCheckpointLock WorkspaceCheckpointDraftCleanupResultV2.Retained(
+                "checkpoint_still_publishable",
+                "The checkpoint draft is still a valid successor of the current pointer.",
+            )
+        }
+
+        val manifestKey = draft.descriptor.syncEpochId to draft.descriptor.checkpointId
+        val existingManifest = checkpointManifests[manifestKey]
+        if (existingManifest != null && existingManifest.objectDigest != draft.manifestObject.objectDigest) {
+            return@withCheckpointLock WorkspaceCheckpointDraftCleanupResultV2.Retained(
+                "immutable_object_mismatch",
+                "Remote checkpoint manifest identity differs from the local cleanup record.",
+            )
+        }
+        val expectedChunks = draft.chunks.associateBy { it.ref.chunkId }
+        val existingChunkEntries = checkpointChunks.filterKeys { (epochId, checkpointId, _) ->
+            epochId == draft.descriptor.syncEpochId && checkpointId == draft.descriptor.checkpointId
+        }
+        val chunksMatch = existingChunkEntries.all { (key, outer) ->
+            expectedChunks[key.third]?.let { expected ->
+                expected.encryptedObject.objectDigest == outer.objectDigest
+            } == true
+        }
+        if (!chunksMatch) {
+            return@withCheckpointLock WorkspaceCheckpointDraftCleanupResultV2.Retained(
+                "immutable_object_mismatch",
+                "Remote checkpoint chunks differ from the local cleanup record.",
+            )
+        }
+        val alreadyAbsent = existingManifest == null && existingChunkEntries.isEmpty()
+        checkpointManifests.remove(manifestKey)
+        checkpointChunks.keys.removeAll {
+            it.first == draft.descriptor.syncEpochId && it.second == draft.descriptor.checkpointId
+        }
+        checkpointChunkOrder.remove(manifestKey)
+        WorkspaceCheckpointDraftCleanupResultV2.Deleted(alreadyAbsent)
     }
 
     override fun pull(
@@ -318,11 +415,17 @@ class InMemoryWorkspaceSyncRemoteV2(
         require(pointer?.syncEpochId != epochId)
         checkpointManifests.keys.removeAll { it.first == epochId }
         checkpointChunks.keys.removeAll { it.first == epochId }
+        checkpointChunkOrder.keys.removeAll { it.first == epochId }
         semanticObjects.keys.removeAll { it.first == epochId }
         mutationIdentities.keys.removeAll { it.first == epochId }
         changes.removeAll { it.epochId == epochId }
         repairReplicas.keys.removeAll { it.first == epochId }
         collectedEpochs += epochId
+    }
+
+    internal fun hasCheckpointDraftForTest(epochId: String): Boolean = withCheckpointLock {
+        checkpointManifests.keys.any { it.first == epochId } ||
+            checkpointChunks.keys.any { it.first == epochId }
     }
 
     private fun <K> immutablePut(

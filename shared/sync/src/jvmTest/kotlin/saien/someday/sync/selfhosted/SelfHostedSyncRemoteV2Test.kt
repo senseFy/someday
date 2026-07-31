@@ -7,12 +7,15 @@ import saien.someday.sync.causality.v2.PreparedWorkspaceEpochCheckpointV2
 import saien.someday.sync.causality.v2.SyncRemoteProfileV2
 import saien.someday.sync.causality.v2.WORKSPACE_PREFERENCES_ENTITY_ID_V2
 import saien.someday.sync.causality.v2.WorkspaceCheckpointBuilderV2
+import saien.someday.sync.causality.v2.WorkspaceCheckpointDraftCleanupResultV2
 import saien.someday.sync.causality.v2.WorkspaceCheckpointSourceHeadV2
 import saien.someday.sync.causality.v2.WorkspaceEntityTypeV2
 import saien.someday.sync.causality.v2.WorkspacePreferencesV2
+import saien.someday.sync.causality.v2.toDraftCleanupV2
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertIs
 import kotlin.time.Instant
 
 class SelfHostedSyncRemoteV2Test {
@@ -88,11 +91,55 @@ class SelfHostedSyncRemoteV2Test {
         assertEquals(listOf<Int?>(null, missingIndex), transport.requestedIndexes)
     }
 
+    @Test
+    fun cleanupForwardsExactCheckpointIdentityAndMapsDeletedResponse() {
+        val workspaceKey = SodiumWorkspaceCrypto()
+            .workspaceKeyFromBytes(ByteArray(32) { (it + 39).toByte() })
+        val prepared = WorkspaceCheckpointBuilderV2(workspaceKey, WRITER_ID).build(
+            remoteProfile = SyncRemoteProfileV2.SELF_HOSTED.wireValue,
+            sourceHeads = listOf(WorkspaceCheckpointSourceHeadV2(
+                WorkspaceEntityTypeV2.WORKSPACE_PREFERENCES,
+                WORKSPACE_PREFERENCES_ENTITY_ID_V2,
+                WorkspacePreferencesV2(),
+                null,
+                "cleanup-test",
+                null,
+                WRITER_ID,
+                null,
+                "preferences-source",
+                "preferences-source-digest",
+            )),
+            createdAt = Instant.parse("2026-07-19T00:00:00Z"),
+        )
+        val transport = CheckpointPagingTransport(prepared)
+        val remote = SelfHostedSyncRemoteV2(
+            endpoint = "https://sync.example.test",
+            workspaceKey = workspaceKey,
+            accessTokenProvider = { "opaque-test-token" },
+            transport = transport,
+        )
+
+        assertIs<WorkspaceCheckpointDraftCleanupResultV2.Deleted>(
+            remote.cleanupCheckpointDraft(prepared.toDraftCleanupV2()),
+        )
+        assertEquals(
+            SelfHostedV2CheckpointCleanupRequest(
+                epochId = prepared.descriptor.syncEpochId,
+                checkpointId = prepared.descriptor.checkpointId,
+                checkpointDigest = prepared.descriptor.checkpointDigest,
+                previousPointerDigest = prepared.pointer.previousPointerDigest,
+                chunks = prepared.chunks.map { it.ref },
+            ),
+            transport.cleanupRequest,
+        )
+    }
+
     private class CheckpointPagingTransport(
         private val prepared: PreparedWorkspaceEpochCheckpointV2,
         private val missingChunkIndex: Int? = null,
     ) : SelfHostedSyncTransportV2 {
         val requestedIndexes = mutableListOf<Int?>()
+        var cleanupRequest: SelfHostedV2CheckpointCleanupRequest? = null
 
         override fun v2FetchCheckpoint(
             endpoint: String,
@@ -133,6 +180,14 @@ class SelfHostedSyncRemoteV2Test {
             accessToken: String,
             request: SelfHostedV2EpochCompareAndSetRequest,
         ): SelfHostedV2EpochCompareAndSetResponse = unused()
+        override fun v2CleanupCheckpointDraft(
+            endpoint: String,
+            accessToken: String,
+            request: SelfHostedV2CheckpointCleanupRequest,
+        ): SelfHostedV2CheckpointCleanupResponse {
+            cleanupRequest = request
+            return SelfHostedV2CheckpointCleanupResponse(deleted = true)
+        }
         override fun v2Push(
             endpoint: String,
             accessToken: String,

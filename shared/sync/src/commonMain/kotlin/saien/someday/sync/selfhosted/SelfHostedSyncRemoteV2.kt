@@ -13,6 +13,8 @@ import saien.someday.sync.causality.v2.SyncEpochKeyDerivationV2
 import saien.someday.sync.causality.v2.SyncRemoteProfileV2
 import saien.someday.sync.causality.v2.SyncStreamFrontierV2
 import saien.someday.sync.causality.v2.WorkspaceCheckpointChunkRefV2
+import saien.someday.sync.causality.v2.WorkspaceCheckpointDraftCleanupResultV2
+import saien.someday.sync.causality.v2.WorkspaceCheckpointDraftCleanupV2
 import saien.someday.sync.causality.v2.WorkspaceControlDecodeResultV2
 import saien.someday.sync.causality.v2.WorkspaceEncryptedCursorUnitV2
 import saien.someday.sync.causality.v2.WorkspaceImmutablePutResultV2
@@ -112,6 +114,12 @@ interface SelfHostedSyncTransportV2 {
         request: SelfHostedV2EpochCompareAndSetRequest,
     ): SelfHostedV2EpochCompareAndSetResponse
 
+    fun v2CleanupCheckpointDraft(
+        endpoint: String,
+        accessToken: String,
+        request: SelfHostedV2CheckpointCleanupRequest,
+    ): SelfHostedV2CheckpointCleanupResponse
+
     fun v2Push(endpoint: String, accessToken: String, request: SelfHostedV2PushRequest): SelfHostedV2PushResponse
     fun v2Pull(endpoint: String, accessToken: String, request: SelfHostedV2PullRequest): SelfHostedV2PullResponse
     fun v2Frontiers(endpoint: String, accessToken: String, request: SelfHostedV2FrontierRequest): SelfHostedV2FrontierResponse
@@ -146,6 +154,11 @@ class RefreshingSelfHostedSyncTransportV2(
         authorized(endpoint, accessToken) { delegate.v2FetchCheckpoint(endpoint, it, request) }
     override fun v2CompareAndSetEpoch(endpoint: String, accessToken: String, request: SelfHostedV2EpochCompareAndSetRequest) =
         authorized(endpoint, accessToken) { delegate.v2CompareAndSetEpoch(endpoint, it, request) }
+    override fun v2CleanupCheckpointDraft(
+        endpoint: String,
+        accessToken: String,
+        request: SelfHostedV2CheckpointCleanupRequest,
+    ) = authorized(endpoint, accessToken) { delegate.v2CleanupCheckpointDraft(endpoint, it, request) }
     override fun v2Push(endpoint: String, accessToken: String, request: SelfHostedV2PushRequest) =
         authorized(endpoint, accessToken) { delegate.v2Push(endpoint, it, request) }
     override fun v2Pull(endpoint: String, accessToken: String, request: SelfHostedV2PullRequest) =
@@ -241,6 +254,22 @@ data class SelfHostedV2CheckpointFetchRequest(
 data class SelfHostedV2CheckpointFetchResponse(
     val manifest: EncryptedWorkspaceObjectV2? = null,
     val chunk: EncryptedWorkspaceObjectV2? = null,
+)
+
+@Serializable
+data class SelfHostedV2CheckpointCleanupRequest(
+    val epochId: String,
+    val checkpointId: String,
+    val checkpointDigest: String,
+    val previousPointerDigest: String? = null,
+    val chunks: List<WorkspaceCheckpointChunkRefV2>,
+)
+
+@Serializable
+data class SelfHostedV2CheckpointCleanupResponse(
+    val deleted: Boolean,
+    val alreadyAbsent: Boolean = false,
+    val error: String? = null,
 )
 
 @Serializable
@@ -437,6 +466,36 @@ class SelfHostedSyncRemoteV2(
                 WorkspacePointerPublishResultV2.CompareAndSetFailed(response.current?.pointer)
             else -> WorkspacePointerPublishResultV2.Rejected(
                 response.error ?: "epoch_pointer_rejected", "Self-hosted server rejected the V2 epoch pointer.",
+            )
+        }
+    }
+
+    override fun cleanupCheckpointDraft(
+        draft: WorkspaceCheckpointDraftCleanupV2,
+    ): WorkspaceCheckpointDraftCleanupResultV2 {
+        if (draft.remoteProfile != remoteProfile) {
+            return WorkspaceCheckpointDraftCleanupResultV2.Retained(
+                "remote_profile_mismatch",
+                "Checkpoint cleanup targets another remote profile.",
+            )
+        }
+        val response = transport.v2CleanupCheckpointDraft(
+            endpoint,
+            token(),
+            SelfHostedV2CheckpointCleanupRequest(
+                epochId = draft.descriptor.syncEpochId,
+                checkpointId = draft.descriptor.checkpointId,
+                checkpointDigest = draft.descriptor.checkpointDigest,
+                previousPointerDigest = draft.pointer.previousPointerDigest,
+                chunks = draft.chunks.map { it.ref },
+            ),
+        )
+        return if (response.deleted) {
+            WorkspaceCheckpointDraftCleanupResultV2.Deleted(response.alreadyAbsent)
+        } else {
+            WorkspaceCheckpointDraftCleanupResultV2.Retained(
+                response.error ?: "checkpoint_cleanup_rejected",
+                "Self-hosted server retained the checkpoint draft safely.",
             )
         }
     }

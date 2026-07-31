@@ -19,6 +19,7 @@ import saien.someday.data.settings.ClientSettingsRepository
 import saien.someday.data.settings.SqlDelightClientSettingsRepository
 import saien.someday.domain.notes.NotesRepository
 import saien.someday.domain.settings.ClientSettings
+import saien.someday.domain.settings.ManualSyncProgressListener
 import saien.someday.domain.settings.ManualSyncRunner
 import saien.someday.domain.settings.SelfHostedSessionCredentialStore
 import saien.someday.domain.settings.SelfHostedSetupClient
@@ -50,6 +51,7 @@ data class DesktopClientRepositories(
     val selfHostedSetupClient: SelfHostedSetupClient,
     val selfHostedSessionCredentialStore: SelfHostedSessionCredentialStore,
     val manualSyncRunner: ManualSyncRunner,
+    val bindManualSyncProgressListener: (ManualSyncProgressListener?) -> Unit = {},
     val syncV2MaintenanceRunner: SyncV2MaintenanceRunner,
     val workspacePairingInvitationCreator: WorkspacePairingInvitationCreator,
     val workspacePairingInvitationJoiner: WorkspacePairingInvitationJoiner,
@@ -167,6 +169,7 @@ fun createDesktopClientRepositories(): DesktopClientRepositories {
         ),
         selfHostedSessionCredentialStore = selfHostedSessionCredentialStore,
         manualSyncRunner = syncV2Services.manualSyncRunner,
+        bindManualSyncProgressListener = syncV2Services.bindManualSyncProgressListener,
         syncV2MaintenanceRunner = syncV2Services.maintenanceRunner,
         workspacePairingInvitationCreator = workspacePairingService,
         workspacePairingInvitationJoiner = workspacePairingService,

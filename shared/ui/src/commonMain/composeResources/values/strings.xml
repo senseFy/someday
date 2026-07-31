@@ -381,6 +381,12 @@
     <string name="status_notes_in_notebook">%1$d notes in %2$s</string>
     <string name="status_sync_mode">Sync mode: %1$s</string>
     <string name="stub_manual_sync">Manual sync is not connected in this build.</string>
+    <string name="sync_in_progress">Syncing changes now.</string>
+    <string name="sync_uploading_checkpoint">Uploading the first sync snapshot.</string>
+    <string name="sync_uploading_checkpoint_chunks">Uploading the first sync snapshot (%1$s/%2$s).</string>
+    <string name="sync_uploading_manifest">Finalizing the sync snapshot.</string>
+    <string name="sync_verifying_remote">Verifying the remote snapshot.</string>
+    <string name="sync_committing_epoch">Activating sync on this device.</string>
     <string name="stub_pairing_unavailable">Workspace pairing is unavailable in this build.</string>
     <string name="stub_selfhosted_setup">Self-hosted setup is unavailable in this build.</string>
     <string name="stub_selfhosted_signin">Self-hosted sign-in is not available in this build.</string>

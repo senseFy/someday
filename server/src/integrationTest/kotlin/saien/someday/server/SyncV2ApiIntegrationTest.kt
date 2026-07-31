@@ -9,6 +9,8 @@ import saien.someday.server.api.DeviceRegistrationRequest
 import saien.someday.server.api.DeviceRegistrationResponse
 import saien.someday.server.api.SyncV2CheckpointChunkRef
 import saien.someday.server.api.SyncV2CheckpointChunkRequest
+import saien.someday.server.api.SyncV2CheckpointCleanupRequest
+import saien.someday.server.api.SyncV2CheckpointCleanupResponse
 import saien.someday.server.api.SyncV2CheckpointFetchRequest
 import saien.someday.server.api.SyncV2CheckpointFetchResponse
 import saien.someday.server.api.SyncV2CheckpointManifestRequest
@@ -223,6 +225,66 @@ class SyncV2ApiIntegrationTest {
             """{"padding":"${"x".repeat(16 * 1024 * 1024)}"}""",
         )
         assertEquals(HttpStatusCode.PayloadTooLarge, oversized.status, oversized.body)
+    }
+
+    @Test
+    fun checkpointCleanupRetainsReferencedEpochAndExactlyDeletesObsoleteDraft() = testApplication {
+        application { somedayServerModule() }
+        clearServerTables()
+        val account = registerAccountAndDevice()
+        val obsolete = checkpoint(account.device.id, previous = null)
+        uploadCheckpointObjects(account.accessToken, obsolete)
+        val winner = checkpoint(account.device.id, previous = null)
+        publishEpoch(account.accessToken, winner)
+
+        val referenced = postJson(
+            "/sync/v2/checkpoint/cleanup",
+            account.accessToken,
+            winner.toCleanupRequest(),
+        )
+        assertEquals(HttpStatusCode.Conflict, referenced.status, referenced.body)
+        assertEquals(
+            "checkpoint_referenced",
+            json.decodeFromString<SyncV2CheckpointCleanupResponse>(referenced.body).error,
+        )
+
+        val deleted = postJson(
+            "/sync/v2/checkpoint/cleanup",
+            account.accessToken,
+            obsolete.toCleanupRequest(),
+        )
+        assertEquals(HttpStatusCode.OK, deleted.status, deleted.body)
+        val deletedBody = json.decodeFromString<SyncV2CheckpointCleanupResponse>(deleted.body)
+        assertTrue(deletedBody.deleted)
+        assertFalse(deletedBody.alreadyAbsent)
+
+        val missingManifest = postJson(
+            "/sync/v2/checkpoint/fetch",
+            account.accessToken,
+            SyncV2CheckpointFetchRequest(
+                obsolete.descriptor.syncEpochId,
+                obsolete.descriptor.checkpointId,
+            ),
+        )
+        assertEquals(HttpStatusCode.NotFound, missingManifest.status, missingManifest.body)
+        val missingChunk = postJson(
+            "/sync/v2/checkpoint/fetch",
+            account.accessToken,
+            SyncV2CheckpointFetchRequest(
+                obsolete.descriptor.syncEpochId,
+                obsolete.descriptor.checkpointId,
+                obsolete.chunks.single().ref.chunkIndex,
+            ),
+        )
+        assertEquals(HttpStatusCode.NotFound, missingChunk.status, missingChunk.body)
+
+        val replay = postJson(
+            "/sync/v2/checkpoint/cleanup",
+            account.accessToken,
+            obsolete.toCleanupRequest(),
+        )
+        assertEquals(HttpStatusCode.OK, replay.status, replay.body)
+        assertTrue(json.decodeFromString<SyncV2CheckpointCleanupResponse>(replay.body).alreadyAbsent)
     }
 
     @Test
@@ -504,6 +566,25 @@ class SyncV2ApiIntegrationTest {
 
     private fun saien.someday.sync.causality.v2.EncryptedWorkspaceObjectV2.toServer(): SyncV2ObjectPayload =
         json.decodeFromString(json.encodeToString(this))
+
+    private fun PreparedWorkspaceEpochCheckpointV2.toCleanupRequest() =
+        SyncV2CheckpointCleanupRequest(
+            epochId = descriptor.syncEpochId,
+            checkpointId = descriptor.checkpointId,
+            checkpointDigest = descriptor.checkpointDigest,
+            previousPointerDigest = pointer.previousPointerDigest,
+            chunks = chunks.map { chunk ->
+                chunk.ref.let {
+                    SyncV2CheckpointChunkRef(
+                        it.chunkIndex,
+                        it.chunkId,
+                        it.chunkDigest,
+                        it.objectCount,
+                        it.plaintextBytes,
+                    )
+                }
+            },
+        )
 
     private suspend fun ApplicationTestBuilder.registerAccountAndDevice(): DeviceRegistrationResponse {
         val registration = client.post("/auth/register") {

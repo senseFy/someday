@@ -110,6 +110,11 @@ sealed interface WebDavRawUploadResult {
     data class Rejected(val safeMessage: String) : WebDavRawUploadResult
 }
 
+sealed interface WebDavRawDeleteResult {
+    data class Deleted(val alreadyAbsent: Boolean) : WebDavRawDeleteResult
+    data class Rejected(val safeMessage: String) : WebDavRawDeleteResult
+}
+
 fun Throwable.toWebDavConnectionFailure(appDirectory: String): WebDavConnectionTestResult =
     WebDavConnectionTestResult(
         success = false,

@@ -191,6 +191,7 @@ import saien.someday.domain.settings.ClientSettings
 import saien.someday.domain.settings.AppLanguage
 import saien.someday.domain.settings.ClientTheme
 import saien.someday.domain.settings.EditorPreferences
+import saien.someday.domain.settings.ManualSyncProgressListener
 import saien.someday.domain.settings.ManualSyncRunner
 import saien.someday.domain.settings.SelfHostedSessionCredentialStore
 import saien.someday.domain.settings.SelfHostedSetupClient
@@ -330,6 +331,7 @@ fun SomedayApp(
     selfHostedSetupClient: SelfHostedSetupClient? = null,
     selfHostedSessionCredentialStore: SelfHostedSessionCredentialStore? = null,
     manualSyncRunner: ManualSyncRunner? = null,
+    bindManualSyncProgressListener: (ManualSyncProgressListener?) -> Unit = {},
     syncV2MaintenanceRunner: SyncV2MaintenanceRunner? = null,
     workspacePairingInvitationCreator: WorkspacePairingInvitationCreator? = null,
     workspacePairingInvitationJoiner: WorkspacePairingInvitationJoiner? = null,
@@ -452,6 +454,7 @@ fun SomedayApp(
                         message = "Sync is not available in this build. Your local changes stay on this device.",
                     )
                 },
+                bindManualSyncProgressListener = bindManualSyncProgressListener,
                 syncV2MaintenanceRunner = syncV2MaintenanceRunner ?: object : SyncV2MaintenanceRunner {
                     override fun rollEpoch() = saien.someday.domain.settings.ManualSyncResult.failure(
                         appSettings.syncConfiguration.mode,

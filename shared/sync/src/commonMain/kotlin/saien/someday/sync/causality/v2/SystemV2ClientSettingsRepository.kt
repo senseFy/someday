@@ -15,6 +15,7 @@ import saien.someday.domain.settings.WorkspacePreferencesConflictView
 import saien.someday.domain.settings.WorkspacePreferencesSnapshot
 import saien.someday.domain.settings.WorkspacePreferencesSyncState
 import saien.someday.domain.settings.WorkspacePreferencesSyncStatus
+import saien.someday.sync.WorkspaceAuthorityMutationCoordinator
 import kotlin.time.Clock
 import kotlin.time.Instant
 
@@ -30,6 +31,7 @@ class SystemV2ClientSettingsRepository(
     writerDeviceIdProvider: () -> String,
     remoteProfileProvider: () -> String,
     private val clock: () -> Instant = { Clock.System.now() },
+    private val authorityMutationCoordinator: WorkspaceAuthorityMutationCoordinator? = null,
 ) : ClientSettingsRepository, WorkspacePreferencesConflictResolver {
     private val contexts = WorkspaceSystemV2ContextProvider(
         localRepository,
@@ -38,7 +40,16 @@ class SystemV2ClientSettingsRepository(
         remoteProfileProvider,
     )
 
-    override fun load(): ClientSettings {
+    private fun <T> productAccess(block: () -> T): T =
+        if (authorityMutationCoordinator != null) {
+            authorityMutationCoordinator.productAccess(block)
+        } else {
+            block()
+        }
+
+    override fun load(): ClientSettings = productAccess(::loadUncoordinated)
+
+    private fun loadUncoordinated(): ClientSettings {
         val local = localSettings.load()
         val context = contexts.openOrNull() ?: return local.copy(
             workspacePreferencesState = WorkspacePreferencesSyncState(
@@ -49,7 +60,10 @@ class SystemV2ClientSettingsRepository(
         return project(context, local)
     }
 
-    override fun save(settings: ClientSettings): ClientSettings {
+    override fun save(settings: ClientSettings): ClientSettings =
+        productAccess { saveUncoordinated(settings) }
+
+    private fun saveUncoordinated(settings: ClientSettings): ClientSettings {
         // Self-hosted sign-in / mode switches must persist before the first
         // whole-product epoch exists. Until an ACTIVE+HEALTHY epoch is local,
         // keep settings on the device-local path (same as load() when openOrNull).
@@ -57,7 +71,7 @@ class SystemV2ClientSettingsRepository(
             it.lifecycle == SyncEpochLifecycleV2.ACTIVE && it.health == SyncEpochHealthV2.HEALTHY
         } ?: return localSettings.save(settings)
         val viewState = settings.workspacePreferencesState
-        val displayed = viewState.displayedSnapshot ?: load().toPreferenceSnapshot()
+        val displayed = viewState.displayedSnapshot ?: loadUncoordinated().toPreferenceSnapshot()
         val requested = settings.toPreferenceSnapshot()
         val changedFields = preferenceChangedFields(displayed, requested)
         val activeConflict = context.store.loadConflicts(preferenceKeyV2())
@@ -108,12 +122,24 @@ class SystemV2ClientSettingsRepository(
         return checkNotNull(result)
     }
 
-    override fun saveLocalSnapshot(settings: ClientSettings): ClientSettings {
+    override fun saveLocalSnapshot(settings: ClientSettings): ClientSettings =
+        productAccess { saveLocalSnapshotUncoordinated(settings) }
+
+    private fun saveLocalSnapshotUncoordinated(settings: ClientSettings): ClientSettings {
         localSettings.saveLocalSnapshot(settings.copy(workspacePreferencesState = WorkspacePreferencesSyncState()))
-        return load()
+        return loadUncoordinated()
     }
 
     override fun resolveWorkspacePreferencesBranch(
+        conflictId: String,
+        selectedVersionId: String,
+        expectedHeadVersionIds: List<String>,
+    ): ClientSettings =
+        productAccess {
+            resolveWorkspacePreferencesBranchUncoordinated(conflictId, selectedVersionId, expectedHeadVersionIds)
+        }
+
+    private fun resolveWorkspacePreferencesBranchUncoordinated(
         conflictId: String,
         selectedVersionId: String,
         expectedHeadVersionIds: List<String>,
@@ -154,7 +180,7 @@ class SystemV2ClientSettingsRepository(
             val projected = project(context, localSettings.load())
             localSettings.saveLocalSnapshot(projected.copy(workspacePreferencesState = WorkspacePreferencesSyncState()))
         }
-        return load()
+        return loadUncoordinated()
     }
 
     private fun project(context: ActiveWorkspaceSystemV2, local: ClientSettings): ClientSettings {

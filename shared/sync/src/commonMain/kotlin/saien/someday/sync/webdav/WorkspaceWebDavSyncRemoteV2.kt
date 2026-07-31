@@ -27,6 +27,8 @@ import saien.someday.sync.causality.v2.SyncStreamFrontierV2
 import saien.someday.sync.causality.v2.UUID_V4_PATTERN_SYSTEM_V2
 import saien.someday.sync.causality.v2.WORKSPACE_ENTITY_VERSION_OBJECT_TYPE_V2
 import saien.someday.sync.causality.v2.WorkspaceCheckpointChunkRefV2
+import saien.someday.sync.causality.v2.WorkspaceCheckpointDraftCleanupResultV2
+import saien.someday.sync.causality.v2.WorkspaceCheckpointDraftCleanupV2
 import saien.someday.sync.causality.v2.WorkspaceControlDecodeResultV2
 import saien.someday.sync.causality.v2.WorkspaceEncryptedCursorUnitV2
 import saien.someday.sync.causality.v2.WorkspaceImmutablePutResultV2
@@ -251,6 +253,135 @@ class WorkspaceWebDavSyncRemoteV2(
                 }
             }
         }
+    }
+
+    override fun cleanupCheckpointDraft(
+        draft: WorkspaceCheckpointDraftCleanupV2,
+    ): WorkspaceCheckpointDraftCleanupResultV2 {
+        if (draft.remoteProfile != remoteProfile) {
+            return retainedCleanup(
+                "remote_profile_mismatch",
+                "Checkpoint cleanup targets another remote profile.",
+            )
+        }
+        val draftControls = codecs(draft.descriptor.syncEpochId).control
+        val decodedDraftPointer = when (val decoded = draftControls.decodeEpochPointer(draft.pointerObject)) {
+            is WorkspaceControlDecodeResultV2.Decoded -> decoded.value
+            is WorkspaceControlDecodeResultV2.Rejected ->
+                return retainedCleanup(decoded.error.code.wireValue, decoded.error.safeMessage)
+        }
+        if (decodedDraftPointer != draft.pointer) {
+            return retainedCleanup(
+                "checkpoint_cleanup_identity_mismatch",
+                "Local checkpoint cleanup pointer does not match its durable descriptor.",
+            )
+        }
+        when (val decoded = draftControls.decodeCheckpointManifest(
+            draft.manifestObject,
+            draft.descriptor.syncEpochId,
+            draft.descriptor.checkpointId,
+        )) {
+            is WorkspaceControlDecodeResultV2.Decoded -> Unit
+            is WorkspaceControlDecodeResultV2.Rejected ->
+                return retainedCleanup(decoded.error.code.wireValue, decoded.error.safeMessage)
+        }
+        draft.chunks.forEach { chunk ->
+            when (val decoded = draftControls.decodeCheckpointChunk(
+                chunk.encryptedObject,
+                draft.descriptor.syncEpochId,
+                draft.descriptor.checkpointId,
+                chunk.ref,
+            )) {
+                is WorkspaceControlDecodeResultV2.Decoded -> Unit
+                is WorkspaceControlDecodeResultV2.Rejected ->
+                    return retainedCleanup(decoded.error.code.wireValue, decoded.error.safeMessage)
+            }
+        }
+
+        val currentOuter = runCatching(::loadEpochPointer).getOrElse {
+            return retainedCleanup("epoch_pointer_read_failed", it.message ?: "Current pointer could not be read.")
+        } ?: return retainedCleanup(
+            "checkpoint_still_publishable",
+            "An empty remote cannot prove that this checkpoint draft is obsolete.",
+        )
+        val currentPointer = when (
+            val decoded = codecs(currentOuter.syncEpochId).control.decodeEpochPointer(currentOuter)
+        ) {
+            is WorkspaceControlDecodeResultV2.Decoded -> decoded.value
+            is WorkspaceControlDecodeResultV2.Rejected ->
+                return retainedCleanup(decoded.error.code.wireValue, decoded.error.safeMessage)
+        }
+        if (currentPointer.descriptor.syncEpochId == draft.descriptor.syncEpochId) {
+            return retainedCleanup(
+                "checkpoint_referenced",
+                "The checkpoint is referenced by the authenticated current pointer.",
+            )
+        }
+        if (currentPointer.descriptor.previousEpochId == draft.descriptor.syncEpochId) {
+            return retainedCleanup(
+                "checkpoint_referenced",
+                if (currentPointer.descriptor.previousEpochPointerDigest == draft.pointerObject.objectDigest) {
+                    "The checkpoint is the authenticated current pointer's direct predecessor."
+                } else {
+                    "The current pointer names this predecessor epoch with a different authenticated digest."
+                },
+            )
+        }
+        if (currentOuter.objectDigest == draft.pointer.previousPointerDigest) {
+            return retainedCleanup(
+                "checkpoint_still_publishable",
+                "The checkpoint draft is still a valid successor of the current pointer.",
+            )
+        }
+
+        val retainedOuter = runCatching {
+            client.getRawObject(paths.v2RetainedEpochPointer(draft.descriptor.syncEpochId))?.decodeOuter()
+        }.getOrElse {
+            return retainedCleanup("epoch_pointer_history_read_failed", it.message ?: "Pointer history could not be read.")
+        }
+        if (retainedOuter != null) {
+            val retainedPointer = when (val decoded = draftControls.decodeEpochPointer(retainedOuter)) {
+                is WorkspaceControlDecodeResultV2.Decoded -> decoded.value
+                is WorkspaceControlDecodeResultV2.Rejected ->
+                    return retainedCleanup(decoded.error.code.wireValue, decoded.error.safeMessage)
+            }
+            if (retainedPointer.descriptor.syncEpochId == draft.descriptor.syncEpochId) {
+                return retainedCleanup(
+                    "checkpoint_referenced",
+                    "The checkpoint is referenced by authenticated pointer history.",
+                )
+            }
+            return retainedCleanup(
+                "epoch_pointer_history_mismatch",
+                "Retained pointer identity differs from the checkpoint cleanup record.",
+            )
+        }
+
+        var alreadyAbsent = true
+        val objects = buildList {
+            add(
+                paths.v2CheckpointManifest(draft.descriptor.syncEpochId, draft.descriptor.checkpointId) to
+                    draft.manifestObject,
+            )
+            draft.chunks.forEach { chunk ->
+                add(
+                    paths.v2CheckpointChunk(
+                        draft.descriptor.syncEpochId,
+                        draft.descriptor.checkpointId,
+                        chunk.ref.chunkIndex,
+                        chunk.ref.chunkId,
+                    ) to chunk.encryptedObject,
+                )
+            }
+        }
+        objects.forEach { (path, outer) ->
+            when (val deleted = client.deleteRawObjectIfUnchanged(path, encodeBytes(outer))) {
+                is WebDavRawDeleteResult.Deleted -> if (!deleted.alreadyAbsent) alreadyAbsent = false
+                is WebDavRawDeleteResult.Rejected ->
+                    return retainedCleanup("checkpoint_cleanup_failed", deleted.safeMessage)
+            }
+        }
+        return WorkspaceCheckpointDraftCleanupResultV2.Deleted(alreadyAbsent)
     }
 
     override fun pull(
@@ -607,6 +738,11 @@ class WorkspaceWebDavSyncRemoteV2(
                 "WebDAV V2 object exceeds the negotiated encoded body limit."
             }
         }
+
+    private fun retainedCleanup(
+        code: String,
+        message: String,
+    ) = WorkspaceCheckpointDraftCleanupResultV2.Retained(code, message.take(500))
 
     private fun codecs(epochId: String): EpochWebDavCodecsV2 {
         val materializer = CanonicalWorkspaceCausalityMaterializerV2(

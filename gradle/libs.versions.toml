@@ -1,4 +1,7 @@
 [versions]
+# Host JVM / Kotlin jvmTarget / Android compileOptions baseline for the monorepo.
+# Desktop runtime and libraries such as backdrop 2.x require class file 65 (Java 21).
+jvm = "21"
 agp = "9.2.1"
 android-compileSdk = "37"
 android-minSdk = "26"

@@ -21,17 +21,18 @@ import saien.someday.data.settings.ClientSettingsRepository
 import saien.someday.data.settings.SqlDelightClientSettingsRepository
 import saien.someday.domain.notes.NotesRepository
 import saien.someday.domain.settings.ClientSettings
+import saien.someday.domain.settings.ManualSyncProgressListener
+import saien.someday.domain.settings.ManualSyncResult
 import saien.someday.domain.settings.ManualSyncRunner
 import saien.someday.domain.settings.SelfHostedSessionCredentialStore
 import saien.someday.domain.settings.SelfHostedSetupClient
+import saien.someday.domain.settings.SyncMode
 import saien.someday.domain.settings.SyncV2MaintenanceRunner
 import saien.someday.domain.settings.WebDavCredentialStore
 import saien.someday.domain.settings.WebDavDiscoveredDevicesRunner
 import saien.someday.domain.settings.WorkspacePairingInvitationCanceller
 import saien.someday.domain.settings.WorkspacePairingInvitationCreator
 import saien.someday.domain.settings.WorkspacePairingInvitationJoiner
-import saien.someday.domain.settings.ManualSyncResult
-import saien.someday.domain.settings.SyncMode
 import saien.someday.sync.causality.v2.SqlDelightSyncProtocolStoreV2
 import saien.someday.sync.createSyncV2ClientServices
 import saien.someday.sync.selfhosted.AndroidSelfHostedSyncTransport
@@ -54,6 +55,7 @@ data class AndroidClientRepositories(
     val selfHostedSetupClient: SelfHostedSetupClient,
     val selfHostedSessionCredentialStore: SelfHostedSessionCredentialStore,
     val manualSyncRunner: ManualSyncRunner,
+    val bindManualSyncProgressListener: (ManualSyncProgressListener?) -> Unit = {},
     val syncV2MaintenanceRunner: SyncV2MaintenanceRunner,
     val workspacePairingInvitationCreator: WorkspacePairingInvitationCreator,
     val workspacePairingInvitationJoiner: WorkspacePairingInvitationJoiner,
@@ -208,6 +210,7 @@ fun createAndroidClientRepositories(context: Context): AndroidClientRepositories
         ),
         selfHostedSessionCredentialStore = selfHostedSessionCredentialStore,
         manualSyncRunner = syncV2Services.manualSyncRunner,
+        bindManualSyncProgressListener = syncV2Services.bindManualSyncProgressListener,
         syncV2MaintenanceRunner = syncV2Services.maintenanceRunner,
         workspacePairingInvitationCreator = workspacePairingService,
         workspacePairingInvitationJoiner = workspacePairingService,

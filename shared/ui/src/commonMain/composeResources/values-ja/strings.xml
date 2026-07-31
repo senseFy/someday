@@ -381,6 +381,12 @@
     <string name="status_notes_in_notebook">%2$s にノート %1$d 件</string>
     <string name="status_sync_mode">同期モード: %1$s</string>
     <string name="stub_manual_sync">このビルドでは手動同期が接続されていません。</string>
+    <string name="sync_in_progress">変更を同期しています。</string>
+    <string name="sync_uploading_checkpoint">最初の同期スナップショットをアップロードしています。</string>
+    <string name="sync_uploading_checkpoint_chunks">最初の同期スナップショットをアップロードしています（%1$s/%2$s）。</string>
+    <string name="sync_uploading_manifest">同期スナップショットを確定しています。</string>
+    <string name="sync_verifying_remote">リモートのスナップショットを検証しています。</string>
+    <string name="sync_committing_epoch">このデバイスで同期を有効化しています。</string>
     <string name="stub_pairing_unavailable">このビルドではワークスペースのペアリングを利用できません。</string>
     <string name="stub_selfhosted_setup">このビルドではセルフホスト設定を利用できません。</string>
     <string name="stub_selfhosted_signin">このビルドではセルフホストのサインインを利用できません。</string>

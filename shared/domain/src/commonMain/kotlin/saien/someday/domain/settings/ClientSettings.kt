@@ -707,6 +707,25 @@ fun interface ManualSyncRunner {
     fun run(): ManualSyncResult
 }
 
+/**
+ * Typed mid-run progress for manual sync (e.g. first-epoch checkpoint upload).
+ * Product copy is formatted by the UI layer; this surface carries no secrets.
+ */
+sealed interface ManualSyncPhase {
+    data class UploadingChunks(val completed: Int, val total: Int) : ManualSyncPhase
+    data object UploadingManifest : ManualSyncPhase
+    data object VerifyingRemote : ManualSyncPhase
+    data object CommittingPointer : ManualSyncPhase
+}
+
+/**
+ * Optional mid-run progress for manual sync.
+ * Implementations must be safe to call from background threads; UI layers hop to Main.
+ */
+fun interface ManualSyncProgressListener {
+    fun onProgress(phase: ManualSyncPhase)
+}
+
 /** Explicit maintenance operations for an already active causal-sync epoch. */
 interface SyncV2MaintenanceRunner {
     fun rollEpoch(): ManualSyncResult
@@ -870,11 +889,14 @@ data class ManualSyncProgress(
                 message = "Ready when sync is configured.",
             )
 
-        fun inProgress(mode: SyncMode): ManualSyncProgress =
+        fun inProgress(
+            mode: SyncMode,
+            message: String = "Syncing changes now.",
+        ): ManualSyncProgress =
             ManualSyncProgress(
                 running = true,
                 mode = mode,
-                message = "Syncing changes now.",
+                message = message,
             )
 
         fun fromResult(result: ManualSyncResult): ManualSyncProgress =

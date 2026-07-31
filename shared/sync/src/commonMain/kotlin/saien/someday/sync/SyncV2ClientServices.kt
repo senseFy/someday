@@ -6,6 +6,8 @@ import saien.someday.data.export.LocalDataImportSummary
 import saien.someday.data.local.SqlDelightLocalDataRepository
 import saien.someday.data.settings.ClientSettingsRepository
 import saien.someday.domain.notes.NotesRepository
+import saien.someday.domain.settings.ManualSyncPhase
+import saien.someday.domain.settings.ManualSyncProgressListener
 import saien.someday.domain.settings.ManualSyncResult
 import saien.someday.domain.settings.ManualSyncRunner
 import saien.someday.domain.settings.SelfHostedSessionCredentialStore
@@ -27,6 +29,7 @@ import saien.someday.sync.causality.v2.SyncRemoteTransportFactoryV2
 import saien.someday.sync.causality.v2.SyncV2RuntimeService
 import saien.someday.sync.causality.v2.StoredSyncEpochV2
 import saien.someday.sync.causality.v2.SystemV2NotesRepository
+import saien.someday.sync.causality.v2.WorkspaceCheckpointPublishProgressV2
 import saien.someday.sync.causality.v2.WorkspaceLocalDataTransferV2
 import saien.someday.sync.causality.v2.WorkspaceEpochRetentionServiceV2
 import saien.someday.sync.causality.v2.WorkspaceRemoteMigrationResultV2
@@ -53,6 +56,12 @@ data class SyncV2ClientServices(
     val authorityMutationCoordinator: WorkspaceAuthorityMutationCoordinator,
     val localDataExportProvider: (kotlin.time.Instant) -> LocalDataExportDocument?,
     val localDataImportProvider: (LocalDataExportDocument) -> LocalDataImportSummary?,
+    /**
+     * Bind/unbind a listener for first-epoch (and other checkpoint) publish
+     * progress while manual sync runs. Pass null to clear. Receives typed
+     * phases; the UI layer formats localized product copy.
+     */
+    val bindManualSyncProgressListener: (ManualSyncProgressListener?) -> Unit = {},
 )
 
 fun createSyncV2ClientServices(
@@ -165,6 +174,16 @@ fun createSyncV2ClientServices(
             else -> null
         }
     }
+    val publishProgressListener = object {
+        @kotlin.concurrent.Volatile
+        var value: ManualSyncProgressListener? = null
+    }
+    val onPublishProgress: (WorkspaceCheckpointPublishProgressV2) -> Unit =
+        { progress ->
+            runCatching {
+                publishProgressListener.value?.onProgress(progress.toManualSyncPhase())
+            }
+        }
     val webDavRuntime = SyncV2RuntimeService(
         mode = SyncMode.WebDav,
         localRepository = localRepository,
@@ -177,6 +196,7 @@ fun createSyncV2ClientServices(
         retainedEpochRemoteProvider = retainedProvider,
         activationEnabled = systemV2ActivationEnabled,
         authorityMutationCoordinator = authorityMutationCoordinator,
+        onPublishProgress = onPublishProgress,
     )
     val selfHostedRuntime = SyncV2RuntimeService(
         mode = SyncMode.SelfHosted,
@@ -190,6 +210,7 @@ fun createSyncV2ClientServices(
         retainedEpochRemoteProvider = retainedProvider,
         activationEnabled = systemV2ActivationEnabled,
         authorityMutationCoordinator = authorityMutationCoordinator,
+        onPublishProgress = onPublishProgress,
     )
 
     val manual = ManualSyncRunner {
@@ -267,6 +288,7 @@ fun createSyncV2ClientServices(
                 targetWriter,
                 sourceRemote,
                 targetRemote,
+                authorityMutationCoordinator,
             ).migrate()) {
                 is WorkspaceRemoteMigrationResultV2.Blocked -> ManualSyncResult.failure(
                     targetMode,
@@ -346,6 +368,7 @@ fun createSyncV2ClientServices(
                 SyncMode.Off -> ""
             }
         },
+        authorityMutationCoordinator = authorityMutationCoordinator,
     )
     val v2LocalDataTransfer = WorkspaceLocalDataTransferV2(
         localRepository = localRepository,
@@ -373,6 +396,7 @@ fun createSyncV2ClientServices(
             localNotes = localNotesRepository,
             systemV2 = v2Notes,
             v2AuthorityAvailable = { protocolStore.loadAuthoritativeEpoch() != null },
+            authorityMutationCoordinator = authorityMutationCoordinator,
         ),
         settingsRepository = v2Settings,
         manualSyncRunner = manual,
@@ -395,8 +419,23 @@ fun createSyncV2ClientServices(
         authorityMutationCoordinator = authorityMutationCoordinator,
         localDataExportProvider = localDataTransfer::exportDocument,
         localDataImportProvider = localDataTransfer::importDocument,
+        bindManualSyncProgressListener = { listener ->
+            publishProgressListener.value = listener
+        },
     )
 }
+
+private fun WorkspaceCheckpointPublishProgressV2.toManualSyncPhase(): ManualSyncPhase =
+    when (this) {
+        is WorkspaceCheckpointPublishProgressV2.UploadingChunks ->
+            ManualSyncPhase.UploadingChunks(completed = completed, total = total)
+        WorkspaceCheckpointPublishProgressV2.UploadingManifest ->
+            ManualSyncPhase.UploadingManifest
+        WorkspaceCheckpointPublishProgressV2.VerifyingRemote ->
+            ManualSyncPhase.VerifyingRemote
+        WorkspaceCheckpointPublishProgressV2.CommittingPointer ->
+            ManualSyncPhase.CommittingPointer
+    }
 
 private fun SyncMode.syncV2Profile(): String = when (this) {
     SyncMode.WebDav -> SyncRemoteProfileV2.WEB_DAV.wireValue
