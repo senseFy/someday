@@ -243,6 +243,95 @@ class NotesUiControllerTest {
     }
 
     @Test
+    fun saveUpdatesVisibleNotesWithoutReloadingWorkspace() = runBlocking {
+        val repository = InMemoryNotesRepository()
+        val controller = NotesUiController(repository)
+        val diary = controller.createNotebook("Diary")
+        val older = repository.seedNote(
+            notebookId = diary.id,
+            title = "Older",
+            markdownBody = "Older body",
+            createdDate = LocalDate(2026, 5, 20),
+        )
+        controller.selectNotebook(diary.id)
+
+        val notebooksBeforeSave = repository.listNotebooksCalls
+        val notesBeforeSave = repository.listNotesCalls
+        val deletedBeforeSave = repository.listDeletedWorkspaceItemsCalls
+        val conflictsBeforeSave = repository.getNotebookConflictDetailsCalls
+        val versionsBeforeSave = repository.listNoteVersionsCalls
+
+        controller.openNewNote(diary.id)
+        controller.updateDraft(
+            title = "Newest",
+            markdownBody = "Newest body",
+            createdDateText = "2026-05-24",
+        )
+        assertTrue(controller.saveEditor())
+
+        assertEquals(listOf("Newest", "Older"), controller.state.notes.map { it.title })
+        assertEquals(older.id, controller.state.notes.last().id)
+        assertEquals(notebooksBeforeSave, repository.listNotebooksCalls)
+        assertEquals(notesBeforeSave, repository.listNotesCalls)
+        assertEquals(deletedBeforeSave, repository.listDeletedWorkspaceItemsCalls)
+        assertEquals(conflictsBeforeSave, repository.getNotebookConflictDetailsCalls)
+        assertEquals(versionsBeforeSave, repository.listNoteVersionsCalls)
+    }
+
+    @Test
+    fun routeExitSaveDoesNotLoadVersionsOrConflicts() = runBlocking {
+        val repository = InMemoryNotesRepository()
+        val controller = NotesUiController(repository)
+        val diary = controller.createNotebook("Diary")
+        controller.selectNotebook(diary.id)
+
+        val notebooksBeforeSave = repository.listNotebooksCalls
+        val notesBeforeSave = repository.listNotesCalls
+        val deletedBeforeSave = repository.listDeletedWorkspaceItemsCalls
+        val conflictsBeforeSave = repository.getNotebookConflictDetailsCalls
+        val versionsBeforeSave = repository.listNoteVersionsCalls
+
+        assertTrue(controller.openNewNote(diary.id))
+        controller.updateDraft(title = "Draft", markdownBody = "Saved on exit", createdDateText = "2026-05-22")
+        assertTrue(controller.saveEditorForRouteExit())
+
+        assertEquals("Draft", controller.state.notes.single().title)
+        assertEquals(notebooksBeforeSave, repository.listNotebooksCalls)
+        assertEquals(notesBeforeSave, repository.listNotesCalls)
+        assertEquals(deletedBeforeSave, repository.listDeletedWorkspaceItemsCalls)
+        assertEquals(conflictsBeforeSave, repository.getNotebookConflictDetailsCalls)
+        assertEquals(versionsBeforeSave, repository.listNoteVersionsCalls)
+    }
+
+    @Test
+    fun saveIntoAnotherNotebookReloadsOnlyThatNotebookList() = runBlocking {
+        val repository = InMemoryNotesRepository()
+        val controller = NotesUiController(repository)
+        val diary = controller.createNotebook("Diary")
+        val travel = controller.createNotebook("Travel")
+        controller.selectNotebook(diary.id)
+
+        val notebooksBeforeSave = repository.listNotebooksCalls
+        val notesBeforeSave = repository.listNotesCalls
+        val deletedBeforeSave = repository.listDeletedWorkspaceItemsCalls
+
+        controller.openNewNote(diary.id)
+        controller.updateDraft(
+            notebookId = travel.id,
+            title = "Trip day",
+            markdownBody = "Arrived by train",
+            createdDateText = "2026-05-23",
+        )
+        assertTrue(controller.saveEditor())
+
+        assertEquals(travel.id, controller.state.selectedNotebookId)
+        assertEquals(listOf("Trip day"), controller.state.notes.map { it.title })
+        assertEquals(notebooksBeforeSave, repository.listNotebooksCalls)
+        assertEquals(notesBeforeSave + 1, repository.listNotesCalls)
+        assertEquals(deletedBeforeSave, repository.listDeletedWorkspaceItemsCalls)
+    }
+
+    @Test
     fun syncErrorPendingAndConflictBadgesAreVisibleInListAndEditor() = runBlocking {
         val repository = InMemoryNotesRepository()
         val controller = NotesUiController(repository)

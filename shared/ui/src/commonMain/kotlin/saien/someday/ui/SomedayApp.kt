@@ -554,7 +554,9 @@ fun SomedayApp(
         LaunchedEffect(notesState.localChangeEventId) {
             if (notesState.localChangeEventId > 0L) {
                 autoSyncScheduler.request(AutoSyncTrigger.LocalChange)
-                settingsController.rescheduleOnThisDayNotifications()
+                if (settingsState.settings.onThisDayNotifications.enabled) {
+                    settingsController.rescheduleOnThisDayNotifications()
+                }
             }
         }
 
