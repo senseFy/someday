@@ -62,6 +62,7 @@ ANDROID_PLAY_VERIFY_SCRIPT := ./scripts/verify-play-aab.sh
 ANDROID_PLAY_UPLOAD_SCRIPT := ./scripts/upload-google-play.sh
 PUBLISH_TRACKS_SCRIPT := ./scripts/publish-tracks.sh
 PUBLISH_TRACKS_TEST := ./scripts/tests/publish-tracks-test.sh
+VERIFY_PLAY_AAB_TEST := ./scripts/tests/verify-play-aab-test.sh
 APP_VERSION_ARGS := $(if $(VERSION_NAME),--version-name "$(VERSION_NAME)",)
 MOBILE_RELEASE_ARGS ?=
 MOBILE_RELEASE_LOG_ROOT ?=
@@ -195,7 +196,7 @@ android-upload-play: check-android-play-publisher-env ## Verify and upload an ex
 .PHONY: ios-smoke ios-simulator-test ios-framework ios-framework-release check-ios-private-env check-ios-team
 .PHONY: ios-release ios-upload-testflight ios-upload-archive ios-archive ios-export ios-upload-check
 .PHONY: bump-ios-version bump-android-version bump-app-version bump-mobile-version bump-mobile-build-version
-.PHONY: publish-tracks test-publish-tracks
+.PHONY: publish-tracks test-publish-tracks test-verify-play-aab
 ios-smoke: ## Link iOS simulator framework and run iOS smoke tests
 	$(GRADLE) :app:ios:iosShellSmoke --max-workers=1
 
@@ -259,6 +260,9 @@ publish-tracks: ## Prepare and publish Android internal and iOS TestFlight build
 
 test-publish-tracks: ## Verify the combined mobile test-track release workflow
 	@$(PUBLISH_TRACKS_TEST)
+
+test-verify-play-aab: ## Verify Play AAB native-alignment tool discovery
+	@$(VERIFY_PLAY_AAB_TEST)
 
 ##@ Desktop
 .PHONY: desktop-run desktop-smoke desktop-package-smoke desktop-release-macos desktop-test

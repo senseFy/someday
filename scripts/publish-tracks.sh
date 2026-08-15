@@ -383,16 +383,27 @@ collect_result_if_ready() {
   local pid="$2"
   local result_path="$3"
   local result
+  local wait_status
 
-  if [[ -f "$result_path" ]]; then
-    result="$(sed -n '1p' "$result_path")"
-    wait "$pid" >/dev/null 2>&1 || true
-  elif ! kill -0 "$pid" >/dev/null 2>&1; then
+  # A leftover result file from an earlier step is not this worker's outcome.
+  # Keep polling while the current pid is alive so a stale 0 cannot look ready.
+  if [[ -n "$pid" ]] && kill -0 "$pid" >/dev/null 2>&1; then
+    return 1
+  fi
+
+  if [[ -n "$pid" ]]; then
     if wait "$pid" >/dev/null 2>&1; then
       result=0
     else
-      result=$?
+      wait_status=$?
+      if [[ "$wait_status" == 127 && -f "$result_path" ]]; then
+        result="$(sed -n '1p' "$result_path")"
+      else
+        result="$wait_status"
+      fi
     fi
+  elif [[ -f "$result_path" ]]; then
+    result="$(sed -n '1p' "$result_path")"
   else
     return 1
   fi

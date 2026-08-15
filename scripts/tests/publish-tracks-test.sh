@@ -181,6 +181,17 @@ assert_called android-release-play failed "$directory/calls"
 assert_not_called ios-archive "$directory/calls"
 assert_no_uploads "$directory/calls"
 
+directory="$(create_case delayed-preparation-failure)"
+if SLOW_TARGET=android-release-play \
+  run_publish "$directory" android-release-play --yes --no-tui; then
+  fail "A delayed Android preparation failure was reported as successful."
+fi
+assert_called android-release-play failed "$directory/calls"
+assert_not_called ios-archive "$directory/calls"
+assert_no_uploads "$directory/calls"
+assert_contains "Android preparation failed" "$directory/output"
+assert_not_contains "Both artifacts are prepared" "$directory/output"
+
 directory="$(create_case non-tty-confirmation)"
 if run_publish "$directory" "" --no-tui; then
   fail "A non-interactive release without --yes was accepted."
