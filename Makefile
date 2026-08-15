@@ -60,7 +60,11 @@ export IOS_ALLOW_PROVISIONING_UPDATES
 IOS_RELEASE_SCRIPT := ./scripts/release-ios.sh
 ANDROID_PLAY_VERIFY_SCRIPT := ./scripts/verify-play-aab.sh
 ANDROID_PLAY_UPLOAD_SCRIPT := ./scripts/upload-google-play.sh
+PUBLISH_TRACKS_SCRIPT := ./scripts/publish-tracks.sh
+PUBLISH_TRACKS_TEST := ./scripts/tests/publish-tracks-test.sh
 APP_VERSION_ARGS := $(if $(VERSION_NAME),--version-name "$(VERSION_NAME)",)
+MOBILE_RELEASE_ARGS ?=
+MOBILE_RELEASE_LOG_ROOT ?=
 ANDROID_PLAY_DRY_RUN_ENABLED := $(if $(filter yes y true 1,$(ANDROID_PLAY_DRY_RUN)),yes,)
 SYSTEM_V2_SHIPPING_ARGS := -Psomeday.systemV2ReleaseEnabled=true -Psomeday.systemV2DevelopmentEnabled=false
 ANDROID_PLAY_UPLOAD_ARGS = --aab "$(abspath $(ANDROID_PLAY_AAB))"
@@ -121,7 +125,7 @@ run-ios: ## Build, install, and launch iOS app; optional DEVICE=<id-or-name>
 
 ##@ Android
 .PHONY: android-debug android-install android-test android-smoke android-connected-test
-.PHONY: android-release-play android-release-play-upload android-upload-play
+.PHONY: android-release-play android-release-play-upload android-upload-play android-upload-check
 .PHONY: build-android-play-aab check-release-control-options
 .PHONY: check-android-play-release-env check-android-play-publisher-env
 android-debug: ## Build Android debug APK
@@ -156,6 +160,9 @@ check-android-play-release-env: check-release-control-options
 	@test -n "$$SOMEDAY_ANDROID_KEY_ALIAS" || (echo "ERROR: SOMEDAY_ANDROID_KEY_ALIAS is required."; exit 1)
 	@test -n "$$SOMEDAY_ANDROID_KEY_PASSWORD" || (echo "ERROR: SOMEDAY_ANDROID_KEY_PASSWORD is required."; exit 1)
 
+android-upload-check: check-android-play-release-env check-android-play-publisher-env ## Verify Play signing and upload credentials without building
+	@echo "Android Play upload prerequisites are ready."
+
 check-android-play-publisher-env: check-release-control-options
 	@if [[ -z "$(ANDROID_PLAY_DRY_RUN_ENABLED)" ]]; then \
 		if [[ -n "$$GOOGLE_PLAY_ACCESS_TOKEN" ]]; then \
@@ -186,8 +193,9 @@ android-upload-play: check-android-play-publisher-env ## Verify and upload an ex
 
 ##@ iOS
 .PHONY: ios-smoke ios-simulator-test ios-framework ios-framework-release check-ios-private-env check-ios-team
-.PHONY: ios-release ios-upload-testflight ios-upload-archive ios-archive ios-export
+.PHONY: ios-release ios-upload-testflight ios-upload-archive ios-archive ios-export ios-upload-check
 .PHONY: bump-ios-version bump-android-version bump-app-version bump-mobile-version bump-mobile-build-version
+.PHONY: publish-tracks test-publish-tracks
 ios-smoke: ## Link iOS simulator framework and run iOS smoke tests
 	$(GRADLE) :app:ios:iosShellSmoke --max-workers=1
 
@@ -211,6 +219,9 @@ check-ios-private-env:
 
 check-ios-team: check-release-control-options check-ios-private-env ## Require IOS_TEAM_ID for App Store packaging targets
 	@test -n "$$IOS_TEAM_ID" || (echo "ERROR: IOS_TEAM_ID must be exported for App Store packaging."; exit 1)
+
+ios-upload-check: check-ios-team ## Verify iOS TestFlight upload credentials without building
+	@echo "iOS TestFlight upload prerequisites are ready."
 
 ios-release: check-ios-team ## Archive and export a local App Store Connect IPA
 	@$(IOS_RELEASE_SCRIPT)
@@ -240,6 +251,14 @@ bump-mobile-version: bump-app-version ## Compatibility alias for bump-app-versio
 
 bump-mobile-build-version: ## Bump iOS build number and Android versionCode only
 	./scripts/bump-mobile-version.sh --platform both
+
+publish-tracks: ## Prepare and publish Android internal and iOS TestFlight builds
+	@SOMEDAY_RELEASE_LOG_ROOT="$(MOBILE_RELEASE_LOG_ROOT)" \
+		SOMEDAY_ANDROID_TRACK=internal \
+		$(PUBLISH_TRACKS_SCRIPT) $(MOBILE_RELEASE_ARGS)
+
+test-publish-tracks: ## Verify the combined mobile test-track release workflow
+	@$(PUBLISH_TRACKS_TEST)
 
 ##@ Desktop
 .PHONY: desktop-run desktop-smoke desktop-package-smoke desktop-release-macos desktop-test

@@ -279,6 +279,19 @@ export APP_STORE_CONNECT_API_ISSUER_ID="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 
 Credential input is environment-only at the Make-wrapper boundary, so the release-script command does not contain the source key path or account identifiers. Before invoking Xcode, the script copies the key into a private temporary directory and redacts Xcode-required identifiers and host paths from output. It refuses API keys stored inside the repository or readable by group/other users. For an explicit Xcode Accounts-based upload, export `IOS_UPLOAD_AUTH_MODE=accounts` without the API key variables. Xcode certificate/profile updates are disabled by default; enable them only when needed with `IOS_ALLOW_PROVISIONING_UPDATES=true`. Ensure the local Apple Distribution certificate and App Store provisioning profile for `saien.someday` are available before packaging.
 
+### Combined mobile test-track release
+
+After verifying and committing a version bump, run `make publish-tracks` to prepare and verify both signed artifacts, confirm once, and then upload Android to Google Play `internal` and iOS to TestFlight. The terminal dashboard shows both platform states and their latest log lines; complete logs remain under `build/release/test-tracks/`. The command never bumps, commits, pushes, or targets production.
+
+Use preparation-only mode to stop before any upload. Non-interactive environments must explicitly confirm publishing and automatically use line-oriented logs:
+
+```bash
+make publish-tracks MOBILE_RELEASE_ARGS="--prepare-only"
+make publish-tracks MOBILE_RELEASE_ARGS="--yes --no-tui"
+```
+
+If only one store accepts its upload, the command exits unsuccessfully, preserves both logs and artifacts, and prints the platform-specific recovery command. The existing Android and iOS release targets remain available for isolated retries. `make test-publish-tracks` covers the coordinator contract without contacting either store.
+
 ### iOS Simulator host app
 
 The installable iOS host app lives in `iosApp/Someday.xcodeproj`. It links and embeds the generated `SomedayIos.framework`, then presents the shared Compose `MainViewController()`.
