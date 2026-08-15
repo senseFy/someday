@@ -1398,7 +1398,29 @@ ORDER BY note_created_at_seconds DESC,
          note_id ASC;
 
 selectContentNoteProjectionsByEffectiveNotebookSystemV2:
-SELECT *
+SELECT epoch_id,
+       note_id,
+       preferred_head_version_id,
+       state,
+       referenced_notebook_id,
+       effective_notebook_id,
+       title,
+       substr(markdown_body, 1, 180) AS markdown_body,
+       note_created_at_seconds,
+       note_created_at_nanos,
+       time_zone_id,
+       location_latitude,
+       location_longitude,
+       location_place_text,
+       location_accuracy_meters,
+       location_altitude_meters,
+       location_captured_at_seconds,
+       location_captured_at_nanos,
+       deleted_at_seconds,
+       deleted_at_nanos,
+       warning,
+       authored_at_seconds,
+       authored_at_nanos
 FROM note_projections_system_v2
 WHERE epoch_id = ?
   AND effective_notebook_id = ?
@@ -1414,6 +1436,13 @@ FROM note_projections_system_v2
 WHERE epoch_id = ?
   AND warning = 'unresolved_notebook_reference'
 LIMIT 1;
+
+selectNoteIdsReferencingNotebookSystemV2:
+SELECT note_id
+FROM note_projections_system_v2
+WHERE epoch_id = ?
+  AND referenced_notebook_id = ?
+ORDER BY note_id ASC;
 
 deleteNoteProjectionsSystemV2:
 DELETE FROM note_projections_system_v2
@@ -1500,6 +1529,11 @@ SELECT *
 FROM sync_pending_mutations_system_v2
 WHERE remote_profile = ? AND epoch_id = ?
 ORDER BY created_at ASC, mutation_id ASC;
+
+selectPendingMutationObjectIdsSystemV2:
+SELECT object_id
+FROM sync_pending_mutations_system_v2
+WHERE remote_profile = ? AND epoch_id = ?;
 
 updatePendingMutationAttemptSystemV2:
 UPDATE sync_pending_mutations_system_v2
