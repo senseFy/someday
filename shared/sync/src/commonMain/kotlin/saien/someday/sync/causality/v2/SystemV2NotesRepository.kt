@@ -618,7 +618,7 @@ class SystemV2NotesRepository(
                 .firstOrNull()
         } ?: return null
         val content = head.contentPayload as? NoteContentV2 ?: return null
-        val pending = context.store.loadPending(context.remoteProfile).any { it.objectId == head.versionId }
+        val pending = context.store.loadPendingObjectIds(context.remoteProfile).contains(head.versionId)
         val badge = when {
             conflict != null -> NoteSyncBadge.Conflict(conflict.descriptor.reason.wireValue)
             pending -> NoteSyncBadge.Pending
@@ -649,7 +649,7 @@ class SystemV2NotesRepository(
                 .firstOrNull()
         } ?: return null
         val content = head.contentPayload as? NotebookContentV2 ?: return null
-        val pending = context.store.loadPending(context.remoteProfile).any { it.objectId == head.versionId }
+        val pending = context.store.loadPendingObjectIds(context.remoteProfile).contains(head.versionId)
         return NotebookSummary(
             id = projection.key.entityId,
             title = content.title,
@@ -682,9 +682,10 @@ class SystemV2NotesRepository(
         deletedAt: Instant?,
         now: Instant,
     ): TokenBasedVersionResultV2.Created {
+        val base = requireNotNull(context.store.loadVersion(token.expectedBaseVersionId))
         val result = context.factory.createFromToken(
             token = token.toSystemToken(),
-            retainedVersions = context.store.loadAllVersions().associateBy { it.versionId },
+            retainedVersions = mapOf(base.versionId to base),
             content = content,
             deletedAt = deletedAt,
             deviceActorId = context.deviceActorId,

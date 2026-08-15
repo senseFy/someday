@@ -15,6 +15,34 @@ require_command() {
   command -v "$1" >/dev/null 2>&1 || die "Required command is unavailable: $1"
 }
 
+resolve_readelf_bin() {
+  local search_roots=()
+  local sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+
+  READELF_BIN="$(command -v llvm-readelf || command -v readelf || true)"
+  if [[ -n "$READELF_BIN" ]]; then
+    return 0
+  fi
+  [[ -n "$sdk_root" ]] || return 1
+  [[ -d "$sdk_root/ndk" ]] && search_roots+=("$sdk_root/ndk")
+  [[ -d "$sdk_root/ndk-bundle" ]] && search_roots+=("$sdk_root/ndk-bundle")
+  [[ ${#search_roots[@]} -gt 0 ]] || return 1
+  # NDK packages llvm-readelf as an executable symlink to llvm-readobj.
+  READELF_BIN="$(
+    find "${search_roots[@]}" -name llvm-readelf -perm -111 2>/dev/null |
+      sort |
+      tail -1
+  )"
+  [[ -n "$READELF_BIN" && -x "$READELF_BIN" ]]
+}
+
+if [[ "${1:-}" == "--resolve-readelf" ]]; then
+  resolve_readelf_bin ||
+    die "llvm-readelf/readelf is required to verify 16 KB ELF alignment."
+  printf '%s\n' "$READELF_BIN"
+  exit 0
+fi
+
 [[ -f "$AAB_PATH" ]] || die "Google Play AAB not found: $AAB_PATH"
 [[ "$EXPECTED_PACKAGE_NAME" =~ ^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$ ]] \
   || die "Invalid expected Android package name: $EXPECTED_PACKAGE_NAME"
@@ -115,21 +143,8 @@ if ! perl -0777 -e '
 fi
 
 if grep -Eq '^base/lib/(arm64-v8a|x86_64)/.+\.so$' "$RESOURCE_LIST"; then
-  READELF_BIN="$(command -v llvm-readelf || command -v readelf || true)"
-  if [[ -z "$READELF_BIN" && -n "${ANDROID_HOME:-}" ]]; then
-    NDK_SEARCH_ROOTS=()
-    [[ -d "$ANDROID_HOME/ndk" ]] && NDK_SEARCH_ROOTS+=("$ANDROID_HOME/ndk")
-    [[ -d "$ANDROID_HOME/ndk-bundle" ]] && NDK_SEARCH_ROOTS+=("$ANDROID_HOME/ndk-bundle")
-    if [[ ${#NDK_SEARCH_ROOTS[@]} -gt 0 ]]; then
-      READELF_BIN="$(
-        find "${NDK_SEARCH_ROOTS[@]}" -type f -name llvm-readelf -perm -111 2>/dev/null \
-          | sort \
-          | tail -1
-      )"
-    fi
-  fi
-  [[ -n "$READELF_BIN" ]] \
-    || die "llvm-readelf/readelf is required to verify 16 KB ELF alignment."
+  resolve_readelf_bin ||
+    die "llvm-readelf/readelf is required to verify 16 KB ELF alignment."
 
   NATIVE_LIB_DIR="$TMP_DIR/native-libs"
   mkdir -p "$NATIVE_LIB_DIR"

@@ -2,6 +2,7 @@
 
 package saien.someday.ui.notes
 
+import saien.someday.domain.notes.DeletedWorkspaceItem
 import saien.someday.domain.notes.MemoryDayCount
 import saien.someday.domain.notes.MemoryMonth
 import saien.someday.domain.notes.ConflictDetails
@@ -12,6 +13,7 @@ import saien.someday.domain.notes.NoteInput
 import saien.someday.domain.notes.NoteSummary
 import saien.someday.domain.notes.NoteSyncBadge
 import saien.someday.domain.notes.NoteVersionSummary
+import saien.someday.domain.notes.NotebookConflictDetails
 import saien.someday.domain.notes.NotebookSummary
 import saien.someday.domain.notes.NotesLocationInput
 import saien.someday.domain.notes.NotesRepository
@@ -23,6 +25,16 @@ import kotlinx.datetime.atStartOfDayIn
 
 class InMemoryNotesRepository : NotesRepository {
     var failNextSave: Boolean = false
+    var listNotebooksCalls: Int = 0
+        private set
+    var listNotesCalls: Int = 0
+        private set
+    var listDeletedWorkspaceItemsCalls: Int = 0
+        private set
+    var getNotebookConflictDetailsCalls: Int = 0
+        private set
+    var listNoteVersionsCalls: Int = 0
+        private set
 
     private var nextId: Int = 0
     private var logicalTime: Long = 0
@@ -31,8 +43,20 @@ class InMemoryNotesRepository : NotesRepository {
     private val versions = linkedMapOf<String, MutableList<NoteVersionSummary>>()
     private val conflictSources = linkedMapOf<String, String>()
 
-    override fun listNotebooks(): List<NotebookSummary> =
-        notebooks.values.sortedWith(compareBy<NotebookSummary> { it.sortOrder }.thenBy { it.title })
+    override fun listNotebooks(): List<NotebookSummary> {
+        listNotebooksCalls += 1
+        return notebooks.values.sortedWith(compareBy<NotebookSummary> { it.sortOrder }.thenBy { it.title })
+    }
+
+    override fun listDeletedWorkspaceItems(): List<DeletedWorkspaceItem> {
+        listDeletedWorkspaceItemsCalls += 1
+        return emptyList()
+    }
+
+    override fun getNotebookConflictDetails(notebookId: String): NotebookConflictDetails? {
+        getNotebookConflictDetailsCalls += 1
+        return null
+    }
 
     override fun createNotebook(title: String): NotebookSummary {
         require(title.isNotBlank()) { "Notebook title must not be blank." }
@@ -69,11 +93,13 @@ class InMemoryNotesRepository : NotesRepository {
         notebooks.remove(notebookId)
     }
 
-    override fun listNotes(notebookId: String): List<NoteSummary> =
-        notes.values
+    override fun listNotes(notebookId: String): List<NoteSummary> {
+        listNotesCalls += 1
+        return notes.values
             .filter { it.notebookId == notebookId }
             .map { it.toSummary() }
             .sortedWith(compareByDescending<NoteSummary> { it.createdAt }.thenBy { it.title })
+    }
 
     override fun getNoteDetails(noteId: String): NoteDetails? = notes[noteId]
 
@@ -146,8 +172,10 @@ class InMemoryNotesRepository : NotesRepository {
         return updated
     }
 
-    override fun listNoteVersions(noteId: String): List<NoteVersionSummary> =
-        versions[noteId].orEmpty().toList()
+    override fun listNoteVersions(noteId: String): List<NoteVersionSummary> {
+        listNoteVersionsCalls += 1
+        return versions[noteId].orEmpty().toList()
+    }
 
     override fun restoreNoteVersion(
         noteId: String,
