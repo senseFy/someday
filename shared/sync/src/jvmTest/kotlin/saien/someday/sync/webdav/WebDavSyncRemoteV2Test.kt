@@ -19,6 +19,8 @@ import saien.someday.sync.causality.v2.NoteLocationV2
 import saien.someday.sync.causality.v2.NotebookContentV2
 import saien.someday.sync.causality.v2.PreparedWorkspaceEpochCheckpointV2
 import saien.someday.sync.causality.v2.SqlDelightSyncProtocolStoreV2
+import saien.someday.sync.causality.v2.SyncDeadLetterFailureClassV2
+import saien.someday.sync.causality.v2.SyncDeadLetterInputV2
 import saien.someday.sync.causality.v2.SyncEpochKeyDerivationV2
 import saien.someday.sync.causality.v2.SyncCoordinatorStatusV2
 import saien.someday.sync.causality.v2.SyncRemoteProfileV2
@@ -262,6 +264,274 @@ class WebDavSyncRemoteV2Test {
         } finally {
             leader.close()
             follower.close()
+        }
+    }
+
+    @Test
+    fun crossWriterDependencyIsAppliedAfterItsLaterSortedParentStream() {
+        val workspaceKey = SodiumWorkspaceCrypto().workspaceKeyFromBytes(ByteArray(32) { (it + 97).toByte() })
+        val transport = MemoryV2WebDavTransport()
+        val firstWriter = fixture(WRITER_A, workspaceKey, transport)
+        val parentWriter = fixture(WRITER_B, workspaceKey, transport)
+        val joining = fixture(WRITER_C, workspaceKey, transport)
+        try {
+            val prepared = checkpoint(workspaceKey)
+            assertIs<WorkspaceCheckpointPersistResultV2.Ready>(
+                WorkspaceCheckpointPersistenceV2(firstWriter.local, workspaceKey, WRITER_A).persist(prepared),
+            )
+            assertIs<WorkspaceCheckpointPublishResultV2.Published>(
+                WorkspaceCheckpointPublisherV2(firstWriter.local, firstWriter.remote).publish(prepared),
+            )
+            assertEquals(
+                SyncCoordinatorStatusV2.SUCCESS,
+                coordinator(parentWriter, workspaceKey, WRITER_B).syncOnce().status,
+            )
+
+            val noteKey = WorkspaceEntityKeyV2(WorkspaceEntityTypeV2.NOTE, NOTE_ID)
+            val firstContext = context(firstWriter, workspaceKey, WRITER_A)
+            val parentContext = context(parentWriter, workspaceKey, WRITER_B)
+            val firstBase = firstContext.store.loadHeads(noteKey).single()
+            val parentBase = parentContext.store.loadHeads(noteKey).single()
+            val firstEdit = firstContext.factory.createContentChild(
+                firstBase,
+                (firstBase.contentPayload as NoteContentV2).copy(title = "First-writer title"),
+                firstContext.deviceActorId,
+                EDITED_AT,
+            )
+            val parentEdit = parentContext.factory.createContentChild(
+                parentBase,
+                (parentBase.contentPayload as NoteContentV2).copy(markdownBody = "Later-stream body"),
+                parentContext.deviceActorId,
+                EDITED_AT,
+            )
+            assertIs<WorkspaceLocalCommitResultV2.Committed>(
+                firstContext.store.commitLocalMutations(listOf(
+                    LocalWorkspaceMutationV2(
+                        SyncRemoteProfileV2.WEB_DAV.wireValue,
+                        firstContext.factory.newMutationId(),
+                        firstEdit,
+                        EDITED_AT,
+                    ),
+                )),
+            )
+            assertIs<WorkspaceLocalCommitResultV2.Committed>(
+                parentContext.store.commitLocalMutations(listOf(
+                    LocalWorkspaceMutationV2(
+                        SyncRemoteProfileV2.WEB_DAV.wireValue,
+                        parentContext.factory.newMutationId(),
+                        parentEdit,
+                        EDITED_AT,
+                    ),
+                )),
+            )
+
+            // B publishes the parent first. A then pulls it, generates a merge
+            // that depends on B, and publishes that merge in A's lexically
+            // earlier writer stream.
+            assertEquals(
+                SyncCoordinatorStatusV2.SUCCESS,
+                coordinator(parentWriter, workspaceKey, WRITER_B).syncOnce().status,
+            )
+            assertEquals(
+                SyncCoordinatorStatusV2.SUCCESS,
+                coordinator(firstWriter, workspaceKey, WRITER_A).syncOnce().status,
+            )
+            val mergedHead = firstContext.store.loadHeads(noteKey).single()
+            val successor = firstContext.factory.createContentChild(
+                mergedHead,
+                (mergedHead.contentPayload as NoteContentV2).copy(title = "First-stream successor"),
+                firstContext.deviceActorId,
+                EDITED_AT,
+            )
+            assertIs<WorkspaceLocalCommitResultV2.Committed>(
+                firstContext.store.commitLocalMutations(listOf(
+                    LocalWorkspaceMutationV2(
+                        SyncRemoteProfileV2.WEB_DAV.wireValue,
+                        firstContext.factory.newMutationId(),
+                        successor,
+                        EDITED_AT,
+                    ),
+                )),
+            )
+            assertEquals(
+                SyncCoordinatorStatusV2.SUCCESS,
+                coordinator(firstWriter, workspaceKey, WRITER_A).syncOnce().status,
+            )
+
+            val bounded = joining.remote.pull(prepared.descriptor.syncEpochId, emptyMap(), 2)
+            assertEquals(listOf(WRITER_A, WRITER_B), bounded.units.map { it.streamId })
+            assertFalse(bounded.frontierStable)
+
+            val joined = coordinator(joining, workspaceKey, WRITER_C).syncOnce()
+
+            assertEquals(SyncCoordinatorStatusV2.SUCCESS, joined.status)
+            assertTrue(
+                joining.protocolStore.loadActiveDeadLetters(
+                    SyncRemoteProfileV2.WEB_DAV.wireValue,
+                    prepared.descriptor.syncEpochId,
+                ).isEmpty(),
+            )
+            val projected = context(joining, workspaceKey, WRITER_C).store.loadProjection(noteKey)?.content as NoteContentV2
+            assertEquals("First-stream successor", projected.title)
+            assertEquals("Later-stream body", projected.markdownBody)
+        } finally {
+            firstWriter.close()
+            parentWriter.close()
+            joining.close()
+        }
+    }
+
+    @Test
+    fun retryableDeadLetterFromEarlierBuildResumesPullAndResolvesItself() {
+        val workspaceKey = SodiumWorkspaceCrypto().workspaceKeyFromBytes(ByteArray(32) { (it + 101).toByte() })
+        val transport = MemoryV2WebDavTransport()
+        val writer = fixture(WRITER_A, workspaceKey, transport)
+        val joining = fixture(WRITER_B, workspaceKey, transport)
+        try {
+            val prepared = checkpoint(workspaceKey)
+            assertIs<WorkspaceCheckpointPersistResultV2.Ready>(
+                WorkspaceCheckpointPersistenceV2(writer.local, workspaceKey, WRITER_A).persist(prepared),
+            )
+            assertIs<WorkspaceCheckpointPublishResultV2.Published>(
+                WorkspaceCheckpointPublisherV2(writer.local, writer.remote).publish(prepared),
+            )
+            assertEquals(
+                SyncCoordinatorStatusV2.SUCCESS,
+                coordinator(joining, workspaceKey, WRITER_B).syncOnce().status,
+            )
+
+            val noteKey = WorkspaceEntityKeyV2(WorkspaceEntityTypeV2.NOTE, NOTE_ID)
+            val writerContext = context(writer, workspaceKey, WRITER_A)
+            val base = writerContext.store.loadHeads(noteKey).single()
+            val edit = writerContext.factory.createContentChild(
+                base,
+                (base.contentPayload as NoteContentV2).copy(title = "Recovered retryable unit"),
+                writerContext.deviceActorId,
+                EDITED_AT,
+            )
+            assertIs<WorkspaceLocalCommitResultV2.Committed>(
+                writerContext.store.commitLocalMutations(listOf(
+                    LocalWorkspaceMutationV2(
+                        SyncRemoteProfileV2.WEB_DAV.wireValue,
+                        writerContext.factory.newMutationId(),
+                        edit,
+                        EDITED_AT,
+                    ),
+                )),
+            )
+            assertEquals(
+                SyncCoordinatorStatusV2.SUCCESS,
+                coordinator(writer, workspaceKey, WRITER_A).syncOnce().status,
+            )
+
+            val joiningContext = context(joining, workspaceKey, WRITER_B)
+            val cursors = joiningContext.store.loadCursors(SyncRemoteProfileV2.WEB_DAV.wireValue)
+                .associate { it.streamId to it.cursorValue }
+            val unit = joining.remote.pull(
+                prepared.descriptor.syncEpochId,
+                cursors,
+                joining.remote.capabilities().maxPullUnits,
+            ).units.single()
+            val firstObject = unit.objects.first()
+            joining.protocolStore.recordDeadLetter(
+                SyncDeadLetterInputV2(
+                    remoteProfile = SyncRemoteProfileV2.WEB_DAV.wireValue,
+                    epochId = prepared.descriptor.syncEpochId,
+                    streamId = unit.streamId,
+                    unitId = unit.unitId,
+                    cursorValue = unit.expectedCursorValue,
+                    unitDigest = unit.unitDigest,
+                    objectId = firstObject.objectId,
+                    objectDigest = firstObject.objectDigest,
+                    authenticatedUnit = null,
+                    failureClass = SyncDeadLetterFailureClassV2.RETRYABLE_DEPENDENCY,
+                    safeErrorCode = "missing_parent",
+                    safeErrorMessage = "A cursor unit is missing a required same-entity parent.",
+                ),
+                SYNC_AT,
+            )
+
+            val resumed = coordinator(joining, workspaceKey, WRITER_B).syncOnce()
+
+            assertEquals(SyncCoordinatorStatusV2.SUCCESS, resumed.status)
+            assertTrue(
+                joining.protocolStore.loadActiveDeadLetters(
+                    SyncRemoteProfileV2.WEB_DAV.wireValue,
+                    prepared.descriptor.syncEpochId,
+                ).isEmpty(),
+            )
+            assertEquals(
+                "Recovered retryable unit",
+                (joiningContext.store.loadProjection(noteKey)?.content as NoteContentV2).title,
+            )
+
+            val nextBase = writerContext.store.loadHeads(noteKey).single()
+            val nextEdit = writerContext.factory.createContentChild(
+                nextBase,
+                (nextBase.contentPayload as NoteContentV2).copy(title = "Recovered after interruption"),
+                writerContext.deviceActorId,
+                EDITED_AT,
+            )
+            assertIs<WorkspaceLocalCommitResultV2.Committed>(
+                writerContext.store.commitLocalMutations(listOf(
+                    LocalWorkspaceMutationV2(
+                        SyncRemoteProfileV2.WEB_DAV.wireValue,
+                        writerContext.factory.newMutationId(),
+                        nextEdit,
+                        EDITED_AT,
+                    ),
+                )),
+            )
+            assertEquals(
+                SyncCoordinatorStatusV2.SUCCESS,
+                coordinator(writer, workspaceKey, WRITER_A).syncOnce().status,
+            )
+            val nextCursors = joiningContext.store.loadCursors(SyncRemoteProfileV2.WEB_DAV.wireValue)
+                .associate { it.streamId to it.cursorValue }
+            val appliedBeforeInterruption = joining.remote.pull(
+                prepared.descriptor.syncEpochId,
+                nextCursors,
+                joining.remote.capabilities().maxPullUnits,
+            ).units.single()
+            assertEquals(
+                SyncCoordinatorStatusV2.SUCCESS,
+                coordinator(joining, workspaceKey, WRITER_B).syncOnce().status,
+            )
+            val interruptedObject = appliedBeforeInterruption.objects.first()
+            joining.protocolStore.recordDeadLetter(
+                SyncDeadLetterInputV2(
+                    remoteProfile = SyncRemoteProfileV2.WEB_DAV.wireValue,
+                    epochId = prepared.descriptor.syncEpochId,
+                    streamId = appliedBeforeInterruption.streamId,
+                    unitId = appliedBeforeInterruption.unitId,
+                    cursorValue = appliedBeforeInterruption.expectedCursorValue,
+                    unitDigest = appliedBeforeInterruption.unitDigest,
+                    objectId = interruptedObject.objectId,
+                    objectDigest = interruptedObject.objectDigest,
+                    authenticatedUnit = null,
+                    failureClass = SyncDeadLetterFailureClassV2.RETRYABLE_DEPENDENCY,
+                    safeErrorCode = "missing_parent",
+                    safeErrorMessage = "A cursor unit is missing a required same-entity parent.",
+                ),
+                SYNC_AT,
+            )
+
+            val resumedAfterInterruption = coordinator(joining, workspaceKey, WRITER_B).syncOnce()
+
+            assertEquals(SyncCoordinatorStatusV2.SUCCESS, resumedAfterInterruption.status)
+            assertTrue(
+                joining.protocolStore.loadActiveDeadLetters(
+                    SyncRemoteProfileV2.WEB_DAV.wireValue,
+                    prepared.descriptor.syncEpochId,
+                ).isEmpty(),
+            )
+            assertEquals(
+                "Recovered after interruption",
+                (joiningContext.store.loadProjection(noteKey)?.content as NoteContentV2).title,
+            )
+        } finally {
+            writer.close()
+            joining.close()
         }
     }
 
@@ -678,6 +948,7 @@ class WebDavSyncRemoteV2Test {
     private companion object {
         const val WRITER_A = "00000000-0000-4000-8000-0000000000a1"
         const val WRITER_B = "00000000-0000-4000-8000-0000000000b2"
+        const val WRITER_C = "00000000-0000-4000-8000-0000000000c3"
         const val NOTE_ID = "30000000-0000-4000-8000-000000000001"
         const val NOTEBOOK_ID = "20000000-0000-4000-8000-000000000001"
         const val SEGMENT = "50000000-0000-4000-8000-000000000001"

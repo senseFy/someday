@@ -3,6 +3,7 @@
 package saien.someday.sync.causality.v2
 
 import saien.someday.data.local.db.Note_projections_system_v2
+import saien.someday.data.local.db.SelectContentNoteProjectionsByEffectiveNotebookSystemV2
 import saien.someday.data.local.db.SomedayDatabase
 import saien.someday.data.local.db.Sync_applied_mutations_system_v2
 import saien.someday.data.local.db.Sync_pending_mutations_system_v2
@@ -106,7 +107,7 @@ data class WorkspaceProjectionSnapshotV2(
 
 /**
  * Denormalized note row for diary list/search paths.
- * Built from [note_projections_system_v2], which is rebuilt on every local/remote commit.
+ * Built from [note_projections_system_v2], which is rebuilt for affected entities on commit.
  */
 data class StoredNoteListProjectionV2(
     val noteId: String,
@@ -245,7 +246,9 @@ class SqlDelightWorkspaceEntityStoreV2(
             .executeAsOneOrNull() != null
 
     fun loadPendingObjectIds(remoteProfile: String): Set<String> =
-        loadPending(remoteProfile).mapTo(linkedSetOf()) { it.objectId }
+        queries.selectPendingMutationObjectIdsSystemV2(remoteProfile, syncEpochId)
+            .executeAsList()
+            .toCollection(linkedSetOf())
 
     fun loadHeads(key: WorkspaceEntityKeyV2): List<WorkspaceEntityVersionV2> =
         queries.selectWorkspaceEntityHeadsV2(syncEpochId, key.entityType.wireValue, key.entityId)
@@ -370,7 +373,7 @@ class SqlDelightWorkspaceEntityStoreV2(
                 insertPending(mutation.remoteProfile, mutation.mutationId, mutation.version, encoded, mutation.createdAt)
             }
             persistGeneratedOutbox(mutations.first().remoteProfile, generatedOutbox, mutations.first().createdAt)
-            rebuildAllProjections(mutations.first().createdAt)
+            rebuildAffectedProjections(prepared.keys, mutations.first().createdAt)
             val allPending = mutations.map { mutation ->
                 checkNotNull(
                     queries.selectPendingMutationByObjectSystemV2(
@@ -465,7 +468,7 @@ class SqlDelightWorkspaceEntityStoreV2(
                 )
             }
             persistGeneratedOutbox(unit.remoteProfile, generatedOutbox, unit.appliedAt)
-            rebuildAllProjections(unit.appliedAt)
+            rebuildAffectedProjections(prepared.keys, unit.appliedAt)
             queries.upsertRemoteCursorSystemV2(
                 unit.remoteProfile,
                 syncEpochId,
@@ -822,7 +825,41 @@ class SqlDelightWorkspaceEntityStoreV2(
             WorkspaceEntityKeyV2(checkNotNull(WorkspaceEntityTypeV2.fromWire(row.entity_type)), row.entity_id)
         }
         keys.forEach { key -> queries.deleteProjectionWarningsForEntityV2(syncEpochId, key.entityType.wireValue, key.entityId) }
+        persistProjectionKeys(keys, rebuiltAt)
+    }
 
+    private fun rebuildAffectedProjections(
+        changedKeys: Set<WorkspaceEntityKeyV2>,
+        rebuiltAt: Instant,
+    ) {
+        if (changedKeys.isEmpty()) {
+            return
+        }
+        val keys = linkedSetOf<WorkspaceEntityKeyV2>()
+        changedKeys.forEach { key ->
+            keys += key
+            if (key.entityType == WorkspaceEntityTypeV2.NOTEBOOK) {
+                queries.selectNoteIdsReferencingNotebookSystemV2(syncEpochId, key.entityId)
+                    .executeAsList()
+                    .forEach { noteId ->
+                        keys += WorkspaceEntityKeyV2(WorkspaceEntityTypeV2.NOTE, noteId)
+                    }
+                keys += WorkspaceEntityKeyV2(
+                    WorkspaceEntityTypeV2.WORKSPACE_PREFERENCES,
+                    WORKSPACE_PREFERENCES_ENTITY_ID_V2,
+                )
+            }
+        }
+        persistProjectionKeys(keys, rebuiltAt)
+    }
+
+    private fun persistProjectionKeys(
+        keys: Collection<WorkspaceEntityKeyV2>,
+        rebuiltAt: Instant,
+    ) {
+        keys.forEach { key ->
+            queries.deleteProjectionWarningsForEntityV2(syncEpochId, key.entityType.wireValue, key.entityId)
+        }
         keys.filter { it.entityType == WorkspaceEntityTypeV2.NOTEBOOK }.forEach { key ->
             persistNotebookProjection(loadProjection(key) ?: return@forEach)
         }
@@ -930,24 +967,74 @@ class SqlDelightWorkspaceEntityStoreV2(
         return heads.size == 1 && heads.single().kind == WorkspaceEntityVersionKindV2.CONTENT
     }
 
-    private fun mapStoredNoteListProjection(row: Note_projections_system_v2): StoredNoteListProjectionV2? {
-        val createdSeconds = row.note_created_at_seconds ?: return null
-        val createdNanos = row.note_created_at_nanos ?: 0L
-        val title = row.title ?: return null
-        val markdownBody = row.markdown_body ?: return null
-        return StoredNoteListProjectionV2(
+    private fun mapStoredNoteListProjection(row: Note_projections_system_v2): StoredNoteListProjectionV2? =
+        mapStoredNoteListProjection(
             noteId = row.note_id,
             preferredHeadVersionId = row.preferred_head_version_id,
             referencedNotebookId = row.referenced_notebook_id,
             effectiveNotebookId = row.effective_notebook_id,
-            title = title,
-            markdownBody = markdownBody,
-            noteCreatedAt = Instant.fromEpochSeconds(createdSeconds, createdNanos),
+            title = row.title,
+            markdownBody = row.markdown_body,
+            createdSeconds = row.note_created_at_seconds,
+            createdNanos = row.note_created_at_nanos,
             timeZoneId = row.time_zone_id,
             locationPlaceText = row.location_place_text,
             warning = row.warning,
-            authoredAt = row.authored_at_seconds?.let { seconds ->
-                Instant.fromEpochSeconds(seconds, row.authored_at_nanos ?: 0L)
+            authoredSeconds = row.authored_at_seconds,
+            authoredNanos = row.authored_at_nanos,
+        )
+
+    private fun mapStoredNoteListProjection(
+        row: SelectContentNoteProjectionsByEffectiveNotebookSystemV2,
+    ): StoredNoteListProjectionV2? =
+        mapStoredNoteListProjection(
+            noteId = row.note_id,
+            preferredHeadVersionId = row.preferred_head_version_id,
+            referencedNotebookId = row.referenced_notebook_id,
+            effectiveNotebookId = row.effective_notebook_id,
+            title = row.title,
+            markdownBody = row.markdown_body,
+            createdSeconds = row.note_created_at_seconds,
+            createdNanos = row.note_created_at_nanos,
+            timeZoneId = row.time_zone_id,
+            locationPlaceText = row.location_place_text,
+            warning = row.warning,
+            authoredSeconds = row.authored_at_seconds,
+            authoredNanos = row.authored_at_nanos,
+        )
+
+    private fun mapStoredNoteListProjection(
+        noteId: String,
+        preferredHeadVersionId: String?,
+        referencedNotebookId: String?,
+        effectiveNotebookId: String?,
+        title: String?,
+        markdownBody: String?,
+        createdSeconds: Long?,
+        createdNanos: Long?,
+        timeZoneId: String?,
+        locationPlaceText: String?,
+        warning: String?,
+        authoredSeconds: Long?,
+        authoredNanos: Long?,
+    ): StoredNoteListProjectionV2? {
+        val createdAtSeconds = createdSeconds ?: return null
+        val createdAtNanos = createdNanos ?: 0L
+        val listTitle = title ?: return null
+        val listBody = markdownBody ?: return null
+        return StoredNoteListProjectionV2(
+            noteId = noteId,
+            preferredHeadVersionId = preferredHeadVersionId,
+            referencedNotebookId = referencedNotebookId,
+            effectiveNotebookId = effectiveNotebookId,
+            title = listTitle,
+            markdownBody = listBody,
+            noteCreatedAt = Instant.fromEpochSeconds(createdAtSeconds, createdAtNanos),
+            timeZoneId = timeZoneId,
+            locationPlaceText = locationPlaceText,
+            warning = warning,
+            authoredAt = authoredSeconds?.let { seconds ->
+                Instant.fromEpochSeconds(seconds, authoredNanos ?: 0L)
             },
         )
     }

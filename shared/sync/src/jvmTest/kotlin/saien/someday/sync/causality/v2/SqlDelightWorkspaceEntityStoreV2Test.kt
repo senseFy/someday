@@ -233,6 +233,44 @@ class SqlDelightWorkspaceEntityStoreV2Test {
     }
 
     @Test
+    fun localNoteCommitDoesNotRebuildUnrelatedNoteProjections() = withFixture { fixture ->
+        val notebook = fixture.factory.createGenesis(
+            WorkspaceEntityTypeV2.NOTEBOOK,
+            NOTEBOOK_ID,
+            NotebookContentV2("Notebook", 1, at(1)),
+            ACTOR,
+            at(2),
+        )
+        val firstNote = fixture.factory.createGenesis(
+            WorkspaceEntityTypeV2.NOTE,
+            NOTE_ID,
+            NoteContentV2(NOTEBOOK_ID, "First", "First body", at(1), null, null),
+            ACTOR,
+            at(3),
+        )
+        fixture.commit(notebook)
+        fixture.commit(firstNote)
+        fixture.database.somedayQueries.deleteNoteProjectionsSystemV2(EPOCH)
+        assertNull(fixture.database.somedayQueries.selectNoteProjectionSystemV2(EPOCH, NOTE_ID).executeAsOneOrNull())
+
+        val secondNote = fixture.factory.createGenesis(
+            WorkspaceEntityTypeV2.NOTE,
+            "30000000-0000-4000-8000-000000000002",
+            NoteContentV2(NOTEBOOK_ID, "Second", "Second body", at(2), null, null),
+            ACTOR,
+            at(4),
+        )
+        fixture.commit(secondNote)
+
+        assertNull(fixture.database.somedayQueries.selectNoteProjectionSystemV2(EPOCH, NOTE_ID).executeAsOneOrNull())
+        val secondProjection = fixture.database.somedayQueries
+            .selectNoteProjectionSystemV2(EPOCH, secondNote.entityId)
+            .executeAsOne()
+        assertEquals("Second", secondProjection.title)
+        assertEquals("Second body", secondProjection.markdown_body)
+    }
+
+    @Test
     fun remoteUnitRequiresTopologicalParentsAndAdvancesCursorWithAllEffects() = withFixture { fixture ->
         val root = fixture.factory.createGenesis(
             WorkspaceEntityTypeV2.NOTEBOOK,

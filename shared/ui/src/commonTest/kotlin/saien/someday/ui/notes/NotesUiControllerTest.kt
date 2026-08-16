@@ -16,6 +16,76 @@ import kotlin.test.assertTrue
 
 class NotesUiControllerTest {
     @Test
+    fun noteSelectionSupportsToggleRangeSelectAllAndScopeChanges() = runBlocking {
+        val repository = InMemoryNotesRepository()
+        val controller = NotesUiController(repository)
+        val diary = controller.createNotebook("Diary")
+        val first = repository.seedNote(diary.id, "First", "One", LocalDate(2026, 5, 23))
+        val second = repository.seedNote(diary.id, "Second", "Two", LocalDate(2026, 5, 22))
+        val third = repository.seedNote(diary.id, "Third", "Three", LocalDate(2026, 5, 21))
+        controller.selectNotebook(diary.id)
+
+        controller.toggleNoteSelection(first.id)
+        controller.toggleNoteSelection(third.id, extendRange = true)
+
+        assertEquals(setOf(first.id, second.id, third.id), controller.state.selectedNoteIds)
+        controller.clearNoteSelection()
+        assertFalse(controller.state.noteSelectionActive)
+
+        controller.selectAllVisibleNotes()
+        assertEquals(3, controller.state.selectedNoteIds.size)
+        controller.updateSearchQuery("First")
+        assertTrue(controller.state.selectedNoteIds.isEmpty(), "Changing list scope must clear selection.")
+    }
+
+    @Test
+    fun selectedNotesCanBeMovedAndEditedAsOneOperation() = runBlocking {
+        val repository = InMemoryNotesRepository()
+        val controller = NotesUiController(repository)
+        val diary = controller.createNotebook("Diary")
+        val archive = controller.createNotebook("Archive")
+        val first = repository.seedNote(
+            notebookId = diary.id,
+            title = "First",
+            markdownBody = "One",
+            createdDate = LocalDate(2026, 5, 23),
+            location = NotesLocationInput(placeText = "Shanghai"),
+        )
+        val second = repository.seedNote(
+            notebookId = diary.id,
+            title = "Second",
+            markdownBody = "Two",
+            createdDate = LocalDate(2026, 5, 22),
+            location = NotesLocationInput(placeText = "Suzhou"),
+        )
+        controller.selectNotebook(diary.id)
+        assertTrue(controller.openExistingNote(first.id))
+        assertNotNull(controller.state.editor)
+        controller.selectAllVisibleNotes()
+
+        assertTrue(controller.moveSelectedNotes(archive.id))
+        assertNull(controller.state.editor, "Batch operations must close a selected clean editor before updating it.")
+        assertTrue(controller.state.selectedNoteIds.isEmpty())
+        assertTrue(repository.listNotes(diary.id).isEmpty())
+        assertEquals(setOf(first.id, second.id), repository.listNotes(archive.id).map { it.id }.toSet())
+
+        controller.selectNotebook(archive.id)
+        controller.selectAllVisibleNotes()
+        assertTrue(controller.changeSelectedNotesCreatedDate(LocalDate(2024, 2, 3)))
+        controller.selectAllVisibleNotes()
+        assertTrue(controller.changeSelectedNotesTimeZone("America/Los_Angeles"))
+        controller.selectAllVisibleNotes()
+        assertTrue(controller.clearSelectedNotesLocation())
+
+        listOf(first.id, second.id).forEach { noteId ->
+            val details = checkNotNull(repository.getNoteDetails(noteId))
+            assertEquals(LocalDate(2024, 2, 3), noteCalendarDate(details.createdAt, details.timeZoneId))
+            assertEquals("America/Los_Angeles", details.timeZoneId)
+            assertNull(details.location)
+        }
+    }
+
+    @Test
     fun newNoteDefaultsToCurrentLocalDateProvider() = runBlocking {
         val repository = InMemoryNotesRepository()
         val controller = NotesUiController(
@@ -240,6 +310,95 @@ class NotesUiControllerTest {
         controller.closeEditorSession(sessionId)
         assertNull(controller.state.editor)
         assertEquals("Draft", repository.listNotes(diary.id).single().title)
+    }
+
+    @Test
+    fun saveUpdatesVisibleNotesWithoutReloadingWorkspace() = runBlocking {
+        val repository = InMemoryNotesRepository()
+        val controller = NotesUiController(repository)
+        val diary = controller.createNotebook("Diary")
+        val older = repository.seedNote(
+            notebookId = diary.id,
+            title = "Older",
+            markdownBody = "Older body",
+            createdDate = LocalDate(2026, 5, 20),
+        )
+        controller.selectNotebook(diary.id)
+
+        val notebooksBeforeSave = repository.listNotebooksCalls
+        val notesBeforeSave = repository.listNotesCalls
+        val deletedBeforeSave = repository.listDeletedWorkspaceItemsCalls
+        val conflictsBeforeSave = repository.getNotebookConflictDetailsCalls
+        val versionsBeforeSave = repository.listNoteVersionsCalls
+
+        controller.openNewNote(diary.id)
+        controller.updateDraft(
+            title = "Newest",
+            markdownBody = "Newest body",
+            createdDateText = "2026-05-24",
+        )
+        assertTrue(controller.saveEditor())
+
+        assertEquals(listOf("Newest", "Older"), controller.state.notes.map { it.title })
+        assertEquals(older.id, controller.state.notes.last().id)
+        assertEquals(notebooksBeforeSave, repository.listNotebooksCalls)
+        assertEquals(notesBeforeSave, repository.listNotesCalls)
+        assertEquals(deletedBeforeSave, repository.listDeletedWorkspaceItemsCalls)
+        assertEquals(conflictsBeforeSave, repository.getNotebookConflictDetailsCalls)
+        assertEquals(versionsBeforeSave, repository.listNoteVersionsCalls)
+    }
+
+    @Test
+    fun routeExitSaveDoesNotLoadVersionsOrConflicts() = runBlocking {
+        val repository = InMemoryNotesRepository()
+        val controller = NotesUiController(repository)
+        val diary = controller.createNotebook("Diary")
+        controller.selectNotebook(diary.id)
+
+        val notebooksBeforeSave = repository.listNotebooksCalls
+        val notesBeforeSave = repository.listNotesCalls
+        val deletedBeforeSave = repository.listDeletedWorkspaceItemsCalls
+        val conflictsBeforeSave = repository.getNotebookConflictDetailsCalls
+        val versionsBeforeSave = repository.listNoteVersionsCalls
+
+        assertTrue(controller.openNewNote(diary.id))
+        controller.updateDraft(title = "Draft", markdownBody = "Saved on exit", createdDateText = "2026-05-22")
+        assertTrue(controller.saveEditorForRouteExit())
+
+        assertEquals("Draft", controller.state.notes.single().title)
+        assertEquals(notebooksBeforeSave, repository.listNotebooksCalls)
+        assertEquals(notesBeforeSave, repository.listNotesCalls)
+        assertEquals(deletedBeforeSave, repository.listDeletedWorkspaceItemsCalls)
+        assertEquals(conflictsBeforeSave, repository.getNotebookConflictDetailsCalls)
+        assertEquals(versionsBeforeSave, repository.listNoteVersionsCalls)
+    }
+
+    @Test
+    fun saveIntoAnotherNotebookReloadsOnlyThatNotebookList() = runBlocking {
+        val repository = InMemoryNotesRepository()
+        val controller = NotesUiController(repository)
+        val diary = controller.createNotebook("Diary")
+        val travel = controller.createNotebook("Travel")
+        controller.selectNotebook(diary.id)
+
+        val notebooksBeforeSave = repository.listNotebooksCalls
+        val notesBeforeSave = repository.listNotesCalls
+        val deletedBeforeSave = repository.listDeletedWorkspaceItemsCalls
+
+        controller.openNewNote(diary.id)
+        controller.updateDraft(
+            notebookId = travel.id,
+            title = "Trip day",
+            markdownBody = "Arrived by train",
+            createdDateText = "2026-05-23",
+        )
+        assertTrue(controller.saveEditor())
+
+        assertEquals(travel.id, controller.state.selectedNotebookId)
+        assertEquals(listOf("Trip day"), controller.state.notes.map { it.title })
+        assertEquals(notebooksBeforeSave, repository.listNotebooksCalls)
+        assertEquals(notesBeforeSave + 1, repository.listNotesCalls)
+        assertEquals(deletedBeforeSave, repository.listDeletedWorkspaceItemsCalls)
     }
 
     @Test

@@ -13,6 +13,9 @@ import saien.someday.domain.notes.ConflictResolutionAction
 import saien.someday.domain.notes.MemoryDayCount
 import saien.someday.domain.notes.MemoryMonth
 import saien.someday.domain.notes.NoteDetails
+import saien.someday.domain.notes.NoteBatchDeletion
+import saien.someday.domain.notes.NoteBatchUndelete
+import saien.someday.domain.notes.NoteBatchUpdate
 import saien.someday.domain.notes.NoteInput
 import saien.someday.domain.notes.NoteSummary
 import saien.someday.domain.notes.NoteSyncBadge
@@ -303,6 +306,37 @@ class SystemV2NotesRepository(
         return getNoteDetails(noteId) ?: created.toTransientDetails(context)
     }
 
+    override fun updateNotes(edits: List<NoteBatchUpdate>): List<NoteDetails> {
+        require(edits.map { it.noteId }.distinct().size == edits.size) {
+            "A note can only appear once in a batch update."
+        }
+        if (edits.isEmpty()) return emptyList()
+        val context = contexts.requireActive()
+        val now = clock()
+        val versions = edits.mapNotNull { edit ->
+            val token = edit.input.causalToken
+                ?: error("A V2 note save requires the causal token captured when the note was loaded.")
+            val base = requireTokenBase(context, noteKey(edit.noteId), token)
+            val current = base.contentPayload as? NoteContentV2
+                ?: error("Use the explicit undelete action for a deleted note.")
+            val notebookId = if (edit.input.notebookId == RECOVERY_INBOX_EFFECTIVE_NOTEBOOK_ID_V2) {
+                current.notebookId
+            } else {
+                requireWritableNotebook(context, edit.input.notebookId)
+            }
+            val next = edit.input.toSystemContent(
+                notebookId = notebookId,
+                noteCreatedAt = edit.input.createdAt ?: current.noteCreatedAt,
+                locationFallbackTime = now,
+            )
+            if (next == current) null else createFromToken(context, token, next, deletedAt = null, now = now)
+        }
+        if (versions.isNotEmpty()) {
+            commit(context, versions.map { it.version to it.mutationId }, now)
+        }
+        return edits.map { edit -> requireNotNull(getNoteDetails(edit.noteId)) }
+    }
+
     override fun deleteNote(noteId: String) {
         error("A V2 note deletion requires the causal token returned with the note detail view.")
     }
@@ -313,6 +347,28 @@ class SystemV2NotesRepository(
         if (base.kind == WorkspaceEntityVersionKindV2.DELETION) return
         val now = clock()
         commitTokenEdit(context, causalToken, content = null, deletedAt = now, now = now)
+    }
+
+    override fun deleteNotes(deletions: List<NoteBatchDeletion>) {
+        require(deletions.map { it.noteId }.distinct().size == deletions.size) {
+            "A note can only appear once in a batch deletion."
+        }
+        if (deletions.isEmpty()) return
+        val context = contexts.requireActive()
+        val now = clock()
+        val versions = deletions.mapNotNull { deletion ->
+            val token = deletion.causalToken
+                ?: error("A V2 note deletion requires the causal token returned with the note detail view.")
+            val base = requireTokenBase(context, noteKey(deletion.noteId), token)
+            if (base.kind == WorkspaceEntityVersionKindV2.DELETION) {
+                null
+            } else {
+                createFromToken(context, token, content = null, deletedAt = now, now = now)
+            }
+        }
+        if (versions.isNotEmpty()) {
+            commit(context, versions.map { it.version to it.mutationId }, now)
+        }
     }
 
     override fun undeleteNote(
@@ -331,6 +387,30 @@ class SystemV2NotesRepository(
         val now = clock()
         val created = commitTokenEdit(context, causalToken, retained, deletedAt = null, now = now)
         return getNoteDetails(noteId) ?: created.toTransientDetails(context)
+    }
+
+    override fun undeleteNotes(restores: List<NoteBatchUndelete>): List<NoteDetails> {
+        require(restores.map { it.noteId }.distinct().size == restores.size) {
+            "A note can only appear once in a batch restore."
+        }
+        if (restores.isEmpty()) return emptyList()
+        val context = contexts.requireActive()
+        val now = clock()
+        val versions = restores.map { restore ->
+            val base = requireTokenBase(context, noteKey(restore.noteId), restore.causalToken)
+            require(base.kind == WorkspaceEntityVersionKindV2.DELETION) {
+                "Note undelete requires a deletion base."
+            }
+            val retained = context.store.loadVersion(restore.retainedContentVersionId)
+                ?.takeIf { it.key == base.key }
+                ?.contentPayload as? NoteContentV2
+                ?: findRetainedContentVersion(base.key, restore.retainedContentVersionId)
+                    ?.contentPayload as? NoteContentV2
+                ?: error("The selected retained note snapshot is unavailable.")
+            createFromToken(context, restore.causalToken, retained, deletedAt = null, now = now)
+        }
+        commit(context, versions.map { it.version to it.mutationId }, now)
+        return restores.map { restore -> requireNotNull(getNoteDetails(restore.noteId)) }
     }
 
     override fun listNoteVersions(noteId: String): List<NoteVersionSummary> {
@@ -618,7 +698,7 @@ class SystemV2NotesRepository(
                 .firstOrNull()
         } ?: return null
         val content = head.contentPayload as? NoteContentV2 ?: return null
-        val pending = context.store.loadPending(context.remoteProfile).any { it.objectId == head.versionId }
+        val pending = context.store.loadPendingObjectIds(context.remoteProfile).contains(head.versionId)
         val badge = when {
             conflict != null -> NoteSyncBadge.Conflict(conflict.descriptor.reason.wireValue)
             pending -> NoteSyncBadge.Pending
@@ -649,7 +729,7 @@ class SystemV2NotesRepository(
                 .firstOrNull()
         } ?: return null
         val content = head.contentPayload as? NotebookContentV2 ?: return null
-        val pending = context.store.loadPending(context.remoteProfile).any { it.objectId == head.versionId }
+        val pending = context.store.loadPendingObjectIds(context.remoteProfile).contains(head.versionId)
         return NotebookSummary(
             id = projection.key.entityId,
             title = content.title,
@@ -682,9 +762,10 @@ class SystemV2NotesRepository(
         deletedAt: Instant?,
         now: Instant,
     ): TokenBasedVersionResultV2.Created {
+        val base = requireNotNull(context.store.loadVersion(token.expectedBaseVersionId))
         val result = context.factory.createFromToken(
             token = token.toSystemToken(),
-            retainedVersions = context.store.loadAllVersions().associateBy { it.versionId },
+            retainedVersions = mapOf(base.versionId to base),
             content = content,
             deletedAt = deletedAt,
             deviceActorId = context.deviceActorId,

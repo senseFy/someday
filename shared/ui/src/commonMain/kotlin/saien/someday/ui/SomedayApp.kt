@@ -16,6 +16,8 @@ import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.horizontalScroll
@@ -100,8 +102,18 @@ import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.isCtrlPressed
+import androidx.compose.ui.input.key.isMetaPressed
+import androidx.compose.ui.input.key.isShiftPressed
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
@@ -177,6 +189,8 @@ import saien.someday.domain.navigation.primaryNavigationTabs
 import saien.someday.domain.notes.ConflictDetails
 import saien.someday.domain.notes.ConflictHistory
 import saien.someday.domain.notes.ConflictResolutionAction
+import saien.someday.domain.notes.DeletedWorkspaceItem
+import saien.someday.domain.notes.DeletedWorkspaceItemType
 import saien.someday.domain.notes.MemoryMonth
 import saien.someday.domain.notes.NoteSummary
 import saien.someday.domain.notes.NoteSyncBadge
@@ -297,7 +311,9 @@ import kotlin.time.Instant
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.datetime.TimeZone
+import kotlinx.datetime.LocalDate
 import kotlinx.datetime.toLocalDateTime
+import org.jetbrains.compose.resources.StringResource
 import org.jetbrains.compose.resources.stringResource
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -383,6 +399,7 @@ fun SomedayApp(
         val selectedTab = currentRouteKind.primaryTab
         val notesSearchActive = currentRouteKind.showsNotesSearch
         var notebookSheetVisible by remember { mutableStateOf(false) }
+        var recentlyDeletedSheetVisible by remember { mutableStateOf(false) }
         var discardEditorOnExit by remember { mutableStateOf(false) }
         val uiCoroutineScope = rememberCoroutineScope()
         val onThisDayNotificationStrings = OnThisDayNotificationStrings(
@@ -554,7 +571,9 @@ fun SomedayApp(
         LaunchedEffect(notesState.localChangeEventId) {
             if (notesState.localChangeEventId > 0L) {
                 autoSyncScheduler.request(AutoSyncTrigger.LocalChange)
-                settingsController.rescheduleOnThisDayNotifications()
+                if (settingsState.settings.onThisDayNotifications.enabled) {
+                    settingsController.rescheduleOnThisDayNotifications()
+                }
             }
         }
 
@@ -612,6 +631,11 @@ fun SomedayApp(
             notebookSheetVisible = true
         }
 
+        fun showRecentlyDeleted() {
+            notebookSheetVisible = false
+            recentlyDeletedSheetVisible = true
+        }
+
         fun selectNotebook(notebookId: String) {
             uiCoroutineScope.launch {
                 if (notesController.selectNotebook(notebookId)) {
@@ -639,6 +663,9 @@ fun SomedayApp(
                     closeSearch()
                     return true
                 }
+            }
+            if (tab != PrimaryTab.Notes) {
+                notesController.clearNoteSelection()
             }
             navController.navigatePrimaryTab(tab)
             return true
@@ -827,12 +854,24 @@ fun SomedayApp(
                                     notesController.resolveNotebookConflictBranch(notebookId, versionId)
                                 }
                             },
+                            onShowRecentlyDeleted = ::showRecentlyDeleted,
+                            onSelectNotebook = ::selectNotebook,
+                        )
+                    }
+                }
+
+                if (recentlyDeletedSheetVisible) {
+                    ModalBottomSheet(
+                        onDismissRequest = { recentlyDeletedSheetVisible = false },
+                    ) {
+                        RecentlyDeletedSheet(
+                            state = notesState,
+                            syncInProgress = settingsState.manualSyncProgress.running,
                             onRestoreDeletedItem = { entityId ->
                                 uiCoroutineScope.launch {
                                     notesController.restoreDeletedWorkspaceItem(entityId)
                                 }
                             },
-                            onSelectNotebook = ::selectNotebook,
                         )
                     }
                 }
@@ -1030,18 +1069,24 @@ private fun NavigationTitleText(
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun SomedayListCard(
     onClick: () -> Unit,
+    onLongClick: (() -> Unit)? = null,
+    containerColor: Color = Color.Transparent,
     modifier: Modifier = Modifier,
     content: @Composable ColumnScope.() -> Unit,
 ) {
     Surface(
-        onClick = onClick,
         shape = SomedayDesignDefaults.ContentCardShape,
-        color = Color.Transparent,
+        color = containerColor,
         contentColor = MaterialTheme.colorScheme.onSurface,
-        modifier = modifier,
+        modifier = modifier.combinedClickable(
+            role = Role.Button,
+            onClick = onClick,
+            onLongClick = onLongClick,
+        ),
     ) {
         Column(
             modifier = Modifier.padding(horizontal = 4.dp, vertical = 14.dp),
@@ -2493,9 +2538,29 @@ private fun NotesListPane(
     modifier: Modifier = Modifier,
 ) {
     val coroutineScope = rememberCoroutineScope()
+    var primarySelectionModifierPressed by remember { mutableStateOf(false) }
+    var extendSelectionPressed by remember { mutableStateOf(false) }
+    var batchDialog by rememberSaveable { mutableStateOf<NotesBatchDialog?>(null) }
     Column(
         modifier = modifier
             .background(MaterialTheme.colorScheme.background)
+            .onPreviewKeyEvent { event ->
+                primarySelectionModifierPressed = event.isMetaPressed || event.isCtrlPressed
+                extendSelectionPressed = event.isShiftPressed
+                when {
+                    event.type == KeyEventType.KeyDown &&
+                        primarySelectionModifierPressed && event.key == Key.A -> {
+                        notesController.selectAllVisibleNotes()
+                        true
+                    }
+                    event.type == KeyEventType.KeyDown && event.key == Key.Escape &&
+                        notesState.noteSelectionActive -> {
+                        notesController.clearNoteSelection()
+                        true
+                    }
+                    else -> false
+                }
+            }
             .fillMaxHeight(),
     ) {
         NotesPageHeader(
@@ -2506,6 +2571,8 @@ private fun NotesListPane(
             onOpenSearch = onOpenSearch,
             onCloseSearch = onCloseSearch,
             onShowNotebooks = onShowNotebooks,
+            onSelectAllNotes = notesController::selectAllVisibleNotes,
+            onClearNoteSelection = notesController::clearNoteSelection,
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(
@@ -2514,6 +2581,15 @@ private fun NotesListPane(
                     end = SomedayDesignDefaults.CompactPageHorizontalPadding,
                 ),
         )
+        if (selectedTab == PrimaryTab.Notes && notesState.noteSelectionActive) {
+            NotesBatchActionBar(
+                operationInProgress = notesState.batchOperationInProgress,
+                onAction = { batchDialog = it },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = SomedayDesignDefaults.CompactPageHorizontalPadding),
+            )
+        }
         SomedaySyncPullToRefresh(
             pullRefresh = pullRefresh.takeUnless { notesSearchActive },
             modifier = Modifier.fillMaxWidth().weight(1f),
@@ -2539,6 +2615,10 @@ private fun NotesListPane(
                         },
                         onClearSearch = notesController::clearSearch,
                         onOpenNote = { noteId -> onOpenNote(noteId) },
+                        showSelectionControls = true,
+                        selectionOnClick = notesState.noteSelectionActive || primarySelectionModifierPressed,
+                        extendSelection = extendSelectionPressed,
+                        onToggleSelection = notesController::toggleNoteSelection,
                     )
                 } else {
                     notesListItems(
@@ -2546,11 +2626,31 @@ private fun NotesListPane(
                         syncInProgress = syncInProgress,
                         onShowNotebooks = onShowNotebooks,
                         onOpenNote = { noteId -> onOpenNote(noteId) },
+                        showSelectionControls = true,
+                        selectionOnClick = notesState.noteSelectionActive || primarySelectionModifierPressed,
+                        extendSelection = extendSelectionPressed,
+                        onToggleSelection = notesController::toggleNoteSelection,
                     )
                 }
             }
         }
+        NotesBatchUndoBar(
+            deletedCount = notesState.batchDeleteUndoItems.size,
+            operationInProgress = notesState.batchOperationInProgress,
+            onUndo = { coroutineScope.launch { notesController.undoLastBatchDelete() } },
+            onDismiss = notesController::dismissBatchDeleteUndo,
+        )
     }
+    NotesBatchDialogs(
+        dialog = batchDialog,
+        state = notesState,
+        onDismiss = { batchDialog = null },
+        onMove = { notebookId -> coroutineScope.launch { notesController.moveSelectedNotes(notebookId) } },
+        onDelete = { coroutineScope.launch { notesController.deleteSelectedNotes() } },
+        onChangeDate = { date -> coroutineScope.launch { notesController.changeSelectedNotesCreatedDate(date) } },
+        onChangeTimeZone = { zone -> coroutineScope.launch { notesController.changeSelectedNotesTimeZone(zone) } },
+        onClearLocation = { coroutineScope.launch { notesController.clearSelectedNotesLocation() } },
+    )
 }
 
 @Composable
@@ -2689,6 +2789,7 @@ private fun shouldShowCreateNoteAction(
     notesState: NotesUiState,
 ): Boolean =
     selectedTab != PrimaryTab.Settings &&
+        !notesState.noteSelectionActive &&
         notesState.editor == null &&
         currentRouteKind != SomedayRouteKind.NotesSearch &&
         currentRouteKind != SomedayRouteKind.NoteEditor &&
@@ -2855,7 +2956,27 @@ private fun NotesTabLazyContent(
     modifier: Modifier = Modifier,
 ) {
     val coroutineScope = rememberCoroutineScope()
-    Column(modifier = modifier) {
+    var primarySelectionModifierPressed by remember { mutableStateOf(false) }
+    var extendSelectionPressed by remember { mutableStateOf(false) }
+    var batchDialog by rememberSaveable { mutableStateOf<NotesBatchDialog?>(null) }
+    Column(
+        modifier = modifier.onPreviewKeyEvent { event ->
+            primarySelectionModifierPressed = event.isMetaPressed || event.isCtrlPressed
+            extendSelectionPressed = event.isShiftPressed
+            when {
+                event.type == KeyEventType.KeyDown && primarySelectionModifierPressed && event.key == Key.A -> {
+                    notesController.selectAllVisibleNotes()
+                    true
+                }
+                event.type == KeyEventType.KeyDown && event.key == Key.Escape &&
+                    notesState.noteSelectionActive -> {
+                    notesController.clearNoteSelection()
+                    true
+                }
+                else -> false
+            }
+        },
+    ) {
         NotesPageHeader(
             selectedTab = selectedTab,
             notesState = notesState,
@@ -2864,6 +2985,8 @@ private fun NotesTabLazyContent(
             onOpenSearch = onOpenSearch,
             onCloseSearch = onCloseSearch,
             onShowNotebooks = onShowNotebooks,
+            onSelectAllNotes = notesController::selectAllVisibleNotes,
+            onClearNoteSelection = notesController::clearNoteSelection,
             modifier = Modifier
                 .fillMaxWidth()
                 .background(MaterialTheme.colorScheme.background)
@@ -2894,6 +3017,10 @@ private fun NotesTabLazyContent(
                         },
                         onClearSearch = notesController::clearSearch,
                         onOpenNote = { noteId -> onOpenNote(noteId) },
+                        showSelectionControls = false,
+                        selectionOnClick = notesState.noteSelectionActive || primarySelectionModifierPressed,
+                        extendSelection = extendSelectionPressed,
+                        onToggleSelection = notesController::toggleNoteSelection,
                     )
                 } else {
                     notesListItems(
@@ -2901,11 +3028,41 @@ private fun NotesTabLazyContent(
                         syncInProgress = syncInProgress,
                         onShowNotebooks = onShowNotebooks,
                         onOpenNote = { noteId -> onOpenNote(noteId) },
+                        showSelectionControls = false,
+                        selectionOnClick = notesState.noteSelectionActive || primarySelectionModifierPressed,
+                        extendSelection = extendSelectionPressed,
+                        onToggleSelection = notesController::toggleNoteSelection,
                     )
                 }
             }
         }
+        NotesBatchUndoBar(
+            deletedCount = notesState.batchDeleteUndoItems.size,
+            operationInProgress = notesState.batchOperationInProgress,
+            onUndo = { coroutineScope.launch { notesController.undoLastBatchDelete() } },
+            onDismiss = notesController::dismissBatchDeleteUndo,
+        )
+        if (selectedTab == PrimaryTab.Notes && notesState.noteSelectionActive) {
+            NotesBatchActionBar(
+                operationInProgress = notesState.batchOperationInProgress,
+                onAction = { batchDialog = it },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = SomedayDesignDefaults.PageHorizontalPadding)
+                    .padding(bottom = 8.dp),
+            )
+        }
     }
+    NotesBatchDialogs(
+        dialog = batchDialog,
+        state = notesState,
+        onDismiss = { batchDialog = null },
+        onMove = { notebookId -> coroutineScope.launch { notesController.moveSelectedNotes(notebookId) } },
+        onDelete = { coroutineScope.launch { notesController.deleteSelectedNotes() } },
+        onChangeDate = { date -> coroutineScope.launch { notesController.changeSelectedNotesCreatedDate(date) } },
+        onChangeTimeZone = { zone -> coroutineScope.launch { notesController.changeSelectedNotesTimeZone(zone) } },
+        onClearLocation = { coroutineScope.launch { notesController.clearSelectedNotesLocation() } },
+    )
 }
 
 private data class SomedayPullRefreshUi(
@@ -3218,14 +3375,31 @@ private fun NotesPageHeader(
     onOpenSearch: () -> Unit,
     onCloseSearch: () -> Unit,
     onShowNotebooks: () -> Unit,
+    onSelectAllNotes: () -> Unit,
+    onClearNoteSelection: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     AppHeader(
-        title = pageHeaderTitle(selectedTab, notesState, notesSearchActive),
-        subtitle = pageHeaderSubtitle(selectedTab, notesState, memoriesState, notesSearchActive),
+        title = if (selectedTab == PrimaryTab.Notes && notesState.noteSelectionActive) {
+            stringResource(Res.string.notes_batch_selected_count, notesState.selectedNoteIds.size)
+        } else {
+            pageHeaderTitle(selectedTab, notesState, notesSearchActive)
+        },
+        subtitle = if (selectedTab == PrimaryTab.Notes && notesState.noteSelectionActive) {
+            null
+        } else {
+            pageHeaderSubtitle(selectedTab, notesState, memoriesState, notesSearchActive)
+        },
         modifier = modifier,
     ) {
-        if (notesSearchActive) {
+        if (selectedTab == PrimaryTab.Notes && notesState.noteSelectionActive) {
+            IconButton(onClick = onSelectAllNotes, enabled = !notesState.batchOperationInProgress) {
+                Icon(Lucide.Check, contentDescription = stringResource(Res.string.common_select_all))
+            }
+            IconButton(onClick = onClearNoteSelection, enabled = !notesState.batchOperationInProgress) {
+                Icon(Lucide.X, contentDescription = stringResource(Res.string.common_close))
+            }
+        } else if (notesSearchActive) {
             IconButton(onClick = onCloseSearch) {
                 Icon(Lucide.X, contentDescription = stringResource(Res.string.notes_close_search))
             }
@@ -3397,6 +3571,10 @@ private fun LazyListScope.notesListItems(
     syncInProgress: Boolean,
     onShowNotebooks: () -> Unit,
     onOpenNote: (String) -> Unit,
+    showSelectionControls: Boolean,
+    selectionOnClick: Boolean,
+    extendSelection: Boolean,
+    onToggleSelection: (String, Boolean) -> Unit,
 ) {
     if (state.notebooks.isEmpty()) {
         item(key = "notes-empty-notebooks", contentType = "empty-state") {
@@ -3432,6 +3610,11 @@ private fun LazyListScope.notesListItems(
                 metadataText = formatNoteCreatedMetadata(note),
                 syncInProgress = syncInProgress,
                 onOpenNote = onOpenNote,
+                selected = note.id in state.selectedNoteIds,
+                showSelectionControl = showSelectionControls || state.noteSelectionActive,
+                selectionOnClick = selectionOnClick,
+                extendSelection = extendSelection,
+                onToggleSelection = onToggleSelection,
             )
         }
     }
@@ -3461,6 +3644,10 @@ private fun LazyListScope.notesSearchItems(
     onSearchQueryChange: (String) -> Unit,
     onClearSearch: () -> Unit,
     onOpenNote: (String) -> Unit,
+    showSelectionControls: Boolean,
+    selectionOnClick: Boolean,
+    extendSelection: Boolean,
+    onToggleSelection: (String, Boolean) -> Unit,
 ) {
     item(key = "notes-search-field", contentType = "search-field") {
         OutlinedTextField(
@@ -3500,7 +3687,10 @@ private fun LazyListScope.notesSearchItems(
         }
     } else {
         item(key = "notes-search-count", contentType = "section-label") {
-            Text("${results.size} matches", style = MaterialTheme.typography.bodySmall)
+            Text(
+                stringResource(Res.string.notes_matches_count, results.size),
+                style = MaterialTheme.typography.bodySmall,
+            )
         }
         items(
             items = results,
@@ -3512,6 +3702,11 @@ private fun LazyListScope.notesSearchItems(
                 metadataText = formatNoteCreatedThenUpdatedMetadata(note),
                 syncInProgress = syncInProgress,
                 onOpenNote = onOpenNote,
+                selected = note.id in state.selectedNoteIds,
+                showSelectionControl = showSelectionControls || state.noteSelectionActive,
+                selectionOnClick = selectionOnClick,
+                extendSelection = extendSelection,
+                onToggleSelection = onToggleSelection,
             )
         }
     }
@@ -3523,9 +3718,32 @@ private fun NoteListItem(
     metadataText: String,
     syncInProgress: Boolean,
     onOpenNote: (String) -> Unit,
+    selected: Boolean = false,
+    showSelectionControl: Boolean = false,
+    selectionOnClick: Boolean = false,
+    extendSelection: Boolean = false,
+    onToggleSelection: ((String, Boolean) -> Unit)? = null,
 ) {
+    val hapticFeedback = LocalHapticFeedback.current
     SomedayListCard(
-        onClick = { onOpenNote(note.id) },
+        onClick = {
+            if (selectionOnClick) {
+                onToggleSelection?.invoke(note.id, extendSelection)
+            } else {
+                onOpenNote(note.id)
+            }
+        },
+        onLongClick = onToggleSelection?.let { toggle ->
+            {
+                hapticFeedback.performHapticFeedback(HapticFeedbackType.LongPress)
+                toggle(note.id, false)
+            }
+        },
+        containerColor = if (selected) {
+            MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.55f)
+        } else {
+            Color.Transparent
+        },
         modifier = Modifier
             .fillMaxWidth()
             .padding(vertical = 6.dp),
@@ -3534,6 +3752,12 @@ private fun NoteListItem(
             horizontalArrangement = Arrangement.spacedBy(10.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
+            if (showSelectionControl && onToggleSelection != null) {
+                Checkbox(
+                    checked = selected,
+                    onCheckedChange = { onToggleSelection.invoke(note.id, extendSelection) },
+                )
+            }
             Column(modifier = Modifier.weight(1f)) {
                 Text(
                     text = note.title,
@@ -3565,6 +3789,285 @@ private fun NoteListItem(
                 style = MaterialTheme.typography.bodyMedium,
             )
         }
+    }
+}
+
+private enum class NotesBatchDialog {
+    Move,
+    Delete,
+    ChangeDate,
+    ChangeTimeZone,
+    ClearLocation,
+}
+
+@Composable
+private fun NotesBatchActionBar(
+    operationInProgress: Boolean,
+    onAction: (NotesBatchDialog) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    var moreExpanded by remember { mutableStateOf(false) }
+    Surface(
+        shape = SomedayDesignDefaults.ContentCardShape,
+        color = MaterialTheme.colorScheme.surfaceContainer,
+        modifier = modifier,
+    ) {
+        Row(
+            horizontalArrangement = Arrangement.SpaceEvenly,
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 4.dp),
+        ) {
+            TextButton(
+                onClick = { onAction(NotesBatchDialog.Move) },
+                enabled = !operationInProgress,
+                modifier = Modifier.weight(1f),
+            ) {
+                Icon(Lucide.NotebookTabs, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(6.dp))
+                Text(stringResource(Res.string.common_move))
+            }
+            TextButton(
+                onClick = { onAction(NotesBatchDialog.Delete) },
+                enabled = !operationInProgress,
+                modifier = Modifier.weight(1f),
+            ) {
+                Icon(Lucide.Trash, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(6.dp))
+                Text(stringResource(Res.string.common_delete))
+            }
+            Box(modifier = Modifier.weight(1f)) {
+                TextButton(
+                    onClick = { moreExpanded = true },
+                    enabled = !operationInProgress,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Icon(Lucide.Ellipsis, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text(stringResource(Res.string.common_more))
+                }
+                DropdownMenu(
+                    expanded = moreExpanded,
+                    onDismissRequest = { moreExpanded = false },
+                ) {
+                    DropdownMenuItem(
+                        text = { Text(stringResource(Res.string.notes_batch_change_date)) },
+                        leadingIcon = { Icon(Lucide.CalendarDays, contentDescription = null) },
+                        onClick = {
+                            moreExpanded = false
+                            onAction(NotesBatchDialog.ChangeDate)
+                        },
+                    )
+                    DropdownMenuItem(
+                        text = { Text(stringResource(Res.string.notes_batch_change_timezone)) },
+                        leadingIcon = { Icon(Lucide.Globe, contentDescription = null) },
+                        onClick = {
+                            moreExpanded = false
+                            onAction(NotesBatchDialog.ChangeTimeZone)
+                        },
+                    )
+                    DropdownMenuItem(
+                        text = { Text(stringResource(Res.string.notes_batch_clear_location)) },
+                        leadingIcon = { Icon(Lucide.MapPin, contentDescription = null) },
+                        onClick = {
+                            moreExpanded = false
+                            onAction(NotesBatchDialog.ClearLocation)
+                        },
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun NotesBatchUndoBar(
+    deletedCount: Int,
+    operationInProgress: Boolean,
+    onUndo: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    if (deletedCount == 0) return
+    Surface(
+        color = MaterialTheme.colorScheme.inverseSurface,
+        contentColor = MaterialTheme.colorScheme.inverseOnSurface,
+        shape = SomedayDesignDefaults.ContentCardShape,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = SomedayDesignDefaults.PageHorizontalPadding, vertical = 6.dp),
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth().padding(start = 14.dp, end = 4.dp),
+        ) {
+            Text(
+                stringResource(Res.string.notes_batch_undo_deleted, deletedCount),
+                style = MaterialTheme.typography.bodyMedium,
+                modifier = Modifier.weight(1f),
+            )
+            TextButton(onClick = onUndo, enabled = !operationInProgress) {
+                Text(stringResource(Res.string.common_undo))
+            }
+            IconButton(onClick = onDismiss, enabled = !operationInProgress) {
+                Icon(Lucide.X, contentDescription = stringResource(Res.string.common_close))
+            }
+        }
+    }
+}
+
+@Composable
+private fun NotesBatchDialogs(
+    dialog: NotesBatchDialog?,
+    state: NotesUiState,
+    onDismiss: () -> Unit,
+    onMove: (String) -> Unit,
+    onDelete: () -> Unit,
+    onChangeDate: (LocalDate) -> Unit,
+    onChangeTimeZone: (String?) -> Unit,
+    onClearLocation: () -> Unit,
+) {
+    val selectedNotes = state.visibleNotes.filter { it.id in state.selectedNoteIds }
+    when (dialog) {
+        NotesBatchDialog.Move -> AlertDialog(
+            onDismissRequest = onDismiss,
+            title = { Text(stringResource(Res.string.notes_batch_move_title)) },
+            text = {
+                Column(
+                    modifier = Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState()),
+                ) {
+                    state.notebooks
+                        .filter { it.syncBadge !is NoteSyncBadge.Error }
+                        .forEach { notebook ->
+                            val changesAnyNote = selectedNotes.any { it.notebookId != notebook.id }
+                            TextButton(
+                                onClick = {
+                                    onDismiss()
+                                    onMove(notebook.id)
+                                },
+                                enabled = changesAnyNote && !state.batchOperationInProgress,
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Text(notebook.title, modifier = Modifier.fillMaxWidth())
+                            }
+                        }
+                }
+            },
+            confirmButton = {},
+            dismissButton = {
+                TextButton(onClick = onDismiss) { Text(stringResource(Res.string.common_cancel)) }
+            },
+        )
+        NotesBatchDialog.Delete -> AlertDialog(
+            onDismissRequest = onDismiss,
+            title = { Text(stringResource(Res.string.notes_batch_delete_title)) },
+            text = { Text(stringResource(Res.string.notes_batch_delete_body, selectedNotes.size)) },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        onDismiss()
+                        onDelete()
+                    },
+                    enabled = selectedNotes.isNotEmpty() && !state.batchOperationInProgress,
+                ) { Text(stringResource(Res.string.common_delete)) }
+            },
+            dismissButton = {
+                TextButton(onClick = onDismiss) { Text(stringResource(Res.string.common_cancel)) }
+            },
+        )
+        NotesBatchDialog.ChangeDate -> {
+            val initialDate = selectedNotes.firstOrNull()
+                ?.let { noteCalendarDate(it.createdAt, it.timeZoneId).toString() }
+                .orEmpty()
+            var dateText by remember(dialog, initialDate) { mutableStateOf(initialDate) }
+            val date = runCatching { LocalDate.parse(dateText.trim()) }.getOrNull()
+            AlertDialog(
+                onDismissRequest = onDismiss,
+                title = { Text(stringResource(Res.string.notes_batch_change_date_title)) },
+                text = {
+                    OutlinedTextField(
+                        value = dateText,
+                        onValueChange = { dateText = it },
+                        label = { Text(stringResource(Res.string.common_date)) },
+                        supportingText = if (date == null) {
+                            { Text(stringResource(Res.string.notes_fb_date_format)) }
+                        } else {
+                            null
+                        },
+                        isError = date == null,
+                        singleLine = true,
+                    )
+                },
+                confirmButton = {
+                    TextButton(
+                        onClick = {
+                            onDismiss()
+                            onChangeDate(checkNotNull(date))
+                        },
+                        enabled = date != null && !state.batchOperationInProgress,
+                    ) { Text(stringResource(Res.string.common_save)) }
+                },
+                dismissButton = {
+                    TextButton(onClick = onDismiss) { Text(stringResource(Res.string.common_cancel)) }
+                },
+            )
+        }
+        NotesBatchDialog.ChangeTimeZone -> {
+            val initialZone = selectedNotes.firstOrNull()?.timeZoneId.orEmpty()
+            var zoneText by remember(dialog, initialZone) { mutableStateOf(initialZone) }
+            val normalized = zoneText.trim().ifBlank { null }
+            val valid = normalized == null || runCatching { TimeZone.of(normalized) }.isSuccess
+            AlertDialog(
+                onDismissRequest = onDismiss,
+                title = { Text(stringResource(Res.string.notes_batch_change_timezone_title)) },
+                text = {
+                    OutlinedTextField(
+                        value = zoneText,
+                        onValueChange = { zoneText = it },
+                        label = { Text(stringResource(Res.string.notes_batch_change_timezone)) },
+                        supportingText = {
+                            Text(
+                                if (valid) {
+                                    stringResource(Res.string.notes_batch_timezone_hint)
+                                } else {
+                                    stringResource(Res.string.notes_batch_timezone_invalid)
+                                },
+                            )
+                        },
+                        isError = !valid,
+                        singleLine = true,
+                    )
+                },
+                confirmButton = {
+                    TextButton(
+                        onClick = {
+                            onDismiss()
+                            onChangeTimeZone(normalized)
+                        },
+                        enabled = valid && !state.batchOperationInProgress,
+                    ) { Text(stringResource(Res.string.common_save)) }
+                },
+                dismissButton = {
+                    TextButton(onClick = onDismiss) { Text(stringResource(Res.string.common_cancel)) }
+                },
+            )
+        }
+        NotesBatchDialog.ClearLocation -> AlertDialog(
+            onDismissRequest = onDismiss,
+            title = { Text(stringResource(Res.string.notes_batch_clear_location)) },
+            text = { Text(stringResource(Res.string.notes_batch_clear_location_body)) },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        onDismiss()
+                        onClearLocation()
+                    },
+                    enabled = !state.batchOperationInProgress,
+                ) { Text(stringResource(Res.string.common_clear)) }
+            },
+            dismissButton = {
+                TextButton(onClick = onDismiss) { Text(stringResource(Res.string.common_cancel)) }
+            },
+        )
+        null -> Unit
     }
 }
 
@@ -7482,7 +7985,7 @@ private fun NotebookSheet(
     onRenameNotebook: (String, String) -> Unit,
     onDeleteNotebook: (String) -> Unit,
     onResolveNotebookConflict: (String, String) -> Unit,
-    onRestoreDeletedItem: (String) -> Unit,
+    onShowRecentlyDeleted: () -> Unit,
     onSelectNotebook: (String) -> Unit,
 ) {
     var creatingNotebook by remember { mutableStateOf(false) }
@@ -7502,8 +8005,13 @@ private fun NotebookSheet(
                 text = stringResource(Res.string.nav_notebooks),
                 style = MaterialTheme.typography.titleLarge,
             )
-            IconButton(onClick = { creatingNotebook = true }) {
-                Icon(Lucide.Plus, contentDescription = stringResource(Res.string.nav_new_notebook))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                IconButton(onClick = onShowRecentlyDeleted) {
+                    Icon(Lucide.Trash, contentDescription = stringResource(Res.string.deleted_title))
+                }
+                IconButton(onClick = { creatingNotebook = true }) {
+                    Icon(Lucide.Plus, contentDescription = stringResource(Res.string.nav_new_notebook))
+                }
             }
         }
         AnimatedVisibility(visible = creatingNotebook) {
@@ -7622,38 +8130,6 @@ private fun NotebookSheet(
                 HorizontalDivider()
             }
         }
-        if (state.deletedWorkspaceItems.isNotEmpty()) {
-            Spacer(modifier = Modifier.height(16.dp))
-            Text(stringResource(Res.string.deleted_title), style = MaterialTheme.typography.titleMedium)
-            Text(
-                stringResource(Res.string.deleted_help),
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                style = MaterialTheme.typography.bodySmall,
-                modifier = Modifier.padding(top = 4.dp, bottom = 8.dp),
-            )
-            state.deletedWorkspaceItems.forEach { item ->
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(12.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(item.displayTitle, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        Text(
-                            stringResource(Res.string.deleted_item, item.type.name.lowercase()),
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            style = MaterialTheme.typography.bodySmall,
-                        )
-                    }
-                    TextButton(
-                        enabled = item.canRestore && !syncInProgress,
-                        onClick = { onRestoreDeletedItem(item.entityId) },
-                    ) {
-                        Text(if (item.canRestore) stringResource(Res.string.deleted_undelete) else stringResource(Res.string.deleted_snapshot_expired))
-                    }
-                }
-            }
-        }
     }
 
     if (deleteNotebook != null) {
@@ -7667,6 +8143,115 @@ private fun NotebookSheet(
             },
             onDismiss = { deleteNotebookId = null },
         )
+    }
+}
+
+@Composable
+private fun RecentlyDeletedSheet(
+    state: NotesUiState,
+    syncInProgress: Boolean,
+    onRestoreDeletedItem: (String) -> Unit,
+) {
+    val deletedNotes = state.deletedWorkspaceItems.filter { it.type == DeletedWorkspaceItemType.Note }
+    val deletedNotebooks = state.deletedWorkspaceItems.filter { it.type == DeletedWorkspaceItemType.Notebook }
+    Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp)) {
+        Text(
+            text = stringResource(Res.string.deleted_title),
+            style = MaterialTheme.typography.titleLarge,
+        )
+        Text(
+            text = stringResource(Res.string.deleted_items_count, state.deletedWorkspaceItems.size),
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            style = MaterialTheme.typography.labelMedium,
+            modifier = Modifier.padding(top = 2.dp),
+        )
+        Text(
+            stringResource(Res.string.deleted_help),
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            style = MaterialTheme.typography.bodySmall,
+            modifier = Modifier.padding(top = 8.dp, bottom = 12.dp),
+        )
+        HorizontalDivider()
+        if (state.deletedWorkspaceItems.isEmpty()) {
+            EmptyState(
+                icon = Lucide.Trash,
+                title = stringResource(Res.string.deleted_empty),
+            )
+        } else {
+            LazyColumn(
+                contentPadding = PaddingValues(bottom = 24.dp),
+                modifier = Modifier.fillMaxWidth().heightIn(max = 520.dp),
+            ) {
+                deletedWorkspaceSection(
+                    key = "notes",
+                    title = Res.string.deleted_notes_section,
+                    items = deletedNotes,
+                    syncInProgress = syncInProgress,
+                    onRestoreDeletedItem = onRestoreDeletedItem,
+                )
+                deletedWorkspaceSection(
+                    key = "notebooks",
+                    title = Res.string.deleted_notebooks_section,
+                    items = deletedNotebooks,
+                    syncInProgress = syncInProgress,
+                    onRestoreDeletedItem = onRestoreDeletedItem,
+                )
+            }
+        }
+    }
+}
+
+private fun LazyListScope.deletedWorkspaceSection(
+    key: String,
+    title: StringResource,
+    items: List<DeletedWorkspaceItem>,
+    syncInProgress: Boolean,
+    onRestoreDeletedItem: (String) -> Unit,
+) {
+    if (items.isEmpty()) return
+    item(key = "deleted-section-$key", contentType = "section-label") {
+        Text(
+            text = stringResource(title),
+            fontWeight = FontWeight.SemiBold,
+            style = MaterialTheme.typography.titleSmall,
+            modifier = Modifier.padding(top = 16.dp, bottom = 4.dp),
+        )
+    }
+    items(
+        items = items,
+        key = { item -> "deleted-${item.type}-${item.entityId}" },
+        contentType = { "deleted-item" },
+    ) { item ->
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(item.displayTitle, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(
+                    stringResource(
+                        Res.string.deleted_on,
+                        item.deletedAt.toLocalDateTime(TimeZone.currentSystemDefault()).date.toString(),
+                    ),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            TextButton(
+                enabled = item.canRestore && !syncInProgress,
+                onClick = { onRestoreDeletedItem(item.entityId) },
+            ) {
+                Text(
+                    if (item.canRestore) {
+                        stringResource(Res.string.deleted_undelete)
+                    } else {
+                        stringResource(Res.string.deleted_snapshot_expired)
+                    },
+                )
+            }
+        }
+        HorizontalDivider()
     }
 }
 

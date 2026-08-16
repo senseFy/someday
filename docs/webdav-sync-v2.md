@@ -17,6 +17,12 @@ Authoritative protocol: [`docs/sync-system-v2-spec.md`](sync-system-v2-spec.md).
 
 No dependence on `LOCK`, `Depth: infinity`, RFC 6578 sync tokens, or `PATCH`.
 
+Writer manifests are independent streams, so lexical manifest order is not a
+causal order. Bounded pulls preserve segment order inside each writer stream
+and interleave available streams to prevent one long stream from starving a
+parent version in another stream. The shared coordinator remains responsible
+for dependency-aware application and fail-closed cursor advancement.
+
 ## Workspace pairing
 
 Devices that share a WebDAV app directory must share the same workspace key.

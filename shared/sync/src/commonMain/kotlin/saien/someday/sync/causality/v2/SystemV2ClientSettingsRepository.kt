@@ -89,9 +89,10 @@ class SystemV2ClientSettingsRepository(
                     ?: error("The exact Settings causal base is unavailable.")
                 val next = applyPreferenceChanges(base, displayed, requested)
                 val now = clock()
+                val baseVersion = requireNotNull(context.store.loadVersion(token.expectedBaseVersionId))
                 val created = context.factory.createFromToken(
                     token = token.toWorkspaceTokenV2(),
-                    retainedVersions = context.store.loadAllVersions().associateBy { it.versionId },
+                    retainedVersions = mapOf(baseVersion.versionId to baseVersion),
                     content = next.toWirePreferences(),
                     deletedAt = null,
                     deviceActorId = context.deviceActorId,

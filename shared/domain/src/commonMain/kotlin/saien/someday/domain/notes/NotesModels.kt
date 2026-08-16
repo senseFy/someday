@@ -161,6 +161,22 @@ data class NoteInput(
     val causalToken: CausalEditToken? = null,
 )
 
+data class NoteBatchUpdate(
+    val noteId: String,
+    val input: NoteInput,
+)
+
+data class NoteBatchDeletion(
+    val noteId: String,
+    val causalToken: CausalEditToken? = null,
+)
+
+data class NoteBatchUndelete(
+    val noteId: String,
+    val retainedContentVersionId: String,
+    val causalToken: CausalEditToken,
+)
+
 data class NoteVersionSummary(
     val versionId: String,
     val noteId: String,
@@ -299,6 +315,10 @@ interface NotesRepository {
         input: NoteInput,
     ): NoteDetails
 
+    /** Applies every note edit in one local transaction or applies none of them. */
+    fun updateNotes(edits: List<NoteBatchUpdate>): List<NoteDetails> =
+        error("Batch note updates are unavailable in this repository.")
+
     fun listNoteVersions(noteId: String): List<NoteVersionSummary>
 
     fun restoreNoteVersion(
@@ -340,11 +360,19 @@ interface NotesRepository {
 
     fun deleteNote(noteId: String, causalToken: CausalEditToken) = deleteNote(noteId)
 
+    /** Applies every note deletion in one local transaction or applies none of them. */
+    fun deleteNotes(deletions: List<NoteBatchDeletion>): Unit =
+        error("Batch note deletion is unavailable in this repository.")
+
     fun undeleteNote(
         noteId: String,
         retainedContentVersionId: String,
         causalToken: CausalEditToken,
     ): NoteDetails = error("Note undelete is unavailable in this repository.")
+
+    /** Applies every note restore in one local transaction or applies none of them. */
+    fun undeleteNotes(restores: List<NoteBatchUndelete>): List<NoteDetails> =
+        error("Batch note restore is unavailable in this repository.")
 
     fun listMemoryDayCounts(month: MemoryMonth): List<MemoryDayCount>
 

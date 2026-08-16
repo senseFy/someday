@@ -394,10 +394,9 @@ class WorkspaceWebDavSyncRemoteV2(
         val resources = client.listDirectory(paths.v2LogManifestDirectory(syncEpochId))
             .filter { !it.collection && it.path.endsWith(".enc") }
             .sortedBy { it.path }
-        val units = mutableListOf<WorkspaceEncryptedCursorUnitV2>()
         val seenWriters = mutableSetOf<String>()
+        val streams = mutableListOf<Pair<WorkspaceWebDavWriterManifestV2, Int>>()
         for (resource in resources) {
-            if (units.size >= limit) break
             val manifestOuter = requireRemote(resource.path, "writer_manifest_missing")
             val manifest = decodeManifest(controls, manifestOuter)
             requireCanonicalManifestSlot(syncEpochId, resource.path, manifest, seenWriters)
@@ -412,8 +411,18 @@ class WorkspaceWebDavSyncRemoteV2(
                         safeErrorCode = "remote_rollback_detected",
                     )
             }
-            for (index in start until manifest.segments.size) {
+            streams += manifest to start
+        }
+        val totalAvailable = streams.sumOf { (manifest, start) -> manifest.segments.size - start }
+        val units = mutableListOf<WorkspaceEncryptedCursorUnitV2>()
+        var offset = 0
+        while (units.size < limit) {
+            var foundAtOffset = false
+            for ((manifest, start) in streams) {
                 if (units.size >= limit) break
+                val index = start + offset
+                if (index !in manifest.segments.indices) continue
+                foundAtOffset = true
                 val ref = manifest.segments[index]
                 val path = paths.v2LogSegment(syncEpochId, manifest.writerDeviceId, ref.ordinal, ref.segmentId)
                 val segmentOuter = requireRemote(path, "segment_missing")
@@ -436,8 +445,10 @@ class WorkspaceWebDavSyncRemoteV2(
                     segment.objects,
                 )
             }
+            if (!foundAtOffset) break
+            offset++
         }
-        val stable = units.size < limit
+        val stable = units.size == totalAvailable
         return WorkspaceSyncPullResultV2(units, frontierStable = stable)
     }
 

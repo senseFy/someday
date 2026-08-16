@@ -637,6 +637,72 @@ class SyncV2RuntimeServiceTest {
     }
 
     @Test
+    fun integrityRepairResumesRetryableDependencyInsteadOfReplayingItInIsolation() {
+        val remote = InMemoryWorkspaceSyncRemoteV2(SyncRemoteProfileV2.WEB_DAV.wireValue)
+        withRuntimeFixture(remote, writerDeviceId = WRITER_A) { leader ->
+            assertTrue(leader.runtime().run().success)
+            withRuntimeFixture(remote, writerDeviceId = WRITER_B) { follower ->
+                assertTrue(follower.runtime().run().success)
+
+                val leaderNotes = leader.notes(NOW)
+                val notebook = leaderNotes.createNotebook("Repairable dependency")
+                val note = leaderNotes.createNote(NoteInput(notebook.id, "Recovered by pull", "Body"))
+                assertTrue(leader.runtime().run().success)
+
+                val active = assertNotNull(follower.protocolStore.loadActiveEpoch(remote.remoteProfile))
+                val context = WorkspaceSystemV2ContextProvider(
+                    follower.localRepository,
+                    { WORKSPACE_KEY },
+                    { WRITER_B },
+                    { remote.remoteProfile },
+                ).requireActive()
+                val cursors = context.store.loadCursors(remote.remoteProfile)
+                    .associate { it.streamId to it.cursorValue }
+                val unit = remote.pull(
+                    active.descriptor.syncEpochId,
+                    cursors,
+                    remote.capabilities().maxPullUnits,
+                ).units.first()
+                val firstObject = unit.objects.first()
+                follower.protocolStore.recordDeadLetter(
+                    SyncDeadLetterInputV2(
+                        remoteProfile = remote.remoteProfile,
+                        epochId = active.descriptor.syncEpochId,
+                        streamId = unit.streamId,
+                        unitId = unit.unitId,
+                        cursorValue = unit.expectedCursorValue,
+                        unitDigest = unit.unitDigest,
+                        objectId = firstObject.objectId,
+                        objectDigest = firstObject.objectDigest,
+                        authenticatedUnit = null,
+                        failureClass = SyncDeadLetterFailureClassV2.RETRYABLE_DEPENDENCY,
+                        safeErrorCode = "missing_parent",
+                        safeErrorMessage = "A cursor unit is missing a required same-entity parent.",
+                    ),
+                    NOW,
+                )
+
+                val repaired = follower.runtime().repairIntegrity()
+
+                assertTrue(repaired.success, repaired.message)
+                assertTrue(
+                    follower.protocolStore.loadActiveDeadLetters(
+                        remote.remoteProfile,
+                        active.descriptor.syncEpochId,
+                    ).isEmpty(),
+                )
+                assertEquals(
+                    "Recovered by pull",
+                    (context.store.loadProjection(WorkspaceEntityKeyV2(
+                        WorkspaceEntityTypeV2.NOTE,
+                        note.id,
+                    ))?.content as NoteContentV2).title,
+                )
+            }
+        }
+    }
+
+    @Test
     fun nonemptyJoiningDeviceImportsIndependentRootsAndSurfacesCollisionAsConflict() {
         val remote = InMemoryWorkspaceSyncRemoteV2(SyncRemoteProfileV2.WEB_DAV.wireValue)
         val notebookId = "31000000-0000-4000-8000-000000000001"

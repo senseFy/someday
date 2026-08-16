@@ -330,7 +330,10 @@ class WorkspaceSyncCoordinatorV2(
                     active.safeErrorMessage ?: "Workspace integrity repair is required before sync can continue.",
                 )
             }
-            if (protocolStore.loadActiveDeadLetters(remote.remoteProfile, descriptor.syncEpochId).isNotEmpty()) {
+            if (protocolStore.loadActiveDeadLetters(remote.remoteProfile, descriptor.syncEpochId).any {
+                    it.input.failureClass != SyncDeadLetterFailureClassV2.RETRYABLE_DEPENDENCY
+                }
+            ) {
                 return blocked(run.runId, counts, descriptor.syncEpochId, "repair_required", "A blocking cursor unit must be repaired before push.")
             }
 
@@ -536,6 +539,51 @@ class WorkspaceSyncCoordinatorV2(
         capabilities: WorkspaceSyncCapabilitiesV2,
         counts: MutableWorkspaceSyncCountsV2,
     ): Pair<String, String>? {
+        val retryableBlockers = protocolStore.loadActiveDeadLetters(
+            remote.remoteProfile,
+            descriptor.syncEpochId,
+        ).filter {
+            it.input.failureClass == SyncDeadLetterFailureClassV2.RETRYABLE_DEPENDENCY
+        }.associateByTo(mutableMapOf()) {
+            it.input.streamId to it.input.unitId
+        }
+
+        fun markRetryableBlockerResolved(key: Pair<String, String>) {
+            protocolStore.resolveDeadLetter(
+                remote.remoteProfile,
+                descriptor.syncEpochId,
+                key.first,
+                key.second,
+                SyncDeadLetterLifecycleV2.REPAIRED,
+                clock(),
+            )
+            retryableBlockers.remove(key)
+        }
+
+        fun resolveRetryableBlocker(unit: WorkspaceEncryptedCursorUnitV2) {
+            val key = unit.streamId to unit.unitId
+            val blocker = retryableBlockers[key] ?: return
+            val input = blocker.input
+            val matchesAuthenticatedUnit = input.cursorValue == unit.expectedCursorValue &&
+                input.unitDigest?.let { it == unit.unitDigest } != false &&
+                input.objectId?.let { objectId ->
+                    unit.objects.any { it.objectId == objectId && input.objectDigest == it.objectDigest }
+                } != false
+            if (matchesAuthenticatedUnit) {
+                markRetryableBlockerResolved(key)
+            }
+        }
+
+        retryableBlockers.values.toList().forEach { blocker ->
+            val input = blocker.input
+            val cursor = store.loadCursor(remote.remoteProfile, input.streamId)
+            val appliedBeforeInterruption = cursor?.unitId == input.unitId &&
+                input.unitDigest?.let { it == cursor.unitDigest } == true
+            if (appliedBeforeInterruption) {
+                markRetryableBlockerResolved(input.streamId to input.unitId)
+            }
+        }
+
         repeat(MAX_PULL_ROUNDS_SYSTEM_V2) {
             val cursors = store.loadCursors(remote.remoteProfile).associate { it.streamId to it.cursorValue }
             val pulled = remote.pull(descriptor.syncEpochId, cursors, capabilities.maxPullUnits)
@@ -551,51 +599,91 @@ class WorkspaceSyncCoordinatorV2(
                 if (pulled.frontierStable) return null
                 return@repeat
             }
-            for (unit in pulled.units) {
-                if (unit.syncEpochId != descriptor.syncEpochId || unit.objects.size > 100) {
-                    return "transport_metadata_mismatch" to "Remote cursor unit has invalid epoch or bounds."
-                }
-                val current = store.loadCursor(remote.remoteProfile, unit.streamId)
-                if (current?.cursorValue != unit.expectedCursorValue) {
-                    return "remote_rollback_detected" to "Remote cursor unit does not continue the durable authenticated stream."
-                }
-                val decoded = decodeEntityObjects(epoch, descriptor.syncEpochId, unit.objects)
-                if (decoded is DecodeEntityObjectsResultV2.Rejected) {
-                    quarantine(descriptor.syncEpochId, unit.streamId, unit.unitId, decoded.outer, decoded.code)
-                    recordBlocker(descriptor.syncEpochId, unit, decoded)
-                    return decoded.code to decoded.message
-                }
-                decoded as DecodeEntityObjectsResultV2.Decoded
-                when (val applied = store.applyRemoteCursorUnit(
-                    RemoteWorkspaceCursorUnitV2(
-                        remote.remoteProfile,
-                        WorkspaceRemoteCursorAdvanceV2(
-                            unit.streamId,
-                            unit.expectedCursorValue,
-                            unit.nextCursorValue,
-                            unit.unitId,
-                            unit.unitDigest,
+            if (pulled.units.map { it.streamId to it.unitId }.distinct().size != pulled.units.size) {
+                return "transport_metadata_mismatch" to "Remote repeated a cursor unit in one bounded pull response."
+            }
+            val remaining = pulled.units.toMutableList()
+            val decodedUnits = mutableMapOf<Pair<String, String>, DecodeEntityObjectsResultV2.Decoded>()
+            val missingParents = mutableMapOf<Pair<String, String>, DecodeEntityObjectsResultV2.Rejected>()
+            while (remaining.isNotEmpty()) {
+                var madeProgress = false
+                val iterator = remaining.listIterator()
+                while (iterator.hasNext()) {
+                    val unit = iterator.next()
+                    val unitKey = unit.streamId to unit.unitId
+                    if (unit.syncEpochId != descriptor.syncEpochId || unit.objects.size > 100) {
+                        return "transport_metadata_mismatch" to "Remote cursor unit has invalid epoch or bounds."
+                    }
+                    val current = store.loadCursor(remote.remoteProfile, unit.streamId)
+                    if (current?.cursorValue != unit.expectedCursorValue) {
+                        val waitsForPulledPredecessor = remaining.any { predecessor ->
+                            predecessor.streamId == unit.streamId &&
+                                predecessor.unitId != unit.unitId &&
+                                predecessor.nextCursorValue == unit.expectedCursorValue
+                        }
+                        if (waitsForPulledPredecessor) continue
+                        return "remote_rollback_detected" to "Remote cursor unit does not continue the durable authenticated stream."
+                    }
+                    val decoded = decodedUnits[unitKey] ?: when (
+                        val value = decodeEntityObjects(epoch, descriptor.syncEpochId, unit.objects)
+                    ) {
+                        is DecodeEntityObjectsResultV2.Rejected -> {
+                            quarantine(descriptor.syncEpochId, unit.streamId, unit.unitId, value.outer, value.code)
+                            recordBlocker(descriptor.syncEpochId, unit, value)
+                            return value.code to value.message
+                        }
+                        is DecodeEntityObjectsResultV2.Decoded -> value.also { decodedUnits[unitKey] = it }
+                    }
+                    when (val applied = store.applyRemoteCursorUnit(
+                        RemoteWorkspaceCursorUnitV2(
+                            remote.remoteProfile,
+                            WorkspaceRemoteCursorAdvanceV2(
+                                unit.streamId,
+                                unit.expectedCursorValue,
+                                unit.nextCursorValue,
+                                unit.unitId,
+                                unit.unitDigest,
+                            ),
+                            decoded.mutations,
+                            clock(),
                         ),
-                        decoded.mutations,
-                        clock(),
-                    ),
-                )) {
-                    is WorkspaceRemoteUnitApplyResultV2.Rejected -> {
-                        val synthetic = DecodeEntityObjectsResultV2.Rejected(
-                            unit.objects.firstOrNull(),
-                            applied.error.code.wireValue,
-                            applied.error.safeMessage,
-                        )
-                        recordBlocker(descriptor.syncEpochId, unit, synthetic)
-                        return synthetic.code to synthetic.message
+                    )) {
+                        is WorkspaceRemoteUnitApplyResultV2.Rejected -> {
+                            val synthetic = DecodeEntityObjectsResultV2.Rejected(
+                                unit.objects.firstOrNull(),
+                                applied.error.code.wireValue,
+                                applied.error.safeMessage,
+                            )
+                            if (applied.error.code == WorkspaceStoreErrorCodeV2.MISSING_PARENT) {
+                                missingParents[unitKey] = synthetic
+                                continue
+                            }
+                            recordBlocker(descriptor.syncEpochId, unit, synthetic)
+                            return synthetic.code to synthetic.message
+                        }
+                        is WorkspaceRemoteUnitApplyResultV2.Applied -> {
+                            counts.observeApplied(applied, decoded.mutations)
+                        }
+                        is WorkspaceRemoteUnitApplyResultV2.AlreadyApplied -> counts.replays += unit.objects.size
                     }
-                    is WorkspaceRemoteUnitApplyResultV2.Applied -> {
-                        counts.observeApplied(applied, decoded.mutations)
-                    }
-                    is WorkspaceRemoteUnitApplyResultV2.AlreadyApplied -> counts.replays += unit.objects.size
+                    resolveRetryableBlocker(unit)
+                    missingParents.remove(unitKey)
+                    iterator.remove()
+                    counts.pulledUnits++
+                    counts.pulledObjects += unit.objects.size
+                    madeProgress = true
                 }
-                counts.pulledUnits++
-                counts.pulledObjects += unit.objects.size
+                if (!madeProgress) {
+                    val blocker = remaining.firstOrNull { unit ->
+                        store.loadCursor(remote.remoteProfile, unit.streamId)?.cursorValue == unit.expectedCursorValue
+                    }
+                    val failure = blocker?.let { missingParents[it.streamId to it.unitId] }
+                    if (blocker != null && failure != null) {
+                        recordBlocker(descriptor.syncEpochId, blocker, failure)
+                        return failure.code to failure.message
+                    }
+                    return "remote_rollback_detected" to "Remote cursor units do not form continuous per-writer streams."
+                }
             }
             if (pulled.frontierStable) return null
         }

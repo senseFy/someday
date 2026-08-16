@@ -11,6 +11,9 @@ import saien.someday.data.local.createSomedayJdbcDriver
 import saien.someday.data.local.db.SomedayDatabase
 import saien.someday.data.settings.SqlDelightClientSettingsRepository
 import saien.someday.domain.notes.NoteInput
+import saien.someday.domain.notes.NoteBatchDeletion
+import saien.someday.domain.notes.NoteBatchUndelete
+import saien.someday.domain.notes.NoteBatchUpdate
 import saien.someday.domain.notes.NotebookOrderEdit
 import saien.someday.domain.notes.NoteSyncBadge
 import saien.someday.domain.notes.NotesLocationInput
@@ -30,12 +33,76 @@ import kotlin.time.Instant
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertFails
 import kotlin.test.assertFailsWith
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class SystemV2ProductRepositoriesTest {
+    @Test
+    fun noteBatchesValidateAllTokensBeforeOneAtomicCommitAndCanBeUndone() = withFixture { fixture ->
+        val notebook = fixture.notes.createNotebook("Batch")
+        val first = fixture.notes.createNote(NoteInput(notebook.id, "First", "One"))
+        val second = fixture.notes.createNote(NoteInput(notebook.id, "Second", "Two"))
+        val firstEdit = NoteBatchUpdate(
+            first.id,
+            NoteInput(
+                notebookId = first.notebookId,
+                title = "First updated",
+                markdownBody = first.markdownBody,
+                createdAt = first.createdAt,
+                location = first.location,
+                timeZoneId = first.timeZoneId,
+                causalToken = first.causalToken,
+            ),
+        )
+        val invalidSecondEdit = NoteBatchUpdate(
+            second.id,
+            NoteInput(
+                notebookId = second.notebookId,
+                title = "Second updated",
+                markdownBody = second.markdownBody,
+                createdAt = second.createdAt,
+                location = second.location,
+                timeZoneId = second.timeZoneId,
+                causalToken = checkNotNull(second.causalToken).copy(expectedBaseVersionId = "missing-version"),
+            ),
+        )
+
+        assertFails { fixture.notes.updateNotes(listOf(firstEdit, invalidSecondEdit)) }
+        assertEquals("First", fixture.notes.getNoteDetails(first.id)?.title)
+        assertEquals("Second", fixture.notes.getNoteDetails(second.id)?.title)
+
+        val updated = fixture.notes.updateNotes(
+            listOf(
+                firstEdit,
+                invalidSecondEdit.copy(
+                    input = invalidSecondEdit.input.copy(causalToken = second.causalToken),
+                ),
+            ),
+        )
+        assertEquals(setOf("First updated", "Second updated"), updated.map { it.title }.toSet())
+
+        fixture.notes.deleteNotes(updated.map { NoteBatchDeletion(it.id, checkNotNull(it.causalToken)) })
+        assertTrue(fixture.notes.listNotes(notebook.id).isEmpty())
+        val deleted = fixture.notes.listDeletedWorkspaceItems()
+            .filter { it.type == DeletedWorkspaceItemType.Note }
+        assertEquals(setOf(first.id, second.id), deleted.map { it.entityId }.toSet())
+
+        fixture.notes.undeleteNotes(deleted.map { item ->
+            NoteBatchUndelete(
+                noteId = item.entityId,
+                retainedContentVersionId = checkNotNull(item.retainedContentVersionId),
+                causalToken = item.causalToken,
+            )
+        })
+        assertEquals(
+            setOf("First updated", "Second updated"),
+            fixture.notes.listNotes(notebook.id).map { it.title }.toSet(),
+        )
+    }
+
     @Test
     fun settingsReadWaitsForProductRouteCommitBarrier() = withFixture { fixture ->
         val coordinator = WorkspaceAuthorityMutationCoordinator()
