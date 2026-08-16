@@ -34,6 +34,14 @@ fun rememberNotesUiStrings(): NotesUiStrings {
     val discarded = stringResource(Res.string.notes_fb_discarded)
     val noteDeleted = stringResource(Res.string.notes_fb_note_deleted)
     val cannotDeleteNote = stringResource(Res.string.notes_fb_cannot_delete_note)
+    val resolveBeforeBatchUpdate = stringResource(Res.string.notes_fb_resolve_before_batch_update)
+    val notesMoved = stringResource(Res.string.notes_fb_batch_moved)
+    val notesUpdated = stringResource(Res.string.notes_fb_batch_updated)
+    val notesDeleted = stringResource(Res.string.notes_fb_batch_deleted)
+    val notesRestored = stringResource(Res.string.notes_fb_batch_restored)
+    val cannotEditNotes = stringResource(Res.string.notes_fb_cannot_batch_edit)
+    val batchNotebookUnavailable = stringResource(Res.string.notes_fb_batch_notebook_unavailable)
+    val invalidTimeZone = stringResource(Res.string.notes_fb_invalid_timezone)
     val saveBeforeHistory = stringResource(Res.string.notes_fb_save_before_history)
     val conflictResolvedAction = stringResource(Res.string.notes_fb_conflict_resolved_action)
     val conflictResolvedBranch = stringResource(Res.string.notes_fb_conflict_resolved_branch)
@@ -63,7 +71,7 @@ fun rememberNotesUiStrings(): NotesUiStrings {
     val conflictActionKeepCopy = stringResource(Res.string.conflict_action_keep_copy)
     val conflictActionRestoreOriginal = stringResource(Res.string.conflict_action_restore_original)
     val conflictActionDeleteCopy = stringResource(Res.string.conflict_action_delete_copy)
-    return remember(conflictWaiting, noteNoLongerExists, resolveBeforeSwitchNotebook, foundNotes, resolveBeforeOpen, createNotebookFirst, notebookCreated, notebookRenamed, notebookDeleted, cannotDeleteNotebook, notebookConflictResolved, cannotResolveNotebookConflict, snapshotExpiredDeletion, noteUndeleted, notebookRestored, cannotRestoreDeleted, conflictCopyExposes, conflictGone, locationAdded, locationPermissionDenied, locationUnavailable, noteSaved, saveFailed, discarded, noteDeleted, cannotDeleteNote, saveBeforeHistory, conflictResolvedAction, conflictResolvedBranch, cannotResolveConflict, saveBeforeRestore, resolveBeforeRestore, restoredVersion, cannotRestoreVersion, demoCreated, cannotCreateDemo, demoCleared, cannotClearDemo, titleRequired, chooseNotebook, dateFormat, latNumber, lonNumber, latLonTogether, latRange, lonRange, accuracyNumber, altitudeNumber, capturedIso, metaRequiresCoords, unknownError, conflictActionMerge, conflictActionKeepCopy, conflictActionRestoreOriginal, conflictActionDeleteCopy) {
+    return remember(conflictWaiting, noteNoLongerExists, resolveBeforeSwitchNotebook, foundNotes, resolveBeforeOpen, createNotebookFirst, notebookCreated, notebookRenamed, notebookDeleted, cannotDeleteNotebook, notebookConflictResolved, cannotResolveNotebookConflict, snapshotExpiredDeletion, noteUndeleted, notebookRestored, cannotRestoreDeleted, conflictCopyExposes, conflictGone, locationAdded, locationPermissionDenied, locationUnavailable, noteSaved, saveFailed, discarded, noteDeleted, cannotDeleteNote, resolveBeforeBatchUpdate, notesMoved, notesUpdated, notesDeleted, notesRestored, cannotEditNotes, batchNotebookUnavailable, invalidTimeZone, saveBeforeHistory, conflictResolvedAction, conflictResolvedBranch, cannotResolveConflict, saveBeforeRestore, resolveBeforeRestore, restoredVersion, cannotRestoreVersion, demoCreated, cannotCreateDemo, demoCleared, cannotClearDemo, titleRequired, chooseNotebook, dateFormat, latNumber, lonNumber, latLonTogether, latRange, lonRange, accuracyNumber, altitudeNumber, capturedIso, metaRequiresCoords, unknownError, conflictActionMerge, conflictActionKeepCopy, conflictActionRestoreOriginal, conflictActionDeleteCopy) {
         NotesUiStrings(
             conflictWaiting = conflictWaiting,
             noteNoLongerExists = noteNoLongerExists,
@@ -91,6 +99,14 @@ fun rememberNotesUiStrings(): NotesUiStrings {
             discarded = discarded,
             noteDeleted = noteDeleted,
             cannotDeleteNote = cannotDeleteNote,
+            resolveBeforeBatchUpdate = resolveBeforeBatchUpdate,
+            notesMoved = notesMoved,
+            notesUpdated = notesUpdated,
+            notesDeleted = notesDeleted,
+            notesRestored = notesRestored,
+            cannotEditNotes = cannotEditNotes,
+            batchNotebookUnavailable = batchNotebookUnavailable,
+            invalidTimeZone = invalidTimeZone,
             saveBeforeHistory = saveBeforeHistory,
             conflictResolvedAction = conflictResolvedAction,
             conflictResolvedBranch = conflictResolvedBranch,

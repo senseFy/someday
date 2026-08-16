@@ -9,6 +9,8 @@ import saien.someday.domain.notes.ConflictDetails
 import saien.someday.domain.notes.ConflictHistory
 import saien.someday.domain.notes.ConflictResolutionAction
 import saien.someday.domain.notes.NoteDetails
+import saien.someday.domain.notes.NoteBatchDeletion
+import saien.someday.domain.notes.NoteBatchUpdate
 import saien.someday.domain.notes.NoteInput
 import saien.someday.domain.notes.NoteSummary
 import saien.someday.domain.notes.NoteSyncBadge
@@ -172,6 +174,19 @@ class InMemoryNotesRepository : NotesRepository {
         return updated
     }
 
+    override fun updateNotes(edits: List<NoteBatchUpdate>): List<NoteDetails> {
+        require(edits.map { it.noteId }.distinct().size == edits.size) {
+            "A note can only appear once in a batch update."
+        }
+        edits.forEach { edit ->
+            require(notes.containsKey(edit.noteId)) { "Cannot edit missing note: ${edit.noteId}" }
+            require(notebooks.containsKey(edit.input.notebookId)) {
+                "Cannot move note to missing notebook: ${edit.input.notebookId}"
+            }
+        }
+        return edits.map { updateNote(it.noteId, it.input) }
+    }
+
     override fun listNoteVersions(noteId: String): List<NoteVersionSummary> {
         listNoteVersionsCalls += 1
         return versions[noteId].orEmpty().toList()
@@ -313,6 +328,14 @@ class InMemoryNotesRepository : NotesRepository {
             "Cannot delete missing note: $noteId"
         }
         conflictSources.remove(noteId)
+    }
+
+    override fun deleteNotes(deletions: List<NoteBatchDeletion>) {
+        require(deletions.map { it.noteId }.distinct().size == deletions.size) {
+            "A note can only appear once in a batch deletion."
+        }
+        require(deletions.all { notes.containsKey(it.noteId) }) { "Cannot delete a missing note." }
+        deletions.forEach { deleteNote(it.noteId) }
     }
 
     override fun listMemoryDayCounts(month: MemoryMonth): List<MemoryDayCount> =

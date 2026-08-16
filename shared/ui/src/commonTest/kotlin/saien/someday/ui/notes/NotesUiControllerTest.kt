@@ -16,6 +16,76 @@ import kotlin.test.assertTrue
 
 class NotesUiControllerTest {
     @Test
+    fun noteSelectionSupportsToggleRangeSelectAllAndScopeChanges() = runBlocking {
+        val repository = InMemoryNotesRepository()
+        val controller = NotesUiController(repository)
+        val diary = controller.createNotebook("Diary")
+        val first = repository.seedNote(diary.id, "First", "One", LocalDate(2026, 5, 23))
+        val second = repository.seedNote(diary.id, "Second", "Two", LocalDate(2026, 5, 22))
+        val third = repository.seedNote(diary.id, "Third", "Three", LocalDate(2026, 5, 21))
+        controller.selectNotebook(diary.id)
+
+        controller.toggleNoteSelection(first.id)
+        controller.toggleNoteSelection(third.id, extendRange = true)
+
+        assertEquals(setOf(first.id, second.id, third.id), controller.state.selectedNoteIds)
+        controller.clearNoteSelection()
+        assertFalse(controller.state.noteSelectionActive)
+
+        controller.selectAllVisibleNotes()
+        assertEquals(3, controller.state.selectedNoteIds.size)
+        controller.updateSearchQuery("First")
+        assertTrue(controller.state.selectedNoteIds.isEmpty(), "Changing list scope must clear selection.")
+    }
+
+    @Test
+    fun selectedNotesCanBeMovedAndEditedAsOneOperation() = runBlocking {
+        val repository = InMemoryNotesRepository()
+        val controller = NotesUiController(repository)
+        val diary = controller.createNotebook("Diary")
+        val archive = controller.createNotebook("Archive")
+        val first = repository.seedNote(
+            notebookId = diary.id,
+            title = "First",
+            markdownBody = "One",
+            createdDate = LocalDate(2026, 5, 23),
+            location = NotesLocationInput(placeText = "Shanghai"),
+        )
+        val second = repository.seedNote(
+            notebookId = diary.id,
+            title = "Second",
+            markdownBody = "Two",
+            createdDate = LocalDate(2026, 5, 22),
+            location = NotesLocationInput(placeText = "Suzhou"),
+        )
+        controller.selectNotebook(diary.id)
+        assertTrue(controller.openExistingNote(first.id))
+        assertNotNull(controller.state.editor)
+        controller.selectAllVisibleNotes()
+
+        assertTrue(controller.moveSelectedNotes(archive.id))
+        assertNull(controller.state.editor, "Batch operations must close a selected clean editor before updating it.")
+        assertTrue(controller.state.selectedNoteIds.isEmpty())
+        assertTrue(repository.listNotes(diary.id).isEmpty())
+        assertEquals(setOf(first.id, second.id), repository.listNotes(archive.id).map { it.id }.toSet())
+
+        controller.selectNotebook(archive.id)
+        controller.selectAllVisibleNotes()
+        assertTrue(controller.changeSelectedNotesCreatedDate(LocalDate(2024, 2, 3)))
+        controller.selectAllVisibleNotes()
+        assertTrue(controller.changeSelectedNotesTimeZone("America/Los_Angeles"))
+        controller.selectAllVisibleNotes()
+        assertTrue(controller.clearSelectedNotesLocation())
+
+        listOf(first.id, second.id).forEach { noteId ->
+            val details = checkNotNull(repository.getNoteDetails(noteId))
+            assertEquals(LocalDate(2024, 2, 3), noteCalendarDate(details.createdAt, details.timeZoneId))
+            assertEquals("America/Los_Angeles", details.timeZoneId)
+            assertNull(details.location)
+        }
+    }
+
+    @Test
     fun newNoteDefaultsToCurrentLocalDateProvider() = runBlocking {
         val repository = InMemoryNotesRepository()
         val controller = NotesUiController(

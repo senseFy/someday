@@ -14,6 +14,9 @@ import saien.someday.domain.notes.CausalEditToken
 import saien.someday.domain.notes.DeletedWorkspaceItem
 import saien.someday.domain.notes.DeletedWorkspaceItemType
 import saien.someday.domain.notes.NoteDetails
+import saien.someday.domain.notes.NoteBatchDeletion
+import saien.someday.domain.notes.NoteBatchUndelete
+import saien.someday.domain.notes.NoteBatchUpdate
 import saien.someday.domain.notes.NoteInput
 import saien.someday.domain.notes.NoteSummary
 import saien.someday.domain.notes.NoteSyncBadge
@@ -154,6 +157,7 @@ class NotesUiController(
             )
             return false
         }
+        clearNoteSelection()
         refresh(preferredNotebookId = notebookId)
         closeEditor()
         return true
@@ -163,6 +167,8 @@ class NotesUiController(
         state = state.copy(
             searchQuery = query,
             searchResults = if (query.isBlank()) emptyList() else state.searchResults,
+            selectedNoteIds = emptySet(),
+            noteSelectionAnchorId = null,
             feedbackMessage = null,
         )
         val results = withContext(backgroundDispatcher) {
@@ -184,8 +190,275 @@ class NotesUiController(
         state = state.copy(
             searchQuery = "",
             searchResults = emptyList(),
+            selectedNoteIds = emptySet(),
+            noteSelectionAnchorId = null,
             feedbackMessage = null,
         )
+    }
+
+    fun toggleNoteSelection(
+        noteId: String,
+        extendRange: Boolean = false,
+    ) {
+        if (state.batchOperationInProgress) return
+        val visibleIds = state.visibleNotes.map { it.id }
+        if (noteId !in visibleIds) return
+        val anchorId = state.noteSelectionAnchorId
+        val nextSelection = if (extendRange && anchorId in visibleIds) {
+            val anchorIndex = visibleIds.indexOf(anchorId)
+            val noteIndex = visibleIds.indexOf(noteId)
+            val range = visibleIds.subList(
+                fromIndex = minOf(anchorIndex, noteIndex),
+                toIndex = maxOf(anchorIndex, noteIndex) + 1,
+            )
+            state.selectedNoteIds + range
+        } else if (noteId in state.selectedNoteIds) {
+            state.selectedNoteIds - noteId
+        } else {
+            state.selectedNoteIds + noteId
+        }
+        state = state.copy(
+            selectedNoteIds = nextSelection,
+            noteSelectionAnchorId = when {
+                nextSelection.isEmpty() -> null
+                extendRange && anchorId != null -> anchorId
+                else -> noteId
+            },
+        )
+    }
+
+    fun selectAllVisibleNotes() {
+        if (state.batchOperationInProgress) return
+        val visibleIds = state.visibleNotes.map { it.id }
+        state = state.copy(
+            selectedNoteIds = visibleIds.toSet(),
+            noteSelectionAnchorId = visibleIds.firstOrNull(),
+        )
+    }
+
+    fun clearNoteSelection() {
+        if (state.batchOperationInProgress) return
+        state = state.copy(
+            selectedNoteIds = emptySet(),
+            noteSelectionAnchorId = null,
+        )
+    }
+
+    suspend fun moveSelectedNotes(notebookId: String): Boolean {
+        if (state.notebooks.none { it.id == notebookId && it.syncBadge !is NoteSyncBadge.Error }) {
+            state = state.copy(feedbackMessage = strings.batchNotebookUnavailable)
+            return false
+        }
+        return updateSelectedNotes(BatchUpdateKind.Moved) { details ->
+            details.toBatchInput(notebookId = notebookId)
+        }
+    }
+
+    suspend fun changeSelectedNotesCreatedDate(date: LocalDate): Boolean =
+        updateSelectedNotes(BatchUpdateKind.Updated) { details ->
+            details.toBatchInput(createdAt = date.toInstantAtStartOfDay(details.timeZoneId))
+        }
+
+    suspend fun changeSelectedNotesTimeZone(timeZoneId: String?): Boolean {
+        val normalized = timeZoneId?.trim()?.ifBlank { null }
+        if (normalized != null && runCatching { TimeZone.of(normalized) }.isFailure) {
+            state = state.copy(feedbackMessage = strings.invalidTimeZone)
+            return false
+        }
+        return updateSelectedNotes(BatchUpdateKind.Updated) { details ->
+            val currentDate = noteCalendarDate(details.createdAt, details.timeZoneId)
+            val createdAt = if (noteCalendarDate(details.createdAt, normalized) == currentDate) {
+                details.createdAt
+            } else {
+                currentDate.toInstantAtStartOfDay(normalized)
+            }
+            details.toBatchInput(createdAt = createdAt, timeZoneId = normalized)
+        }
+    }
+
+    suspend fun clearSelectedNotesLocation(): Boolean =
+        updateSelectedNotes(BatchUpdateKind.Updated) { details ->
+            details.toBatchInput(location = null)
+        }
+
+    suspend fun deleteSelectedNotes(): Boolean {
+        val noteIds = selectedNoteIdsInVisibleOrder()
+        if (noteIds.isEmpty() || !beginBatchOperation()) return false
+        val selectedNotebookId = state.selectedNotebookId
+        val searchQuery = state.searchQuery
+        return runCatching {
+            withContext(backgroundDispatcher) {
+                val details = noteIds.map { noteId ->
+                    requireNotNull(repository.getNoteDetails(noteId)) { "Note no longer exists: $noteId" }
+                }
+                repository.deleteNotes(details.map { detail ->
+                    NoteBatchDeletion(noteId = detail.id, causalToken = detail.causalToken)
+                })
+                val repositoryData = loadRepositoryDataBlocking(selectedNotebookId, searchQuery)
+                val undoItems = repositoryData.deletedWorkspaceItems
+                    .filter { it.type == DeletedWorkspaceItemType.Note && it.entityId in noteIds && it.canRestore }
+                BatchDeleteResult(repositoryData, undoItems)
+            }
+        }.fold(
+            onSuccess = { result ->
+                applyRepositoryData(result.repositoryData)
+                state = state.copy(
+                    editor = state.editor?.takeUnless { it.noteId in noteIds },
+                    versionHistory = state.versionHistory?.takeUnless { it.noteId in noteIds },
+                    conflictDetails = state.conflictDetails?.takeUnless { details ->
+                        noteIds.any(details::referencesNote)
+                    },
+                    selectedNoteIds = emptySet(),
+                    noteSelectionAnchorId = null,
+                    batchOperationInProgress = false,
+                    batchDeleteUndoItems = result.undoItems,
+                    feedbackMessage = formatUiString(strings.notesDeleted, noteIds.size),
+                    localChangeEventId = state.localChangeEventId + 1,
+                )
+                true
+            },
+            onFailure = { failure ->
+                state = state.copy(
+                    batchOperationInProgress = false,
+                    feedbackMessage = formatUiString(
+                        strings.cannotEditNotes,
+                        failure.message ?: strings.unknownError,
+                    ),
+                )
+                false
+            },
+        )
+    }
+
+    suspend fun undoLastBatchDelete(): Boolean {
+        val items = state.batchDeleteUndoItems
+        if (items.isEmpty() || state.batchOperationInProgress) return false
+        state = state.copy(batchOperationInProgress = true)
+        val selectedNotebookId = state.selectedNotebookId
+        val searchQuery = state.searchQuery
+        return runCatching {
+            withContext(backgroundDispatcher) {
+                repository.undeleteNotes(items.map { item ->
+                    NoteBatchUndelete(
+                        noteId = item.entityId,
+                        retainedContentVersionId = requireNotNull(item.retainedContentVersionId),
+                        causalToken = item.causalToken,
+                    )
+                })
+                loadRepositoryDataBlocking(selectedNotebookId, searchQuery)
+            }
+        }.fold(
+            onSuccess = { repositoryData ->
+                applyRepositoryData(repositoryData)
+                state = state.copy(
+                    batchOperationInProgress = false,
+                    batchDeleteUndoItems = emptyList(),
+                    feedbackMessage = formatUiString(strings.notesRestored, items.size),
+                    localChangeEventId = state.localChangeEventId + 1,
+                )
+                true
+            },
+            onFailure = { failure ->
+                state = state.copy(
+                    batchOperationInProgress = false,
+                    feedbackMessage = formatUiString(
+                        strings.cannotEditNotes,
+                        failure.message ?: strings.unknownError,
+                    ),
+                )
+                false
+            },
+        )
+    }
+
+    fun dismissBatchDeleteUndo() {
+        state = state.copy(batchDeleteUndoItems = emptyList())
+    }
+
+    private suspend fun updateSelectedNotes(
+        kind: BatchUpdateKind,
+        transform: (NoteDetails) -> NoteInput,
+    ): Boolean {
+        val noteIds = selectedNoteIdsInVisibleOrder()
+        if (noteIds.isEmpty() || !beginBatchOperation()) return false
+        val selectedNotebookId = state.selectedNotebookId
+        val searchQuery = state.searchQuery
+        return runCatching {
+            withContext(backgroundDispatcher) {
+                val edits = noteIds.map { noteId ->
+                    val details = requireNotNull(repository.getNoteDetails(noteId)) {
+                        "Note no longer exists: $noteId"
+                    }
+                    NoteBatchUpdate(noteId, transform(details))
+                }
+                val updated = repository.updateNotes(edits)
+                BatchUpdateResult(
+                    repositoryData = loadRepositoryDataBlocking(selectedNotebookId, searchQuery),
+                    updated = updated.associateBy { it.id },
+                )
+            }
+        }.fold(
+            onSuccess = { result ->
+                val previousEditor = state.editor
+                applyRepositoryData(result.repositoryData)
+                val refreshedEditor = previousEditor
+                    ?.noteId
+                    ?.let(result.updated::get)
+                    ?.let { details ->
+                        NoteEditorState.fromDetails(
+                            details = details,
+                            markdownPreviewVisible = previousEditor.markdownPreviewVisible,
+                            sessionId = previousEditor.sessionId,
+                        )
+                    }
+                    ?: previousEditor
+                state = state.copy(
+                    editor = refreshedEditor,
+                    selectedNoteIds = emptySet(),
+                    noteSelectionAnchorId = null,
+                    batchOperationInProgress = false,
+                    feedbackMessage = formatUiString(
+                        if (kind == BatchUpdateKind.Moved) strings.notesMoved else strings.notesUpdated,
+                        noteIds.size,
+                    ),
+                    localChangeEventId = state.localChangeEventId + 1,
+                )
+                true
+            },
+            onFailure = { failure ->
+                state = state.copy(
+                    batchOperationInProgress = false,
+                    feedbackMessage = formatUiString(
+                        strings.cannotEditNotes,
+                        failure.message ?: strings.unknownError,
+                    ),
+                )
+                false
+            },
+        )
+    }
+
+    private fun selectedNoteIdsInVisibleOrder(): List<String> =
+        state.visibleNotes.map { it.id }.filter { it in state.selectedNoteIds }
+
+    private fun beginBatchOperation(): Boolean {
+        val editor = state.editor
+        if (editor?.hasUnsavedChanges == true && editor.noteId in state.selectedNoteIds) {
+            state = state.copy(feedbackMessage = strings.resolveBeforeBatchUpdate)
+            return false
+        }
+        state = state.copy(
+            editor = editor?.takeUnless { it.noteId in state.selectedNoteIds },
+            versionHistory = state.versionHistory?.takeUnless { it.noteId in state.selectedNoteIds },
+            conflictDetails = state.conflictDetails?.takeUnless { details ->
+                state.selectedNoteIds.any(details::referencesNote)
+            },
+            unsavedChangesDialogVisible = false,
+            batchOperationInProgress = true,
+            batchDeleteUndoItems = emptyList(),
+            feedbackMessage = null,
+        )
+        return true
     }
 
     fun canNavigateToNewNote(notebookId: String? = state.selectedNotebookId): Boolean {
@@ -1120,7 +1393,14 @@ class NotesUiController(
             selectedNotebookId = data.selectedNotebookId,
             notes = data.notes,
             searchResults = if (searchQuery == data.searchQuery) data.searchResults else searchResults,
-        )
+        ).let { updated ->
+            val visibleIds = updated.visibleNotes.mapTo(mutableSetOf()) { it.id }
+            val retainedSelection = updated.selectedNoteIds.intersect(visibleIds)
+            updated.copy(
+                selectedNoteIds = retainedSelection,
+                noteSelectionAnchorId = updated.noteSelectionAnchorId?.takeIf { it in retainedSelection },
+            )
+        }
 
     private fun clearMockContentBlocking(): MockContentResult {
         var deletedNotes = 0
@@ -1159,6 +1439,21 @@ class NotesUiController(
         val searchResults: List<NoteSummary>,
         val deletedWorkspaceItems: List<DeletedWorkspaceItem>,
     )
+
+    private data class BatchUpdateResult(
+        val repositoryData: NotesRepositoryData,
+        val updated: Map<String, NoteDetails>,
+    )
+
+    private data class BatchDeleteResult(
+        val repositoryData: NotesRepositoryData,
+        val undoItems: List<DeletedWorkspaceItem>,
+    )
+
+    private enum class BatchUpdateKind {
+        Moved,
+        Updated,
+    }
 
     private data class SyncRefreshData(
         val repositoryData: NotesRepositoryData,
@@ -1899,6 +2194,10 @@ data class NotesUiState(
     val notes: List<NoteSummary> = emptyList(),
     val searchQuery: String = "",
     val searchResults: List<NoteSummary> = emptyList(),
+    val selectedNoteIds: Set<String> = emptySet(),
+    val noteSelectionAnchorId: String? = null,
+    val batchOperationInProgress: Boolean = false,
+    val batchDeleteUndoItems: List<DeletedWorkspaceItem> = emptyList(),
     val editor: NoteEditorState? = null,
     val versionHistory: NoteVersionHistoryState? = null,
     val conflictDetails: ConflictDetails? = null,
@@ -1911,7 +2210,25 @@ data class NotesUiState(
 
     val visibleNotes: List<NoteSummary> =
         if (searchQuery.isBlank()) notes else searchResults
+
+    val noteSelectionActive: Boolean get() = selectedNoteIds.isNotEmpty()
 }
+
+private fun NoteDetails.toBatchInput(
+    notebookId: String = this.notebookId,
+    createdAt: Instant = this.createdAt,
+    location: NotesLocationInput? = this.location,
+    timeZoneId: String? = this.timeZoneId,
+): NoteInput =
+    NoteInput(
+        notebookId = notebookId,
+        title = title,
+        markdownBody = markdownBody,
+        createdAt = createdAt,
+        location = location,
+        timeZoneId = timeZoneId,
+        causalToken = causalToken,
+    )
 
 private fun ConflictDetails.referencesNote(noteId: String): Boolean =
     conflictNoteId == noteId || originalNoteId == noteId

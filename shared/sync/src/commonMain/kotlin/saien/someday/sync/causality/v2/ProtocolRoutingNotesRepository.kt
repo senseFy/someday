@@ -6,6 +6,9 @@ import saien.someday.domain.notes.ConflictHistory
 import saien.someday.domain.notes.ConflictResolutionAction
 import saien.someday.domain.notes.MemoryMonth
 import saien.someday.domain.notes.NoteInput
+import saien.someday.domain.notes.NoteBatchDeletion
+import saien.someday.domain.notes.NoteBatchUndelete
+import saien.someday.domain.notes.NoteBatchUpdate
 import saien.someday.domain.notes.NotebookOrderEdit
 import saien.someday.domain.notes.NotesRepository
 import saien.someday.sync.WorkspaceAuthorityMutationCoordinator
@@ -58,6 +61,7 @@ class ProtocolRoutingNotesRepository(
     override fun getNoteDetails(noteId: String) = routed { it.getNoteDetails(noteId) }
     override fun createNote(input: NoteInput) = routed { it.createNote(input) }
     override fun updateNote(noteId: String, input: NoteInput) = routed { it.updateNote(noteId, input) }
+    override fun updateNotes(edits: List<NoteBatchUpdate>) = routed { it.updateNotes(edits) }
     override fun listNoteVersions(noteId: String) = routed { it.listNoteVersions(noteId) }
     override fun restoreNoteVersion(noteId: String, versionId: String) =
         routed { it.restoreNoteVersion(noteId, versionId) }
@@ -78,11 +82,13 @@ class ProtocolRoutingNotesRepository(
     override fun deleteNote(noteId: String) = routed { it.deleteNote(noteId) }
     override fun deleteNote(noteId: String, causalToken: CausalEditToken) =
         routed { it.deleteNote(noteId, causalToken) }
+    override fun deleteNotes(deletions: List<NoteBatchDeletion>) = routed { it.deleteNotes(deletions) }
     override fun undeleteNote(
         noteId: String,
         retainedContentVersionId: String,
         causalToken: CausalEditToken,
     ) = routed { it.undeleteNote(noteId, retainedContentVersionId, causalToken) }
+    override fun undeleteNotes(restores: List<NoteBatchUndelete>) = routed { it.undeleteNotes(restores) }
     override fun listMemoryDayCounts(month: MemoryMonth) = routed { it.listMemoryDayCounts(month) }
     override fun listActiveNoteDates() = routed { it.listActiveNoteDates() }
     override fun listNotesForDate(date: LocalDate) = routed { it.listNotesForDate(date) }

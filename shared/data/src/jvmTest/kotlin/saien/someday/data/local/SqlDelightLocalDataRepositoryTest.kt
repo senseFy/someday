@@ -7,6 +7,8 @@ import app.cash.sqldelight.driver.jdbc.sqlite.JdbcSqliteDriver
 import saien.someday.data.local.db.SomedayDatabase
 import saien.someday.data.requiredLocalTables
 import saien.someday.domain.notes.ConflictResolutionAction
+import saien.someday.domain.notes.NoteBatchUpdate
+import saien.someday.domain.notes.NoteInput
 import kotlin.time.Instant
 import java.nio.file.Files
 import java.sql.DriverManager
@@ -20,6 +22,33 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class SqlDelightLocalDataRepositoryTest {
+    @Test
+    fun productBatchUpdateRollsBackEveryNoteWhenOneEditFails() =
+        withFixture { fixture ->
+            val notebook = fixture.repository.createNotebook("Batch")
+            val first = fixture.repository.createNote(notebook.id, "First", "One")
+            val second = fixture.repository.createNote(notebook.id, "Second", "Two")
+            val notes = SqlDelightNotesRepository(fixture.repository)
+
+            assertFailsWith<IllegalArgumentException> {
+                notes.updateNotes(
+                    listOf(
+                        NoteBatchUpdate(
+                            first.id,
+                            NoteInput(notebook.id, "First updated", first.markdownBody),
+                        ),
+                        NoteBatchUpdate(
+                            second.id,
+                            NoteInput("missing-notebook", "Second updated", second.markdownBody),
+                        ),
+                    ),
+                )
+            }
+
+            assertEquals("First", notes.getNoteDetails(first.id)?.title)
+            assertEquals("Second", notes.getNoteDetails(second.id)?.title)
+        }
+
     @Test
     fun jdbcFactoryRegistersSqliteDriverWithDriverManager() {
         val driver = createSomedayJdbcDriver("jdbc:sqlite::memory:")

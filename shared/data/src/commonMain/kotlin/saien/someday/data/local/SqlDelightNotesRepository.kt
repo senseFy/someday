@@ -6,6 +6,8 @@ import saien.someday.domain.notes.MemoryMonth
 import saien.someday.domain.notes.ConflictDetails
 import saien.someday.domain.notes.ConflictResolutionAction
 import saien.someday.domain.notes.NoteDetails
+import saien.someday.domain.notes.NoteBatchDeletion
+import saien.someday.domain.notes.NoteBatchUpdate
 import saien.someday.domain.notes.NoteInput
 import saien.someday.domain.notes.NoteSummary
 import saien.someday.domain.notes.NoteSyncBadge
@@ -85,6 +87,17 @@ class SqlDelightNotesRepository(
         return checkNotNull(getNoteDetails(note.id))
     }
 
+    override fun updateNotes(edits: List<NoteBatchUpdate>): List<NoteDetails> {
+        require(edits.map { it.noteId }.distinct().size == edits.size) {
+            "A note can only appear once in a batch update."
+        }
+        var updated = emptyList<NoteDetails>()
+        localRepository.database.transaction {
+            updated = edits.map { edit -> updateNote(edit.noteId, edit.input) }
+        }
+        return updated
+    }
+
     override fun listNoteVersions(noteId: String): List<NoteVersionSummary> =
         localRepository.listNoteVersions(noteId).map { it.toSummary() }
 
@@ -112,6 +125,15 @@ class SqlDelightNotesRepository(
 
     override fun deleteNote(noteId: String) {
         localRepository.deleteNote(noteId)
+    }
+
+    override fun deleteNotes(deletions: List<NoteBatchDeletion>) {
+        require(deletions.map { it.noteId }.distinct().size == deletions.size) {
+            "A note can only appear once in a batch deletion."
+        }
+        localRepository.database.transaction {
+            deletions.forEach { localRepository.deleteNote(it.noteId) }
+        }
     }
 
     override fun listMemoryDayCounts(month: MemoryMonth): List<MemoryDayCount> =
