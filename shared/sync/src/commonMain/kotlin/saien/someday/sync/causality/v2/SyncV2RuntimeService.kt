@@ -391,7 +391,9 @@ class SyncV2RuntimeService(
         val repair = WorkspaceImmutableObjectRepairServiceV2(
             localRepository, workspaceKey, writerDeviceId, remote, protocolStore, clock,
         )
-        blockers.forEach { deadLetter ->
+        blockers.filter {
+            it.input.failureClass != SyncDeadLetterFailureClassV2.RETRYABLE_DEPENDENCY
+        }.forEach { deadLetter ->
             when (val result = repair.repair(deadLetter)) {
                 is WorkspaceRepairResultV2.Repaired -> Unit
                 is WorkspaceRepairResultV2.RebootstrapRequired ->

@@ -148,6 +148,15 @@ Authentication failures, rollback evidence, missing referenced objects,
 immutable-id byte mismatches, cursor gaps, and persistent replica corruption
 block the run before unsafe upload or cursor advancement.
 
+Cursor order is authoritative only within one writer stream. A bounded pull
+may return causally related units from different writer streams in any order.
+The coordinator preserves each stream's cursor order, defers a unit whose
+authenticated entity parent is not yet local, and applies eligible units from
+the other returned streams before retrying the deferred unit. If no unit can
+make progress, the missing-parent unit remains a retryable dependency blocker
+and push stays disabled. A later pull may resume past that blocker and resolves
+it only after the exact cursor unit applies atomically.
+
 Successful manual sync always refreshes the Notes product view, including a
 zero-delta bootstrap. This is required for pair, join, sync, and immediately
 view the leader workspace.
