@@ -320,6 +320,8 @@ import org.jetbrains.compose.resources.stringResource
 @Composable
 fun SomedayApp(
     platformName: String = "shared",
+    appVersionName: String = "",
+    appVersionCode: String = "",
     windowChromeTopInset: Dp = 0.dp,
     developerOptionsEnabled: Boolean = false,
     systemV2ActivationEnabled: Boolean = false,
@@ -819,6 +821,8 @@ fun SomedayApp(
                     developerOptions = developerOptions,
                     systemV2ActivationEnabled = systemV2ActivationEnabled,
                     workspacePairingScanner = workspacePairingScanner,
+                    appVersionName = appVersionName,
+                    appVersionCode = appVersionCode,
                     pullRefresh = pullRefresh,
                     syncTopRevealSignal = syncTopRevealSignal,
                     discardEditorOnExit = discardEditorOnExit,
@@ -1370,6 +1374,8 @@ private fun SomedayAdaptiveShell(
     developerOptions: DeveloperOptionsUi?,
     systemV2ActivationEnabled: Boolean,
     workspacePairingScanner: WorkspacePairingScanner,
+    appVersionName: String,
+    appVersionCode: String,
     pullRefresh: SomedayPullRefreshUi?,
     syncTopRevealSignal: Long,
     discardEditorOnExit: Boolean,
@@ -1400,6 +1406,8 @@ private fun SomedayAdaptiveShell(
             developerOptions = developerOptions,
             systemV2ActivationEnabled = systemV2ActivationEnabled,
             workspacePairingScanner = workspacePairingScanner,
+            appVersionName = appVersionName,
+            appVersionCode = appVersionCode,
             pullRefresh = pullRefresh,
             syncTopRevealSignal = syncTopRevealSignal,
             discardEditorOnExit = discardEditorOnExit,
@@ -1430,6 +1438,8 @@ private fun SomedayAdaptiveShell(
             developerOptions = developerOptions,
             systemV2ActivationEnabled = systemV2ActivationEnabled,
             workspacePairingScanner = workspacePairingScanner,
+            appVersionName = appVersionName,
+            appVersionCode = appVersionCode,
             pullRefresh = pullRefresh,
             syncTopRevealSignal = syncTopRevealSignal,
             discardEditorOnExit = discardEditorOnExit,
@@ -1463,6 +1473,8 @@ private fun SomedayCompactShell(
     developerOptions: DeveloperOptionsUi?,
     systemV2ActivationEnabled: Boolean,
     workspacePairingScanner: WorkspacePairingScanner,
+    appVersionName: String,
+    appVersionCode: String,
     pullRefresh: SomedayPullRefreshUi?,
     syncTopRevealSignal: Long,
     discardEditorOnExit: Boolean,
@@ -1521,6 +1533,8 @@ private fun SomedayCompactShell(
                 developerOptions = developerOptions,
                 systemV2ActivationEnabled = systemV2ActivationEnabled,
                 workspacePairingScanner = workspacePairingScanner,
+                appVersionName = appVersionName,
+                appVersionCode = appVersionCode,
                 pullRefresh = pullRefresh,
                 syncTopRevealSignal = syncTopRevealSignal,
                 discardEditorOnExit = discardEditorOnExit,
@@ -1556,6 +1570,8 @@ private fun SomedayWideShell(
     developerOptions: DeveloperOptionsUi?,
     systemV2ActivationEnabled: Boolean,
     workspacePairingScanner: WorkspacePairingScanner,
+    appVersionName: String,
+    appVersionCode: String,
     pullRefresh: SomedayPullRefreshUi?,
     syncTopRevealSignal: Long,
     discardEditorOnExit: Boolean,
@@ -1635,6 +1651,8 @@ private fun SomedayWideShell(
                     developerOptions = developerOptions,
                     systemV2ActivationEnabled = systemV2ActivationEnabled,
                     workspacePairingScanner = workspacePairingScanner,
+                    appVersionName = appVersionName,
+                    appVersionCode = appVersionCode,
                     pullRefresh = pullRefresh,
                     syncTopRevealSignal = syncTopRevealSignal,
                     discardEditorOnExit = discardEditorOnExit,
@@ -1917,6 +1935,8 @@ private fun SomedayNavigationHost(
     developerOptions: DeveloperOptionsUi?,
     systemV2ActivationEnabled: Boolean,
     workspacePairingScanner: WorkspacePairingScanner,
+    appVersionName: String,
+    appVersionCode: String,
     pullRefresh: SomedayPullRefreshUi?,
     syncTopRevealSignal: Long,
     discardEditorOnExit: Boolean,
@@ -2207,6 +2227,8 @@ private fun SomedayNavigationHost(
                     developerOptions = developerOptions,
                     systemV2ActivationEnabled = systemV2ActivationEnabled,
                     workspacePairingScanner = workspacePairingScanner,
+                    appVersionName = appVersionName,
+                    appVersionCode = appVersionCode,
                     onOpenPage = { page -> navController.navigate(SettingsDetailRoute(page.routeId)) },
                     onBack = { navController.popBackStack() },
                     modifier = settingsContentModifier(layoutSpec, paddingValues),
@@ -4283,6 +4305,8 @@ private fun SettingsContent(
     developerOptions: DeveloperOptionsUi? = null,
     systemV2ActivationEnabled: Boolean,
     workspacePairingScanner: WorkspacePairingScanner,
+    appVersionName: String = "",
+    appVersionCode: String = "",
     onOpenPage: (SettingsPage) -> Unit,
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
@@ -4302,6 +4326,8 @@ private fun SettingsContent(
                     controller = controller,
                     onThisDayNotificationTimeFormatter = onThisDayNotificationTimeFormatter,
                     developerOptions = developerOptions,
+                    appVersionName = appVersionName,
+                    appVersionCode = appVersionCode,
                     onOpenPage = onOpenPage,
                 )
             }
@@ -4378,6 +4404,8 @@ private fun SettingsMainContent(
     controller: SettingsUiController,
     onThisDayNotificationTimeFormatter: OnThisDayNotificationTimeFormatter,
     developerOptions: DeveloperOptionsUi?,
+    appVersionName: String,
+    appVersionCode: String,
     onOpenPage: (SettingsPage) -> Unit,
 ) {
     WorkspacePreferencesStatusSection(state, controller)
@@ -4447,6 +4475,34 @@ private fun SettingsMainContent(
             )
         }
     }
+
+    SettingsVersionFooter(
+        versionName = appVersionName,
+        versionCode = appVersionCode,
+    )
+}
+
+@Composable
+private fun SettingsVersionFooter(
+    versionName: String,
+    versionCode: String,
+) {
+    val label = when {
+        versionName.isNotBlank() && versionCode.isNotBlank() ->
+            stringResource(Res.string.settings_app_version, versionName, versionCode)
+        versionName.isNotBlank() -> versionName
+        versionCode.isNotBlank() -> versionCode
+        else -> return
+    }
+    Text(
+        text = label,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        textAlign = TextAlign.Center,
+        style = MaterialTheme.typography.labelSmall,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 28.dp, bottom = 8.dp),
+    )
 }
 
 @Composable

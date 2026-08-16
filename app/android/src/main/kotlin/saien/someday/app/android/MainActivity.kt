@@ -193,6 +193,8 @@ class MainActivity : ComponentActivity() {
             }
             SomedayApp(
                 platformName = AndroidShellEntrypoint.platformName,
+                appVersionName = BuildConfig.VERSION_NAME,
+                appVersionCode = BuildConfig.VERSION_CODE.toString(),
                 developerOptionsEnabled = BuildConfig.DEBUG,
                 systemV2ActivationEnabled = BuildConfig.SOMEDAY_SYSTEM_V2_RELEASE_ENABLED || BuildConfig.DEBUG,
                 initialSettings = loaded.initialSettings,

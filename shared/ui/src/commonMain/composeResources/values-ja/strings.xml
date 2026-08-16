@@ -322,6 +322,7 @@
     <string name="selfhosted_forget_session_title">セルフホストセッションを削除</string>
     <string name="selfhosted_sign_in">サインイン</string>
     <string name="selfhosted_signing_in">サインイン中…</string>
+    <string name="settings_app_version">%1$s（%2$s）</string>
     <string name="settings_appearance">外観</string>
     <string name="settings_branch_theme">ブランチ %1$d: %2$s</string>
     <string name="settings_connection">接続</string>

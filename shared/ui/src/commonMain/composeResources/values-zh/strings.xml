@@ -322,6 +322,7 @@
     <string name="selfhosted_forget_session_title">清除自建服务会话</string>
     <string name="selfhosted_sign_in">登录</string>
     <string name="selfhosted_signing_in">正在登录…</string>
+    <string name="settings_app_version">%1$s（%2$s）</string>
     <string name="settings_appearance">外观</string>
     <string name="settings_branch_theme">分支 %1$d：%2$s</string>
     <string name="settings_connection">连接</string>

@@ -322,6 +322,7 @@
     <string name="selfhosted_forget_session_title">Forget self-hosted session</string>
     <string name="selfhosted_sign_in">Sign in</string>
     <string name="selfhosted_signing_in">Signing in...</string>
+    <string name="settings_app_version">%1$s (%2$s)</string>
     <string name="settings_appearance">Appearance</string>
     <string name="settings_branch_theme">Branch %1$d: %2$s</string>
     <string name="settings_connection">Connection</string>

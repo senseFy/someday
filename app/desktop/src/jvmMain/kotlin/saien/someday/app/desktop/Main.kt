@@ -66,6 +66,8 @@ fun main() = application {
         val importCoroutineScope = rememberCoroutineScope()
         SomedayApp(
             platformName = DesktopShellEntrypoint.platformName,
+            appVersionName = DesktopBuildConfig.VERSION_NAME,
+            appVersionCode = DesktopBuildConfig.VERSION_CODE,
             windowChromeTopInset = if (usesImmersiveMacChrome) 32.dp else 0.dp,
             developerOptionsEnabled = DesktopBuildConfig.DEVELOPER_OPTIONS_ENABLED,
             systemV2ActivationEnabled = DesktopBuildConfig.SOMEDAY_SYSTEM_V2_RELEASE_ENABLED ||
