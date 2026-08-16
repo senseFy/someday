@@ -30,7 +30,7 @@ libsodium = "0.9.5"
 okio = "3.16.4"
 qrcode-kotlin = "4.5.0"
 zxing = "3.5.4"
-postgresql = "42.7.8"
+postgresql = "42.7.13"
 sqldelight = "2.1.0"
 sqlite-jdbc = "3.49.1.0"
 
