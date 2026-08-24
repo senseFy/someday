@@ -7,10 +7,17 @@ SCHEMA_DIR="$ROOT_DIR/shared/data/src/commonMain/sqldelight/databases"
 MIGRATION_DIR="$ROOT_DIR/shared/data/src/commonMain/sqldelight/saien/someday/data/local/db"
 BASELINE="$SCHEMA_DIR/1.db"
 
-command -v sqlite3 >/dev/null 2>&1 || {
+# GitHub's Ubuntu image puts Android platform-tools on PATH. That sqlite3 is a
+# reduced build and can omit CHECK-constraint literals from sqlite_master.sql,
+# which made this verifier fail while the committed baseline was valid.
+if [[ -x /usr/bin/sqlite3 ]]; then
+    SQLITE3=/usr/bin/sqlite3
+elif command -v sqlite3 >/dev/null 2>&1; then
+    SQLITE3="$(command -v sqlite3)"
+else
     printf 'error: sqlite3 is required for schema verification.\n' >&2
     exit 1
-}
+fi
 
 [[ -f "$BASELINE" ]] || {
     printf 'error: missing V2-only SQLDelight baseline: %s\n' "$BASELINE" >&2
@@ -29,11 +36,11 @@ if find "$MIGRATION_DIR" -maxdepth 1 -type f -name '*.sqm' | grep -q .; then
     exit 1
 fi
 
-[[ "$(sqlite3 "$BASELINE" 'PRAGMA integrity_check;')" == "ok" ]] || {
+[[ "$("$SQLITE3" "$BASELINE" 'PRAGMA integrity_check;')" == "ok" ]] || {
     printf 'error: baseline failed SQLite integrity_check.\n' >&2
     exit 1
 }
-[[ -z "$(sqlite3 "$BASELINE" 'PRAGMA foreign_key_check;')" ]] || {
+[[ -z "$("$SQLITE3" "$BASELINE" 'PRAGMA foreign_key_check;')" ]] || {
     printf 'error: baseline failed SQLite foreign_key_check.\n' >&2
     exit 1
 }
@@ -75,7 +82,7 @@ expected_tables="$(
         sort
 )"
 actual_tables="$(
-    sqlite3 "$BASELINE" \
+    "$SQLITE3" "$BASELINE" \
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name;"
 )"
 [[ "$actual_tables" == "$expected_tables" ]] || {
@@ -84,7 +91,6 @@ actual_tables="$(
     exit 1
 }
 
-schema_sql="$(sqlite3 "$BASELINE" "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL;")"
 for required in \
     someday-system-v2 \
     workspace-entity-schema-set-v2 \
@@ -93,7 +99,8 @@ for required in \
     field-merge-v2 \
     manual-resolution-v2 \
     source_import; do
-    printf '%s\n' "$schema_sql" | grep -Fq "$required" || {
+    count="$("$SQLITE3" "$BASELINE" "SELECT COUNT(*) FROM sqlite_master WHERE sql IS NOT NULL AND instr(sql, '${required}') > 0;")"
+    [[ "$count" != "0" ]] || {
         printf 'error: baseline is missing required V2 wire value: %s\n' "$required" >&2
         exit 1
     }
@@ -101,7 +108,8 @@ done
 
 retired_major='v''1'
 retired_history='leg''acy'
-if printf '%s\n' "$schema_sql" | grep -Eiq "${retired_major}|${retired_history}"; then
+retired_count="$("$SQLITE3" "$BASELINE" "SELECT COUNT(*) FROM sqlite_master WHERE sql IS NOT NULL AND (instr(lower(sql), '${retired_major}') > 0 OR instr(lower(sql), '${retired_history}') > 0);")"
+if [[ "$retired_count" != "0" ]]; then
     printf 'error: baseline contains a retired sync wire value.\n' >&2
     exit 1
 fi
