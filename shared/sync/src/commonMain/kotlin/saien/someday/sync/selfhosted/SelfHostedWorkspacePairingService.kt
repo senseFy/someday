@@ -8,18 +8,20 @@ import saien.someday.data.crypto.SodiumWorkspaceCrypto
 import saien.someday.domain.settings.ClientSettings
 import saien.someday.domain.settings.SelfHostedSessionCredentialStore
 import saien.someday.domain.settings.SyncMode
+import saien.someday.domain.settings.normalizeSelfHostedEndpoint
 import saien.someday.domain.settings.WorkspaceJoinPackageProvider
 import saien.someday.domain.settings.WorkspaceJoinResult
 import saien.someday.domain.settings.WorkspaceJoiner
+import saien.someday.domain.settings.LocalWorkspaceAdoptionPolicy
 import saien.someday.domain.settings.WorkspacePairingInvitation
 import saien.someday.domain.settings.WorkspacePairingInvitationCanceller
 import saien.someday.domain.settings.WorkspacePairingInvitationCreator
 import saien.someday.domain.settings.WorkspacePairingInvitationJoiner
 import saien.someday.domain.settings.WorkspacePairingInvitationResult
+import saien.someday.domain.settings.WorkspacePairingReason
 import saien.someday.sync.pairing.WorkspacePairingAuthority
 import saien.someday.sync.pairing.WorkspacePairingEnvelopeCodec
 import saien.someday.sync.pairing.WorkspacePairingEnvelopeDecodeResult
-import saien.someday.sync.pairing.WorkspacePairingRemoteProfile
 import saien.someday.sync.pairing.WorkspacePairingToken
 import saien.someday.sync.pairing.base64UrlNoPadding
 import saien.someday.sync.WorkspaceAuthorityMutationCoordinator
@@ -31,8 +33,10 @@ class SelfHostedWorkspacePairingService(
     private val sessionExecutor: RefreshingSelfHostedSessionExecutor,
     private val workspaceJoinPackageProvider: WorkspaceJoinPackageProvider,
     private val workspaceJoiner: WorkspaceJoiner,
-    private val localV2KeyBoundStatePresent: () -> Boolean,
+    private val adoptionPolicy: LocalWorkspaceAdoptionPolicy,
     private val authorityMutationCoordinator: WorkspaceAuthorityMutationCoordinator,
+    private val activeWorkspaceSessionGuard: ActiveWorkspaceSessionGuard,
+    private val workspacePairingInviterReady: () -> Boolean,
     private val crypto: SodiumWorkspaceCrypto = SodiumWorkspaceCrypto(),
     private val clock: () -> Instant = { Clock.System.now() },
 ) : WorkspacePairingInvitationCreator,
@@ -42,12 +46,22 @@ class SelfHostedWorkspacePairingService(
 
     override fun createInvitation(): WorkspacePairingInvitationResult =
         runCatching {
-            val session = requireSession().getOrElse {
-                return WorkspacePairingInvitationResult.failure(it.message ?: "Self-hosted session is missing.")
+            if (!workspacePairingInviterReady()) {
+                return WorkspacePairingInvitationResult.failure(
+                    WorkspacePairingReason.PublishRequired,
+                )
+            }
+            val session = when (val sessionResult = requireSession()) {
+                is PairingSessionResult.Ready -> sessionResult.session
+                is PairingSessionResult.Failed ->
+                    return WorkspacePairingInvitationResult.failure(sessionResult.reason)
             }
             val packageResult = workspaceJoinPackageProvider.createPackage()
             val packageData = packageResult.packageData
-                ?: return WorkspacePairingInvitationResult.failure(packageResult.message)
+                ?: return WorkspacePairingInvitationResult.failure(
+                    packageResult.reason,
+                    packageResult.diagnosticMessage,
+                )
             val authority = authority(session)
 
             repeat(MAX_CREATE_ATTEMPTS) {
@@ -62,7 +76,7 @@ class SelfHostedWorkspacePairingService(
                     packageData = packageData,
                 )
                 val response = try {
-                    sessionExecutor.authorized(session.endpoint, session.accessToken) { accessToken ->
+                    sessionExecutor.authorized(session.endpoint, session.userId, session.accessToken) { accessToken ->
                         transport.createPairingInvite(
                             endpoint = session.endpoint,
                             accessToken = accessToken,
@@ -79,7 +93,7 @@ class SelfHostedWorkspacePairingService(
                     throw error
                 }
                 return WorkspacePairingInvitationResult.success(
-                    message = "Pairing invitation created. Scan the QR code or enter the token before it expires.",
+                    reason = WorkspacePairingReason.InvitationCreated,
                     invitation = WorkspacePairingInvitation.create(
                         manualToken = token.formattedManualToken(),
                         qrPayload = token.qrPayload(),
@@ -87,36 +101,39 @@ class SelfHostedWorkspacePairingService(
                     ),
                 )
             }
-            WorkspacePairingInvitationResult.failure("Could not create a unique pairing invitation. Try again.")
+            WorkspacePairingInvitationResult.failure(WorkspacePairingReason.Failed)
         }.getOrElse { error ->
             WorkspacePairingInvitationResult.failure(
-                "Workspace pairing failed (${error.safePairingFailureDetail()}).",
+                reason = WorkspacePairingReason.Failed,
+                diagnosticMessage = "Workspace pairing failed (${error.safePairingFailureDetail()}).",
             )
         }
 
     override fun joinWithToken(tokenInput: String): WorkspaceJoinResult =
         runCatching {
             val token = WorkspacePairingToken.parse(tokenInput)
-                ?: return WorkspaceJoinResult.failure("Enter a valid pairing token or scan its QR code.")
-            if (localV2KeyBoundStatePresent()) {
-                return WorkspaceJoinResult.failure(localHistoryRefusalMessage())
+                ?: return WorkspaceJoinResult.failure(WorkspacePairingReason.InvalidToken)
+            adoptionPolicy.refusalReason()?.let { return WorkspaceJoinResult.failure(it) }
+            authorityMutationCoordinator.exclusive {
+                joinWithTokenLocked(token)
             }
-            authorityMutationCoordinator.exclusive { joinWithTokenLocked(token) }
-        }.getOrElse {
-            WorkspaceJoinResult.failure("Workspace pairing failed; credentials and secrets redacted.")
+        }.getOrElse { error ->
+            WorkspaceJoinResult.failure(
+                reason = WorkspacePairingReason.Failed,
+                diagnosticMessage = "Workspace pairing failed (${error.safePairingFailureDetail()}).",
+            )
         }
 
     private fun joinWithTokenLocked(token: WorkspacePairingToken): WorkspaceJoinResult {
-        if (localV2KeyBoundStatePresent()) {
-            return WorkspaceJoinResult.failure(localHistoryRefusalMessage())
-        }
-        val session = requireSession().getOrElse {
-            return WorkspaceJoinResult.failure(it.message ?: "Self-hosted session is missing.")
+        adoptionPolicy.refusalReason()?.let { return WorkspaceJoinResult.failure(it) }
+        val session = when (val sessionResult = requireSession()) {
+            is PairingSessionResult.Ready -> sessionResult.session
+            is PairingSessionResult.Failed -> return WorkspaceJoinResult.failure(sessionResult.reason)
         }
         val material = token.deriveMaterial()
         val claimId = base64UrlNoPadding(crypto.randomBytes(CLAIM_ID_BYTES))
         val claimed = try {
-            sessionExecutor.authorized(session.endpoint, session.accessToken) { accessToken ->
+            sessionExecutor.authorized(session.endpoint, session.userId, session.accessToken) { accessToken ->
                 transport.claimPairingInvite(
                     endpoint = session.endpoint,
                     accessToken = accessToken,
@@ -126,19 +143,22 @@ class SelfHostedWorkspacePairingService(
             }
         } catch (error: SelfHostedSyncHttpException) {
             return when (error.status) {
-                404 -> WorkspaceJoinResult.failure("Pairing invitation was not found.")
-                409 -> WorkspaceJoinResult.failure("Pairing invitation was already claimed or cancelled.")
-                410 -> WorkspaceJoinResult.failure("Pairing invitation has expired. Generate a new one and try again.")
-                else -> WorkspaceJoinResult.failure("Workspace pairing failed; credentials and secrets redacted.")
+                404 -> WorkspaceJoinResult.failure(WorkspacePairingReason.InvitationNotFound)
+                409 -> WorkspaceJoinResult.failure(WorkspacePairingReason.InvitationAlreadyUsed)
+                410 -> WorkspaceJoinResult.failure(WorkspacePairingReason.InvitationExpired)
+                else -> WorkspaceJoinResult.failure(
+                    WorkspacePairingReason.Failed,
+                    error.safeMessage,
+                )
             }
         }
         try {
             val bytes = claimed.envelopeJson.encodeToByteArray()
             if (WorkspacePairingEnvelopeCodec.digest(bytes) != claimed.envelopeDigest) {
-                return WorkspaceJoinResult.failure("Pairing invitation ciphertext failed its server digest check.")
+                return WorkspaceJoinResult.failure(WorkspacePairingReason.VerificationFailed)
             }
             if (clock().toEpochMilliseconds() > claimed.expiresAtEpochMillis) {
-                return WorkspaceJoinResult.failure("Pairing invitation has expired. Generate a new one and try again.")
+                return WorkspaceJoinResult.failure(WorkspacePairingReason.InvitationExpired)
             }
             val decoded = when (
                 val result = envelopeCodec.decode(
@@ -150,16 +170,17 @@ class SelfHostedWorkspacePairingService(
             ) {
                 is WorkspacePairingEnvelopeDecodeResult.Success -> result
                 WorkspacePairingEnvelopeDecodeResult.Expired ->
-                    return WorkspaceJoinResult.failure("Pairing invitation has expired. Generate a new one and try again.")
+                    return WorkspaceJoinResult.failure(WorkspacePairingReason.InvitationExpired)
                 WorkspacePairingEnvelopeDecodeResult.Invalid ->
-                    return WorkspaceJoinResult.failure(
-                        "Pairing invitation could not be verified for this self-hosted account.",
-                    )
+                    return WorkspaceJoinResult.failure(WorkspacePairingReason.VerificationFailed)
             }
-            return workspaceJoiner.join(decoded.packageData)
+            return authorityMutationCoordinator.productAccess {
+                adoptionPolicy.refusalReason()?.let { return@productAccess WorkspaceJoinResult.failure(it) }
+                workspaceJoiner.join(decoded.packageData)
+            }
         } finally {
             runCatching {
-                sessionExecutor.authorized(session.endpoint, session.accessToken) { accessToken ->
+                sessionExecutor.authorized(session.endpoint, session.userId, session.accessToken) { accessToken ->
                     transport.completePairingInvite(
                         endpoint = session.endpoint,
                         accessToken = accessToken,
@@ -174,51 +195,56 @@ class SelfHostedWorkspacePairingService(
     override fun cancelInvitation(invitation: WorkspacePairingInvitation): WorkspaceJoinResult =
         runCatching {
             val token = WorkspacePairingToken.parse(invitation.revealManualToken())
-                ?: return WorkspaceJoinResult.failure("The local pairing invitation is invalid.")
-            val session = requireSession().getOrElse {
-                return WorkspaceJoinResult.failure(it.message ?: "Self-hosted session is missing.")
+                ?: return WorkspaceJoinResult.failure(WorkspacePairingReason.InvalidToken)
+            val session = when (val sessionResult = requireSession()) {
+                is PairingSessionResult.Ready -> sessionResult.session
+                is PairingSessionResult.Failed -> return WorkspaceJoinResult.failure(sessionResult.reason)
             }
             try {
-                sessionExecutor.authorized(session.endpoint, session.accessToken) { accessToken ->
+                sessionExecutor.authorized(session.endpoint, session.userId, session.accessToken) { accessToken ->
                     transport.cancelPairingInvite(
                         endpoint = session.endpoint,
                         accessToken = accessToken,
                         inviteId = token.deriveMaterial().inviteId,
                     )
                 }
-                WorkspaceJoinResult.success("Pairing invitation cancelled.")
+                WorkspaceJoinResult.success(WorkspacePairingReason.InvitationCancelled)
             } catch (error: SelfHostedSyncHttpException) {
                 when (error.status) {
-                    404, 410 -> WorkspaceJoinResult.success("Pairing invitation is no longer available.")
-                    409 -> WorkspaceJoinResult.failure(
-                        "Pairing invitation was already claimed and cannot be cancelled.",
-                    )
+                    404, 410 -> WorkspaceJoinResult.success(WorkspacePairingReason.InvitationUnavailable)
+                    409 -> WorkspaceJoinResult.failure(WorkspacePairingReason.InvitationAlreadyUsed)
                     else -> WorkspaceJoinResult.failure(
-                        "Could not cancel pairing invitation; credentials and secrets redacted.",
+                        WorkspacePairingReason.Failed,
+                        error.safeMessage,
                     )
                 }
             }
-        }.getOrElse {
-            WorkspaceJoinResult.failure("Could not cancel pairing invitation; credentials and secrets redacted.")
+        }.getOrElse { error ->
+            WorkspaceJoinResult.failure(
+                WorkspacePairingReason.Failed,
+                error.safePairingFailureDetail(),
+            )
         }
 
-    private fun requireSession(): Result<SelfHostedSyncSession> {
+    private fun requireSession(): PairingSessionResult {
         val sync = settingsProvider().syncConfiguration
         if (sync.mode != SyncMode.SelfHosted) {
-            return Result.failure(IllegalStateException("Select Self-hosted mode and sign in before pairing devices."))
+            return PairingSessionResult.Failed(WorkspacePairingReason.SessionRequired)
         }
         if (!sync.selfHostedSession.loggedIn) {
-            return Result.failure(IllegalStateException("Sign in to the self-hosted server before pairing devices."))
+            return PairingSessionResult.Failed(WorkspacePairingReason.SessionRequired)
         }
         val credentials = sessionStore.load()
-            ?: return Result.failure(IllegalStateException("Self-hosted session is missing; tokens redacted."))
-        return Result.success(SelfHostedSyncSession.fromCredentials(credentials))
+            ?: return PairingSessionResult.Failed(WorkspacePairingReason.SessionRequired)
+        if (!activeWorkspaceSessionGuard.isCompatible(credentials)) {
+            return PairingSessionResult.Failed(WorkspacePairingReason.AuthorityMismatch)
+        }
+        return PairingSessionResult.Ready(SelfHostedSyncSession.fromCredentials(credentials))
     }
 
     private fun authority(session: SelfHostedSyncSession): WorkspacePairingAuthority =
         WorkspacePairingAuthority(
-            remoteProfile = WorkspacePairingRemoteProfile.SelfHosted,
-            binding = canonicalAuthorityBinding(session.endpoint.trimEnd('/'), session.userId),
+            binding = canonicalAuthorityBinding(normalizeSelfHostedEndpoint(session.endpoint), session.userId),
         )
 
     private companion object {
@@ -227,51 +253,13 @@ class SelfHostedWorkspacePairingService(
     }
 }
 
-class ModeRoutingWorkspacePairingService(
-    private val settingsProvider: () -> ClientSettings,
-    private val webDavCreator: WorkspacePairingInvitationCreator,
-    private val webDavJoiner: WorkspacePairingInvitationJoiner,
-    private val webDavCanceller: WorkspacePairingInvitationCanceller,
-    private val selfHostedCreator: WorkspacePairingInvitationCreator,
-    private val selfHostedJoiner: WorkspacePairingInvitationJoiner,
-    private val selfHostedCanceller: WorkspacePairingInvitationCanceller,
-) : WorkspacePairingInvitationCreator,
-    WorkspacePairingInvitationJoiner,
-    WorkspacePairingInvitationCanceller {
-    override fun createInvitation(): WorkspacePairingInvitationResult =
-        when (settingsProvider().syncConfiguration.mode) {
-            SyncMode.WebDav -> webDavCreator.createInvitation()
-            SyncMode.SelfHosted -> selfHostedCreator.createInvitation()
-            SyncMode.Off -> WorkspacePairingInvitationResult.failure(
-                "Choose WebDAV or Self-hosted mode before pairing devices.",
-            )
-        }
-
-    override fun joinWithToken(tokenInput: String): WorkspaceJoinResult =
-        when (settingsProvider().syncConfiguration.mode) {
-            SyncMode.WebDav -> webDavJoiner.joinWithToken(tokenInput)
-            SyncMode.SelfHosted -> selfHostedJoiner.joinWithToken(tokenInput)
-            SyncMode.Off -> WorkspaceJoinResult.failure(
-                "Choose WebDAV or Self-hosted mode before pairing devices.",
-            )
-        }
-
-    override fun cancelInvitation(invitation: WorkspacePairingInvitation): WorkspaceJoinResult =
-        when (settingsProvider().syncConfiguration.mode) {
-            SyncMode.WebDav -> webDavCanceller.cancelInvitation(invitation)
-            SyncMode.SelfHosted -> selfHostedCanceller.cancelInvitation(invitation)
-            SyncMode.Off -> WorkspaceJoinResult.failure(
-                "Choose WebDAV or Self-hosted mode before cancelling an invitation.",
-            )
-        }
+private sealed interface PairingSessionResult {
+    data class Ready(val session: SelfHostedSyncSession) : PairingSessionResult
+    data class Failed(val reason: WorkspacePairingReason) : PairingSessionResult
 }
 
 private fun canonicalAuthorityBinding(vararg parts: String): String =
     parts.joinToString(separator = "|") { part -> "${part.encodeToByteArray().size}:$part" }
-
-private fun localHistoryRefusalMessage(): String =
-    "This device already has local Sync V2 history for its current workspace key. " +
-        "Clear local app data before joining another workspace."
 
 private fun Throwable.safePairingFailureDetail(): String =
     if (this is SelfHostedSyncHttpException) {

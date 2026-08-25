@@ -7,8 +7,6 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
-val systemV2ReleaseEnabled = providers.gradleProperty("someday.systemV2ReleaseEnabled").orElse("false")
-
 data class AndroidSigningEnvironment(
     val storeFile: String,
     val storePassword: String,
@@ -29,14 +27,6 @@ val releaseSigningRequested = gradle.startParameter.taskNames.any { taskName ->
             simpleName.contains("release") &&
             listOf("assemble", "bundle", "package", "sign", "publish").any(simpleName::contains)
     )
-}
-val systemV2ReleaseEnabledValue = systemV2ReleaseEnabled.get().toBooleanStrictOrNull()
-    ?: error("someday.systemV2ReleaseEnabled must be true or false.")
-if (releaseSigningRequested) {
-    check(systemV2ReleaseEnabledValue) {
-        "Android release packaging requires -Psomeday.systemV2ReleaseEnabled=true. " +
-            "Use the canonical make android-release-play entrypoint."
-    }
 }
 val releaseSigning = AndroidSigningEnvironment(
     storeFile = "SOMEDAY_ANDROID_KEYSTORE_PATH",
@@ -74,11 +64,6 @@ android {
         versionCode = 17
         versionName = "1.0.16"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-        buildConfigField(
-            "boolean",
-            "SOMEDAY_SYSTEM_V2_RELEASE_ENABLED",
-            systemV2ReleaseEnabledValue.toString(),
-        )
     }
 
     signingConfigs {
@@ -163,6 +148,22 @@ tasks.register("androidShellSmoke") {
     description = "Builds the Android app shell and runs its shared UI startup contract test."
     dependsOn("assembleDebug", "testDebugUnitTest")
     doLast {
-        println("Android shell smoke: platform=android shared-ui=shared:ui startup=SomedayApp material=Material3 tabs=Notes|Memories|Settings notes-reclick=opens-notebook-sheet add-entry=new-note settings=local-persistent markdown-source=plain-text preview=toggle toolbar=heading|bold|italic|list|quote|code-block|link wysiwyg-assist=selection-aware-toolbar+preview-feedback attachments=absent memories=calendar-counts|month-navigation|selected-day|prior-year location=system-coordinates|manual-place|permission-denied-usable|no-map-sdk platform-smoke=workspace-setup|unlock|create-note|markdown-preview|denied-location|restart-persistence search=local-title-body-active-only settings-sections=sync-mode-account|webdav-config|self-hosted-device-management|device-pairing|editor-preferences|theme-default-notebook|sync-status-last-error|export-entry-points workspace-pairing=one-use-invitation|qr-or-token|redacted-logs export=notes-notebooks|excludes-raw-keys-tokens-passwords-recovery-material")
+        println(
+            "Android shell smoke: platform=android shared-ui=shared:ui startup=SomedayApp material=Material3 " +
+                "tabs=Notes|Memories|Settings notes-reclick=opens-notebook-sheet add-entry=new-note " +
+                "settings=local-persistent markdown-source=plain-text preview=toggle " +
+                "toolbar=heading|bold|italic|list|quote|code-block|link|image " +
+                "wysiwyg-assist=live-edit-preview+selection-aware-toolbar+preview-feedback " +
+                "images=app-owned-assets+local-preview+user-requested-materialization " +
+                "memories=calendar-counts|month-navigation|selected-day|prior-year " +
+                "location=system-coordinates|manual-place|permission-denied-usable|no-map-sdk " +
+                "platform-smoke=workspace-setup|unlock|create-note|markdown-preview|denied-location|" +
+                "restart-persistence search=local-title-body-active-only " +
+                "settings-sections=sync-mode-account|self-hosted-device-management|device-pairing|" +
+                "editor-preferences|theme-default-notebook|sync-status-last-error|export-entry-points " +
+                "workspace-pairing=one-use-invitation|qr-or-token|redacted-logs " +
+                "export=notes-notebooks|dag-only|excludes-media-bytes|asset-references-may-be-unresolved|" +
+                "excludes-raw-keys-tokens-passwords-recovery-material",
+        )
     }
 }

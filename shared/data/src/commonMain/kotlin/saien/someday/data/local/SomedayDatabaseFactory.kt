@@ -6,7 +6,6 @@ import app.cash.sqldelight.db.SqlDriver
 import saien.someday.data.local.db.SomedayDatabase
 import saien.someday.data.settings.ClientSettingsRepository
 import saien.someday.data.settings.SqlDelightClientSettingsRepository
-import saien.someday.domain.notes.NotesRepository
 import org.koin.dsl.module
 
 fun createSomedayDatabase(driver: SqlDriver): SomedayDatabase = SomedayDatabase(driver)
@@ -22,6 +21,5 @@ fun localDataModule(
             deviceId = deviceId,
         )
     }
-    single<NotesRepository> { SqlDelightNotesRepository(get()) }
     single<ClientSettingsRepository> { SqlDelightClientSettingsRepository(get()) }
 }

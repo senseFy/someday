@@ -15,7 +15,6 @@ const val SYNC_CHECKPOINT_MANIFEST_OBJECT_TYPE_V2: String = "sync_checkpoint_man
 const val SYNC_CHECKPOINT_CHUNK_OBJECT_TYPE_V2: String = "sync_checkpoint_chunk_v2"
 
 enum class SyncRemoteProfileV2(val wireValue: String) {
-    WEB_DAV("webdav-log-v2"),
     SELF_HOSTED("self-hosted-v2"),
 }
 
@@ -23,7 +22,7 @@ enum class SyncMetadataPrivacyModeV2(val wireValue: String) {
     OPAQUE("opaque"),
 }
 
-/** Authenticated high-water mark captured before a V2-to-V2 checkpoint roll. */
+/** Frozen lineage wire field; first-release clients reject descriptors containing one. */
 @Serializable
 data class SyncStreamFrontierV2(
     val streamId: String,
@@ -52,7 +51,7 @@ data class SyncEpochDescriptorV2(
     val checkpointId: String,
     val checkpointDigest: String,
     val previousEpochId: String? = null,
-    /** Digest of the pointer that made [previousEpochId] authoritative, even across remotes. */
+    /** Frozen lineage wire field; first-release clients require it to be null. */
     val previousEpochPointerDigest: String? = null,
     val createdByDeviceId: String,
     val createdAt: Instant,
@@ -66,10 +65,7 @@ data class SyncEpochDescriptorV2(
         require(semanticProtocolVersion == SEMANTIC_SYNC_PROTOCOL_VERSION_V2)
         require(minimumWriterProtocolVersion >= MINIMUM_WRITER_VERSION_V2)
         require(keySetVersion == SYNC_KEY_SET_VERSION_V2)
-        require(remoteProfile in setOf(
-            SyncRemoteProfileV2.WEB_DAV.wireValue,
-            SyncRemoteProfileV2.SELF_HOSTED.wireValue,
-        ))
+        require(remoteProfile == SyncRemoteProfileV2.SELF_HOSTED.wireValue)
         require(supportedOfflineWindowSeconds >= SUPPORTED_OFFLINE_WINDOW_SECONDS_V2)
         require(metadataPrivacyMode == SyncMetadataPrivacyModeV2.OPAQUE.wireValue)
         require(UUID_V4_PATTERN_SYSTEM_V2.matches(checkpointId))

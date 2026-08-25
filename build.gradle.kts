@@ -32,15 +32,15 @@ subprojects {
     }
 }
 
-val syncV2ReliabilityGateRequested = providers
-    .gradleProperty("someday.syncV2ReliabilityGate")
+val systemV3ReliabilityGateRequested = providers
+    .gradleProperty("someday.systemV3ReliabilityGate")
     .map { value ->
         value.toBooleanStrictOrNull()
-            ?: error("someday.syncV2ReliabilityGate must be true or false")
+            ?: error("someday.systemV3ReliabilityGate must be true or false")
     }
     .orElse(false)
 
-val syncV2ReliabilityTestTaskNames = setOf(
+val systemV3ReliabilityTestTaskNames = setOf(
     "jvmTest",
     "testDebugUnitTest",
     "iosSimulatorArm64Test",
@@ -51,8 +51,8 @@ val syncV2ReliabilityTestTaskNames = setOf(
 
 subprojects {
     tasks.configureEach {
-        if (name in syncV2ReliabilityTestTaskNames) {
-            outputs.upToDateWhen { !syncV2ReliabilityGateRequested.get() }
+        if (name in systemV3ReliabilityTestTaskNames) {
+            outputs.upToDateWhen { !systemV3ReliabilityGateRequested.get() }
         }
     }
 }
@@ -215,7 +215,7 @@ tasks.register("sharedBehaviorTargetSmoke") {
 
 tasks.register("endToEndPlatformValidation") {
     group = "verification"
-    description = "Runs self-hosted/WebDAV E2E checks and cross-platform smoke validators for final platform readiness."
+    description = "Runs self-hosted E2E checks and cross-platform smoke validators for final platform readiness."
     dependsOn(
         ":server:integrationTest",
         ":integration-tests:realRemoteTest",

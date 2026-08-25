@@ -7,9 +7,6 @@ import saien.someday.data.export.ExportedNote
 import saien.someday.data.export.ExportedNotebook
 import saien.someday.data.export.LocalDataExportDocument
 import saien.someday.data.export.LocalDataImportSummary
-import saien.someday.data.local.LocationInput
-import saien.someday.data.local.NoteLocation
-import saien.someday.data.local.SqlDelightLocalDataRepository
 import saien.someday.domain.notes.noteCalendarDate
 import kotlin.time.Instant
 import kotlinx.datetime.LocalDate
@@ -29,8 +26,8 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 
 class DayOneImportService(
-    private val localRepository: SqlDelightLocalDataRepository,
-    private val authoritativeImporter: ((LocalDataExportDocument) -> LocalDataImportSummary?)? = null,
+    /** Parsed Day One content is written only through the System V3 workspace DAG. */
+    private val authoritativeImporter: (LocalDataExportDocument) -> LocalDataImportSummary,
 ) {
     fun importArchive(
         archiveBytes: ByteArray,
@@ -40,100 +37,10 @@ class DayOneImportService(
 
     fun importDocuments(documents: List<DayOneJsonDocument>): DayOneImportSummary {
         require(documents.isNotEmpty()) { "Day One import requires at least one JSON document." }
-        tryAuthoritativeImport(documents)?.let { return it }
-
-        var notebooksCreated = 0
-        var notebooksReused = 0
-        var notesCreated = 0
-        var notesUpdated = 0
-        var notesSkipped = 0
-        var richTextConverted = 0
-        var richTextFallbacks = 0
-        var locationsImported = 0
-        var tagsFound = 0
-        var starredFound = 0
-        var pinnedFound = 0
-        var photosReferenced = 0
-        var audiosReferenced = 0
-        var videosReferenced = 0
-        var pdfsReferenced = 0
-        var weatherFound = 0
-        var unsupportedEmbeddedObjects = 0
-
-        val notebookIdsByTitle = localRepository.listActiveNotebooks()
-            .associateBy { notebookTitleKey(it.title) }
-            .toMutableMap()
-
-        documents.forEach { document ->
-            val notebookTitle = document.journalTitle.trim().ifBlank { "Day One" }
-            val notebookKey = notebookTitleKey(notebookTitle)
-            val notebook = notebookIdsByTitle[notebookKey]
-            val notebookId = if (notebook != null) {
-                notebooksReused += 1
-                notebook.id
-            } else {
-                val created = localRepository.createNotebook(
-                    title = notebookTitle,
-                    sortOrder = (localRepository.listActiveNotebooks().maxOfOrNull { it.sortOrder } ?: 0L) + 1L,
-                )
-                notebookIdsByTitle[notebookKey] = created
-                notebooksCreated += 1
-                created.id
-            }
-
-            val decoded = json.decodeFromString(DayOneExportDocument.serializer(), document.json)
-            decoded.entries.forEach { entry ->
-                val entryResult = importEntry(entry, notebookId)
-                when (entryResult.status) {
-                    DayOneEntryImportStatus.Created -> notesCreated += 1
-                    DayOneEntryImportStatus.Updated -> notesUpdated += 1
-                    DayOneEntryImportStatus.Skipped -> notesSkipped += 1
-                }
-                if (entryResult.richTextConverted) {
-                    richTextConverted += 1
-                }
-                if (entryResult.richTextFallback) {
-                    richTextFallbacks += 1
-                }
-                if (entryResult.locationImported) {
-                    locationsImported += 1
-                }
-                tagsFound += entryResult.tagsFound
-                starredFound += entryResult.starredFound
-                pinnedFound += entryResult.pinnedFound
-                photosReferenced += entryResult.photosReferenced
-                audiosReferenced += entryResult.audiosReferenced
-                videosReferenced += entryResult.videosReferenced
-                pdfsReferenced += entryResult.pdfsReferenced
-                weatherFound += entryResult.weatherFound
-                unsupportedEmbeddedObjects += entryResult.unsupportedEmbeddedObjects
-            }
-        }
-
-        return DayOneImportSummary(
-            journalsImported = documents.size,
-            notebooksCreated = notebooksCreated,
-            notebooksReused = notebooksReused,
-            notesCreated = notesCreated,
-            notesUpdated = notesUpdated,
-            notesSkipped = notesSkipped,
-            richTextConverted = richTextConverted,
-            richTextFallbacks = richTextFallbacks,
-            locationsImported = locationsImported,
-            tagsFound = tagsFound,
-            starredFound = starredFound,
-            pinnedFound = pinnedFound,
-            photosReferenced = photosReferenced,
-            audiosReferenced = audiosReferenced,
-            videosReferenced = videosReferenced,
-            pdfsReferenced = pdfsReferenced,
-            weatherFound = weatherFound,
-            unsupportedEmbeddedObjects = unsupportedEmbeddedObjects,
-        )
+        return importThroughWorkspaceDag(documents)
     }
 
-    private fun tryAuthoritativeImport(documents: List<DayOneJsonDocument>): DayOneImportSummary? {
-        val importer = authoritativeImporter ?: return null
+    private fun importThroughWorkspaceDag(documents: List<DayOneJsonDocument>): DayOneImportSummary {
         val notebooksByTitle = linkedMapOf<String, ExportedNotebook>()
         val notes = mutableListOf<ExportedNote>()
         var richTextConverted = 0
@@ -171,7 +78,7 @@ class DayOneImportService(
                 val markdown = conversion.markdown
                 val timeZoneId = entry.timeZone?.takeIf { it.isNotBlank() }
                 val titleValue = deriveTitle(markdown, noteCalendarDate(createdAt, timeZoneId))
-                val location = entry.location?.toLocationInput(createdAt)
+                val location = entry.location?.toExportedLocation(createdAt)
                 val noteId = "dayone-${entry.uuid.trim()}"
                 notes += ExportedNote(
                     id = noteId,
@@ -183,16 +90,7 @@ class DayOneImportService(
                     createdAt = createdAt.toString(),
                     updatedAt = updatedAt.toString(),
                     revision = 1L,
-                    location = location?.let {
-                        ExportedLocation(
-                            it.latitude,
-                            it.longitude,
-                            it.accuracyMeters,
-                            it.altitudeMeters,
-                            it.placeText,
-                            (it.capturedAt ?: createdAt).toString(),
-                        )
-                    },
+                    location = location,
                     currentVersionId = "dayone-version-${entry.uuid.trim()}",
                     versionDeviceId = "day-one-import",
                     mergeMetadataJson = "day-one",
@@ -214,13 +112,13 @@ class DayOneImportService(
         }
         val exportedAt = notes.maxOfOrNull { it.updatedAt }
             ?: kotlin.time.Clock.System.now().toString()
-        val imported = importer(
+        val imported = authoritativeImporter(
             LocalDataExportDocument(
                 exportedAt = exportedAt,
                 notebooks = notebooksByTitle.values.toList(),
                 notes = notes.distinctBy { it.id },
             ),
-        ) ?: return null
+        )
         return DayOneImportSummary(
             journalsImported = documents.size,
             notebooksCreated = imported.notebooksCreated,
@@ -243,93 +141,13 @@ class DayOneImportService(
         )
     }
 
-    private fun importEntry(
-        entry: DayOneEntry,
-        notebookId: String,
-    ): DayOneEntryImportResult {
-        val noteId = "dayone-${entry.uuid.trim()}"
-        val createdAt = parseInstantOrNow(entry.creationDate)
-        val updatedAt = entry.modifiedDate?.let(::parseInstantOrNull) ?: createdAt
-        val timeZoneId = entry.timeZone?.takeIf { it.isNotBlank() }
-        val createdDate = noteCalendarDate(createdAt, timeZoneId)
-        val conversion = DayOneRichTextMarkdownConverter.convert(
-            richText = entry.richText,
-            fallbackText = entry.text.orEmpty(),
-        )
-        val markdownBody = conversion.markdown
-        val title = deriveTitle(markdownBody, createdDate)
-        val location = entry.location?.toLocationInput(createdAt)
-        val current = localRepository.getNote(noteId)
-        val currentLocation = current?.let { localRepository.getLocation(it.id) }
-        val contentMatches = current != null &&
-            current.notebookId == notebookId &&
-            current.title == title &&
-            current.markdownBody == markdownBody &&
-            current.createdAt == createdAt &&
-            current.timeZoneId == timeZoneId &&
-            currentLocation.matches(location)
-
-        val status = when {
-            contentMatches -> DayOneEntryImportStatus.Skipped
-            current == null && localRepository.getNote(noteId, includeDeleted = true) == null -> {
-                localRepository.importNoteSnapshot(
-                    id = noteId,
-                    notebookId = notebookId,
-                    title = title,
-                    markdownBody = markdownBody,
-                    timeZoneId = timeZoneId,
-                    createdAt = createdAt,
-                    updatedAt = updatedAt,
-                    revision = 1L,
-                    location = location,
-                    currentVersionId = "dayone-version-${entry.uuid.trim()}",
-                    versionDeviceId = "day-one-import",
-                    mergeMetadataJson = """{"source":"day-one","dayOneUuid":"${jsonEscape(entry.uuid.trim())}"}""",
-                )
-                DayOneEntryImportStatus.Created
-            }
-            current != null -> {
-                localRepository.updateNote(
-                    noteId = current.id,
-                    notebookId = notebookId,
-                    title = title,
-                    markdownBody = markdownBody,
-                    createdAt = createdAt,
-                    timeZoneId = timeZoneId,
-                    clearTimeZone = timeZoneId == null,
-                    location = location,
-                    clearLocation = location == null,
-                )
-                DayOneEntryImportStatus.Updated
-            }
-            else -> DayOneEntryImportStatus.Skipped
-        }
-
-        val mediaCounts = entry.mediaCounts()
-        return DayOneEntryImportResult(
-            status = status,
-            richTextConverted = conversion.converted,
-            richTextFallback = conversion.fallbackUsed,
-            locationImported = location != null,
-            tagsFound = entry.tags.size,
-            starredFound = if (entry.starred) 1 else 0,
-            pinnedFound = if (entry.isPinned) 1 else 0,
-            photosReferenced = mediaCounts.photos.takeIf { it > 0 } ?: conversion.photosReferenced,
-            audiosReferenced = mediaCounts.audios.takeIf { it > 0 } ?: conversion.audiosReferenced,
-            videosReferenced = mediaCounts.videos.takeIf { it > 0 } ?: conversion.videosReferenced,
-            pdfsReferenced = mediaCounts.pdfs.takeIf { it > 0 } ?: conversion.pdfsReferenced,
-            weatherFound = if (entry.weather == null) 0 else 1,
-            unsupportedEmbeddedObjects = conversion.unsupportedEmbeddedObjects,
-        )
-    }
-
     private fun parseInstantOrNow(value: String?): Instant =
         value?.let(::parseInstantOrNull) ?: kotlin.time.Clock.System.now()
 
     private fun parseInstantOrNull(value: String): Instant? =
         runCatching { Instant.parse(value) }.getOrNull()
 
-    private fun DayOneLocation.toLocationInput(createdAt: Instant): LocationInput? {
+    private fun DayOneLocation.toExportedLocation(createdAt: Instant): ExportedLocation? {
         val place = listOfNotNull(
             placeName?.takeIf { it.isNotBlank() },
             address?.takeIf { it.isNotBlank() },
@@ -341,26 +159,13 @@ class DayOneImportService(
         if (!hasCoordinates && place == null) {
             return null
         }
-        return LocationInput(
+        return ExportedLocation(
             latitude = latitude,
             longitude = longitude,
             placeText = place,
-            capturedAt = createdAt,
+            capturedAt = createdAt.toString(),
         )
     }
-
-    private fun NoteLocation?.matches(input: LocationInput?): Boolean =
-        when {
-            this == null && input == null -> true
-            this == null || input == null -> false
-            else ->
-                latitude == input.latitude &&
-                    longitude == input.longitude &&
-                    accuracyMeters == input.accuracyMeters &&
-                    altitudeMeters == input.altitudeMeters &&
-                    placeText == input.placeText?.takeIf { it.isNotBlank() } &&
-                    capturedAt == (input.capturedAt ?: capturedAt)
-        }
 
     private fun DayOneEntry.mediaCounts(): DayOneMediaCounts =
         DayOneMediaCounts(
@@ -464,28 +269,6 @@ private data class DayOneMediaCounts(
     val videos: Int,
     val pdfs: Int,
 )
-
-private data class DayOneEntryImportResult(
-    val status: DayOneEntryImportStatus,
-    val richTextConverted: Boolean,
-    val richTextFallback: Boolean,
-    val locationImported: Boolean,
-    val tagsFound: Int,
-    val starredFound: Int,
-    val pinnedFound: Int,
-    val photosReferenced: Int,
-    val audiosReferenced: Int,
-    val videosReferenced: Int,
-    val pdfsReferenced: Int,
-    val weatherFound: Int,
-    val unsupportedEmbeddedObjects: Int,
-)
-
-private enum class DayOneEntryImportStatus {
-    Created,
-    Updated,
-    Skipped,
-}
 
 private object DayOneRichTextMarkdownConverter {
     fun convert(
@@ -701,20 +484,6 @@ private fun JsonElement.asStringOrNull(): String? =
     when (this) {
         is JsonPrimitive -> contentOrNull
         else -> null
-    }
-
-private fun jsonEscape(value: String): String =
-    buildString {
-        value.forEach { character ->
-            when (character) {
-                '\\' -> append("\\\\")
-                '"' -> append("\\\"")
-                '\n' -> append("\\n")
-                '\r' -> append("\\r")
-                '\t' -> append("\\t")
-                else -> append(character)
-            }
-        }
     }
 
 private val json = Json {

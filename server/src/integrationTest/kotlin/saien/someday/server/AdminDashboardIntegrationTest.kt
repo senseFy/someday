@@ -256,7 +256,7 @@ class AdminDashboardIntegrationTest {
         }
         assertEquals(HttpStatusCode.Unauthorized, refreshAfterDisable.status, refreshAfterDisable.bodyAsText())
 
-        val syncAfterDisable = client.get("/sync/v2/capabilities") {
+        val syncAfterDisable = client.get("/sync/v3/capabilities") {
             bearerAuth(device.accessToken)
         }
         assertEquals(HttpStatusCode.Unauthorized, syncAfterDisable.status, syncAfterDisable.bodyAsText())
@@ -291,7 +291,7 @@ class AdminDashboardIntegrationTest {
         assertEquals(HttpStatusCode.OK, after.status, after.bodyAsText())
         assertTrue(after.bodyAsText().contains("revoked"), after.bodyAsText())
 
-        val deniedSync = client.get("/sync/v2/capabilities") {
+        val deniedSync = client.get("/sync/v3/capabilities") {
             bearerAuth(device.accessToken)
         }
         assertTrue(
@@ -362,7 +362,7 @@ class AdminDashboardIntegrationTest {
         val response = client.post("/devices/register") {
             bearerAuth(accessToken)
             contentType(ContentType.Application.Json)
-            setBody(json.encodeToString(DeviceRegistrationRequest(name, platform)))
+            setBody(json.encodeToString(DeviceRegistrationRequest(UUID.randomUUID().toString(), name, platform)))
         }
         assertEquals(HttpStatusCode.OK, response.status, response.bodyAsText())
         return json.decodeFromString(response.bodyAsText())
@@ -397,7 +397,7 @@ class AdminDashboardIntegrationTest {
     ) {
         value.chunks.forEach { chunk ->
             val response = postJson(
-                "/sync/v2/checkpoint/chunk",
+                "/sync/v3/workspaces/$WORKSPACE_ID/entities/checkpoint/chunk",
                 accessToken,
                 SyncV2CheckpointChunkRequest(
                     value.descriptor.syncEpochId,
@@ -417,7 +417,7 @@ class AdminDashboardIntegrationTest {
             assertTrue(json.decodeFromString<SyncV2ImmutablePutResponse>(response.body).stored, response.body)
         }
         val manifest = postJson(
-            "/sync/v2/checkpoint/manifest",
+            "/sync/v3/workspaces/$WORKSPACE_ID/entities/checkpoint/manifest",
             accessToken,
             SyncV2CheckpointManifestRequest(
                 value.descriptor.syncEpochId,
@@ -441,7 +441,7 @@ class AdminDashboardIntegrationTest {
         assertTrue(json.decodeFromString<SyncV2ImmutablePutResponse>(manifest.body).stored, manifest.body)
         val descriptor = value.descriptor
         val cas = postJson(
-            "/sync/v2/epoch/compare-and-set",
+            "/sync/v3/workspaces/$WORKSPACE_ID/entities/epoch/compare-and-set",
             accessToken,
             SyncV2EpochCompareAndSetRequest(
                 value.pointer.previousPointerDigest,
@@ -471,7 +471,7 @@ class AdminDashboardIntegrationTest {
         entity: SyncV2ObjectPayload,
     ): HttpResult {
         return postJson(
-            "/sync/v2/push",
+            "/sync/v3/workspaces/$WORKSPACE_ID/entities/push",
             accessToken,
             SyncV2PushRequest(epochId = epochId, writerProtocolVersion = 2, objects = listOf(entity)),
         )
@@ -527,7 +527,6 @@ class AdminDashboardIntegrationTest {
                         TRUNCATE TABLE
                             someday_sync_v2_mutations,
                             someday_sync_v2_changes,
-                            someday_sync_v2_object_replicas,
                             someday_sync_v2_objects,
                             someday_sync_v2_checkpoint_chunks,
                             someday_sync_v2_checkpoint_manifests,
@@ -567,6 +566,10 @@ class AdminDashboardIntegrationTest {
 
     private fun syncV2ObjectCount(): Int =
         DriverManager.getConnection(dbUrl, dbUser, dbPassword).use { connection ->
+            connection.prepareStatement(
+                "SELECT set_config('someday.user_id', '*', false), " +
+                    "set_config('someday.workspace_id', '*', false)",
+            ).use { statement -> statement.executeQuery().close() }
             connection.createStatement().use { statement ->
                 statement.executeQuery("SELECT COUNT(*) FROM someday_sync_v2_objects").use { result ->
                     result.next()
@@ -619,6 +622,7 @@ class AdminDashboardIntegrationTest {
     private data class HttpResult(val status: HttpStatusCode, val body: String)
 
     private companion object {
+        const val WORKSPACE_ID = "workspace-00000000000000000000000000000001"
         const val NOTEBOOK_ID = "00000000-0000-4000-8000-000000000111"
         val NOW = Instant.parse("2026-05-22T00:00:00Z")
         val WORKSPACE_KEY = SodiumWorkspaceCrypto().workspaceKeyFromBytes(ByteArray(32) { (it + 17).toByte() })

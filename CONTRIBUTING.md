@@ -24,18 +24,18 @@ make check
 ```
 
 `make check` is hermetic: it must not require localhost services, network
-accounts, or developer credentials. The Docker-backed Sync V2 release gate is
+accounts, or developer credentials. The Docker-backed System V3 release gate is
 explicit and separate:
 
 ```bash
-make sync-v2-gate
+make sync-v3-gate
 ```
 
 Platform-specific smoke and packaging targets are documented in the README.
 
 ## Engineering rules
 
-Repository-wide constraints for schema, UI threading, and Sync V2 live in
+Repository-wide constraints for schema, UI threading, and System V3 live in
 [agent.md](agent.md). Protocol and migration details live under `docs/`.
 
 Important defaults:
@@ -46,6 +46,9 @@ Important defaults:
   storage I/O. Controllers own dispatcher boundaries for suspend IO.
 - Protocol changes must update the matching `docs/` specification in the same
   change and include tests where the gate docs require them.
+- Synchronization tests follow `docs/sync-system-v3-test-strategy.md`: prove an
+  invariant at its lowest owning layer, keep real E2E journeys few and complete,
+  and use explicit fixtures rather than a scenario DSL.
 - Dependency verification metadata, Gradle wrapper checksums, pinned CI action
   SHAs, and container digests are security-sensitive review surfaces. Never
   regenerate or weaken them without reviewing the exact dependency update.
@@ -64,5 +67,13 @@ Important defaults:
 
 ## Scope notes
 
-- Sync is **System V2** (DAG + epoch). See `docs/sync-system-v2-spec.md`.
-- Attachments and map SDKs are intentionally out of the current product scope.
+- Sync is the single self-hosted **System V3** contract: the internal entity
+  DAG plus one immutable encrypted object per media asset. The canonical route
+  roots are `/sync/v3/workspaces/{workspaceId}/entities` and
+  `/sync/v3/workspaces/{workspaceId}/media`. See
+  `docs/sync-system-v3-spec.md`.
+- Static JPEG, PNG, and WebP originals are supported up to 4 MiB and 12MP.
+  General files, SVG, animation, video, and map SDKs remain outside the initial
+  product scope.
+- Portable export/restore intentionally omits image bytes. Self-hosted operator
+  recovery must preserve PostgreSQL and the media blob directory together.

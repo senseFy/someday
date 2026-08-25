@@ -54,7 +54,7 @@ class SystemV2ClientSettingsRepository(
         val context = contexts.openOrNull() ?: return local.copy(
             workspacePreferencesState = WorkspacePreferencesSyncState(
                 status = WorkspacePreferencesSyncStatus.Unavailable,
-                warning = "The authenticated whole-product V2 epoch is not available.",
+                warning = "The authenticated workspace sync epoch is not available.",
             ),
         )
         return project(context, local)
@@ -64,11 +64,11 @@ class SystemV2ClientSettingsRepository(
         productAccess { saveUncoordinated(settings) }
 
     private fun saveUncoordinated(settings: ClientSettings): ClientSettings {
-        // Self-hosted sign-in / mode switches must persist before the first
-        // whole-product epoch exists. Until an ACTIVE+HEALTHY epoch is local,
-        // keep settings on the device-local path (same as load() when openOrNull).
+        // Account/session settings remain local, while workspace preferences
+        // mutate the day-one local DAG in both PREPARING and ACTIVE lifecycle.
         val context = contexts.openOrNull()?.takeIf {
-            it.lifecycle == SyncEpochLifecycleV2.ACTIVE && it.health == SyncEpochHealthV2.HEALTHY
+            it.lifecycle in setOf(SyncEpochLifecycleV2.PREPARING, SyncEpochLifecycleV2.ACTIVE) &&
+                it.health == SyncEpochHealthV2.HEALTHY
         } ?: return localSettings.save(settings)
         val viewState = settings.workspacePreferencesState
         val displayed = viewState.displayedSnapshot ?: loadUncoordinated().toPreferenceSnapshot()
@@ -145,7 +145,7 @@ class SystemV2ClientSettingsRepository(
         selectedVersionId: String,
         expectedHeadVersionIds: List<String>,
     ): ClientSettings {
-        val context = contexts.requireActive()
+        val context = contexts.requireWritable()
         val conflict = context.store.loadConflicts(preferenceKeyV2()).singleOrNull {
             it.lifecycle == WorkspaceConflictLifecycleV2.ACTIVE && it.descriptor.conflictId == conflictId
         } ?: error("The workspace-preferences conflict is no longer active.")
@@ -189,7 +189,7 @@ class SystemV2ClientSettingsRepository(
         val projection = context.store.loadProjection(key) ?: return local.copy(
             workspacePreferencesState = WorkspacePreferencesSyncState(
                 status = WorkspacePreferencesSyncStatus.Unavailable,
-                warning = "The V2 epoch is invalid because its workspace-preferences root is missing.",
+                warning = "The sync epoch is invalid because its workspace-preferences root is missing.",
             ),
         )
         val conflict = context.store.loadConflicts(key)

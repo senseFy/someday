@@ -20,6 +20,7 @@ class ServerConfigTest {
         assertTrue(first.registrationEnabled)
         assertFalse(first.trustProxyHeaders)
         assertFalse(first.secureAdminCookies)
+        assertEquals(5L * 1024L * 1024L * 1024L, first.mediaQuotaBytes)
         assertTrue(first.jwtSecret.encodeToByteArray().size >= 32)
         assertNotEquals(first.jwtSecret, second.jwtSecret)
     }
@@ -74,6 +75,9 @@ class ServerConfigTest {
         assertFailsWith<IllegalStateException> {
             ServerConfig.fromEnvironment(mapOf("SOMEDAY_PORT" to "not-a-port"))
         }
+        assertFailsWith<IllegalArgumentException> {
+            ServerConfig.fromEnvironment(mapOf("SOMEDAY_MEDIA_QUOTA_BYTES" to "0"))
+        }
     }
 
     private fun productionEnvironment(): Map<String, String> = mapOf(
@@ -82,6 +86,7 @@ class ServerConfigTest {
         "SOMEDAY_DB_URL" to "jdbc:postgresql://database.internal:5432/someday",
         "SOMEDAY_DB_USER" to "someday_app",
         "SOMEDAY_DB_PASSWORD" to "database-test-secret",
+        "SOMEDAY_MEDIA_BLOB_DIR" to "/tmp/someday-server-config-test-media",
         "SOMEDAY_JWT_SECRET" to "0123456789abcdef0123456789abcdef",
     )
 }

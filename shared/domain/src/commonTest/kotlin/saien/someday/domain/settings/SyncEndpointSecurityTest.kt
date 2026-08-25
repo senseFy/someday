@@ -1,9 +1,9 @@
 package saien.someday.domain.settings
 
 import kotlin.test.Test
-import kotlin.test.assertFalse
 import kotlin.test.assertEquals
-import kotlin.test.assertNotNull
+import kotlin.test.assertFalse
+import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 
 class SyncEndpointSecurityTest {
@@ -25,17 +25,16 @@ class SyncEndpointSecurityTest {
         assertFalse(isSecureSyncEndpoint("http://localhost:not-a-port"))
         assertFalse(isSecureSyncEndpoint("http://localhost:65536"))
         assertFalse(isSecureSyncEndpoint("ftp://localhost"))
+        assertFalse(isSecureSyncEndpoint("https://user:password@sync.example.test"))
+        assertFalse(isSecureSyncEndpoint("https://sync.example.test/base-path"))
+        assertFalse(isSecureSyncEndpoint("https://sync.example.test?token=redacted"))
+        assertFalse(isSecureSyncEndpoint("https://sync.example.test#fragment"))
+        assertFalse(isSecureSyncEndpoint("https://sync.example.test:0443"))
+        assertFalse(isSecureSyncEndpoint("https://sync_example.test"))
     }
 
     @Test
     fun providerValidationRejectsNonLoopbackPlaintextBeforeCredentialsAreUsed() {
-        assertTrue(
-            WebDavConnectionInput(
-                endpoint = "http://dav.example.test",
-                username = "alice",
-                password = "redacted-test-value",
-            ).validate().any { "requires HTTPS" in it },
-        )
         assertTrue(
             SelfHostedSetupInput(
                 endpoint = "http://sync.example.test",
@@ -44,33 +43,34 @@ class SyncEndpointSecurityTest {
                 deviceName = "test",
                 platform = "test",
                 createAccount = false,
-            ).validate().any { "requires HTTPS" in it },
+            ).validate().contains(SelfHostedSetupValidationIssue.HttpsRequired),
         )
     }
 
     @Test
-    fun authorityCredentialEncodingBindsEndpointWithoutExposingItInTheBindingSecret() {
-        val binding = webDavV2AuthorityBindingId("https://dav.example.test/", "someday")
-        val original = WebDavAuthorityCredentials(
-            binding,
-            "https://dav.example.test",
-            "alice",
-            "/someday/",
-            "test-secret-not-for-logs",
-        )
-
-        val decoded = assertNotNull(decodeWebDavAuthorityCredentials(original.encodeForSecureStorage()))
-
-        assertEquals(original, decoded)
-        assertEquals("webdav-log-v2|https://dav.example.test|/someday/", binding)
-        assertFalse(original.encodeForSecureStorage().contains(original.secret))
-
-        val rotatedCredential = original.copy(secret = "rotated-test-secret")
-        assertEquals(binding, rotatedCredential.authorityBindingId)
+    fun selfHostedAuthorityBindsCanonicalEndpointAndAuthenticatedAccount() {
         assertEquals(
-            rotatedCredential,
-            decodeWebDavAuthorityCredentials(rotatedCredential.encodeForSecureStorage()),
+            selfHostedAuthorityBindingId("HTTPS://Sync.Example.Test:443/", "user-1"),
+            selfHostedAuthorityBindingId("https://sync.example.test", "user-1"),
         )
-        assertFalse(rotatedCredential.encodeForSecureStorage().contains(rotatedCredential.secret))
+        assertNotEquals(
+            selfHostedAuthorityBindingId("https://sync.example.test", "user-1"),
+            selfHostedAuthorityBindingId("https://sync.example.test", "user-2"),
+        )
+        assertNotEquals(
+            selfHostedAuthorityBindingId("https://sync-a.example.test", "user-1"),
+            selfHostedAuthorityBindingId("https://sync-b.example.test", "user-1"),
+        )
+        assertEquals(
+            "https://sync.example.test",
+            normalizeSelfHostedEndpoint(" HTTPS://Sync.Example.Test:443/ "),
+        )
+        assertEquals(
+            SelfHostedAuthorityBinding("https://sync.example.test", "user-用户"),
+            parseSelfHostedAuthorityBindingId(
+                selfHostedAuthorityBindingId("https://sync.example.test", "user-用户"),
+            ),
+        )
+        assertEquals(null, parseSelfHostedAuthorityBindingId("self-hosted|4:http|6:user-1"))
     }
 }

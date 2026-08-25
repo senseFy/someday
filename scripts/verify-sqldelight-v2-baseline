@@ -20,7 +20,7 @@ else
 fi
 
 [[ -f "$BASELINE" ]] || {
-    printf 'error: missing V2-only SQLDelight baseline: %s\n' "$BASELINE" >&2
+    printf 'error: missing squashed System V3 SQLDelight baseline: %s\n' "$BASELINE" >&2
     exit 1
 }
 
@@ -48,12 +48,9 @@ fi
 expected_tables="$(
     printf '%s\n' \
         devices \
-        locations \
+        media_assets \
         note_projections_system_v2 \
-        note_versions \
         notebook_projections_v2 \
-        notebooks \
-        notes \
         projection_warnings_v2 \
         settings \
         sync_applied_mutations_system_v2 \
@@ -63,16 +60,10 @@ expected_tables="$(
         sync_dead_letters_v2 \
         sync_epochs_v2 \
         sync_local_authority_system_v2 \
-        sync_metadata \
         sync_pending_mutations_system_v2 \
-        sync_quarantined_objects_v2 \
-        sync_reconciliation_state_system_v2 \
         sync_remote_cursors_system_v2 \
-        sync_repair_replicas_v2 \
         sync_run_history_v2 \
         sync_source_imports_system_v2 \
-        sync_transport_units_system_v2 \
-        tombstones \
         workspace_entity_conflict_heads_v2 \
         workspace_entity_conflicts_v2 \
         workspace_entity_heads_v2 \
@@ -87,7 +78,7 @@ actual_tables="$(
 )"
 [[ "$actual_tables" == "$expected_tables" ]] || {
     diff -u <(printf '%s\n' "$expected_tables") <(printf '%s\n' "$actual_tables") >&2 || true
-    printf 'error: baseline table inventory differs from the V2-only contract.\n' >&2
+    printf 'error: baseline table inventory differs from the System V3 contract.\n' >&2
     exit 1
 }
 
@@ -114,4 +105,122 @@ if [[ "$retired_count" != "0" ]]; then
     exit 1
 fi
 
-printf 'SQLDelight V2-only baseline verified: %s\n' "$BASELINE"
+for required_media_value in available missing corrupt; do
+    count="$("$SQLITE3" "$BASELINE" "SELECT COUNT(*) FROM sqlite_master WHERE name = 'media_assets' AND sql IS NOT NULL AND instr(sql, '${required_media_value}') > 0;")"
+    [[ "$count" != "0" ]] || {
+        printf 'error: media baseline is missing required state: %s\n' "$required_media_value" >&2
+        exit 1
+    }
+done
+
+publication_state_column_count="$($SQLITE3 "$BASELINE" \
+    "SELECT COUNT(*) FROM pragma_table_info('media_assets') WHERE name = 'publication_state';")"
+[[ "$publication_state_column_count" == "0" ]] || {
+    printf 'error: media baseline retains a redundant publication state column.\n' >&2
+    exit 1
+}
+
+for retired_local_table in notebooks notes note_versions tombstones locations sync_metadata; do
+    retired_count="$($SQLITE3 "$BASELINE" \
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '${retired_local_table}';")"
+    [[ "$retired_count" == "0" ]] || {
+        printf 'error: baseline retains retired normal-row table: %s\n' "$retired_local_table" >&2
+        exit 1
+    }
+done
+
+for retired_protocol_table in sync_reconciliation_state_system_v2 sync_transport_units_system_v2; do
+    retired_count="$($SQLITE3 "$BASELINE" \
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '${retired_protocol_table}';")"
+    [[ "$retired_count" == "0" ]] || {
+        printf 'error: baseline retains retired protocol table: %s\n' "$retired_protocol_table" >&2
+        exit 1
+    }
+done
+
+for retired_epoch_health in degraded; do
+    retired_count="$($SQLITE3 "$BASELINE" \
+        "SELECT COUNT(*) FROM sqlite_master WHERE name = 'sync_epochs_v2' AND sql IS NOT NULL AND instr(sql, '''${retired_epoch_health}''') > 0;")"
+    [[ "$retired_count" == "0" ]] || {
+        printf 'error: epoch health CHECK retains retired state: %s\n' "$retired_epoch_health" >&2
+        exit 1
+    }
+done
+
+for retired_control_value in sync_writer_manifest_v2 sync_log_segment_v2 superseded; do
+    retired_count="$($SQLITE3 "$BASELINE" \
+        "SELECT COUNT(*) FROM sqlite_master WHERE name = 'sync_control_objects_system_v2' AND sql IS NOT NULL AND instr(sql, '${retired_control_value}') > 0;")"
+    [[ "$retired_count" == "0" ]] || {
+        printf 'error: control-object CHECK retains retired value: %s\n' "$retired_control_value" >&2
+        exit 1
+    }
+done
+
+for retired_checkpoint_state in expired; do
+    retired_count="$($SQLITE3 "$BASELINE" \
+        "SELECT COUNT(*) FROM sqlite_master WHERE name = 'sync_checkpoints_system_v2' AND sql IS NOT NULL AND instr(sql, '''${retired_checkpoint_state}''') > 0;")"
+    [[ "$retired_count" == "0" ]] || {
+        printf 'error: checkpoint CHECK retains retired state: %s\n' "$retired_checkpoint_state" >&2
+        exit 1
+    }
+done
+
+for retired_import_state in prepared queued recovery_required; do
+    retired_count="$($SQLITE3 "$BASELINE" \
+        "SELECT COUNT(*) FROM sqlite_master WHERE name = 'sync_source_imports_system_v2' AND sql IS NOT NULL AND instr(sql, '''${retired_import_state}''') > 0;")"
+    [[ "$retired_count" == "0" ]] || {
+        printf 'error: source-import CHECK retains retired state: %s\n' "$retired_import_state" >&2
+        exit 1
+    }
+done
+
+dead_letter_lifecycle_count="$($SQLITE3 "$BASELINE" \
+    "SELECT COUNT(*) FROM pragma_table_info('sync_dead_letters_v2') WHERE name = 'lifecycle';")"
+[[ "$dead_letter_lifecycle_count" == "0" ]] || {
+    printf 'error: unresolved dead-letter evidence retains lifecycle state.\n' >&2
+    exit 1
+}
+
+checkpoint_horizon_count="$($SQLITE3 "$BASELINE" \
+    "SELECT COUNT(*) FROM pragma_table_info('sync_run_history_v2') WHERE name = 'checkpoint_horizon';")"
+[[ "$checkpoint_horizon_count" == "0" ]] || {
+    printf 'error: run history retains a checkpoint retention horizon.\n' >&2
+    exit 1
+}
+
+published_authority_column_count="$($SQLITE3 "$BASELINE" \
+    "SELECT COUNT(*) FROM pragma_table_info('media_assets') WHERE name = 'published_authority_binding_id' AND \"notnull\" = 0;")"
+[[ "$published_authority_column_count" == "1" ]] || {
+    printf 'error: media baseline is missing authority-scoped publication evidence.\n' >&2
+    exit 1
+}
+
+published_workspace_column_count="$($SQLITE3 "$BASELINE" \
+    "SELECT COUNT(*) FROM pragma_table_info('media_assets') WHERE name = 'published_workspace_id' AND \"notnull\" = 0;")"
+[[ "$published_workspace_column_count" == "1" ]] || {
+    printf 'error: media baseline is missing workspace-scoped publication evidence.\n' >&2
+    exit 1
+}
+
+published_workspace_check_count="$($SQLITE3 "$BASELINE" \
+    "SELECT COUNT(*) FROM sqlite_master WHERE name = 'media_assets' AND sql IS NOT NULL AND instr(sql, 'substr(published_workspace_id, 11) NOT GLOB ''*[^0-9a-f]*''') > 0;")"
+[[ "$published_workspace_check_count" == "1" ]] || {
+    printf 'error: media baseline does not strictly validate workspace id hex.\n' >&2
+    exit 1
+}
+
+authority_check_count="$($SQLITE3 "$BASELINE" \
+    "SELECT COUNT(*) FROM sqlite_master WHERE name = 'media_assets' AND sql IS NOT NULL AND instr(sql, '(published_authority_binding_id IS NULL) = (published_object_digest IS NULL)') > 0;")"
+[[ "$authority_check_count" == "1" ]] || {
+    printf 'error: media baseline permits object evidence without an authority/workspace binding.\n' >&2
+    exit 1
+}
+
+published_authority_index_count="$($SQLITE3 "$BASELINE" \
+    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'media_assets_published_authority_idx';")"
+[[ "$published_authority_index_count" == "1" ]] || {
+    printf 'error: media baseline is missing its authority-scoped publication index.\n' >&2
+    exit 1
+}
+
+printf 'SQLDelight System V3 baseline verified: %s\n' "$BASELINE"

@@ -14,7 +14,7 @@ class SyncTopRevealTest {
     ): ManualSyncProgress =
         ManualSyncProgress(
             running = false,
-            mode = SyncMode.WebDav,
+            mode = SyncMode.SelfHosted,
             message = "Sync finished.",
             pushedObjects = pushedObjects,
             pulledObjects = pulledObjects,
@@ -36,7 +36,7 @@ class SyncTopRevealTest {
         assertFalse(
             syncCompletionRevealsRemoteChanges(
                 wasRunning = true,
-                progress = ManualSyncProgress.inProgress(SyncMode.WebDav),
+                progress = ManualSyncProgress.inProgress(SyncMode.SelfHosted, "Syncing"),
             ),
         )
     }

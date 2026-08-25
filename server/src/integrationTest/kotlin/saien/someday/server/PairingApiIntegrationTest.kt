@@ -213,7 +213,7 @@ class PairingApiIntegrationTest {
         val response = client.post("/devices/register") {
             bearerAuth(accessToken)
             contentType(ContentType.Application.Json)
-            setBody(json.encodeToString(DeviceRegistrationRequest(name, platform)))
+            setBody(json.encodeToString(DeviceRegistrationRequest(java.util.UUID.randomUUID().toString(), name, platform)))
         }
         assertEquals(HttpStatusCode.OK, response.status, response.bodyAsText())
         return json.decodeFromString(response.bodyAsText())

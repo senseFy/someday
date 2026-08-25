@@ -4,15 +4,17 @@
 package saien.someday.sync.selfhosted
 
 import saien.someday.domain.settings.isSecureSyncEndpoint
+import saien.someday.domain.settings.normalizeSelfHostedEndpoint
 
 import saien.someday.domain.settings.SelfHostedSessionCredentials
+import saien.someday.sync.causality.v2.normalizeWriterDeviceIdV2
 import kotlinx.serialization.Serializable
 
 class SelfHostedSyncClient(
     endpoint: String,
     private val transport: SelfHostedSyncTransport,
 ) {
-    val normalizedEndpoint: String = endpoint.trim().trimEnd('/')
+    val normalizedEndpoint: String = normalizeSelfHostedEndpoint(endpoint)
 
     init {
         require(isSecureSyncEndpoint(normalizedEndpoint)) {
@@ -25,29 +27,13 @@ class SelfHostedSyncClient(
         password: String,
         deviceName: String,
         platform: String,
+        localDeviceId: String,
     ): SelfHostedSyncSession {
         val auth = transport.register(
             endpoint = normalizedEndpoint,
             request = SelfHostedAuthRequest(email = email.trim().lowercase(), password = password),
         )
-        val device = transport.registerDevice(
-            endpoint = normalizedEndpoint,
-            accessToken = auth.accessToken,
-            request = SelfHostedDeviceRegistrationRequest(
-                name = deviceName.trim(),
-                platform = platform.trim().lowercase(),
-            ),
-        )
-        return SelfHostedSyncSession(
-            endpoint = normalizedEndpoint,
-            userId = auth.user.id,
-            userEmail = auth.user.email,
-            deviceId = device.device.id,
-            deviceName = device.device.name,
-            devicePlatform = device.device.platform,
-            accessToken = device.accessToken,
-            refreshToken = device.refreshToken,
-        )
+        return connectAuthenticated(auth, deviceName, platform, localDeviceId)
     }
 
     fun loginAndConnect(
@@ -55,29 +41,38 @@ class SelfHostedSyncClient(
         password: String,
         deviceName: String,
         platform: String,
+        localDeviceId: String,
     ): SelfHostedSyncSession {
         val auth = transport.login(
             endpoint = normalizedEndpoint,
             request = SelfHostedAuthRequest(email = email.trim().lowercase(), password = password),
         )
-        val device = transport.registerDevice(
+        return connectAuthenticated(auth, deviceName, platform, localDeviceId)
+    }
+
+    /**
+     * Obtains fresh credentials for an already-bound workspace without changing its authority.
+     * Account identity is verified before the server sees a device-registration request.
+     */
+    fun loginAndReconnectBound(
+        email: String,
+        password: String,
+        deviceName: String,
+        platform: String,
+        expectedUserId: String,
+        stableDeviceId: String,
+    ): SelfHostedSyncSession {
+        val canonicalExpectedUserId = expectedUserId.trim().also {
+            require(it.isNotEmpty()) { "The bound self-hosted user id is missing." }
+        }
+        val auth = transport.login(
             endpoint = normalizedEndpoint,
-            accessToken = auth.accessToken,
-            request = SelfHostedDeviceRegistrationRequest(
-                name = deviceName.trim(),
-                platform = platform.trim().lowercase(),
-            ),
+            request = SelfHostedAuthRequest(email = email.trim().lowercase(), password = password),
         )
-        return SelfHostedSyncSession(
-            endpoint = normalizedEndpoint,
-            userId = auth.user.id,
-            userEmail = auth.user.email,
-            deviceId = device.device.id,
-            deviceName = device.device.name,
-            devicePlatform = device.device.platform,
-            accessToken = device.accessToken,
-            refreshToken = device.refreshToken,
-        )
+        require(auth.user.id == canonicalExpectedUserId) {
+            "The authenticated self-hosted account does not match the bound workspace authority."
+        }
+        return connectAuthenticated(auth, deviceName, platform, stableDeviceId)
     }
 
     fun refresh(session: SelfHostedSyncSession): SelfHostedSyncSession {
@@ -90,6 +85,40 @@ class SelfHostedSyncClient(
             userEmail = auth.user.email,
             accessToken = auth.accessToken,
             refreshToken = auth.refreshToken,
+        )
+    }
+
+    private fun connectAuthenticated(
+        auth: SelfHostedAuthTokensResponse,
+        deviceName: String,
+        platform: String,
+        localDeviceId: String,
+    ): SelfHostedSyncSession {
+        val stableDeviceId = normalizeWriterDeviceIdV2(localDeviceId)
+        val device = transport.registerDevice(
+            endpoint = normalizedEndpoint,
+            accessToken = auth.accessToken,
+            request = SelfHostedDeviceRegistrationRequest(
+                deviceId = stableDeviceId,
+                name = deviceName.trim(),
+                platform = platform.trim().lowercase(),
+            ),
+        )
+        require(device.device.id == stableDeviceId) {
+            "The server did not claim the requested installation identity."
+        }
+        require(!device.device.revoked) {
+            "The bound self-hosted device has been revoked."
+        }
+        return SelfHostedSyncSession(
+            endpoint = normalizedEndpoint,
+            userId = auth.user.id,
+            userEmail = auth.user.email,
+            deviceId = device.device.id,
+            deviceName = device.device.name,
+            devicePlatform = device.device.platform,
+            accessToken = device.accessToken,
+            refreshToken = device.refreshToken,
         )
     }
 
@@ -226,6 +255,7 @@ data class SelfHostedUserResponse(
 
 @Serializable
 data class SelfHostedDeviceRegistrationRequest(
+    val deviceId: String,
     val name: String,
     val platform: String,
 )

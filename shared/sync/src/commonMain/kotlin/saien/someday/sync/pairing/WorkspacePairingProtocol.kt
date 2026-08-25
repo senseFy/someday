@@ -157,17 +157,9 @@ internal class WorkspacePairingKeyMaterial(
         "WorkspacePairingKeyMaterial(inviteId=$inviteId, keys=<redacted>)"
 }
 
-enum class WorkspacePairingRemoteProfile(
-    val wireName: String,
-) {
-    WebDav("webdav"),
-    SelfHosted("self-hosted"),
-}
-
 data class WorkspacePairingAuthority(
-    val remoteProfile: WorkspacePairingRemoteProfile,
     /**
-     * A canonical, non-secret identity for the configured remote authority.
+     * A canonical, non-secret identity for the configured self-hosted authority.
      * It is authenticated as AAD and is intentionally not stored in the
      * envelope.
      */
@@ -242,7 +234,6 @@ class WorkspacePairingEnvelopeCodec(
             plaintext = plaintext,
         )
         val envelope = WorkspacePairingEnvelope(
-            remoteProfile = authority.remoteProfile.wireName,
             inviteId = material.inviteId,
             createdAtEpochMillis = createdAtEpochMillis,
             expiresAtEpochMillis = expiresAtEpochMillis,
@@ -273,7 +264,6 @@ class WorkspacePairingEnvelopeCodec(
         val material = token.deriveMaterial()
         if (envelope.format != ENVELOPE_FORMAT ||
             envelope.protocolVersion != PROTOCOL_VERSION ||
-            envelope.remoteProfile != authority.remoteProfile.wireName ||
             envelope.inviteId != material.inviteId ||
             envelope.cipherSuite != CIPHER_SUITE ||
             envelope.keyDerivation != KEY_DERIVATION ||
@@ -388,7 +378,6 @@ class WorkspacePairingEnvelopeCodec(
         listOf(
             ENVELOPE_FORMAT,
             PROTOCOL_VERSION.toString(),
-            authority.remoteProfile.wireName,
             inviteId,
             createdAtEpochMillis.toString(),
             expiresAtEpochMillis.toString(),
@@ -418,7 +407,6 @@ class WorkspacePairingEnvelopeCodec(
         private val ENVELOPE_FIELDS = setOf(
             "format",
             "protocolVersion",
-            "remoteProfile",
             "inviteId",
             "createdAtEpochMillis",
             "expiresAtEpochMillis",
@@ -450,7 +438,6 @@ class WorkspacePairingEnvelopeCodec(
 private data class WorkspacePairingEnvelope(
     val format: String = WorkspacePairingEnvelopeCodec.ENVELOPE_FORMAT,
     val protocolVersion: Int = WorkspacePairingEnvelopeCodec.PROTOCOL_VERSION,
-    val remoteProfile: String,
     val inviteId: String,
     val createdAtEpochMillis: Long,
     val expiresAtEpochMillis: Long,

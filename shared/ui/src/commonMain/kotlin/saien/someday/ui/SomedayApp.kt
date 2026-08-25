@@ -13,6 +13,7 @@ import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.slideOutVertically
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.clickable
@@ -100,6 +101,7 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
@@ -114,6 +116,7 @@ import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
@@ -160,6 +163,7 @@ import com.composables.icons.lucide.History
 import com.composables.icons.lucide.Heading
 import com.composables.icons.lucide.Globe
 import com.composables.icons.lucide.Info
+import com.composables.icons.lucide.Image as ImageIcon
 import com.composables.icons.lucide.Italic
 import com.composables.icons.lucide.Link
 import com.composables.icons.lucide.LockKeyhole
@@ -205,29 +209,20 @@ import saien.someday.domain.settings.ClientSettings
 import saien.someday.domain.settings.AppLanguage
 import saien.someday.domain.settings.ClientTheme
 import saien.someday.domain.settings.EditorPreferences
+import saien.someday.domain.settings.ManualSyncReason
 import saien.someday.domain.settings.ManualSyncProgressListener
 import saien.someday.domain.settings.ManualSyncRunner
 import saien.someday.domain.settings.SelfHostedSessionCredentialStore
 import saien.someday.domain.settings.SelfHostedSetupClient
 import saien.someday.domain.settings.SelfHostedSetupInput
-import saien.someday.domain.settings.SyncConfiguration
-import saien.someday.domain.settings.SyncErrorCode
+import saien.someday.domain.settings.SelfHostedSetupReason
 import saien.someday.domain.settings.SyncMode
-import saien.someday.domain.settings.SyncV2MaintenanceRunner
-import saien.someday.domain.settings.WebDavAutoBackupFrequency
-import saien.someday.domain.settings.WebDavBackupStatus
-import saien.someday.domain.settings.WebDavBackupCatalogRunner
-import saien.someday.domain.settings.WebDavBackupVersion
-import saien.someday.domain.settings.WebDavBackupRunner
-import saien.someday.domain.settings.WebDavConnectionTester
-import saien.someday.domain.settings.WebDavCredentialStore
-import saien.someday.domain.settings.WebDavDiscoveredDevicesRunner
-import saien.someday.domain.settings.WebDavRestoreRunner
 import saien.someday.domain.settings.WorkspaceJoinResult
 import saien.someday.domain.settings.WorkspacePairingInvitationCanceller
 import saien.someday.domain.settings.WorkspacePairingInvitationCreator
 import saien.someday.domain.settings.WorkspacePairingInvitationJoiner
 import saien.someday.domain.settings.WorkspacePairingInvitationResult
+import saien.someday.domain.settings.WorkspacePairingReason
 import saien.someday.domain.settings.WorkspacePreferencesConflictResolver
 import saien.someday.domain.settings.WorkspacePreferencesSyncStatus
 import saien.someday.ui.designsystem.SomedayDesignDefaults
@@ -252,6 +247,11 @@ import saien.someday.ui.settings.WorkspacePairingScanner
 import saien.someday.ui.memories.MemoriesUiController
 import saien.someday.ui.memories.MemoriesUiState
 import saien.someday.ui.memories.MemoryCalendarDay
+import saien.someday.ui.media.MediaImportUiResult
+import saien.someday.ui.media.MediaMaterializationUiResult
+import saien.someday.ui.media.MediaPreviewUiResult
+import saien.someday.ui.media.MediaUiFailureReason
+import saien.someday.ui.media.MediaUiPorts
 import saien.someday.ui.notes.InMemoryNotesRepository
 import saien.someday.ui.notes.MarkdownEditSpanKind
 import saien.someday.ui.notes.MarkdownInlineKind
@@ -285,17 +285,6 @@ import saien.someday.ui.resources.on_this_day_settings_time_title
 import saien.someday.ui.resources.on_this_day_settings_toggle_description
 import saien.someday.ui.resources.on_this_day_settings_toggle_title
 import saien.someday.ui.resources.sync_status_syncing
-import saien.someday.ui.resources.webdav_devices_description
-import saien.someday.ui.resources.webdav_devices_disclaimer
-import saien.someday.ui.resources.webdav_devices_first_seen
-import saien.someday.ui.resources.webdav_devices_inactive
-import saien.someday.ui.resources.webdav_devices_last_active
-import saien.someday.ui.resources.webdav_devices_load_failure
-import saien.someday.ui.resources.webdav_devices_other_device
-import saien.someday.ui.resources.webdav_devices_recently_active
-import saien.someday.ui.resources.webdav_devices_refresh
-import saien.someday.ui.resources.webdav_devices_this_device
-import saien.someday.ui.resources.webdav_devices_title
 import saien.someday.ui.settings.AppliedTheme
 import saien.someday.ui.settings.DayOneImportRunner
 import saien.someday.ui.settings.OnThisDayNotificationStrings
@@ -303,17 +292,19 @@ import saien.someday.ui.settings.SettingsExportSummary
 import saien.someday.ui.settings.SettingsImportSummary
 import saien.someday.ui.settings.SettingsUiController
 import saien.someday.ui.settings.SettingsUiState
-import saien.someday.ui.settings.WebDavDiscoveredDeviceStrings
 import saien.someday.ui.settings.resolveAppliedTheme
 import kotlin.math.roundToInt
-import kotlin.time.Clock
 import kotlin.time.Instant
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.datetime.TimeZone
 import kotlinx.datetime.LocalDate
 import kotlinx.datetime.toLocalDateTime
 import org.jetbrains.compose.resources.StringResource
+import org.jetbrains.compose.resources.decodeToImageBitmap
 import org.jetbrains.compose.resources.stringResource
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -322,10 +313,10 @@ fun SomedayApp(
     platformName: String = "shared",
     windowChromeTopInset: Dp = 0.dp,
     developerOptionsEnabled: Boolean = false,
-    systemV2ActivationEnabled: Boolean = false,
     initialSettings: ClientSettings = ClientSettings(),
     notesRepository: NotesRepository? = null,
     locationCaptureAdapter: LocationCaptureAdapter = UnavailableLocationCaptureAdapter,
+    mediaUiPorts: MediaUiPorts = MediaUiPorts(),
     onThisDayNotificationScheduler: OnThisDayNotificationScheduler = UnavailableOnThisDayNotificationScheduler,
     onThisDayNotificationTimeFormatter: OnThisDayNotificationTimeFormatter =
         TwentyFourHourOnThisDayNotificationTimeFormatter,
@@ -338,17 +329,10 @@ fun SomedayApp(
     dayOneImportRunner: DayOneImportRunner = DayOneImportRunner { onResult ->
         onResult(SettingsImportSummary.unavailable("Day One import is unavailable in this build."))
     },
-    webDavConnectionTester: WebDavConnectionTester? = null,
-    webDavCredentialStore: WebDavCredentialStore? = null,
-    webDavBackupRunner: WebDavBackupRunner? = null,
-    webDavBackupCatalogRunner: WebDavBackupCatalogRunner? = null,
-    webDavRestoreRunner: WebDavRestoreRunner? = null,
-    webDavDiscoveredDevicesRunner: WebDavDiscoveredDevicesRunner? = null,
     selfHostedSetupClient: SelfHostedSetupClient? = null,
     selfHostedSessionCredentialStore: SelfHostedSessionCredentialStore? = null,
     manualSyncRunner: ManualSyncRunner? = null,
     bindManualSyncProgressListener: (ManualSyncProgressListener?) -> Unit = {},
-    syncV2MaintenanceRunner: SyncV2MaintenanceRunner? = null,
     workspacePairingInvitationCreator: WorkspacePairingInvitationCreator? = null,
     workspacePairingInvitationJoiner: WorkspacePairingInvitationJoiner? = null,
     workspacePairingInvitationCanceller: WorkspacePairingInvitationCanceller? = null,
@@ -410,17 +394,12 @@ fun SomedayApp(
             invalidTime = stringResource(Res.string.on_this_day_feedback_invalid_time),
             timeUpdated = stringResource(Res.string.on_this_day_feedback_time_updated),
         )
-        val webDavDiscoveredDeviceStrings = WebDavDiscoveredDeviceStrings(
-            loadFailure = stringResource(Res.string.webdav_devices_load_failure),
-        )
         val settingsController = remember(
             effectiveNotesRepository,
             appDispatchers.background,
             onThisDayNotificationScheduler,
             onThisDayNotificationStrings,
-            webDavDiscoveredDeviceStrings,
             settingsUiStrings,
-            syncV2MaintenanceRunner,
             workspacePairingInvitationCreator,
             workspacePairingInvitationJoiner,
             workspacePairingInvitationCanceller,
@@ -433,25 +412,6 @@ fun SomedayApp(
                 workspacePreferencesConflictResolver = workspacePreferencesConflictResolver,
                 exportProvider = onLocalExport,
                 dayOneImportRunner = dayOneImportRunner,
-                webDavConnectionTester = webDavConnectionTester ?: WebDavConnectionTester { input ->
-                    val errors = input.validate()
-                    if (errors.isEmpty()) {
-                        saien.someday.domain.settings.WebDavConnectionTestResult(
-                            success = false,
-                            status = saien.someday.domain.settings.WebDavConnectionStatus(
-                                ready = false,
-                                message = "WebDAV connection testing is not available in this build; credentials are redacted.",
-                                appDirectory = input.sanitized().appDirectory,
-                            ),
-                        )
-                    } else {
-                        saien.someday.domain.settings.WebDavConnectionTestResult.validationFailed(errors)
-                    }
-                },
-                webDavCredentialStore = webDavCredentialStore ?: saien.someday.domain.settings.UnavailableWebDavCredentialStore,
-                webDavBackupRunner = webDavBackupRunner,
-                webDavBackupCatalogRunner = webDavBackupCatalogRunner,
-                webDavRestoreRunner = webDavRestoreRunner,
                 onDataRestored = {
                     uiCoroutineScope.launch {
                         notesController.refreshAfterSync()
@@ -460,7 +420,8 @@ fun SomedayApp(
                 },
                 selfHostedSetupClient = selfHostedSetupClient ?: SelfHostedSetupClient { input ->
                     saien.someday.domain.settings.SelfHostedSetupResult.failure(
-                        "Self-hosted sign-in is not available in this build for ${input.redactedDescription()}.",
+                        reason = SelfHostedSetupReason.Unavailable,
+                        diagnosticMessage = input.redactedDescription(),
                     )
                 },
                 selfHostedSessionCredentialStore = selfHostedSessionCredentialStore
@@ -468,32 +429,22 @@ fun SomedayApp(
                 manualSyncRunner = manualSyncRunner ?: ManualSyncRunner {
                     saien.someday.domain.settings.ManualSyncResult.failure(
                         mode = appSettings.syncConfiguration.mode,
-                        message = "Sync is not available in this build. Your local changes stay on this device.",
+                        reason = ManualSyncReason.Unavailable,
                     )
                 },
                 bindManualSyncProgressListener = bindManualSyncProgressListener,
-                syncV2MaintenanceRunner = syncV2MaintenanceRunner ?: object : SyncV2MaintenanceRunner {
-                    override fun rollEpoch() = saien.someday.domain.settings.ManualSyncResult.failure(
-                        appSettings.syncConfiguration.mode,
-                        "Sync v2 maintenance is not available in this build.",
-                    )
-
-                    override fun repairIntegrity() = rollEpoch()
-                },
                 workspacePairingInvitationCreator =
                     workspacePairingInvitationCreator ?: WorkspacePairingInvitationCreator {
-                        WorkspacePairingInvitationResult.failure("Workspace pairing is not available in this build.")
+                        WorkspacePairingInvitationResult.failure(WorkspacePairingReason.Unavailable)
                     },
                 workspacePairingInvitationJoiner =
                     workspacePairingInvitationJoiner ?: WorkspacePairingInvitationJoiner {
-                        WorkspaceJoinResult.failure("Workspace pairing is not available in this build.")
+                        WorkspaceJoinResult.failure(WorkspacePairingReason.Unavailable)
                     },
                 workspacePairingInvitationCanceller =
                     workspacePairingInvitationCanceller ?: WorkspacePairingInvitationCanceller {
-                        WorkspaceJoinResult.failure("Workspace pairing is not available in this build.")
+                        WorkspaceJoinResult.failure(WorkspacePairingReason.Unavailable)
                     },
-                webDavDiscoveredDevicesRunner = webDavDiscoveredDevicesRunner,
-                webDavDiscoveredDeviceStrings = webDavDiscoveredDeviceStrings,
                 onThisDayNotificationScheduler = onThisDayNotificationScheduler,
                 onThisDayNotificationStrings = onThisDayNotificationStrings,
                 uiStrings = settingsUiStrings,
@@ -575,17 +526,6 @@ fun SomedayApp(
                     settingsController.rescheduleOnThisDayNotifications()
                 }
             }
-        }
-
-        LaunchedEffect(
-            settingsState.settings.syncConfiguration.webDavAutoBackupEnabled,
-            settingsState.settings.syncConfiguration.webDavAutoBackupFrequency,
-            settingsState.settings.syncConfiguration.webDavEndpoint,
-            settingsState.settings.syncConfiguration.webDavUsername,
-            settingsState.webDavCredentialSaved,
-            settingsState.settings.syncConfiguration.webDavLastBackup?.completedAtEpochMillis,
-        ) {
-            settingsController.runDueWebDavAutoBackup()
         }
 
         LaunchedEffect(settingsState.feedbackEventId) {
@@ -760,8 +700,6 @@ fun SomedayApp(
             }
 
         val devLocalRefreshedMsg = stringResource(Res.string.dev_local_refreshed)
-        val devBackupCompletedMsg = stringResource(Res.string.dev_backup_completed)
-        val devBackupNotConfiguredMsg = stringResource(Res.string.dev_backup_not_configured)
         val developerOptions = if (developerOptionsEnabled) {
             DeveloperOptionsUi(
                 platformName = platformName,
@@ -788,16 +726,10 @@ fun SomedayApp(
                     settingsController.refresh()
                     showDeveloperFeedback(devLocalRefreshedMsg)
                 },
-                runDueAutoBackup = {
-                    val ran = settingsController.runDueWebDavAutoBackup()
-                    showDeveloperFeedback(if (ran) devBackupCompletedMsg else devBackupNotConfiguredMsg)
-                },
             )
         } else {
             null
         }
-
-        // placeholder
 
         SomedayLiquidGlassHost {
             BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
@@ -813,11 +745,11 @@ fun SomedayApp(
                     notesController = notesController,
                     memoriesController = memoriesController,
                     settingsController = settingsController,
+                    mediaUiPorts = mediaUiPorts,
                     onThisDayNotificationTimeFormatter = onThisDayNotificationTimeFormatter,
                     notesSearchActive = notesSearchActive,
                     windowChromeTopInset = windowChromeTopInset,
                     developerOptions = developerOptions,
-                    systemV2ActivationEnabled = systemV2ActivationEnabled,
                     workspacePairingScanner = workspacePairingScanner,
                     pullRefresh = pullRefresh,
                     syncTopRevealSignal = syncTopRevealSignal,
@@ -1309,7 +1241,6 @@ private data class DeveloperOptionsUi(
     val seedMockContent: suspend () -> String,
     val clearMockContent: suspend () -> String,
     val refreshLocalState: suspend () -> String,
-    val runDueAutoBackup: suspend () -> String,
 )
 
 private enum class SomedayNavigationLayout {
@@ -1364,11 +1295,11 @@ private fun SomedayAdaptiveShell(
     notesController: NotesUiController,
     memoriesController: MemoriesUiController,
     settingsController: SettingsUiController,
+    mediaUiPorts: MediaUiPorts,
     onThisDayNotificationTimeFormatter: OnThisDayNotificationTimeFormatter,
     notesSearchActive: Boolean,
     windowChromeTopInset: Dp,
     developerOptions: DeveloperOptionsUi?,
-    systemV2ActivationEnabled: Boolean,
     workspacePairingScanner: WorkspacePairingScanner,
     pullRefresh: SomedayPullRefreshUi?,
     syncTopRevealSignal: Long,
@@ -1394,11 +1325,11 @@ private fun SomedayAdaptiveShell(
             notesController = notesController,
             memoriesController = memoriesController,
             settingsController = settingsController,
+            mediaUiPorts = mediaUiPorts,
             onThisDayNotificationTimeFormatter = onThisDayNotificationTimeFormatter,
             notesSearchActive = notesSearchActive,
             windowChromeTopInset = windowChromeTopInset,
             developerOptions = developerOptions,
-            systemV2ActivationEnabled = systemV2ActivationEnabled,
             workspacePairingScanner = workspacePairingScanner,
             pullRefresh = pullRefresh,
             syncTopRevealSignal = syncTopRevealSignal,
@@ -1424,11 +1355,11 @@ private fun SomedayAdaptiveShell(
             notesController = notesController,
             memoriesController = memoriesController,
             settingsController = settingsController,
+            mediaUiPorts = mediaUiPorts,
             onThisDayNotificationTimeFormatter = onThisDayNotificationTimeFormatter,
             notesSearchActive = notesSearchActive,
             windowChromeTopInset = windowChromeTopInset,
             developerOptions = developerOptions,
-            systemV2ActivationEnabled = systemV2ActivationEnabled,
             workspacePairingScanner = workspacePairingScanner,
             pullRefresh = pullRefresh,
             syncTopRevealSignal = syncTopRevealSignal,
@@ -1457,11 +1388,11 @@ private fun SomedayCompactShell(
     notesController: NotesUiController,
     memoriesController: MemoriesUiController,
     settingsController: SettingsUiController,
+    mediaUiPorts: MediaUiPorts,
     onThisDayNotificationTimeFormatter: OnThisDayNotificationTimeFormatter,
     notesSearchActive: Boolean,
     windowChromeTopInset: Dp,
     developerOptions: DeveloperOptionsUi?,
-    systemV2ActivationEnabled: Boolean,
     workspacePairingScanner: WorkspacePairingScanner,
     pullRefresh: SomedayPullRefreshUi?,
     syncTopRevealSignal: Long,
@@ -1517,9 +1448,9 @@ private fun SomedayCompactShell(
                 notesController = notesController,
                 memoriesController = memoriesController,
                 settingsController = settingsController,
+                mediaUiPorts = mediaUiPorts,
                 onThisDayNotificationTimeFormatter = onThisDayNotificationTimeFormatter,
                 developerOptions = developerOptions,
-                systemV2ActivationEnabled = systemV2ActivationEnabled,
                 workspacePairingScanner = workspacePairingScanner,
                 pullRefresh = pullRefresh,
                 syncTopRevealSignal = syncTopRevealSignal,
@@ -1550,11 +1481,11 @@ private fun SomedayWideShell(
     notesController: NotesUiController,
     memoriesController: MemoriesUiController,
     settingsController: SettingsUiController,
+    mediaUiPorts: MediaUiPorts,
     onThisDayNotificationTimeFormatter: OnThisDayNotificationTimeFormatter,
     notesSearchActive: Boolean,
     windowChromeTopInset: Dp,
     developerOptions: DeveloperOptionsUi?,
-    systemV2ActivationEnabled: Boolean,
     workspacePairingScanner: WorkspacePairingScanner,
     pullRefresh: SomedayPullRefreshUi?,
     syncTopRevealSignal: Long,
@@ -1631,9 +1562,9 @@ private fun SomedayWideShell(
                     notesController = notesController,
                     memoriesController = memoriesController,
                     settingsController = settingsController,
+                    mediaUiPorts = mediaUiPorts,
                     onThisDayNotificationTimeFormatter = onThisDayNotificationTimeFormatter,
                     developerOptions = developerOptions,
-                    systemV2ActivationEnabled = systemV2ActivationEnabled,
                     workspacePairingScanner = workspacePairingScanner,
                     pullRefresh = pullRefresh,
                     syncTopRevealSignal = syncTopRevealSignal,
@@ -1913,9 +1844,9 @@ private fun SomedayNavigationHost(
     notesController: NotesUiController,
     memoriesController: MemoriesUiController,
     settingsController: SettingsUiController,
+    mediaUiPorts: MediaUiPorts,
     onThisDayNotificationTimeFormatter: OnThisDayNotificationTimeFormatter,
     developerOptions: DeveloperOptionsUi?,
-    systemV2ActivationEnabled: Boolean,
     workspacePairingScanner: WorkspacePairingScanner,
     pullRefresh: SomedayPullRefreshUi?,
     syncTopRevealSignal: Long,
@@ -1992,6 +1923,7 @@ private fun SomedayNavigationHost(
                         memoriesState = memoriesState,
                         settingsState = settingsState,
                         notesController = notesController,
+                        mediaUiPorts = mediaUiPorts,
                         notesSearchActive = false,
                         pullRefresh = pullRefresh,
                         syncTopRevealSignal = syncTopRevealSignal,
@@ -2037,6 +1969,7 @@ private fun SomedayNavigationHost(
                             memoriesState = memoriesState,
                             settingsState = settingsState,
                             notesController = notesController,
+                            mediaUiPorts = mediaUiPorts,
                             notesSearchActive = true,
                             pullRefresh = pullRefresh,
                             syncTopRevealSignal = syncTopRevealSignal,
@@ -2104,6 +2037,7 @@ private fun SomedayNavigationHost(
                             notesState = routeNotesState,
                             settingsState = settingsState,
                             notesController = notesController,
+                            mediaUiPorts = mediaUiPorts,
                             onOpenConflictResolution = onOpenConflictResolution,
                             paddingValues = paddingValues,
                         )
@@ -2115,6 +2049,7 @@ private fun SomedayNavigationHost(
                             memoriesState = memoriesState,
                             settingsState = settingsState,
                             notesController = notesController,
+                            mediaUiPorts = mediaUiPorts,
                             notesSearchActive = false,
                             pullRefresh = pullRefresh,
                             syncTopRevealSignal = syncTopRevealSignal,
@@ -2205,7 +2140,6 @@ private fun SomedayNavigationHost(
                     controller = settingsController,
                     onThisDayNotificationTimeFormatter = onThisDayNotificationTimeFormatter,
                     developerOptions = developerOptions,
-                    systemV2ActivationEnabled = systemV2ActivationEnabled,
                     workspacePairingScanner = workspacePairingScanner,
                     onOpenPage = { page -> navController.navigate(SettingsDetailRoute(page.routeId)) },
                     onBack = { navController.popBackStack() },
@@ -2228,7 +2162,6 @@ private fun SomedayNavigationHost(
                         controller = settingsController,
                         onThisDayNotificationTimeFormatter = onThisDayNotificationTimeFormatter,
                         developerOptions = developerOptions,
-                        systemV2ActivationEnabled = systemV2ActivationEnabled,
                         workspacePairingScanner = workspacePairingScanner,
                         onOpenPage = { nextPage -> navController.navigate(SettingsDetailRoute(nextPage.routeId)) },
                         onBack = { navController.popBackStack() },
@@ -2260,6 +2193,7 @@ private fun NoteEditorRouteContent(
     notesState: NotesUiState,
     settingsState: SettingsUiState,
     notesController: NotesUiController,
+    mediaUiPorts: MediaUiPorts,
     onOpenConflictResolution: (ConflictDetails) -> Unit,
     paddingValues: PaddingValues,
 ) {
@@ -2268,6 +2202,7 @@ private fun NoteEditorRouteContent(
         NoteEditorContent(
             state = notesState,
             controller = notesController,
+            mediaUiPorts = mediaUiPorts,
             editorPreferences = settingsState.settings.editorPreferences,
             toolbarPlacement = NoteEditorToolbarPlacement.KeyboardAccessory,
             contentHorizontalPadding = 24.dp,
@@ -2391,7 +2326,11 @@ private fun NoteConflictResolutionRouteContent(
                                     append(it)
                                 }
                             },
-                            actionLabel = if (branch.deleted) stringResource(Res.string.conflict_keep_deletion) else stringResource(Res.string.conflict_use_this_branch),
+                            actionLabel = if (branch.deleted) {
+                                stringResource(Res.string.conflict_keep_deletion)
+                            } else {
+                                stringResource(Res.string.conflict_use_this_branch)
+                            },
                             onAction = {
                                 coroutineScope.launch {
                                     if (notesController.resolveConflictBranch(branch.versionId)) {
@@ -2450,6 +2389,7 @@ private fun NotesAdaptiveWorkspace(
     memoriesState: MemoriesUiState,
     settingsState: SettingsUiState,
     notesController: NotesUiController,
+    mediaUiPorts: MediaUiPorts,
     notesSearchActive: Boolean,
     pullRefresh: SomedayPullRefreshUi?,
     syncTopRevealSignal: Long,
@@ -2496,6 +2436,7 @@ private fun NotesAdaptiveWorkspace(
             NoteEditorContent(
                 state = notesState,
                 controller = notesController,
+                mediaUiPorts = mediaUiPorts,
                 editorPreferences = settingsState.settings.editorPreferences,
                 autoFocusBody = true,
                 syncInProgress = syncInProgress,
@@ -4281,7 +4222,6 @@ private fun SettingsContent(
     controller: SettingsUiController,
     onThisDayNotificationTimeFormatter: OnThisDayNotificationTimeFormatter,
     developerOptions: DeveloperOptionsUi? = null,
-    systemV2ActivationEnabled: Boolean,
     workspacePairingScanner: WorkspacePairingScanner,
     onOpenPage: (SettingsPage) -> Unit,
     onBack: () -> Unit,
@@ -4317,7 +4257,6 @@ private fun SettingsContent(
                     controller = controller,
                     onThisDayNotificationTimeFormatter = onThisDayNotificationTimeFormatter,
                     developerOptions = developerOptions,
-                    systemV2ActivationEnabled = systemV2ActivationEnabled,
                     workspacePairingScanner = workspacePairingScanner,
                     onOpenPage = onOpenPage,
                 )
@@ -4393,7 +4332,11 @@ private fun SettingsMainContent(
         SettingsNavigationRow(
             icon = Lucide.Pencil,
             title = stringResource(Res.string.settings_editor),
-            subtitle = if (state.settings.editorPreferences.previewByDefault) stringResource(Res.string.settings_preview_opens_first) else stringResource(Res.string.settings_source_opens_first),
+            subtitle = if (state.settings.editorPreferences.previewByDefault) {
+                stringResource(Res.string.settings_preview_opens_first)
+            } else {
+                stringResource(Res.string.settings_source_opens_first)
+            },
             onClick = { onOpenPage(SettingsPage.Editor) },
         )
         if (controller.onThisDayNotificationsSupported) {
@@ -4418,7 +4361,7 @@ private fun SettingsMainContent(
     SettingsSection(title = stringResource(Res.string.common_sync)) {
         SettingsNavigationRow(
             icon = Lucide.Cloud,
-            title = stringResource(Res.string.settings_sync_and_backup),
+            title = stringResource(Res.string.common_sync),
             subtitle = state.settings.syncConfiguration.mode.localizedLabel(),
             onClick = { onOpenPage(SettingsPage.Sync) },
         )
@@ -4536,7 +4479,6 @@ private fun SettingsDetailContent(
     controller: SettingsUiController,
     onThisDayNotificationTimeFormatter: OnThisDayNotificationTimeFormatter,
     developerOptions: DeveloperOptionsUi?,
-    systemV2ActivationEnabled: Boolean,
     workspacePairingScanner: WorkspacePairingScanner,
     onOpenPage: (SettingsPage) -> Unit,
 ) {
@@ -4552,17 +4494,9 @@ private fun SettingsDetailContent(
         SettingsPage.Sync -> SyncSettingsContent(
             state = state,
             controller = controller,
-            systemV2ActivationEnabled = systemV2ActivationEnabled,
             workspacePairingScanner = workspacePairingScanner,
             onOpenPage = onOpenPage,
         )
-        SettingsPage.WebDav -> WebDavSettingsContent(
-            state = state,
-            controller = controller,
-            workspacePairingScanner = workspacePairingScanner,
-            onOpenPage = onOpenPage,
-        )
-        SettingsPage.WebDavConfiguration -> WebDavConfigurationSettingsContent(state = state, controller = controller)
         SettingsPage.SelfHosted -> SelfHostedSettingsContent(state = state, controller = controller)
         SettingsPage.Import -> ImportSettingsContent(state = state, controller = controller)
         SettingsPage.Export -> ExportSettingsContent(state = state, controller = controller)
@@ -4577,8 +4511,6 @@ private fun settingsPageTitle(page: SettingsPage): String =
         SettingsPage.Editor -> stringResource(Res.string.settings_editor)
         SettingsPage.Notifications -> stringResource(Res.string.on_this_day_settings_navigation_title)
         SettingsPage.Sync -> stringResource(Res.string.common_sync)
-        SettingsPage.WebDav -> stringResource(Res.string.settings_webdav)
-        SettingsPage.WebDavConfiguration -> stringResource(Res.string.settings_connection)
         SettingsPage.SelfHosted -> stringResource(Res.string.settings_self_hosted)
         SettingsPage.Import -> stringResource(Res.string.common_import)
         SettingsPage.Export -> stringResource(Res.string.common_export)
@@ -4638,16 +4570,6 @@ private fun DeveloperSettingsContent(options: DeveloperOptionsUi) {
             busy = activeAction == "refresh",
             enabled = activeAction == null,
             onClick = { runDeveloperAction("refresh", options.refreshLocalState) },
-        )
-        HorizontalDivider()
-        DeveloperActionRow(
-            icon = Lucide.Cloud,
-            title = stringResource(Res.string.dev_run_backup_title),
-            subtitle = stringResource(Res.string.dev_run_backup_subtitle),
-            buttonText = stringResource(Res.string.common_run),
-            busy = activeAction == "backup",
-            enabled = activeAction == null,
-            onClick = { runDeveloperAction("backup", options.runDueAutoBackup) },
         )
     }
 
@@ -4896,17 +4818,12 @@ private fun EditorSettingsContent(
 private fun SyncSettingsContent(
     state: SettingsUiState,
     controller: SettingsUiController,
-    systemV2ActivationEnabled: Boolean,
     workspacePairingScanner: WorkspacePairingScanner,
     onOpenPage: (SettingsPage) -> Unit,
 ) {
     val coroutineScope = rememberCoroutineScope()
     var syncModeDialogVisible by remember { mutableStateOf(false) }
     var manualSyncRunning by remember { mutableStateOf(false) }
-    var epochRolloverDialogVisible by remember { mutableStateOf(false) }
-    var remoteMigrationDialogVisible by remember { mutableStateOf(false) }
-    var authorizedRecoveryDialogVisible by remember { mutableStateOf(false) }
-    var maintenanceRunning by remember { mutableStateOf(false) }
     val syncConfiguration = state.settings.syncConfiguration
     val syncMode = syncConfiguration.mode
 
@@ -4922,46 +4839,16 @@ private fun SyncSettingsContent(
             SettingsChevron()
         }
         when (syncMode) {
-            SyncMode.WebDav -> {
-                HorizontalDivider()
-                SettingsRow(
-                    icon = Lucide.Server,
-                    title = stringResource(Res.string.sync_webdav_sync_backup),
-                    subtitle = syncConfiguration.webDavEndpoint ?: stringResource(Res.string.common_not_configured),
-                    onClick = { onOpenPage(SettingsPage.WebDav) },
-                ) {
-                    SettingsChevron()
-                }
-                HorizontalDivider()
-                val progress = state.manualSyncProgress
-                val syncEnabled = webDavManualSyncEnabled(state)
-                SettingsActionRow(
-                    icon = Lucide.Cloud,
-                    title = stringResource(Res.string.sync_now),
-                    subtitle = webDavManualSyncSubtitle(state, progress),
-                    actionText = stringResource(Res.string.common_sync),
-                    busy = manualSyncRunning || progress.running,
-                    enabled = !manualSyncRunning && !progress.running && syncEnabled,
-                    onClick = {
-                        if (!manualSyncRunning) {
-                            manualSyncRunning = true
-                            coroutineScope.launch {
-                                controller.runManualSync()
-                                manualSyncRunning = false
-                            }
-                        }
-                    },
-                )
-                if (progress.running || progress.pushedObjects > 0 || progress.pulledObjects > 0 || progress.conflicts > 0) {
-                    StatusLine(stringResource(Res.string.common_changes), stringResource(Res.string.sync_progress_summary, progress.pushedObjects, progress.pulledObjects, progress.conflicts))
-                }
-            }
             SyncMode.SelfHosted -> {
                 HorizontalDivider()
                 SettingsRow(
                     icon = Lucide.Server,
                     title = stringResource(Res.string.sync_self_hosted_server),
-                    subtitle = if (syncConfiguration.selfHostedSession.loggedIn) stringResource(Res.string.common_signed_in) else stringResource(Res.string.common_not_configured),
+                    subtitle = if (syncConfiguration.selfHostedSession.loggedIn) {
+                        stringResource(Res.string.common_signed_in)
+                    } else {
+                        stringResource(Res.string.common_not_configured)
+                    },
                     onClick = { onOpenPage(SettingsPage.SelfHosted) },
                 ) {
                     SettingsChevron()
@@ -4987,95 +4874,39 @@ private fun SyncSettingsContent(
                     },
                 )
                 if (progress.running || progress.pushedObjects > 0 || progress.pulledObjects > 0 || progress.conflicts > 0) {
-                    StatusLine(stringResource(Res.string.common_changes), stringResource(Res.string.sync_progress_summary, progress.pushedObjects, progress.pulledObjects, progress.conflicts))
+                    StatusLine(
+                        stringResource(Res.string.common_changes),
+                        stringResource(
+                            Res.string.sync_progress_summary,
+                            progress.pushedObjects,
+                            progress.pulledObjects,
+                            progress.conflicts,
+                        ),
+                    )
                 }
             }
             SyncMode.Off -> {
                 HorizontalDivider()
                 SettingsRow(
                     icon = Lucide.Server,
-                    title = stringResource(Res.string.sync_webdav_sync_backup),
-                    subtitle = syncConfiguration.webDavEndpoint ?: stringResource(Res.string.sync_set_up_webdav),
-                    onClick = { onOpenPage(SettingsPage.WebDav) },
-                ) {
-                    SettingsChevron()
-                }
-                HorizontalDivider()
-                SettingsRow(
-                    icon = Lucide.Server,
                     title = stringResource(Res.string.sync_self_hosted_server),
-                    subtitle = if (syncConfiguration.selfHostedSession.loggedIn) stringResource(Res.string.common_signed_in) else stringResource(Res.string.sync_set_up),
+                    subtitle = if (syncConfiguration.selfHostedSession.loggedIn) {
+                        stringResource(Res.string.common_signed_in)
+                    } else {
+                        stringResource(Res.string.sync_set_up)
+                    },
                     onClick = { onOpenPage(SettingsPage.SelfHosted) },
                 ) {
                     SettingsChevron()
                 }
             }
         }
-        if (syncMode != SyncMode.Off) {
-            HorizontalDivider()
-            SettingsActionRow(
-                icon = Lucide.History,
-                title = stringResource(Res.string.sync_repair_title),
-                subtitle = stringResource(Res.string.sync_repair_subtitle),
-                actionText = stringResource(Res.string.common_repair),
-                busy = maintenanceRunning,
-                enabled = !manualSyncRunning && !state.manualSyncProgress.running,
-                onClick = {
-                    maintenanceRunning = true
-                    coroutineScope.launch {
-                        controller.repairSyncV2Integrity()
-                        maintenanceRunning = false
-                    }
-                },
-            )
-            HorizontalDivider()
-            SettingsActionRow(
-                icon = Lucide.History,
-                title = stringResource(Res.string.sync_recover_title),
-                subtitle = stringResource(Res.string.sync_recover_subtitle),
-                actionText = stringResource(Res.string.common_review),
-                busy = maintenanceRunning,
-                enabled = !manualSyncRunning && !state.manualSyncProgress.running,
-                onClick = { authorizedRecoveryDialogVisible = true },
-            )
-            HorizontalDivider()
-            SettingsActionRow(
-                icon = Lucide.History,
-                title = stringResource(Res.string.sync_roll_title),
-                subtitle = stringResource(Res.string.sync_roll_subtitle),
-                actionText = stringResource(Res.string.common_review),
-                busy = maintenanceRunning,
-                enabled = !manualSyncRunning && !state.manualSyncProgress.running,
-                onClick = { epochRolloverDialogVisible = true },
-            )
-            HorizontalDivider()
-            SettingsActionRow(
-                icon = Lucide.Server,
-                title = stringResource(Res.string.sync_migrate_title),
-                subtitle = stringResource(Res.string.sync_migrate_subtitle),
-                actionText = stringResource(Res.string.common_review),
-                busy = maintenanceRunning,
-                enabled = !manualSyncRunning && !state.manualSyncProgress.running,
-                onClick = { remoteMigrationDialogVisible = true },
-            )
-            HorizontalDivider()
-            SettingsActionRow(
-                icon = Lucide.History,
-                title = stringResource(Res.string.sync_collect_title),
-                subtitle = stringResource(Res.string.sync_collect_subtitle),
-                actionText = stringResource(Res.string.common_collect),
-                busy = maintenanceRunning,
-                enabled = !manualSyncRunning && !state.manualSyncProgress.running,
-                onClick = {
-                    maintenanceRunning = true
-                    coroutineScope.launch {
-                        controller.collectExpiredSyncV2History()
-                        maintenanceRunning = false
-                    }
-                },
+        syncConfiguration.lastError?.let {
+            StatusLine(
+                stringResource(Res.string.sync_last_issue),
+                stringResource(Res.string.sync_last_issue_safe),
             )
         }
-        syncConfiguration.lastError?.let { StatusLine(stringResource(Res.string.sync_last_issue), it) }
     }
 
     // Device pairing is how a second client receives the workspace master key.
@@ -5089,7 +4920,6 @@ private fun SyncSettingsContent(
             } else {
                 stringResource(Res.string.sync_sign_in_to_enable)
             },
-            showWebDavDevices = false,
             scanner = workspacePairingScanner,
         )
     }
@@ -5102,115 +4932,6 @@ private fun SyncSettingsContent(
                 syncModeDialogVisible = false
             },
             onDismiss = { syncModeDialogVisible = false },
-        )
-    }
-    if (epochRolloverDialogVisible) {
-        AlertDialog(
-            onDismissRequest = { if (!maintenanceRunning) epochRolloverDialogVisible = false },
-            confirmButton = {
-                TextButton(
-                    enabled = !maintenanceRunning,
-                    onClick = {
-                        epochRolloverDialogVisible = false
-                        maintenanceRunning = true
-                        coroutineScope.launch {
-                            controller.rollSyncV2Epoch()
-                            maintenanceRunning = false
-                        }
-                    },
-                ) {
-                    Text(stringResource(Res.string.sync_roll_action))
-                }
-            },
-            dismissButton = {
-                TextButton(
-                    enabled = !maintenanceRunning,
-                    onClick = { epochRolloverDialogVisible = false },
-                ) {
-                    Text(stringResource(Res.string.common_cancel))
-                }
-            },
-            title = { Text(stringResource(Res.string.sync_roll_confirm_title)) },
-            text = {
-                Text(
-                    "Someday will first drain the current authenticated frontier, then publish a new checkpoint. " +
-                        "Every current head, deletion, and unresolved conflict branch is retained. Devices outside the " +
-                        "retention window must re-bootstrap from the new epoch.",
-                )
-            },
-        )
-    }
-    if (authorizedRecoveryDialogVisible) {
-        AlertDialog(
-            onDismissRequest = { if (!maintenanceRunning) authorizedRecoveryDialogVisible = false },
-            confirmButton = {
-                TextButton(
-                    enabled = !maintenanceRunning,
-                    onClick = {
-                        authorizedRecoveryDialogVisible = false
-                        maintenanceRunning = true
-                        coroutineScope.launch {
-                            controller.recoverSyncV2FromVerifiedLocalCheckpoint()
-                            maintenanceRunning = false
-                        }
-                    },
-                ) {
-                    Text(stringResource(Res.string.sync_recover_action))
-                }
-            },
-            dismissButton = {
-                TextButton(
-                    enabled = !maintenanceRunning,
-                    onClick = { authorizedRecoveryDialogVisible = false },
-                ) {
-                    Text(stringResource(Res.string.common_cancel))
-                }
-            },
-            title = { Text(stringResource(Res.string.sync_recover_confirm_title)) },
-            text = {
-                Text(
-                    "Use this only after exact replica repair has failed and you have chosen this device as the healthiest copy. " +
-                        "Someday verifies and rebuilds its local causal DAG before committing a successor checkpoint. " +
-                        "Remote branches that exist on no healthy device or backup cannot be reconstructed and may be absent. " +
-                        "The blocked epoch remains read-only for the disclosed retention window.",
-                )
-            },
-        )
-    }
-    if (remoteMigrationDialogVisible) {
-        AlertDialog(
-            onDismissRequest = { if (!maintenanceRunning) remoteMigrationDialogVisible = false },
-            confirmButton = {
-                TextButton(
-                    enabled = !maintenanceRunning,
-                    onClick = {
-                        remoteMigrationDialogVisible = false
-                        maintenanceRunning = true
-                        coroutineScope.launch {
-                            controller.migrateSyncV2Authority()
-                            maintenanceRunning = false
-                        }
-                    },
-                ) {
-                    Text(stringResource(Res.string.sync_migrate_action))
-                }
-            },
-            dismissButton = {
-                TextButton(
-                    enabled = !maintenanceRunning,
-                    onClick = { remoteMigrationDialogVisible = false },
-                ) {
-                    Text(stringResource(Res.string.common_cancel))
-                }
-            },
-            title = { Text(stringResource(Res.string.sync_migrate_confirm_title)) },
-            text = {
-                Text(
-                    "The current authority is synchronized first. The configured target must be empty and authenticated, " +
-                        "then Someday publishes one complete checkpoint and switches once. The source becomes read-only for " +
-                        "at least 180 days; changes are never dual-written.",
-                )
-            },
         )
     }
 }
@@ -5357,634 +5078,6 @@ private fun DialogOptionRow(
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-private fun WebDavSettingsContent(
-    state: SettingsUiState,
-    controller: SettingsUiController,
-    workspacePairingScanner: WorkspacePairingScanner,
-    onOpenPage: (SettingsPage) -> Unit,
-) {
-    val coroutineScope = rememberCoroutineScope()
-    var activeAction by remember { mutableStateOf<WebDavUiAction?>(null) }
-    var restoreDialogVisible by remember { mutableStateOf(false) }
-    var backupVersionsSheetVisible by remember { mutableStateOf(false) }
-    var frequencyDialogVisible by remember { mutableStateOf(false) }
-
-    var restoreTargetLabel by remember { mutableStateOf<String?>(null) }
-    var restoreTargetPath by remember { mutableStateOf<String?>(null) }
-    val syncConfiguration = state.settings.syncConfiguration
-    val webDavEndpoint = syncConfiguration.webDavEndpoint.orEmpty()
-    val webDavUsername = syncConfiguration.webDavUsername.orEmpty()
-    val webDavAppDirectory = syncConfiguration.webDavAppDirectory
-    val connectionReady = syncConfiguration.webDavLastTest?.ready == true
-    val actionRunning = activeAction != null
-    fun runWebDavAction(
-        action: WebDavUiAction,
-        block: suspend () -> Boolean,
-    ) {
-        if (activeAction != null) {
-            return
-        }
-        activeAction = action
-        coroutineScope.launch {
-            block()
-            activeAction = null
-        }
-    }
-    fun refreshWebDavVersions() {
-        runWebDavAction(WebDavUiAction.Refresh) {
-            controller.refreshWebDavBackupVersions(
-                endpoint = webDavEndpoint,
-                username = webDavUsername,
-                password = null,
-                appDirectory = webDavAppDirectory,
-            )
-        }
-    }
-    fun selectRestoreTarget(version: WebDavBackupVersion) {
-        restoreTargetLabel = version.label
-        restoreTargetPath = version.path
-        restoreDialogVisible = true
-    }
-
-    SettingsSection(title = stringResource(Res.string.common_status)) {
-        SettingsRow(
-            icon = if (connectionReady) Lucide.Cloud else Lucide.Server,
-            title = if (connectionReady) stringResource(Res.string.webdav_ready) else stringResource(Res.string.webdav_needs_test),
-            subtitle = webDavReadinessSubtitle(syncConfiguration),
-        )
-        HorizontalDivider()
-        SettingsRow(
-            icon = Lucide.Server,
-            title = stringResource(Res.string.webdav_connection_settings),
-            subtitle = webDavConnectionSettingsSubtitle(state),
-            onClick = { onOpenPage(SettingsPage.WebDavConfiguration) },
-        ) {
-            SettingsChevron()
-        }
-        syncConfiguration.webDavLastBackup?.let { backup ->
-            HorizontalDivider()
-            StatusLine(stringResource(Res.string.webdav_last_backup), webDavBackupStatusText(backup))
-        }
-        if (webDavWorkspaceMismatchDetected(syncConfiguration)) {
-            HorizontalDivider()
-            // V2 remote wipe is disabled product-wide until DAG-preserving reset exists.
-            // Keep the row visible for mismatch context, but do not offer a destructive confirm.
-            SettingsActionRow(
-                icon = Lucide.X,
-                title = stringResource(Res.string.webdav_reset),
-                subtitle = stringResource(Res.string.webdav_reset_subtitle),
-                actionText = stringResource(Res.string.webdav_reset_unavailable),
-                busy = false,
-                enabled = false,
-                onClick = { },
-            )
-        }
-        activeAction?.let { action ->
-            HorizontalDivider()
-            StatusLine(stringResource(Res.string.common_now), action.progressText())
-        }
-    }
-
-    SettingsSection(title = stringResource(Res.string.webdav_sync_v2)) {
-        val progress = state.manualSyncProgress
-        SettingsActionRow(
-            icon = Lucide.Cloud,
-            title = stringResource(Res.string.sync_now),
-            subtitle = webDavManualSyncSubtitle(state, progress),
-            actionText = stringResource(Res.string.common_sync),
-            busy = activeAction == WebDavUiAction.Sync || progress.running,
-            enabled = !actionRunning && !progress.running && webDavManualSyncEnabled(state),
-            onClick = {
-                runWebDavAction(WebDavUiAction.Sync) {
-                    controller.runManualSync()
-                }
-            },
-        )
-        if (progress.running || progress.pushedObjects > 0 || progress.pulledObjects > 0 || progress.conflicts > 0) {
-            HorizontalDivider()
-            StatusLine(stringResource(Res.string.common_changes), stringResource(Res.string.sync_progress_summary, progress.pushedObjects, progress.pulledObjects, progress.conflicts))
-        }
-    }
-
-    WorkspacePairingContent(
-        state = state,
-        controller = controller,
-        pairingReady = when (syncConfiguration.mode) {
-            SyncMode.WebDav -> connectionReady
-            SyncMode.SelfHosted -> syncConfiguration.selfHostedSession.loggedIn
-            SyncMode.Off -> false
-        },
-        readinessSubtitle = when (syncConfiguration.mode) {
-            SyncMode.SelfHosted ->
-                if (syncConfiguration.selfHostedSession.loggedIn) {
-                    stringResource(Res.string.self_hosted_pairing_help)
-                } else {
-                    stringResource(Res.string.sync_sign_in_to_enable)
-                }
-            else -> webDavPairingReadinessSubtitle(syncConfiguration)
-        },
-        showWebDavDevices = true,
-        scanner = workspacePairingScanner,
-    )
-
-    SettingsSection(title = stringResource(Res.string.webdav_automation)) {
-        SettingsRow(
-            icon = Lucide.Cloud,
-            title = stringResource(Res.string.webdav_automatic_backup),
-            subtitle = if (syncConfiguration.webDavAutoBackupEnabled) {
-                "${syncConfiguration.webDavAutoBackupFrequency.name}; checked while open"
-            } else {
-                stringResource(Res.string.common_off)
-            },
-        ) {
-            Switch(
-                checked = syncConfiguration.webDavAutoBackupEnabled,
-                onCheckedChange = { enabled ->
-                    coroutineScope.launch { controller.toggleWebDavAutoBackup(enabled) }
-                },
-            )
-        }
-        if (syncConfiguration.webDavAutoBackupEnabled) {
-            HorizontalDivider()
-            SettingsRow(
-                icon = Lucide.History,
-                title = stringResource(Res.string.webdav_cadence),
-                subtitle = syncConfiguration.webDavAutoBackupFrequency.name,
-                onClick = { frequencyDialogVisible = true },
-            ) {
-                SettingsChevron()
-            }
-        }
-    }
-
-    SettingsSection(title = stringResource(Res.string.webdav_disaster_recovery)) {
-        SettingsActionRow(
-            icon = Lucide.Cloud,
-            title = stringResource(Res.string.webdav_backup_now),
-            actionText = stringResource(Res.string.common_backup),
-            busy = activeAction == WebDavUiAction.Backup,
-            enabled = !actionRunning,
-            onClick = {
-                runWebDavAction(WebDavUiAction.Backup) {
-                    controller.backupToWebDav(
-                        endpoint = webDavEndpoint,
-                        username = webDavUsername,
-                        password = null,
-                        appDirectory = webDavAppDirectory,
-                    )
-                }
-            },
-        )
-        HorizontalDivider()
-        SettingsRow(
-            icon = Lucide.History,
-            title = stringResource(Res.string.webdav_backup_versions),
-            subtitle = webDavBackupVersionsSubtitle(state.webDavBackupVersions),
-            onClick = {
-                backupVersionsSheetVisible = true
-                refreshWebDavVersions()
-            },
-        ) {
-            SettingsChevron()
-        }
-    }
-
-    if (frequencyDialogVisible) {
-        AlertDialog(
-            onDismissRequest = { frequencyDialogVisible = false },
-            confirmButton = {},
-            dismissButton = {
-                TextButton(onClick = { frequencyDialogVisible = false }) {
-                    Text(stringResource(Res.string.common_cancel))
-                }
-            },
-            title = { Text(stringResource(Res.string.webdav_automatic_backup)) },
-            text = {
-                Column {
-                    WebDavAutoBackupFrequency.entries.forEach { frequency ->
-                        DialogOptionRow(
-                            title = frequency.localizedLabel(),
-                            selected = frequency == state.settings.syncConfiguration.webDavAutoBackupFrequency,
-                            onClick = {
-                                coroutineScope.launch { controller.selectWebDavAutoBackupFrequency(frequency) }
-                                frequencyDialogVisible = false
-                            },
-                        )
-                    }
-                }
-            },
-        )
-    }
-
-    if (backupVersionsSheetVisible) {
-        ModalBottomSheet(
-            onDismissRequest = { backupVersionsSheetVisible = false },
-        ) {
-            WebDavBackupVersionsSheet(
-                versions = state.webDavBackupVersions,
-                refreshing = activeAction == WebDavUiAction.Refresh,
-                restoring = activeAction == WebDavUiAction.Restore,
-                actionRunning = actionRunning,
-                onRefresh = ::refreshWebDavVersions,
-                onRestore = ::selectRestoreTarget,
-            )
-        }
-    }
-
-    if (restoreDialogVisible) {
-        AlertDialog(
-            onDismissRequest = { restoreDialogVisible = false },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        if (activeAction == null) {
-                            activeAction = WebDavUiAction.Restore
-                            coroutineScope.launch {
-                                val restored = controller.restoreFromWebDav(
-                                        endpoint = webDavEndpoint,
-                                        username = webDavUsername,
-                                        password = null,
-                                        appDirectory = webDavAppDirectory,
-                                        backupPath = restoreTargetPath,
-                                    )
-                                if (restored) {
-                                    restoreDialogVisible = false
-                                    backupVersionsSheetVisible = false
-                                }
-                                activeAction = null
-                            }
-                        }
-                    },
-                    enabled = activeAction != WebDavUiAction.Restore,
-                ) {
-                    ActionButtonLabel(
-                        icon = Lucide.Download,
-                        text = stringResource(Res.string.common_restore),
-                        busy = activeAction == WebDavUiAction.Restore,
-                    )
-                }
-            },
-            dismissButton = {
-                TextButton(
-                    onClick = { restoreDialogVisible = false },
-                    enabled = activeAction != WebDavUiAction.Restore,
-                ) {
-                    Text(stringResource(Res.string.webdav_keep_current_data))
-                }
-            },
-            title = { Text(stringResource(Res.string.webdav_restore_title, restoreTargetLabel ?: stringResource(Res.string.webdav_restore_selected))) },
-            text = {
-                Text(
-                    stringResource(Res.string.webdav_restore_message),
-                )
-            },
-        )
-    }
-
-}
-
-@Composable
-private fun WebDavConfigurationSettingsContent(
-    state: SettingsUiState,
-    controller: SettingsUiController,
-) {
-    val coroutineScope = rememberCoroutineScope()
-    var activeAction by remember { mutableStateOf<WebDavUiAction?>(null) }
-    var clearCredentialDialogVisible by remember { mutableStateOf(false) }
-    var webDavEndpoint by remember(state.settings.syncConfiguration.webDavEndpoint) {
-        mutableStateOf(state.settings.syncConfiguration.webDavEndpoint.orEmpty())
-    }
-    var webDavUsername by remember(state.settings.syncConfiguration.webDavUsername) {
-        mutableStateOf(state.settings.syncConfiguration.webDavUsername.orEmpty())
-    }
-    var webDavPassword by remember { mutableStateOf("") }
-    var webDavAppDirectory by remember(state.settings.syncConfiguration.webDavAppDirectory) {
-        mutableStateOf(state.settings.syncConfiguration.webDavAppDirectory)
-    }
-    val connectionReady = state.settings.syncConfiguration.webDavLastTest?.ready == true
-    val actionRunning = activeAction != null
-    val credentialStateText = when {
-        webDavPassword.isNotBlank() -> stringResource(Res.string.webdav_new_credential_hint)
-        state.webDavCredentialSaved -> stringResource(Res.string.webdav_blank_keeps_credential)
-        else -> stringResource(Res.string.webdav_enter_password_before_test)
-    }
-    fun runWebDavConfigurationAction(
-        action: WebDavUiAction,
-        block: suspend () -> Boolean,
-    ) {
-        if (activeAction != null) {
-            return
-        }
-        activeAction = action
-        coroutineScope.launch {
-            val succeeded = block()
-            if (succeeded) {
-                webDavPassword = ""
-            }
-            activeAction = null
-        }
-    }
-
-    SettingsSection(title = stringResource(Res.string.common_server)) {
-        OutlinedTextField(
-            value = webDavEndpoint,
-            onValueChange = { webDavEndpoint = it },
-            label = { Text(stringResource(Res.string.webdav_server_url)) },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth(),
-        )
-        OutlinedTextField(
-            value = webDavUsername,
-            onValueChange = { webDavUsername = it },
-            label = { Text(stringResource(Res.string.common_username)) },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth(),
-        )
-        OutlinedTextField(
-            value = webDavPassword,
-            onValueChange = { webDavPassword = it },
-            label = { Text(stringResource(Res.string.webdav_password_or_token)) },
-            singleLine = true,
-            visualTransformation = PasswordVisualTransformation(),
-            supportingText = { Text(credentialStateText) },
-            trailingIcon = {
-                Icon(
-                    imageVector = if (webDavPassword.isNotBlank() || state.webDavCredentialSaved) {
-                        Lucide.LockKeyhole
-                    } else {
-                        Lucide.X
-                    },
-                    contentDescription = null,
-                    modifier = Modifier.size(18.dp),
-                )
-            },
-            modifier = Modifier.fillMaxWidth(),
-        )
-        OutlinedTextField(
-            value = webDavAppDirectory,
-            onValueChange = { webDavAppDirectory = it },
-            label = { Text(stringResource(Res.string.common_folder)) },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth(),
-        )
-        Column(verticalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-            Button(
-                onClick = {
-                    runWebDavConfigurationAction(WebDavUiAction.Test) {
-                        controller.testAndSaveWebDavConnection(
-                            endpoint = webDavEndpoint,
-                            username = webDavUsername,
-                            password = webDavPassword,
-                            appDirectory = webDavAppDirectory,
-                        )
-                    }
-                },
-                enabled = !actionRunning,
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                ActionButtonLabel(icon = Lucide.Server, text = stringResource(Res.string.webdav_test_and_save), busy = activeAction == WebDavUiAction.Test)
-            }
-            TextButton(
-                onClick = {
-                    runWebDavConfigurationAction(WebDavUiAction.Save) {
-                        controller.saveWebDavConfiguration(
-                            endpoint = webDavEndpoint,
-                            username = webDavUsername,
-                            password = webDavPassword,
-                            appDirectory = webDavAppDirectory,
-                        )
-                    }
-                },
-                enabled = !actionRunning,
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                ActionButtonLabel(icon = Lucide.Save, text = stringResource(Res.string.webdav_save_settings), busy = activeAction == WebDavUiAction.Save)
-            }
-        }
-    }
-
-    SettingsSection(title = stringResource(Res.string.webdav_current_status)) {
-        SettingsRow(
-            icon = if (connectionReady) Lucide.Cloud else Lucide.Server,
-            title = if (connectionReady) stringResource(Res.string.webdav_connection_tested) else stringResource(Res.string.common_not_tested),
-            subtitle = state.settings.syncConfiguration.webDavLastTest?.message
-                ?: stringResource(Res.string.webdav_test_after_change),
-        )
-        HorizontalDivider()
-        if (state.webDavCredentialSaved) {
-            SettingsActionRow(
-                icon = Lucide.LockKeyhole,
-                title = stringResource(Res.string.webdav_saved_credential),
-                subtitle = stringResource(Res.string.webdav_saved_credential_subtitle),
-                actionText = stringResource(Res.string.common_forget),
-                enabled = !actionRunning,
-                onClick = { clearCredentialDialogVisible = true },
-            )
-        } else {
-            SettingsRow(
-                icon = Lucide.LockKeyhole,
-                title = stringResource(Res.string.webdav_credential_needed),
-                subtitle = stringResource(Res.string.webdav_enter_password_before_test),
-            )
-        }
-    }
-
-    if (clearCredentialDialogVisible) {
-        ConfirmActionDialog(
-            title = stringResource(Res.string.webdav_forget_credential_title),
-            text = stringResource(Res.string.webdav_forget_credential_message),
-            confirmText = stringResource(Res.string.common_forget),
-            onConfirm = {
-                coroutineScope.launch { controller.clearWebDavCredential() }
-                clearCredentialDialogVisible = false
-            },
-            onDismiss = { clearCredentialDialogVisible = false },
-        )
-    }
-}
-
-@Composable
-private fun WebDavBackupVersionsSheet(
-    versions: List<WebDavBackupVersion>,
-    refreshing: Boolean,
-    restoring: Boolean,
-    actionRunning: Boolean,
-    onRefresh: () -> Unit,
-    onRestore: (WebDavBackupVersion) -> Unit,
-) {
-    Column(
-        verticalArrangement = Arrangement.spacedBy(12.dp),
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(start = 24.dp, end = 24.dp, bottom = 32.dp),
-    ) {
-        Row(
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier.fillMaxWidth(),
-        ) {
-            Text(
-                text = stringResource(Res.string.webdav_backup_versions),
-                style = MaterialTheme.typography.headlineSmall,
-                modifier = Modifier.weight(1f),
-            )
-            CompactSettingsActionButton(
-                text = stringResource(Res.string.common_refresh),
-                busy = refreshing,
-                enabled = !actionRunning || refreshing,
-                onClick = onRefresh,
-            )
-        }
-        Text(
-            text = if (refreshing) stringResource(Res.string.webdav_refreshing_versions) else webDavBackupVersionsSubtitle(versions),
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            style = MaterialTheme.typography.bodyMedium,
-        )
-        if (versions.isEmpty()) {
-            Text(
-                text = stringResource(Res.string.webdav_no_versions_loaded),
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                style = MaterialTheme.typography.bodyMedium,
-                modifier = Modifier.padding(vertical = 16.dp),
-            )
-        } else {
-            Column(modifier = Modifier.fillMaxWidth()) {
-                versions.forEachIndexed { index, version ->
-                    if (index > 0) {
-                        HorizontalDivider()
-                    }
-                    SettingsActionRow(
-                        icon = Lucide.History,
-                        title = version.label,
-                        subtitle = webDavBackupVersionSubtitle(version),
-                        actionText = stringResource(Res.string.common_restore),
-                        busy = restoring,
-                        enabled = !actionRunning,
-                        onClick = { onRestore(version) },
-                    )
-                }
-            }
-        }
-    }
-}
-
-private enum class WebDavUiAction {
-    Save,
-    Test,
-    Sync,
-    Backup,
-    Refresh,
-    Restore,
-}
-
-@Composable
-private fun WebDavUiAction.progressText(): String =
-    when (this) {
-        WebDavUiAction.Save -> stringResource(Res.string.webdav_busy_saving)
-        WebDavUiAction.Test -> stringResource(Res.string.webdav_busy_testing)
-        WebDavUiAction.Sync -> stringResource(Res.string.webdav_busy_syncing)
-        WebDavUiAction.Backup -> stringResource(Res.string.webdav_busy_uploading)
-        WebDavUiAction.Refresh -> stringResource(Res.string.webdav_busy_loading_versions)
-        WebDavUiAction.Restore -> stringResource(Res.string.webdav_busy_restoring)
-    }
-
-@Composable
-private fun webDavReadinessSubtitle(syncConfiguration: SyncConfiguration): String =
-    if (syncConfiguration.webDavLastTest?.ready == true) {
-        stringResource(Res.string.webdav_server_tested)
-    } else {
-        syncConfiguration.webDavLastTest?.message ?: stringResource(Res.string.webdav_test_before_sync)
-    }
-
-private fun webDavManualSyncEnabled(state: SettingsUiState): Boolean {
-    val syncConfiguration = state.settings.syncConfiguration
-    return when {
-        syncConfiguration.mode != SyncMode.WebDav -> false
-        syncConfiguration.webDavEndpoint.isNullOrBlank() -> false
-        syncConfiguration.webDavUsername.isNullOrBlank() -> false
-        !state.webDavCredentialSaved -> false
-        syncConfiguration.webDavLastTest?.ready != true -> false
-        else -> true
-    }
-}
-
-@Composable
-private fun webDavManualSyncSubtitle(
-    state: SettingsUiState,
-    progress: saien.someday.domain.settings.ManualSyncProgress,
-): String? =
-    if (progress.running && progress.mode == SyncMode.WebDav) {
-        progress.message
-    } else {
-        webDavManualSyncBlockedReason(state) ?: stringResource(Res.string.webdav_pull_then_push)
-    }
-
-@Composable
-private fun webDavManualSyncBlockedReason(state: SettingsUiState): String? {
-    val syncConfiguration = state.settings.syncConfiguration
-    return when {
-        syncConfiguration.mode != SyncMode.WebDav -> stringResource(Res.string.webdav_select_mode)
-        syncConfiguration.webDavEndpoint.isNullOrBlank() -> stringResource(Res.string.webdav_configure_server_first)
-        syncConfiguration.webDavUsername.isNullOrBlank() -> stringResource(Res.string.webdav_enter_username_first)
-        !state.webDavCredentialSaved -> stringResource(Res.string.webdav_save_credential_first)
-        else -> null
-    }
-}
-
-@Composable
-private fun webDavPairingReadinessSubtitle(syncConfiguration: SyncConfiguration): String =
-    when {
-        syncConfiguration.mode != SyncMode.WebDav ->
-            stringResource(Res.string.webdav_pairing_need_mode)
-        syncConfiguration.webDavLastTest?.ready != true ->
-            stringResource(Res.string.webdav_pairing_need_test)
-        else ->
-            stringResource(Res.string.webdav_pairing_help)
-    }
-
-@Composable
-private fun webDavConnectionSettingsSubtitle(state: SettingsUiState): String {
-    val syncConfiguration = state.settings.syncConfiguration
-    return syncConfiguration.webDavEndpoint?.takeIf { it.isNotBlank() }
-        ?: stringResource(Res.string.webdav_fields_summary)
-}
-
-@Composable
-private fun webDavBackupVersionsSubtitle(versions: List<WebDavBackupVersion>): String =
-    if (versions.isEmpty()) {
-        stringResource(Res.string.webdav_open_to_refresh)
-    } else {
-        "${versions.size} versions available"
-    }
-
-@Composable
-private fun webDavBackupVersionSubtitle(version: WebDavBackupVersion): String? =
-    version.path
-        ?.substringAfterLast('/')
-        ?.takeIf { it.isNotBlank() && it != version.label }
-
-@Composable
-private fun webDavBackupStatusText(backup: WebDavBackupStatus): String =
-    if (backup.success) {
-        backup.versionLabel ?: stringResource(Res.string.webdav_backup_saved)
-    } else {
-        stringResource(Res.string.webdav_last_attempt_failed)
-    }
-
-private fun webDavWorkspaceMismatchDetected(syncConfiguration: SyncConfiguration): Boolean {
-    if (syncConfiguration.lastErrorCode == SyncErrorCode.WebDavWorkspaceKeyMismatch) {
-        return true
-    }
-    if (syncConfiguration.lastErrorCode != null) {
-        return false
-    }
-    val message = syncConfiguration.lastError.orEmpty()
-    return message.contains("different workspace key", ignoreCase = true) ||
-        message.contains("cannot decrypt remote Someday data", ignoreCase = true)
-}
-
 @Composable
 private fun SelfHostedSettingsContent(
     state: SettingsUiState,
@@ -6041,7 +5134,7 @@ private fun SelfHostedSettingsContent(
         OutlinedTextField(
             value = selfHostedEndpoint,
             onValueChange = { selfHostedEndpoint = it },
-            label = { Text(stringResource(Res.string.webdav_server_url)) },
+            label = { Text(stringResource(Res.string.common_server_url)) },
             singleLine = true,
             modifier = Modifier.fillMaxWidth(),
         )
@@ -6161,7 +5254,6 @@ private fun WorkspacePairingContent(
     controller: SettingsUiController,
     pairingReady: Boolean,
     readinessSubtitle: String,
-    showWebDavDevices: Boolean,
     scanner: WorkspacePairingScanner,
 ) {
     val coroutineScope = rememberCoroutineScope()
@@ -6231,64 +5323,6 @@ private fun WorkspacePairingContent(
             title = stringResource(Res.string.pairing_title),
             subtitle = readinessSubtitle,
         )
-        if (showWebDavDevices) {
-            HorizontalDivider()
-            SettingsActionRow(
-                icon = Lucide.RefreshCw,
-                title = stringResource(Res.string.webdav_devices_title),
-                subtitle = stringResource(Res.string.webdav_devices_description),
-                actionText = stringResource(Res.string.webdav_devices_refresh),
-                busy = activeAction == WorkspacePairingUiAction.RefreshDevices,
-                enabled = !actionRunning && pairingReady,
-                onClick = {
-                    runWorkspacePairingAction(WorkspacePairingUiAction.RefreshDevices) {
-                        controller.refreshWebDavDiscoveredDevices()
-                    }
-                },
-            )
-            state.webDavDiscoveredDevices.forEach { device ->
-                val shortDeviceId = device.deviceId.take(8)
-                HorizontalDivider()
-                SettingsRow(
-                    icon = Lucide.Monitor,
-                    title = if (device.isCurrentDevice) {
-                        stringResource(Res.string.webdav_devices_this_device)
-                    } else {
-                        stringResource(Res.string.webdav_devices_other_device, shortDeviceId)
-                    },
-                    subtitle = listOfNotNull(
-                        shortDeviceId,
-                        device.firstSeenAtEpochMillis?.let {
-                            stringResource(
-                                Res.string.webdav_devices_first_seen,
-                                formatDeviceActivityTime(it),
-                            )
-                        },
-                        device.lastSeenAtEpochMillis?.let {
-                            stringResource(
-                                Res.string.webdav_devices_last_active,
-                                formatDeviceActivityTime(it),
-                            )
-                        },
-                        device.lastSeenAtEpochMillis?.let {
-                            if (isRecentlyActive(it)) {
-                                stringResource(Res.string.webdav_devices_recently_active)
-                            } else {
-                                stringResource(Res.string.webdav_devices_inactive)
-                            }
-                        },
-                    ).joinToString(" · "),
-                )
-            }
-            if (state.webDavDiscoveredDevices.isNotEmpty()) {
-                Text(
-                    stringResource(Res.string.webdav_devices_disclaimer),
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    style = MaterialTheme.typography.bodySmall,
-                    modifier = Modifier.padding(vertical = 8.dp),
-                )
-            }
-        }
         HorizontalDivider()
         Row(
             horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -6467,19 +5501,6 @@ private enum class WorkspacePairingUiAction {
     CreateInvitation,
     CancelInvitation,
     Join,
-    RefreshDevices,
-}
-
-private fun formatDeviceActivityTime(epochMillis: Long): String {
-    val local = Instant.fromEpochMilliseconds(epochMillis).toLocalDateTime(TimeZone.currentSystemDefault())
-    val hour = local.hour.toString().padStart(2, '0')
-    val minute = local.minute.toString().padStart(2, '0')
-    return "${local.date} $hour:$minute"
-}
-
-private fun isRecentlyActive(lastSeenAtEpochMillis: Long): Boolean {
-    val inactiveForMillis = Clock.System.now().toEpochMilliseconds() - lastSeenAtEpochMillis
-    return inactiveForMillis <= 30L * 24 * 60 * 60 * 1_000
 }
 
 @Composable
@@ -6513,6 +5534,9 @@ private fun ImportSettingsContent(
             }
             if (summary.mediaReferenced > 0 || summary.unsupportedItems > 0) {
                 StatusLine(stringResource(Res.string.common_unsupported), "${summary.mediaReferenced} media references, ${summary.unsupportedItems} objects")
+            }
+            if (summary.success && (!summary.includesMediaBytes || summary.assetReferencesMayBeUnresolved)) {
+                Text(stringResource(Res.string.import_media_boundary), style = MaterialTheme.typography.bodySmall)
             }
         }
     }
@@ -6843,6 +5867,7 @@ private fun LazyListScope.noteSummaryListItems(
 private fun NoteEditorContent(
     state: NotesUiState,
     controller: NotesUiController,
+    mediaUiPorts: MediaUiPorts,
     editorPreferences: EditorPreferences,
     toolbarPlacement: NoteEditorToolbarPlacement = NoteEditorToolbarPlacement.Inline,
     contentHorizontalPadding: Dp = 0.dp,
@@ -6861,6 +5886,37 @@ private fun NoteEditorContent(
     var deleteDialogVisible by remember { mutableStateOf(false) }
     var placeDraft by remember(editor.placeText) { mutableStateOf(editor.placeText) }
     var bodyFocused by remember(editor.sessionId) { mutableStateOf(false) }
+    var mediaImportInProgress by remember(editor.sessionId) { mutableStateOf(false) }
+    val imagePickerTitle = stringResource(Res.string.image_picker_title)
+    val onMarkdownToolbarAction: (MarkdownToolbarAction) -> Unit = { action ->
+        if (action == MarkdownToolbarAction.Image) {
+            if (!mediaImportInProgress) {
+                mediaImportInProgress = true
+                val editorSessionId = editor.sessionId
+                var callbackConsumed = false
+                try {
+                    mediaUiPorts.importRunner.start(imagePickerTitle) { result ->
+                        if (!callbackConsumed) {
+                            callbackConsumed = true
+                            mediaImportInProgress = false
+                            controller.applyMediaImportResult(editorSessionId, result)
+                        }
+                    }
+                } catch (_: Exception) {
+                    if (!callbackConsumed) {
+                        callbackConsumed = true
+                        mediaImportInProgress = false
+                        controller.applyMediaImportResult(
+                            editorSessionId,
+                            MediaImportUiResult.Failed(MediaUiFailureReason.ImportFailed),
+                        )
+                    }
+                }
+            }
+        } else {
+            controller.applyMarkdownToolbarAction(action)
+        }
+    }
     val bodyFocusRequester = remember { FocusRequester() }
     var markdownFieldValue by remember(editor.noteId) {
         mutableStateOf(noteEditorMarkdownFieldValue(editor))
@@ -6971,11 +6027,15 @@ private fun NoteEditorContent(
                             if (inlineToolbarVisible) {
                                 MarkdownToolbar(
                                     inputActionsEnabled = markdownFieldValue.composition == null,
-                                    onToolbarAction = controller::applyMarkdownToolbarAction,
+                                    imageActionEnabled = !mediaImportInProgress,
+                                    onToolbarAction = onMarkdownToolbarAction,
                                 )
                             }
                             if (editor.markdownPreviewVisible) {
-                                MarkdownPreviewContent(source = editor.markdownBody)
+                                MarkdownPreviewContent(
+                                    source = editor.markdownBody,
+                                    mediaUiPorts = mediaUiPorts,
+                                )
                             } else {
                                 EditorBodyInput(
                                     value = markdownFieldValue,
@@ -7006,7 +6066,8 @@ private fun NoteEditorContent(
             if (keyboardToolbarVisible) {
                 MarkdownKeyboardAccessoryBar(
                     inputActionsEnabled = markdownFieldValue.composition == null,
-                    onToolbarAction = controller::applyMarkdownToolbarAction,
+                    imageActionEnabled = !mediaImportInProgress,
+                    onToolbarAction = onMarkdownToolbarAction,
                     modifier = Modifier.align(Alignment.BottomCenter),
                 )
             }
@@ -7498,7 +6559,13 @@ private fun NoteDetailsDialog(
                 TextButton(onClick = { onCaptureCurrentLocation() }) {
                     Icon(Lucide.MapPin, contentDescription = null, modifier = Modifier.size(18.dp))
                     Spacer(modifier = Modifier.width(6.dp))
-                    Text(if (editor.latitudeText.isNotBlank()) stringResource(Res.string.note_update_current_location) else stringResource(Res.string.note_use_current_location))
+                    Text(
+                        if (editor.latitudeText.isNotBlank()) {
+                            stringResource(Res.string.note_update_current_location)
+                        } else {
+                            stringResource(Res.string.note_use_current_location)
+                        },
+                    )
                 }
             }
         },
@@ -7792,6 +6859,7 @@ private fun ConflictActionsPanel(
 @Composable
 private fun MarkdownToolbar(
     inputActionsEnabled: Boolean,
+    imageActionEnabled: Boolean,
     onToolbarAction: (MarkdownToolbarAction) -> Unit,
     modifier: Modifier = Modifier,
     buttonSize: Dp = 48.dp,
@@ -7809,7 +6877,8 @@ private fun MarkdownToolbar(
             markdownToolbarActions.forEach { action ->
                 MarkdownToolbarButton(
                     action = action,
-                    enabled = inputActionsEnabled,
+                    enabled = inputActionsEnabled &&
+                        (action != MarkdownToolbarAction.Image || imageActionEnabled),
                     buttonSize = buttonSize,
                     iconSize = iconSize,
                     onClick = { onToolbarAction(action) },
@@ -7827,6 +6896,11 @@ private fun MarkdownToolbarButton(
     iconSize: Dp,
     onClick: () -> Unit,
 ) {
+    val contentDescription = if (action == MarkdownToolbarAction.Image) {
+        stringResource(Res.string.image_toolbar_action)
+    } else {
+        action.label
+    }
     val tint = if (enabled) {
         MaterialTheme.colorScheme.onSurface
     } else {
@@ -7845,7 +6919,7 @@ private fun MarkdownToolbarButton(
     ) {
         Icon(
             imageVector = markdownToolbarIcon(action),
-            contentDescription = action.label,
+            contentDescription = contentDescription,
             tint = tint,
             modifier = Modifier.size(iconSize),
         )
@@ -7855,6 +6929,7 @@ private fun MarkdownToolbarButton(
 @Composable
 private fun MarkdownKeyboardAccessoryBar(
     inputActionsEnabled: Boolean,
+    imageActionEnabled: Boolean,
     onToolbarAction: (MarkdownToolbarAction) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -7866,6 +6941,7 @@ private fun MarkdownKeyboardAccessoryBar(
     ) {
         MarkdownToolbar(
             inputActionsEnabled = inputActionsEnabled,
+            imageActionEnabled = imageActionEnabled,
             onToolbarAction = onToolbarAction,
             buttonSize = NoteEditorKeyboardToolbarButtonSize,
             iconSize = NoteEditorKeyboardToolbarIconSize,
@@ -7883,10 +6959,14 @@ private fun markdownToolbarIcon(action: MarkdownToolbarAction): ImageVector =
         MarkdownToolbarAction.Quote -> Lucide.Quote
         MarkdownToolbarAction.CodeBlock -> Lucide.Code
         MarkdownToolbarAction.Link -> Lucide.Link
+        MarkdownToolbarAction.Image -> Lucide.ImageIcon
     }
 
 @Composable
-private fun MarkdownPreviewContent(source: String) {
+private fun MarkdownPreviewContent(
+    source: String,
+    mediaUiPorts: MediaUiPorts,
+) {
     val blocks = renderMarkdownPreview(source)
 
     Column(
@@ -7901,14 +6981,17 @@ private fun MarkdownPreviewContent(source: String) {
             )
         } else {
             blocks.forEach { block ->
-                MarkdownPreviewBlockContent(block)
+                MarkdownPreviewBlockContent(block, mediaUiPorts)
             }
         }
     }
 }
 
 @Composable
-private fun MarkdownPreviewBlockContent(block: MarkdownPreviewBlock) {
+private fun MarkdownPreviewBlockContent(
+    block: MarkdownPreviewBlock,
+    mediaUiPorts: MediaUiPorts,
+) {
     when (block) {
         is MarkdownPreviewBlock.Heading -> Text(
             text = block.plainText,
@@ -7945,6 +7028,189 @@ private fun MarkdownPreviewBlockContent(block: MarkdownPreviewBlock) {
                 fontFamily = FontFamily.Monospace,
             )
         }
+        is MarkdownPreviewBlock.Image -> MarkdownImagePreviewBlock(block, mediaUiPorts)
+    }
+}
+
+private sealed interface LocalImagePreviewState {
+    data object Loading : LocalImagePreviewState
+    data class Ready(val bitmap: ImageBitmap) : LocalImagePreviewState
+    data object Missing : LocalImagePreviewState
+    data class Failed(val safeMessage: String) : LocalImagePreviewState
+}
+
+@Composable
+private fun MarkdownImagePreviewBlock(
+    block: MarkdownPreviewBlock.Image,
+    mediaUiPorts: MediaUiPorts,
+) {
+    val assetUri = block.localAssetUri
+    val defaultAltText = stringResource(Res.string.image_preview_default_alt)
+    val title = block.altText.ifBlank { defaultAltText }
+
+    if (assetUri == null) {
+        MarkdownImagePreviewFrame(title = title) {
+            Text(
+                text = stringResource(Res.string.image_preview_remote),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+        return
+    }
+
+    val assetId = assetUri.assetId
+    val previewTooLargeMessage = stringResource(Res.string.image_preview_too_large)
+    val previewLoadFailedMessage = stringResource(Res.string.image_preview_load_failed)
+    val previewDecodeFailedMessage = stringResource(Res.string.image_preview_decode_failed)
+    val materializationCancelledMessage = stringResource(Res.string.image_preview_download_cancelled)
+    val materializationFailedMessage = stringResource(Res.string.image_preview_download_failed)
+    var loadGeneration by remember(assetId) { mutableStateOf(0) }
+    var previewState by remember(assetId, mediaUiPorts.previewLoader) {
+        mutableStateOf<LocalImagePreviewState>(LocalImagePreviewState.Loading)
+    }
+    var materializing by remember(assetId) { mutableStateOf(false) }
+    var materializationMessage by remember(assetId) { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(assetId, mediaUiPorts.previewLoader, loadGeneration) {
+        previewState = LocalImagePreviewState.Loading
+        previewState = try {
+            when (val result = mediaUiPorts.previewLoader.loadPreview(assetId)) {
+                is MediaPreviewUiResult.Loaded -> {
+                    try {
+                        val bitmap = withContext(Dispatchers.Default) {
+                            result.copyBytes().decodeToImageBitmap()
+                        }
+                        LocalImagePreviewState.Ready(bitmap)
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) {
+                        LocalImagePreviewState.Failed(previewDecodeFailedMessage)
+                    }
+                }
+
+                MediaPreviewUiResult.Missing -> LocalImagePreviewState.Missing
+                is MediaPreviewUiResult.Failed -> LocalImagePreviewState.Failed(
+                    when (result.reason) {
+                        MediaUiFailureReason.PreviewTooLarge -> previewTooLargeMessage
+                        MediaUiFailureReason.Unavailable,
+                        MediaUiFailureReason.ImportFailed,
+                        MediaUiFailureReason.PreviewLoadFailed,
+                        MediaUiFailureReason.MaterializationFailed,
+                        -> previewLoadFailedMessage
+                    },
+                )
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            LocalImagePreviewState.Failed(previewLoadFailedMessage)
+        }
+    }
+
+    fun requestMaterialization() {
+        if (materializing) return
+        materializing = true
+        materializationMessage = null
+        var callbackConsumed = false
+        try {
+            mediaUiPorts.materializationRunner.start(assetId) { result ->
+                if (!callbackConsumed) {
+                    callbackConsumed = true
+                    materializing = false
+                    when (result) {
+                        MediaMaterializationUiResult.Materialized -> loadGeneration += 1
+                        MediaMaterializationUiResult.Cancelled -> {
+                            materializationMessage = materializationCancelledMessage
+                        }
+                        is MediaMaterializationUiResult.Failed -> {
+                            materializationMessage = materializationFailedMessage
+                        }
+                    }
+                }
+            }
+        } catch (_: Exception) {
+            if (!callbackConsumed) {
+                callbackConsumed = true
+                materializing = false
+                materializationMessage = materializationFailedMessage
+            }
+        }
+    }
+
+    MarkdownImagePreviewFrame(title = title) {
+        when (val current = previewState) {
+            LocalImagePreviewState.Loading -> Text(
+                text = stringResource(Res.string.image_preview_loading),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodySmall,
+            )
+
+            is LocalImagePreviewState.Ready -> Image(
+                bitmap = current.bitmap,
+                contentDescription = block.altText.ifBlank { null },
+                contentScale = ContentScale.Fit,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 480.dp),
+            )
+
+            LocalImagePreviewState.Missing -> {
+                Text(
+                    text = stringResource(Res.string.image_preview_missing),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                materializationMessage?.let { message ->
+                    Text(
+                        text = message,
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+                TextButton(
+                    enabled = !materializing,
+                    onClick = ::requestMaterialization,
+                ) {
+                    Text(
+                        if (materializing) {
+                            stringResource(Res.string.image_preview_downloading)
+                        } else {
+                            stringResource(Res.string.image_preview_download)
+                        },
+                    )
+                }
+            }
+
+            is LocalImagePreviewState.Failed -> Text(
+                text = current.safeMessage,
+                color = MaterialTheme.colorScheme.error,
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+    }
+}
+
+@Composable
+private fun MarkdownImagePreviewFrame(
+    title: String,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    Column(
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(
+                MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.48f),
+                SomedayDesignDefaults.CellShape,
+            )
+            .padding(horizontal = 12.dp, vertical = 16.dp),
+    ) {
+        Text(
+            text = title,
+            style = MaterialTheme.typography.titleSmall,
+        )
+        content()
     }
 }
 

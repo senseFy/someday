@@ -42,13 +42,12 @@ class WorkspacePairingProtocolTest {
     }
 
     @Test
-    fun envelopeRoundTripBindsProfileAndAuthority() {
+    fun envelopeRoundTripBindsSelfHostedAuthority() {
         val crypto = SodiumWorkspaceCrypto()
         val token = WorkspacePairingToken.fromSecretBytes(ByteArray(16) { (it + 3).toByte() })
         val codec = WorkspacePairingEnvelopeCodec(crypto)
         val authority = WorkspacePairingAuthority(
-            remoteProfile = WorkspacePairingRemoteProfile.WebDav,
-            binding = "https://dav.example.test|alice|someday",
+            binding = "https://sync.example.test|alice|someday",
         )
         val packageData = WorkspaceJoinPackage(
             metadataJson = """{"workspaceId":"workspace-a"}""",
@@ -78,17 +77,6 @@ class WorkspacePairingProtocolTest {
             codec.decode(
                 token = token,
                 authority = authority.copy(binding = authority.binding + "-other"),
-                envelopeBytes = encoded.bytes,
-                nowEpochMillis = 2_000,
-            ),
-        )
-        assertIs<WorkspacePairingEnvelopeDecodeResult.Invalid>(
-            codec.decode(
-                token = token,
-                authority = WorkspacePairingAuthority(
-                    WorkspacePairingRemoteProfile.SelfHosted,
-                    authority.binding,
-                ),
                 envelopeBytes = encoded.bytes,
                 nowEpochMillis = 2_000,
             ),

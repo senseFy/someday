@@ -24,8 +24,6 @@ val CONTROL_OBJECT_TYPES_SYSTEM_V2: Set<String> = setOf(
     "sync_epoch_pointer_v2",
     "sync_checkpoint_manifest_v2",
     "sync_checkpoint_chunk_v2",
-    "webdav_writer_manifest_v2",
-    "webdav_log_segment_v2",
 )
 
 @Serializable

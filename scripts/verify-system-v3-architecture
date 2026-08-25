@@ -1,0 +1,239 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$ROOT_DIR"
+
+fail() {
+    printf 'system-v3 architecture violation: %s\n' "$*" >&2
+    exit 1
+}
+
+pass() {
+    printf 'EVIDENCE %s passed\n' "$1"
+}
+
+SYNC_MAIN="shared/sync/src/commonMain/kotlin"
+SYNC_CORE="$SYNC_MAIN/saien/someday/sync/causality/v2"
+DATA_MAIN="shared/data/src/commonMain"
+DOMAIN_MAIN="shared/domain/src/commonMain"
+SERVER_MAIN="server/src/main"
+SERVICE_FILE="$SYNC_MAIN/saien/someday/sync/SystemV3ClientServices.kt"
+MEDIA_WIRE="$SYNC_MAIN/saien/someday/sync/selfhosted/SelfHostedMediaV3.kt"
+SERVER_ROUTES="$SERVER_MAIN/kotlin/saien/someday/server/routes/SystemV3Routes.kt"
+SERVER_ENTITY_REPOSITORY="$SERVER_MAIN/kotlin/saien/someday/server/persistence/SyncV2Repository.kt"
+SERVER_MEDIA_REPOSITORY="$SERVER_MAIN/kotlin/saien/someday/server/persistence/SystemV3MediaRepository.kt"
+ENTITY_MIGRATION="$SERVER_MAIN/resources/db/migration/V4__sync_v2_epochs_immutable_objects.sql"
+MEDIA_MIGRATION="$SERVER_MAIN/resources/db/migration/V8__system_v3_media_metadata.sql"
+
+[[ -f "$SERVICE_FILE" ]] || fail "the product-facing System V3 client composition is missing"
+[[ ! -e "$SYNC_MAIN/saien/someday/sync/SyncV2ClientServices.kt" ]] ||
+    fail "the product-facing client composition still exposes a V2 facade"
+pass ARCH-PRODUCT-V3
+
+# The retired provider label is assembled so this verifier does not preserve
+# the removed product surface itself. The V3 design document may state that it
+# is unsupported; no implementation, test, script, or filename may remain.
+removed_provider='web''dav'
+provider_targets=(shared app server integration-tests scripts .github README.md CONTRIBUTING.md SECURITY.md Makefile agent.md)
+if rg -n -i --glob '!**/build/**' --glob '!**/.gradle/**' \
+    "$removed_provider" "${provider_targets[@]}" >/dev/null; then
+    rg -n -i --glob '!**/build/**' --glob '!**/.gradle/**' \
+        "$removed_provider" "${provider_targets[@]}" >&2
+    fail "removed remote provider remains outside the architecture decision record"
+fi
+while IFS= read -r path; do
+    printf '%s\n' "$path" >&2
+    fail "removed remote provider remains in a filename"
+done < <(rg --files shared app server integration-tests scripts | rg -i "$removed_provider" || true)
+pass ARCH-SELF-HOSTED-ONLY
+
+if rg -n --glob '!verify-system-v3-architecture' \
+    'systemV2ActivationEnabled|systemV2ReleaseEnabled|systemV2DevelopmentEnabled|SOMEDAY_SYSTEM_V2_(RELEASE|DEVELOPMENT)_ENABLED' \
+    shared app server integration-tests scripts Makefile gradle.properties build.gradle.kts >/dev/null; then
+    rg -n --glob '!verify-system-v3-architecture' \
+        'systemV2ActivationEnabled|systemV2ReleaseEnabled|systemV2DevelopmentEnabled|SOMEDAY_SYSTEM_V2_(RELEASE|DEVELOPMENT)_ENABLED' \
+        shared app server integration-tests scripts Makefile gradle.properties build.gradle.kts >&2
+    fail "the day-one DAG still has an activation switch"
+fi
+for retired_gate in \
+    scripts/sync-v2-reliability-gate \
+    scripts/sync-v2-test-evidence.tsv \
+    scripts/verify-sync-v2-architecture; do
+    [[ ! -e "$retired_gate" ]] || fail "retired acceptance artifact remains: $retired_gate"
+done
+pass ARCH-DAY-ONE-DAG
+
+rg -Fq 'route("/sync/v3")' "$SERVER_ROUTES" || fail "System V3 route root is missing"
+rg -Fq 'route("/workspaces/{workspaceId}")' "$SERVER_ROUTES" || fail "workspace path scope is missing"
+rg -Fq 'route("/entities")' "$SERVER_ROUTES" || fail "entity data plane is not under workspace scope"
+rg -Fq 'route("/media/{mediaId}")' "$SERVER_ROUTES" || fail "media data plane is not under workspace scope"
+if rg -n 'route\("/sync/v2|/sync/v3/entities' "$SERVER_MAIN/kotlin" "$SYNC_MAIN" >/dev/null; then
+    fail "an unscoped or retired product sync route remains"
+fi
+rg -Fq 'apiBasePath == "/sync/v3/workspaces/{workspaceId}/entities"' "$MEDIA_WIRE" ||
+    fail "entity capabilities do not advertise the workspace-scoped route"
+rg -Fq 'apiBasePath == "/sync/v3/workspaces/{workspaceId}/media"' "$MEDIA_WIRE" ||
+    fail "media capabilities do not advertise the workspace-scoped route"
+rg -q 'fun loadEpoch\(userId: UUID, workspaceId: String\)' "$SERVER_ENTITY_REPOSITORY" ||
+    fail "entity repository entry points are not explicitly account/workspace scoped"
+rg -q 'WHERE user_id = \? AND workspace_id = \?' "$SERVER_ENTITY_REPOSITORY" ||
+    fail "entity SQL does not carry an explicit account/workspace predicate"
+rg -Fq "set_config('someday.user_id'" "$SERVER_ENTITY_REPOSITORY" ||
+    fail "entity RLS scope does not bind the authenticated account"
+rg -Fq "set_config('someday.workspace_id'" "$SERVER_ENTITY_REPOSITORY" ||
+    fail "entity RLS scope does not bind the workspace"
+rg -Fq 'user_id::text = current_setting(' "$ENTITY_MIGRATION" ||
+    fail "entity RLS policy does not enforce account scope"
+rg -Fq 'FORCE ROW LEVEL SECURITY' "$MEDIA_MIGRATION" ||
+    fail "media RLS defense in depth is missing"
+rg -Fq "set_config('someday.user_id'" "$SERVER_MEDIA_REPOSITORY" ||
+    fail "media repository does not select an account RLS scope"
+rg -Fq "set_config('someday.workspace_id'" "$SERVER_MEDIA_REPOSITORY" ||
+    fail "media repository does not select a workspace RLS scope"
+pass ARCH-WORKSPACE-SCOPE
+
+entity_values="$({
+    sed -n '/enum class WorkspaceEntityTypeV2/,/^}/p' "$SYNC_CORE/WorkspaceEntityModelsV2.kt" |
+        sed -n 's/^    [A-Z_]*("\([a-z_]*\)"),$/\1/p'
+} | sort | tr '\n' ' ')"
+[[ "$entity_values" == "note notebook workspace_preferences " ]] ||
+    fail "the closed entity allowlist changed without a wire review: $entity_values"
+rg -Fq 'SYNC_V2_CONTRACT_ID: String = "someday-system-v2"' "$SYNC_CORE/WorkspaceEntityModelsV2.kt" ||
+    fail "the frozen entity contract id changed"
+rg -Fq 'SYNC_V2_SCHEMA_SET_VERSION: String = "workspace-entity-schema-set-v2"' "$SYNC_CORE/WorkspaceEntityModelsV2.kt" ||
+    fail "the frozen entity schema set changed"
+rg -Fq 'SYNC_KEY_SET_VERSION_V2: String = "sync-key-set-v2"' "$SYNC_CORE/SyncEpochKeyDerivationV2.kt" ||
+    fail "the frozen entity key set changed"
+pass ARCH-ENTITY-WIRE
+
+rg -q 'SystemV2NotesRepository\(' "$SERVICE_FILE" || fail "Notes are not composed directly on the DAG"
+rg -q 'SystemV2ClientSettingsRepository\(' "$SERVICE_FILE" ||
+    fail "synchronized settings are not composed directly on the DAG"
+rg -q 'ensureWorkspaceLocalDraftV2\(' "$SERVICE_FILE" || fail "workspace creation does not ensure a local DAG draft"
+for retired_local_file in \
+    LocalDataModels.kt \
+    SqlDelightMappers.kt \
+    SqlDelightNotesRepository.kt \
+    WorkspaceProtectedLocalDataRepository.kt; do
+    if find "$DATA_MAIN" -type f -name "$retired_local_file" -print -quit | grep -q .; then
+        fail "retired normal-row data path remains: $retired_local_file"
+    fi
+done
+if rg -n '^CREATE TABLE (notebooks|notes|note_versions|tombstones|locations|sync_metadata)\b' \
+    "$DATA_MAIN/sqldelight" >/dev/null; then
+    rg -n '^CREATE TABLE (notebooks|notes|note_versions|tombstones|locations|sync_metadata)\b' \
+        "$DATA_MAIN/sqldelight" >&2
+    fail "a parallel normal-row product data plane remains"
+fi
+if rg -n 'SqlDelightNotesRepository|ProtocolRoutingNotesRepository|somedayQueries|workspace_entity_versions_v2' \
+    shared/ui/src/commonMain/kotlin app/android/src/main app/desktop/src/jvmMain app/ios/src/iosMain >/dev/null; then
+    rg -n 'SqlDelightNotesRepository|ProtocolRoutingNotesRepository|somedayQueries|workspace_entity_versions_v2' \
+        shared/ui/src/commonMain/kotlin app/android/src/main app/desktop/src/jvmMain app/ios/src/iosMain >&2
+    fail "product or UI code bypasses the typed DAG repository boundary"
+fi
+pass ARCH-LOCAL-AUTHORITY
+
+for retired_file in \
+    WorkspaceMasterKeyRotationV2.kt \
+    WorkspaceEpochRetentionV2.kt \
+    WorkspaceImmutableObjectRepairV2.kt \
+    WorkspaceRemoteMigrationV2.kt; do
+    [[ ! -e "$SYNC_CORE/$retired_file" ]] || fail "retired lifecycle mechanism remains: $retired_file"
+done
+if rg -n 'epoch/history|repair/object|repair/replica' "$SERVER_MAIN" "$SYNC_MAIN" >/dev/null; then
+    rg -n 'epoch/history|repair/object|repair/replica' "$SERVER_MAIN" "$SYNC_MAIN" >&2
+    fail "retired remote history or repair API remains"
+fi
+if rg -n 'SyncEpochLifecycleV2\.READ_ONLY|read_only_at|retain_until|sync_repair_replicas_v2' \
+    "$SYNC_MAIN" "$DATA_MAIN" >/dev/null; then
+    rg -n 'SyncEpochLifecycleV2\.READ_ONLY|read_only_at|retain_until|sync_repair_replicas_v2' \
+        "$SYNC_MAIN" "$DATA_MAIN" >&2
+    fail "retained-generation lifecycle remains in the local product model"
+fi
+if rg -n 'SyncDeadLetterLifecycleV2|checkpoint_horizon|markEpochDeadLettersRebootstrapV2' \
+    "$SYNC_MAIN" "$DATA_MAIN" >/dev/null; then
+    rg -n 'SyncDeadLetterLifecycleV2|checkpoint_horizon|markEpochDeadLettersRebootstrapV2' \
+        "$SYNC_MAIN" "$DATA_MAIN" >&2
+    fail "dead-letter repair lifecycle or checkpoint retention horizon remains"
+fi
+if rg -n 'WorkspaceSyncWriterManifestV2|WorkspaceSyncLogSegmentV2|WorkspaceSyncSegmentRefV2|StoredWorkspaceTransportUnitV2|SyncEpochHealthV2\.DEGRADED|sync_transport_units_system_v2|sync_reconciliation_state_system_v2' \
+    "$SYNC_MAIN" "$DATA_MAIN" "$SERVER_MAIN" >/dev/null; then
+    fail "unused writer-log, transport-unit, reconciliation, or degraded lifecycle remains"
+fi
+pass ARCH-SINGLE-GENERATION
+
+rg -Fq 'SYSTEM_V3_MEDIA_MAX_PLAINTEXT_BYTES: Int = 4 * 1024 * 1024' "$MEDIA_WIRE" ||
+    fail "the 4 MiB media bound changed"
+rg -Fq 'MAX_MEDIA_ASSET_PIXEL_COUNT: Long = 12_000_000L' \
+    "$DOMAIN_MAIN/kotlin/saien/someday/domain/media/MediaAssets.kt" ||
+    fail "the 12 MP media bound changed"
+rg -Fq 'setOf("image/jpeg", "image/png", "image/webp")' "$MEDIA_WIRE" ||
+    fail "the closed image media-type set changed"
+rg -Fq 'SYSTEM_V3_MEDIA_CIPHERTEXT_MODE: String = "deterministic-single-object-v1"' "$MEDIA_WIRE" ||
+    fail "media is no longer the bounded single-object protocol"
+media_files=(
+    "$MEDIA_WIRE"
+    "$SYNC_MAIN/saien/someday/sync/selfhosted/SystemV3MediaCoordinator.kt"
+    "$SERVER_MAIN/kotlin/saien/someday/server/persistence/SystemV3MediaRepository.kt"
+    "$SERVER_MAIN/kotlin/saien/someday/server/routes/SystemV3Routes.kt"
+)
+if rg -n -i 'media(chunk|manifest|draft|reservation|finalize)|resumable' "${media_files[@]}" >/dev/null; then
+    fail "chunked or draft media lifecycle leaked into the bounded image protocol"
+fi
+pass ARCH-BOUNDED-IMAGES
+
+rg -q 'beforeEntityPublication = \{ versions ->' "$SERVICE_FILE" ||
+    fail "the product composition does not install the media publication gate"
+rg -q 'mediaCoordinator\.ensurePublished\(mediaIds\)' "$SERVICE_FILE" ||
+    fail "referenced media is not proven before entity publication"
+if rg -n 'beforeEntityPublication:.*=[[:space:]]*\{[[:space:]]*\}' \
+    "$SYNC_CORE/WorkspaceSyncCoordinatorV2.kt" "$SYNC_CORE/WorkspaceCheckpointLifecycleV2.kt" >/dev/null; then
+    fail "an entity publication path can silently bypass media reachability"
+fi
+pass ARCH-CROSS-PLANE-ORDER
+
+export_model="$DATA_MAIN/kotlin/saien/someday/data/export/LocalDataExporter.kt"
+rg -Fq 'val includesMediaBytes: Boolean = false' "$export_model" ||
+    fail "portable export does not explicitly exclude media bytes"
+if rg -n 'mediaBytes|imageBytes|base64Image|mediaPayload' \
+    "$DATA_MAIN/kotlin/saien/someday/data/export" >/dev/null; then
+    fail "portable export/import unexpectedly carries image bytes"
+fi
+pass ARCH-PORTABLE-NO-MEDIA
+
+pairing="$SYNC_MAIN/saien/someday/sync/selfhosted/SelfHostedWorkspacePairingService.kt"
+draft="$SYNC_CORE/WorkspaceLocalDraftV2.kt"
+rg -q 'workspacePairingInviterReady' "$pairing" || fail "pairing does not require a published inviter"
+rg -q 'localWorkspaceAdoptionRefusalReasonV2' "$draft" || fail "semantic-empty adoption policy is missing"
+rg -q 'discardEmptyLocalWorkspaceDraftForAdoptionV2' "$draft" || fail "empty-draft adoption cleanup is missing"
+rg -Fq 'requestedDeviceId.version() != 4' \
+    "$SERVER_MAIN/kotlin/saien/someday/server/routes/DeviceRoutes.kt" ||
+    fail "server device registration does not require UUIDv4"
+rg -Fq 'requestedDeviceId.variant() != 2' \
+    "$SERVER_MAIN/kotlin/saien/someday/server/routes/DeviceRoutes.kt" ||
+    fail "server device registration does not require the RFC 4122 variant"
+pass ARCH-PAIRING-IDENTITY
+
+if rg -ni 'trustAll|X509TrustManager|HostnameVerifier|disableHostname|insecureSkip|ALLOW_ALL' \
+    shared/sync/src app server/src/main >/dev/null; then
+    fail "production transport contains a certificate or hostname bypass"
+fi
+rg -Fq 'require(isSecureSyncEndpoint(endpoint))' \
+    "$SYNC_MAIN/saien/someday/sync/selfhosted/KtorSelfHostedSyncTransport.kt" ||
+    fail "Ktor self-hosted transport accepts an insecure endpoint"
+rg -Fq 'require(isSecureSyncEndpoint(endpoint))' \
+    shared/sync/src/jvmMain/kotlin/saien/someday/sync/selfhosted/JdkSelfHostedSyncTransport.kt ||
+    fail "JDK self-hosted transport accepts an insecure endpoint"
+pass ARCH-TLS
+
+if rg -n 'payloadDigest' \
+    "$SYNC_MAIN/saien/someday/sync/selfhosted" "$SERVER_MAIN" >/dev/null; then
+    fail "semantic payload metadata escaped encrypted client code"
+fi
+rg -Fq 'FORCE ROW LEVEL SECURITY' "$ENTITY_MIGRATION" ||
+    fail "entity RLS defense in depth is missing"
+pass ARCH-OPAQUE-SERVER
+
+printf 'System V3 architecture and privacy scan passed.\n'

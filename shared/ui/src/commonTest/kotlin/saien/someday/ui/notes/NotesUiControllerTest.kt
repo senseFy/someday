@@ -1,10 +1,13 @@
 @file:OptIn(kotlin.time.ExperimentalTime::class)
 package saien.someday.ui.notes
 
+import saien.someday.domain.media.MediaAssetId
 import saien.someday.domain.notes.NoteSyncBadge
 import saien.someday.domain.notes.NotesLocationInput
 import saien.someday.domain.notes.noteCalendarDate
 import saien.someday.domain.settings.EditorPreferences
+import saien.someday.ui.media.MediaImportUiResult
+import saien.someday.ui.media.MediaUiFailureReason
 import kotlinx.coroutines.runBlocking
 import kotlinx.datetime.LocalDate
 import kotlin.test.Test
@@ -594,6 +597,53 @@ class NotesUiControllerTest {
 
         val saved = repository.listNotes(diary.id).single()
         assertEquals(formattedSource, repository.getNoteDetails(saved.id)?.markdownBody)
+    }
+
+    @Test
+    fun mediaImportMutatesOnlyTheEditorSessionThatOpenedThePicker() = runBlocking {
+        val repository = InMemoryNotesRepository()
+        val controller = NotesUiController(repository)
+        val diary = controller.createNotebook("Diary")
+        controller.openNewNote(diary.id)
+        controller.updateDraft(markdownBody = "A sunset memory")
+        controller.updateMarkdownSelection(2, 8)
+        val sessionId = assertNotNull(controller.currentEditorSessionId())
+        val assetId = MediaAssetId.fromCanonicalValue("ab".repeat(32))
+
+        assertTrue(
+            controller.applyMediaImportResult(
+                sessionId,
+                MediaImportUiResult.Imported(assetId, suggestedAltText = "ignored"),
+            ),
+        )
+        assertEquals(
+            "A \n![sunset](someday-asset://${"ab".repeat(32)})\n memory",
+            controller.state.editor?.markdownBody,
+        )
+        assertEquals("Image added.", controller.state.feedbackMessage)
+
+        val bodyAfterImport = assertNotNull(controller.state.editor?.markdownBody)
+        assertFalse(controller.applyMediaImportResult(sessionId, MediaImportUiResult.Cancelled))
+        assertEquals(bodyAfterImport, controller.state.editor?.markdownBody)
+        assertEquals("Image import cancelled.", controller.state.feedbackMessage)
+
+        assertFalse(
+            controller.applyMediaImportResult(
+                sessionId,
+                MediaImportUiResult.Failed(MediaUiFailureReason.ImportFailed),
+            ),
+        )
+        assertEquals(bodyAfterImport, controller.state.editor?.markdownBody)
+        assertEquals("Unable to import the selected image.", controller.state.feedbackMessage)
+
+        controller.closeEditorSession(sessionId, discarded = true)
+        assertFalse(
+            controller.applyMediaImportResult(
+                sessionId,
+                MediaImportUiResult.Imported(MediaAssetId.fromCanonicalValue("cd".repeat(32))),
+            ),
+        )
+        assertNull(controller.state.editor)
     }
 
     @Test

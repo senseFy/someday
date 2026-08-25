@@ -6,6 +6,7 @@ import saien.someday.domain.settings.ClientSettings
 import saien.someday.domain.settings.ClientTheme
 import saien.someday.domain.settings.ManualSyncPhase
 import saien.someday.domain.settings.ManualSyncProgressListener
+import saien.someday.domain.settings.ManualSyncReason
 import saien.someday.domain.settings.ManualSyncResult
 import saien.someday.domain.settings.OnThisDayNotificationPreferences
 import saien.someday.domain.settings.SelfHostedSessionCredentialStore
@@ -14,31 +15,16 @@ import saien.someday.domain.settings.SelfHostedSessionSummary
 import saien.someday.domain.settings.SelfHostedSetupClient
 import saien.someday.domain.settings.SelfHostedSetupInput
 import saien.someday.domain.settings.SelfHostedSetupResult
+import saien.someday.domain.settings.SelfHostedSetupReason
 import saien.someday.domain.settings.SelfHostedSetupStatus
 import saien.someday.domain.settings.SyncConfiguration
-import saien.someday.domain.settings.SyncErrorCode
 import saien.someday.domain.settings.SyncMode
-import saien.someday.domain.settings.SyncV2MaintenanceRunner
-import saien.someday.domain.settings.WebDavBackupResult
-import saien.someday.domain.settings.WebDavBackupRunner
-import saien.someday.domain.settings.WebDavBackupCatalogRunner
-import saien.someday.domain.settings.WebDavBackupListResult
-import saien.someday.domain.settings.WebDavBackupVersion
-import saien.someday.domain.settings.WebDavConnectionStatus
-import saien.someday.domain.settings.WebDavConnectionTestResult
-import saien.someday.domain.settings.WebDavConnectionTester
-import saien.someday.domain.settings.WebDavAuthorityCredentials
-import saien.someday.domain.settings.WebDavCredentialStore
-import saien.someday.domain.settings.WebDavDiscoveredDevice
-import saien.someday.domain.settings.WebDavDiscoveredDevicesResult
-import saien.someday.domain.settings.WebDavDiscoveredDevicesRunner
-import saien.someday.domain.settings.WebDavRestoreResult
-import saien.someday.domain.settings.WebDavRestoreRunner
 import saien.someday.domain.settings.WorkspaceJoinResult
 import saien.someday.domain.settings.WorkspacePairingInvitation
 import saien.someday.domain.settings.WorkspacePairingInvitationCreator
 import saien.someday.domain.settings.WorkspacePairingInvitationJoiner
 import saien.someday.domain.settings.WorkspacePairingInvitationResult
+import saien.someday.domain.settings.WorkspacePairingReason
 import saien.someday.ui.i18n.SettingsUiStrings
 import saien.someday.ui.notes.InMemoryNotesRepository
 import kotlinx.coroutines.Dispatchers
@@ -52,25 +38,7 @@ import kotlin.test.assertTrue
 
 class SettingsUiControllerTest {
     @Test
-    fun refreshDiscoveredDevicesPublishesAuthenticatedManifestInventory() = runBlocking {
-        val controller = SettingsUiController(
-            webDavDiscoveredDevicesRunner = WebDavDiscoveredDevicesRunner {
-                WebDavDiscoveredDevicesResult.success(
-                    listOf(
-                        WebDavDiscoveredDevice("device-current", 1_000, 3_000, true),
-                        WebDavDiscoveredDevice("device-other", 2_000, 2_500, false),
-                    ),
-                )
-            },
-        )
-
-        assertTrue(controller.refreshWebDavDiscoveredDevices())
-        assertEquals(2, controller.state.webDavDiscoveredDevices.size)
-        assertTrue(controller.state.webDavDiscoveredDevices.first().isCurrentDevice)
-    }
-
-    @Test
-    fun settingsSectionsExposePairingForBothRemoteProfiles() = runBlocking {
+    fun settingsSectionsExposeSelfHostedPairingAndLocalDataTools() = runBlocking {
         val repository = InMemoryNotesRepository()
         repository.createNotebook("Diary")
         val controller = SettingsUiController(
@@ -88,7 +56,6 @@ class SettingsUiControllerTest {
             .joinToString(separator = "\n")
 
         assertTrue(hierarchyText.contains("Sync mode/account"))
-        assertTrue(hierarchyText.contains("WebDAV config"))
         assertTrue(hierarchyText.contains("Self-hosted device management"))
         assertTrue(hierarchyText.contains("Device pairing"))
         assertFalse(hierarchyText.contains("Encryption/recovery"))
@@ -287,7 +254,7 @@ class SettingsUiControllerTest {
             notebooksProvider = repository::listNotebooks,
             exportProvider = {
                 SettingsExportSummary(
-                    formatName = "someday.local-export.v2+json",
+                    formatName = "Someday JSON export",
                     notebookCount = 1,
                     noteCount = 1,
                     excludedSensitiveFields = SettingsExportSummary.defaultExcludedSensitiveFields,
@@ -298,12 +265,14 @@ class SettingsUiControllerTest {
         assertTrue(controller.runLocalExport())
 
         val summary = assertNotNull(controller.state.exportSummary)
-        assertEquals("someday.local-export.v2+json", summary.formatName)
+        assertEquals("Someday JSON export", summary.formatName)
         assertEquals(1, summary.notebookCount)
         assertEquals(1, summary.noteCount)
         assertTrue(summary.excludedSensitiveFields.contains("raw workspace keys"))
         assertTrue(summary.excludedSensitiveFields.contains("refresh tokens"))
         assertTrue(summary.excludedSensitiveFields.contains("recovery material"))
+        assertFalse(summary.includesMediaBytes)
+        assertTrue(summary.assetReferencesMayBeUnresolved)
         assertTrue(controller.state.feedbackMessage.orEmpty().contains("Export prepared"))
     }
 
@@ -338,6 +307,8 @@ class SettingsUiControllerTest {
         assertEquals(2, summary.notesImported)
         assertEquals(1, summary.journalsImported)
         assertEquals(1, summary.mediaReferenced)
+        assertFalse(summary.includesMediaBytes)
+        assertTrue(summary.assetReferencesMayBeUnresolved)
         assertEquals("Imported 2 Day One notes.", controller.state.feedbackMessage)
     }
 
@@ -349,7 +320,7 @@ class SettingsUiControllerTest {
         val controller = SettingsUiController(
             workspacePairingInvitationCreator = WorkspacePairingInvitationCreator {
                 WorkspacePairingInvitationResult.success(
-                    message = "Pairing invitation created.",
+                    reason = WorkspacePairingReason.InvitationCreated,
                     invitation = WorkspacePairingInvitation.create(
                         manualToken = manualToken,
                         qrPayload = qrPayload,
@@ -359,7 +330,7 @@ class SettingsUiControllerTest {
             },
             workspacePairingInvitationJoiner = WorkspacePairingInvitationJoiner { token ->
                 capturedToken = token
-                WorkspaceJoinResult.success("Joined workspace workspace-a.")
+                WorkspaceJoinResult.success(WorkspacePairingReason.Joined)
             },
         )
 
@@ -384,7 +355,7 @@ class SettingsUiControllerTest {
             currentEpochMillis = { now },
             workspacePairingInvitationCreator = WorkspacePairingInvitationCreator {
                 WorkspacePairingInvitationResult.success(
-                    message = "Pairing invitation created.",
+                    reason = WorkspacePairingReason.InvitationCreated,
                     invitation = WorkspacePairingInvitation.create(
                         manualToken = "000G40R 40M30E2 09185GR 38E1WRJ",
                         qrPayload = "SOMEDAY:PAIR:1:000G40R40M30E209185GR38E1WRJ",
@@ -407,407 +378,63 @@ class SettingsUiControllerTest {
     }
 
     @Test
-    fun webDavSetupValidatesRequiredFieldsTestsConnectionAndRedactsCredentials() = runBlocking {
-        var persisted = ClientSettings()
-        var testedCredential: String? = null
-        val credentialStore = FakeWebDavCredentialStore()
+    fun typedCoreDiagnosticsAreMappedToLocalizedCopyAndNeverShown() = runBlocking {
+        val rawDiagnostic = "raw-diagnostic-must-not-reach-ui"
         val controller = SettingsUiController(
-            initialSettings = persisted,
-            persistSettings = { updated ->
-                persisted = updated
-                updated
-            },
-            webDavConnectionTester = WebDavConnectionTester { input ->
-                testedCredential = input.password
-                WebDavConnectionTestResult(
-                    success = true,
-                    status = WebDavConnectionStatus(
-                        ready = true,
-                        message = "WebDAV connection succeeded for app-owned path; credentials redacted.",
-                        appDirectory = input.appDirectory,
-                    ),
+            initialSettings = ClientSettings(
+                syncConfiguration = loggedInSelfHostedConfiguration(),
+            ),
+            selfHostedSetupClient = SelfHostedSetupClient {
+                SelfHostedSetupResult.failure(
+                    reason = SelfHostedSetupReason.Failed,
+                    diagnosticMessage = rawDiagnostic,
                 )
             },
-            webDavCredentialStore = credentialStore,
+            manualSyncRunner = {
+                ManualSyncResult.failure(
+                    mode = SyncMode.SelfHosted,
+                    reason = ManualSyncReason.AuthorityMismatch,
+                    diagnosticMessage = rawDiagnostic,
+                )
+            },
+            workspacePairingInvitationCreator = WorkspacePairingInvitationCreator {
+                WorkspacePairingInvitationResult.failure(
+                    reason = WorkspacePairingReason.Failed,
+                    diagnosticMessage = rawDiagnostic,
+                )
+            },
+            uiStrings = SettingsUiStrings(
+                selfHostedSetupFailed = "localized-setup-failure",
+                syncAuthorityMismatch = "localized-sync-authority-failure",
+                pairingInvitationFailed = "localized-pairing-failure",
+            ),
+            backgroundDispatcher = Dispatchers.Unconfined,
+            uiDispatcher = Dispatchers.Unconfined,
         )
 
         assertFalse(
-            controller.testAndSaveWebDavConnection(
-                endpoint = "",
-                username = "alice",
-                password = "super-secret",
-                appDirectory = "/someday/",
-            ),
-        )
-        assertTrue(controller.state.feedbackMessage.orEmpty().contains("endpoint is required"))
-        assertFalse(controller.state.feedbackMessage.orEmpty().contains("super-secret"))
-
-        assertTrue(
-            controller.testAndSaveWebDavConnection(
-                endpoint = "http://127.0.0.1:3182",
-                username = "alice",
-                password = "super-secret",
-                appDirectory = "someday",
-            ),
-        )
-
-        assertEquals("super-secret", testedCredential)
-        assertEquals("super-secret", credentialStore.load())
-        assertEquals(SyncMode.WebDav, persisted.syncConfiguration.mode)
-        assertEquals("http://127.0.0.1:3182", persisted.syncConfiguration.webDavEndpoint)
-        assertEquals("alice", persisted.syncConfiguration.webDavUsername)
-        assertEquals("/someday/", persisted.syncConfiguration.webDavAppDirectory)
-        assertEquals(true, persisted.syncConfiguration.webDavLastTest?.ready)
-        assertFalse(persisted.syncConfiguration.webDavLastTest?.message.orEmpty().contains("PROPFIND"))
-        assertFalse(controller.state.feedbackMessage.orEmpty().contains("super-secret"))
-        val hierarchyText = controller.state.sections
-            .flatMap { section -> listOf(section.title, section.description) + section.entryPoints }
-            .joinToString(separator = "\n")
-        assertTrue(hierarchyText.contains("Credentials: redacted"))
-        assertFalse(hierarchyText.contains("super-secret"))
-    }
-
-    @Test
-    fun webDavTestReusesSavedCredentialWhenPasswordIsBlank() = runBlocking {
-        var persisted = ClientSettings()
-        var testedCredential: String? = null
-        val credentialStore = FakeWebDavCredentialStore(initialSecret = "saved-secret")
-        val controller = SettingsUiController(
-            initialSettings = persisted,
-            persistSettings = { updated ->
-                persisted = updated
-                updated
-            },
-            webDavConnectionTester = WebDavConnectionTester { input ->
-                testedCredential = input.password
-                WebDavConnectionTestResult(
-                    success = true,
-                    status = WebDavConnectionStatus(
-                        ready = true,
-                        message = "WebDAV connection succeeded; credentials redacted.",
-                        appDirectory = input.appDirectory,
-                    ),
-                )
-            },
-            webDavCredentialStore = credentialStore,
-        )
-
-        assertTrue(
-            controller.testAndSaveWebDavConnection(
-                endpoint = "https://dav.example.com/dav/",
-                username = "alice",
-                password = "",
-                appDirectory = "someday",
-            ),
-        )
-
-        assertEquals("saved-secret", testedCredential)
-        assertEquals("saved-secret", credentialStore.load())
-        assertEquals(SyncMode.WebDav, persisted.syncConfiguration.mode)
-        assertEquals(true, persisted.syncConfiguration.webDavLastTest?.ready)
-        assertTrue(controller.state.webDavCredentialSaved)
-        assertEquals("WebDAV connection succeeded.", controller.state.feedbackMessage)
-    }
-
-    @Test
-    fun webDavSuccessfulTestDoesNotMarkReadyWhenCredentialCannotBeSaved() = runBlocking {
-        var persisted = ClientSettings()
-        var testedCredential: String? = null
-        val controller = SettingsUiController(
-            initialSettings = persisted,
-            persistSettings = { updated ->
-                persisted = updated
-                updated
-            },
-            webDavConnectionTester = WebDavConnectionTester { input ->
-                testedCredential = input.password
-                WebDavConnectionTestResult(
-                    success = true,
-                    status = WebDavConnectionStatus(
-                        ready = true,
-                        message = "WebDAV connection succeeded; credentials redacted.",
-                        appDirectory = input.appDirectory,
-                    ),
-                )
-            },
-            webDavCredentialStore = FakeWebDavCredentialStore(failOnSave = true),
-        )
-
-        assertFalse(
-            controller.testAndSaveWebDavConnection(
-                endpoint = "https://dav.example.com/dav/",
-                username = "alice",
-                password = "new-secret",
-                appDirectory = "someday",
-            ),
-        )
-
-        assertEquals("new-secret", testedCredential)
-        assertEquals(SyncMode.Off, persisted.syncConfiguration.mode)
-        assertEquals(null, persisted.syncConfiguration.webDavLastTest)
-        assertEquals(null, persisted.syncConfiguration.webDavEndpoint)
-        assertTrue(controller.state.feedbackMessage.orEmpty().contains("could not be saved locally"))
-        assertFalse(controller.state.feedbackMessage.orEmpty().contains("new-secret"))
-    }
-
-    @Test
-    fun webDavFailedTestSavesNonSecretFieldsWithoutSavingCredentialOrEnablingMode() = runBlocking {
-        var persisted = ClientSettings()
-        var testedCredential: String? = null
-        val credentialStore = FakeWebDavCredentialStore()
-        val controller = SettingsUiController(
-            initialSettings = persisted,
-            persistSettings = { updated ->
-                persisted = updated
-                updated
-            },
-            webDavConnectionTester = WebDavConnectionTester { input ->
-                testedCredential = input.password
-                WebDavConnectionTestResult(
-                    success = false,
-                    status = WebDavConnectionStatus(
-                        ready = false,
-                        message = "WebDAV connection failed: HTTP 401; credentials redacted.",
-                        appDirectory = input.appDirectory,
-                    ),
-                )
-            },
-            webDavCredentialStore = credentialStore,
-        )
-
-        assertFalse(
-            controller.testAndSaveWebDavConnection(
-                endpoint = "https://dav.example.com/dav/",
-                username = "alice",
-                password = "bad-secret",
-                appDirectory = "someday",
-            ),
-        )
-
-        assertEquals("bad-secret", testedCredential)
-        assertEquals(null, credentialStore.load())
-        assertEquals(SyncMode.Off, persisted.syncConfiguration.mode)
-        assertEquals("https://dav.example.com/dav", persisted.syncConfiguration.webDavEndpoint)
-        assertEquals("alice", persisted.syncConfiguration.webDavUsername)
-        assertEquals("/someday/", persisted.syncConfiguration.webDavAppDirectory)
-        assertEquals(false, persisted.syncConfiguration.webDavLastTest?.ready)
-        assertTrue(persisted.syncConfiguration.webDavLastTest?.message.orEmpty().contains("HTTP 401"))
-        assertFalse(controller.state.feedbackMessage.orEmpty().contains("bad-secret"))
-    }
-
-    @Test
-    fun webDavFailedTestCannotReplaceADifferentActiveAuthority() = runBlocking {
-        val activeConfiguration = SyncConfiguration(
-            mode = SyncMode.WebDav,
-            webDavEndpoint = "https://active.example.com/dav",
-            webDavUsername = "active-user",
-            webDavAppDirectory = "/active-workspace/",
-            webDavLastTest = WebDavConnectionStatus(
-                ready = true,
-                message = "WebDAV connection succeeded; credentials redacted.",
-                appDirectory = "/active-workspace/",
-            ),
-        )
-        var persisted = ClientSettings(syncConfiguration = activeConfiguration)
-        val credentialStore = FakeWebDavCredentialStore(initialSecret = "active-secret")
-        val controller = SettingsUiController(
-            initialSettings = persisted,
-            persistSettings = { updated ->
-                persisted = updated
-                updated
-            },
-            webDavConnectionTester = WebDavConnectionTester { input ->
-                WebDavConnectionTestResult(
-                    success = false,
-                    status = WebDavConnectionStatus(
-                        ready = false,
-                        message = "WebDAV connection failed: HTTP 401; credentials redacted.",
-                        appDirectory = input.appDirectory,
-                    ),
-                )
-            },
-            webDavCredentialStore = credentialStore,
-        )
-
-        assertFalse(
-            controller.testAndSaveWebDavConnection(
-                endpoint = "https://candidate.example.com/dav",
-                username = "candidate-user",
-                password = "bad-candidate-secret",
-                appDirectory = "candidate-workspace",
-            ),
-        )
-
-        assertEquals(activeConfiguration, persisted.syncConfiguration)
-        assertEquals("active-secret", credentialStore.load())
-        assertTrue(controller.state.feedbackMessage.orEmpty().contains("HTTP 401"))
-        assertFalse(controller.state.feedbackMessage.orEmpty().contains("bad-candidate-secret"))
-    }
-
-    @Test
-    fun webDavSaveClearsStaleReadinessWhenServerFieldsChange() = runBlocking {
-        var persisted = ClientSettings(
-            syncConfiguration = SyncConfiguration(
-                mode = SyncMode.WebDav,
-                webDavEndpoint = "https://dav.example.com/dav",
-                webDavUsername = "alice",
-                webDavAppDirectory = "/someday/",
-                webDavLastTest = WebDavConnectionStatus(
-                    ready = true,
-                    message = "WebDAV connection succeeded; credentials redacted.",
-                    appDirectory = "/someday/",
+            controller.setupSelfHosted(
+                SelfHostedSetupInput(
+                    endpoint = "https://sync.example.test",
+                    email = "alice@example.test",
+                    password = "redacted-password",
+                    deviceName = "Test device",
+                    platform = "test",
+                    createAccount = false,
                 ),
             ),
         )
-        val controller = SettingsUiController(
-            initialSettings = persisted,
-            persistSettings = { updated ->
-                persisted = updated
-                updated
-            },
-            webDavCredentialStore = FakeWebDavCredentialStore(initialSecret = "saved-secret"),
-        )
+        assertEquals("localized-setup-failure", controller.state.feedbackMessage)
+        assertFalse(controller.state.feedbackMessage.orEmpty().contains(rawDiagnostic))
 
-        assertTrue(
-            controller.saveWebDavConfiguration(
-                endpoint = "https://dav.example.com/dav",
-                username = "alice",
-                password = "",
-                appDirectory = "other-folder",
-            ),
-        )
+        assertFalse(controller.runManualSync())
+        assertEquals("localized-sync-authority-failure", controller.state.feedbackMessage)
+        assertEquals("localized-sync-authority-failure", controller.state.manualSyncProgress.message)
+        assertFalse(controller.state.manualSyncProgress.message.contains(rawDiagnostic))
 
-        assertEquals(SyncMode.WebDav, persisted.syncConfiguration.mode)
-        assertEquals("/other-folder/", persisted.syncConfiguration.webDavAppDirectory)
-        assertEquals(null, persisted.syncConfiguration.webDavLastTest)
-    }
-
-    @Test
-    fun webDavOperationsRequireLocalCredentialBeforeNetworkRequests() = runBlocking {
-        var testerCalled = false
-        val controller = SettingsUiController(
-            webDavConnectionTester = WebDavConnectionTester {
-                testerCalled = true
-                WebDavConnectionTestResult(
-                    success = true,
-                    status = WebDavConnectionStatus(
-                        ready = true,
-                        message = "WebDAV connection succeeded; credentials redacted.",
-                    ),
-                )
-            },
-            webDavCredentialStore = FakeWebDavCredentialStore(),
-        )
-
-        assertFalse(
-            controller.testAndSaveWebDavConnection(
-                endpoint = "https://dav.example.com/remote.php/dav/files/alice",
-                username = "alice",
-                password = "",
-                appDirectory = "/someday/",
-            ),
-        )
-
-        assertFalse(testerCalled)
-        assertTrue(controller.state.feedbackMessage.orEmpty().contains("credential"))
-        assertFalse(controller.state.feedbackMessage.orEmpty().contains("MKCOL"))
-    }
-
-    @Test
-    fun webDavBackupAndRestorePersistConfigurationAndRedactCredentials() = runBlocking {
-        var persisted = ClientSettings()
-        var backupCredential: String? = null
-        var restoreCredential: String? = null
-        var restoredBackupPath: String? = null
-        var restored = false
-        val version = WebDavBackupVersion(
-            id = "20260524T100000Z",
-            label = "Snapshot 20260524T100000Z",
-            path = "Someday/backups/20260524T100000Z.json",
-        )
-        val credentialStore = FakeWebDavCredentialStore()
-        val controller = SettingsUiController(
-            initialSettings = persisted,
-            persistSettings = { updated ->
-                persisted = updated
-                updated
-            },
-            webDavBackupRunner = WebDavBackupRunner { input ->
-                backupCredential = input.password
-                WebDavBackupResult(
-                    success = true,
-                    message = "WebDAV backup saved: 1 notebooks and 2 notes.",
-                    notebookCount = 1,
-                    noteCount = 2,
-                    version = version,
-                )
-            },
-            webDavBackupCatalogRunner = WebDavBackupCatalogRunner {
-                WebDavBackupListResult(
-                    success = true,
-                    message = "Found 1 WebDAV backup versions.",
-                    versions = listOf(version),
-                )
-            },
-            webDavRestoreRunner = WebDavRestoreRunner { input, backupPath ->
-                restoreCredential = input.password
-                restoredBackupPath = backupPath
-                WebDavRestoreResult(
-                    success = true,
-                    message = "WebDAV backup restored: 2 notes imported, 0 already present.",
-                    notebooksCreated = 1,
-                    notesCreated = 2,
-                )
-            },
-            webDavCredentialStore = credentialStore,
-            onDataRestored = { restored = true },
-        )
-
-        assertTrue(
-            controller.backupToWebDav(
-                endpoint = "https://dav.example.com/remote.php/dav/files/alice/",
-                username = "alice",
-                password = "super-secret",
-                appDirectory = "Someday",
-            ),
-        )
-        assertEquals("super-secret", backupCredential)
-        assertEquals("super-secret", credentialStore.load())
-        assertEquals(SyncMode.WebDav, persisted.syncConfiguration.mode)
-        assertEquals("https://dav.example.com/remote.php/dav/files/alice", persisted.syncConfiguration.webDavEndpoint)
-        assertEquals("alice", persisted.syncConfiguration.webDavUsername)
-        assertEquals("/Someday/", persisted.syncConfiguration.webDavAppDirectory)
-        assertEquals(true, persisted.syncConfiguration.webDavLastTest?.ready)
-        assertEquals("Snapshot 20260524T100000Z", persisted.syncConfiguration.webDavLastBackup?.versionLabel)
-        assertFalse(controller.state.feedbackMessage.orEmpty().contains("super-secret"))
-        assertTrue(controller.state.webDavBackupVersions.any { it.path == version.path })
-
-        assertTrue(
-            controller.refreshWebDavBackupVersions(
-                endpoint = "https://dav.example.com/remote.php/dav/files/alice/",
-                username = "alice",
-                password = "",
-                appDirectory = "Someday",
-            ),
-        )
-        assertEquals(listOf(version), controller.state.webDavBackupVersions)
-
-        assertTrue(
-            controller.restoreFromWebDav(
-                endpoint = "https://dav.example.com/remote.php/dav/files/alice/",
-                username = "alice",
-                password = "",
-                appDirectory = "Someday",
-                backupPath = version.path,
-            ),
-        )
-        assertEquals("super-secret", restoreCredential)
-        assertEquals(version.path, restoredBackupPath)
-        assertTrue(restored)
-        assertFalse(controller.state.feedbackMessage.orEmpty().contains("super-secret"))
-
-        assertTrue(controller.clearWebDavCredential())
-        assertEquals(null, credentialStore.load())
+        assertFalse(controller.createWorkspacePairingInvitation())
+        assertEquals("localized-pairing-failure", controller.state.feedbackMessage)
+        assertFalse(controller.state.feedbackMessage.orEmpty().contains(rawDiagnostic))
     }
 
     @Test
@@ -818,14 +445,8 @@ class SettingsUiControllerTest {
         lateinit var controller: SettingsUiController
         controller = SettingsUiController(
             initialSettings = ClientSettings(
-                syncConfiguration = SyncConfiguration(
-                    mode = SyncMode.WebDav,
-                    webDavEndpoint = "https://dav.example.com/remote.php/dav/files/alice",
-                    webDavUsername = "alice",
-                    webDavAppDirectory = "/someday/",
-                ),
+                syncConfiguration = loggedInSelfHostedConfiguration(),
             ),
-            webDavCredentialStore = FakeWebDavCredentialStore(initialSecret = "saved-secret"),
             manualSyncRunner = {
                 initialMessage = controller.state.manualSyncProgress.message
                 checkNotNull(progressListener).onProgress(
@@ -833,15 +454,16 @@ class SettingsUiControllerTest {
                 )
                 chunkMessage = controller.state.manualSyncProgress.message
                 ManualSyncResult.success(
-                    mode = SyncMode.WebDav,
+                    mode = SyncMode.SelfHosted,
                     pushedObjects = 0,
                     pulledObjects = 0,
                     conflicts = 0,
-                    message = "done",
+                    diagnosticMessage = "raw completion diagnostic",
                 )
             },
             bindManualSyncProgressListener = { progressListener = it },
             uiStrings = SettingsUiStrings(
+                syncReady = "同步已就绪。",
                 syncInProgress = "正在同步更改。",
                 syncUploadingCheckpointChunks = "正在上传快照（%1\$s/%2\$s）。",
             ),
@@ -850,6 +472,7 @@ class SettingsUiControllerTest {
         )
         controller.refresh()
 
+        assertEquals("同步已就绪。", controller.state.manualSyncProgress.message)
         assertTrue(controller.runManualSync())
 
         assertEquals("正在同步更改。", initialMessage)
@@ -858,14 +481,9 @@ class SettingsUiControllerTest {
     }
 
     @Test
-    fun webDavModeRunsManualSyncWithSavedCredentialAndRefreshesPulledData() = runBlocking {
+    fun selfHostedModeRunsManualSyncAndRefreshesPulledData() = runBlocking {
         var persisted = ClientSettings(
-            syncConfiguration = SyncConfiguration(
-                mode = SyncMode.WebDav,
-                webDavEndpoint = "https://dav.example.com/remote.php/dav/files/alice",
-                webDavUsername = "alice",
-                webDavAppDirectory = "/someday/",
-            ),
+            syncConfiguration = loggedInSelfHostedConfiguration(),
         )
         var syncCalled = false
         var restored = false
@@ -875,15 +493,14 @@ class SettingsUiControllerTest {
                 persisted = updated
                 updated
             },
-            webDavCredentialStore = FakeWebDavCredentialStore(initialSecret = "saved-secret"),
             manualSyncRunner = {
                 syncCalled = true
                 ManualSyncResult.success(
-                    mode = SyncMode.WebDav,
+                    mode = SyncMode.SelfHosted,
                     pushedObjects = 3,
                     pulledObjects = 2,
                     conflicts = 0,
-                    message = "WebDAV sync complete: pushed 3, pulled 2, conflicts 0.",
+                    diagnosticMessage = "raw self-hosted completion diagnostic",
                 )
             },
             onDataRestored = { restored = true },
@@ -898,97 +515,7 @@ class SettingsUiControllerTest {
         assertEquals(3, controller.state.manualSyncProgress.pushedObjects)
         assertEquals(2, controller.state.manualSyncProgress.pulledObjects)
         assertEquals(null, persisted.syncConfiguration.lastError)
-        assertFalse(controller.state.feedbackMessage.orEmpty().contains("saved-secret"))
-    }
-
-    @Test
-    fun v2EpochAndRepairMaintenanceUseTheConnectedRuntime() = runBlocking {
-        var rollCalls = 0
-        var repairCalls = 0
-        val controller = SettingsUiController(
-            initialSettings = ClientSettings(
-                syncConfiguration = SyncConfiguration(
-                    mode = SyncMode.WebDav,
-                    webDavEndpoint = "https://dav.example.com/remote.php/dav/files/alice",
-                    webDavUsername = "alice",
-                ),
-            ),
-            webDavCredentialStore = FakeWebDavCredentialStore(initialSecret = "saved-secret"),
-            syncV2MaintenanceRunner = object : SyncV2MaintenanceRunner {
-                override fun rollEpoch(): ManualSyncResult {
-                    rollCalls += 1
-                    return ManualSyncResult.success(
-                        mode = SyncMode.WebDav,
-                        pushedObjects = 2,
-                        pulledObjects = 0,
-                        conflicts = 0,
-                        message = "Epoch rolled.",
-                    )
-                }
-
-                override fun repairIntegrity(): ManualSyncResult {
-                    repairCalls += 1
-                    return ManualSyncResult.success(
-                        mode = SyncMode.WebDav,
-                        pushedObjects = 0,
-                        pulledObjects = 1,
-                        conflicts = 0,
-                        message = "Integrity repaired.",
-                    )
-                }
-            },
-        )
-
-        controller.refresh()
-        assertTrue(controller.rollSyncV2Epoch())
-        assertTrue(controller.repairSyncV2Integrity())
-
-        assertEquals(1, rollCalls)
-        assertEquals(1, repairCalls)
-        assertEquals(1, controller.state.manualSyncProgress.pulledObjects)
-        assertEquals("Integrity repaired.", controller.state.feedbackMessage)
-    }
-
-    @Test
-    fun manualSyncPersistsAndClearsMachineReadableErrorCode() = runBlocking {
-        var persisted = ClientSettings(
-            syncConfiguration = SyncConfiguration(
-                mode = SyncMode.WebDav,
-                webDavEndpoint = "https://dav.example.com/remote.php/dav/files/alice",
-                webDavUsername = "alice",
-                webDavAppDirectory = "/someday/",
-            ),
-        )
-        var nextResult = ManualSyncResult.failure(
-            mode = SyncMode.WebDav,
-            message = "WebDAV sync cannot decrypt remote Someday data; credentials redacted.",
-            errorCode = SyncErrorCode.WebDavWorkspaceKeyMismatch,
-        )
-        val controller = SettingsUiController(
-            initialSettings = persisted,
-            persistSettings = { updated ->
-                persisted = updated
-                updated
-            },
-            webDavCredentialStore = FakeWebDavCredentialStore(initialSecret = "saved-secret"),
-            manualSyncRunner = { nextResult },
-        )
-        controller.refresh()
-
-        assertFalse(controller.runManualSync())
-        assertEquals(SyncErrorCode.WebDavWorkspaceKeyMismatch, persisted.syncConfiguration.lastErrorCode)
-
-        nextResult = ManualSyncResult.success(
-            mode = SyncMode.WebDav,
-            pushedObjects = 0,
-            pulledObjects = 0,
-            conflicts = 0,
-            message = "WebDAV sync complete: pushed 0, pulled 0, conflicts 0.",
-        )
-
-        assertTrue(controller.runManualSync())
-        assertEquals(null, persisted.syncConfiguration.lastError)
-        assertEquals(null, persisted.syncConfiguration.lastErrorCode)
+        assertFalse(controller.state.feedbackMessage.orEmpty().contains("session-token"))
     }
 
     @Test
@@ -996,21 +523,16 @@ class SettingsUiControllerTest {
         var refreshed = false
         val controller = SettingsUiController(
             initialSettings = ClientSettings(
-                syncConfiguration = SyncConfiguration(
-                    mode = SyncMode.WebDav,
-                    webDavEndpoint = "https://dav.example.com/remote.php/dav/files/alice",
-                    webDavUsername = "alice",
-                    webDavAppDirectory = "/someday/",
-                ),
+                syncConfiguration = loggedInSelfHostedConfiguration(),
             ),
-            webDavCredentialStore = FakeWebDavCredentialStore(initialSecret = "saved-secret"),
             manualSyncRunner = {
                 ManualSyncResult.failure(
-                    mode = SyncMode.WebDav,
+                    mode = SyncMode.SelfHosted,
+                    reason = ManualSyncReason.Blocked,
                     pushedObjects = 0,
                     pulledObjects = 1,
                     conflicts = 1,
-                    message = "WebDAV sync finished with conflicts: pushed 0, pulled 1, conflicts 1.",
+                    diagnosticMessage = "raw conflict diagnostic",
                 )
             },
             onDataRestored = { refreshed = true },
@@ -1028,21 +550,15 @@ class SettingsUiControllerTest {
         var refreshed = false
         val controller = SettingsUiController(
             initialSettings = ClientSettings(
-                syncConfiguration = SyncConfiguration(
-                    mode = SyncMode.WebDav,
-                    webDavEndpoint = "https://dav.example.com/remote.php/dav/files/alice",
-                    webDavUsername = "alice",
-                    webDavAppDirectory = "/someday/",
-                ),
+                syncConfiguration = loggedInSelfHostedConfiguration(),
             ),
-            webDavCredentialStore = FakeWebDavCredentialStore(initialSecret = "saved-secret"),
             manualSyncRunner = {
                 ManualSyncResult.success(
-                    mode = SyncMode.WebDav,
+                    mode = SyncMode.SelfHosted,
                     pushedObjects = 0,
                     pulledObjects = 0,
                     conflicts = 0,
-                    message = "Whole-product Sync V2 is active; checkpoint, local imports, and first synchronization completed.",
+                    diagnosticMessage = "raw bootstrap completion diagnostic",
                 )
             },
             onDataRestored = { refreshed = true },
@@ -1059,12 +575,7 @@ class SettingsUiControllerTest {
     @Test
     fun automaticSyncRefreshesLocalStateAfterPushWithoutConfigurationToasts() = runBlocking {
         var persisted = ClientSettings(
-            syncConfiguration = SyncConfiguration(
-                mode = SyncMode.WebDav,
-                webDavEndpoint = "https://dav.example.com/remote.php/dav/files/alice",
-                webDavUsername = "alice",
-                webDavAppDirectory = "/someday/",
-            ),
+            syncConfiguration = loggedInSelfHostedConfiguration(),
         )
         var syncCalls = 0
         var refreshed = false
@@ -1074,15 +585,14 @@ class SettingsUiControllerTest {
                 persisted = updated
                 updated
             },
-            webDavCredentialStore = FakeWebDavCredentialStore(initialSecret = "saved-secret"),
             manualSyncRunner = {
                 syncCalls += 1
                 ManualSyncResult.success(
-                    mode = SyncMode.WebDav,
+                    mode = SyncMode.SelfHosted,
                     pushedObjects = 1,
                     pulledObjects = 0,
                     conflicts = 0,
-                    message = "WebDAV sync complete: pushed 1, pulled 0, conflicts 0.",
+                    diagnosticMessage = "raw automatic sync diagnostic",
                 )
             },
             onDataRestored = { refreshed = true },
@@ -1115,7 +625,7 @@ class SettingsUiControllerTest {
                     pushedObjects = 0,
                     pulledObjects = 0,
                     conflicts = 0,
-                    message = "Unexpected sync.",
+                    diagnosticMessage = "unexpected sync diagnostic",
                 )
             },
         )
@@ -1134,7 +644,7 @@ class SettingsUiControllerTest {
             pushedObjects = 2,
             pulledObjects = 1,
             conflicts = 0,
-            message = "Self-hosted sync succeeded.",
+            diagnosticMessage = "raw self-hosted success diagnostic",
         )
         val controller = SettingsUiController(
             initialSettings = persisted,
@@ -1144,12 +654,16 @@ class SettingsUiControllerTest {
             },
             selfHostedSetupClient = SelfHostedSetupClient { input ->
                 if (input.password == "bad-password") {
-                    SelfHostedSetupResult.failure("Self-hosted login failed: invalid credentials; password redacted.")
+                    SelfHostedSetupResult.failure(
+                        reason = SelfHostedSetupReason.Failed,
+                        diagnosticMessage = "Self-hosted login failed: invalid credentials; password redacted.",
+                    )
                 } else {
                     SelfHostedSetupResult.success(
                         status = SelfHostedSetupStatus(
                             ready = true,
-                            message = "Self-hosted account and device registered; password redacted.",
+                            reason = SelfHostedSetupReason.Ready,
+                            diagnosticMessage = "Self-hosted account and device registered; password redacted.",
                         ),
                         session = SelfHostedSessionSummary(
                             loggedIn = true,
@@ -1193,7 +707,8 @@ class SettingsUiControllerTest {
                 ),
             ),
         )
-        assertTrue(controller.state.feedbackMessage.orEmpty().contains("invalid credentials"))
+        assertEquals("Self-hosted setup failed safely.", controller.state.feedbackMessage)
+        assertFalse(controller.state.feedbackMessage.orEmpty().contains("invalid credentials"))
         assertFalse(controller.state.feedbackMessage.orEmpty().contains("bad-password"))
 
         assertTrue(
@@ -1226,22 +741,71 @@ class SettingsUiControllerTest {
         assertTrue(controller.beginManualSync())
         assertTrue(controller.state.manualSyncProgress.running)
         assertTrue(controller.state.manualSyncProgress.message.contains("Syncing"))
+        assertFalse(controller.beginManualSync())
+        assertTrue(controller.state.manualSyncProgress.running)
 
         assertTrue(controller.completeManualSync(nextManualSyncResult))
         assertFalse(controller.state.manualSyncProgress.running)
-        assertTrue(controller.state.manualSyncProgress.message.contains("succeeded"))
+        assertTrue(controller.state.manualSyncProgress.message.contains("Sync complete"))
+        assertFalse(controller.state.manualSyncProgress.message.contains("raw self-hosted"))
         assertEquals(2, controller.state.manualSyncProgress.pushedObjects)
         assertEquals(1, controller.state.manualSyncProgress.pulledObjects)
         assertEquals(null, persisted.syncConfiguration.lastError)
 
         nextManualSyncResult = ManualSyncResult.failure(
             mode = SyncMode.SelfHosted,
-            message = "Self-hosted sync failed safely: HTTP 503; retryable.",
+            reason = ManualSyncReason.Failed,
+            diagnosticMessage = "Self-hosted sync failed safely: HTTP 503; retryable.",
         )
         assertFalse(controller.runManualSync())
         assertFalse(controller.state.manualSyncProgress.running)
         assertTrue(controller.state.manualSyncProgress.message.contains("failed"))
-        assertTrue(persisted.syncConfiguration.lastError.orEmpty().contains("HTTP 503"))
+        assertEquals("sync:Failed", persisted.syncConfiguration.lastError)
+    }
+
+    @Test
+    fun failedSelfHostedReplacementPreservesTheBoundEndpointDeviceAndSession() = runBlocking {
+        val originalConfiguration = loggedInSelfHostedConfiguration()
+        var persisted = ClientSettings(
+            activeDeviceId = "device-123",
+            syncConfiguration = originalConfiguration,
+        )
+        val controller = SettingsUiController(
+            initialSettings = persisted,
+            persistSettings = { updated ->
+                persisted = updated
+                updated
+            },
+            selfHostedSetupClient = SelfHostedSetupClient {
+                SelfHostedSetupResult.failure(
+                    reason = SelfHostedSetupReason.AccountChangeBlocked,
+                    diagnosticMessage = "raw-bound-replacement-diagnostic",
+                )
+            },
+        )
+
+        assertFalse(
+            controller.setupSelfHosted(
+                SelfHostedSetupInput(
+                    endpoint = "https://other.example.com",
+                    email = "other@example.com",
+                    password = "another-password",
+                    deviceName = "Replacement device",
+                    platform = "desktop",
+                    createAccount = false,
+                ),
+            ),
+        )
+
+        assertEquals("device-123", persisted.activeDeviceId)
+        assertEquals(originalConfiguration.selfHostedEndpoint, persisted.syncConfiguration.selfHostedEndpoint)
+        assertEquals(originalConfiguration.selfHostedSession, persisted.syncConfiguration.selfHostedSession)
+        assertEquals("setup:AccountChangeBlocked", persisted.syncConfiguration.lastError)
+        assertEquals(
+            "This workspace is already bound to an account; sign in to that account instead.",
+            controller.state.feedbackMessage,
+        )
+        assertFalse(controller.state.feedbackMessage.orEmpty().contains("raw-bound-replacement"))
     }
 
     @Test
@@ -1275,38 +839,18 @@ class SettingsUiControllerTest {
     }
 }
 
-private class FakeWebDavCredentialStore(
-    initialSecret: String? = null,
-    private val failOnSave: Boolean = false,
-) : WebDavCredentialStore {
-    private var secret: String? = initialSecret
-    private val authorityCredentials = mutableMapOf<String, WebDavAuthorityCredentials>()
-
-    override fun load(): String? = secret
-
-    override fun save(secret: String) {
-        require(secret.isNotBlank())
-        check(!failOnSave) { "secure store locked" }
-        this.secret = secret
-    }
-
-    override fun clear() {
-        secret = null
-        authorityCredentials.clear()
-    }
-
-    override fun loadForAuthority(authorityBindingId: String): WebDavAuthorityCredentials? =
-        authorityCredentials[authorityBindingId]
-
-    override fun saveForAuthority(credentials: WebDavAuthorityCredentials) {
-        check(!failOnSave) { "secure store locked" }
-        authorityCredentials[credentials.authorityBindingId] = credentials
-    }
-
-    override fun clearAuthority(authorityBindingId: String) {
-        authorityCredentials.remove(authorityBindingId)
-    }
-}
+private fun loggedInSelfHostedConfiguration(): SyncConfiguration =
+    SyncConfiguration(
+        mode = SyncMode.SelfHosted,
+        selfHostedEndpoint = "https://sync.example.com",
+        selfHostedSession = SelfHostedSessionSummary(
+            loggedIn = true,
+            userEmail = "alice@example.com",
+            deviceId = "device-123",
+            deviceName = "Test device",
+            devicePlatform = "desktop",
+        ),
+    )
 
 private class FakeSelfHostedSessionCredentialStore(
     private val failOnClear: Boolean = false,

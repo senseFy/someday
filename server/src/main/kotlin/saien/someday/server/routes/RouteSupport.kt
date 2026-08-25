@@ -271,8 +271,8 @@ suspend fun ApplicationCall.requireAuthenticationRateLimit(
 
 private const val MAX_CLIENT_ADDRESS_LENGTH = 128
 
-suspend fun ApplicationCall.requireSyncV2RateLimit(context: ServerContext, deviceId: UUID): Boolean {
-    if (context.syncV2RateLimiter.allow("sync-v2:$deviceId")) {
+suspend fun ApplicationCall.requireSystemV3RateLimit(context: ServerContext, deviceId: UUID): Boolean {
+    if (context.systemV3RateLimiter.allow("system-v3:$deviceId")) {
         return true
     }
     respondError(HttpStatusCode.TooManyRequests, "rate_limited")

@@ -10,6 +10,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.LocaleList
 import android.os.SystemClock
+import android.provider.OpenableColumns
 import android.util.Log
 import android.view.View
 import android.view.Window
@@ -29,22 +30,41 @@ import saien.someday.domain.settings.AppLanguage
 import saien.someday.domain.settings.ClientSettings
 import saien.someday.domain.settings.ClientTheme
 import saien.someday.domain.settings.WorkspacePreferencesConflictResolver
+import saien.someday.domain.media.MediaAssetId
+import saien.someday.domain.media.isSafeOriginalFileName
+import saien.someday.data.media.MediaAssetImportRequest
+import saien.someday.data.media.MediaAssetLocalState
+import saien.someday.data.media.MediaAssetVerificationResult
+import saien.someday.sync.AuthorityCoordinatedMediaAssetStore
 import saien.someday.ui.SomedayApp
 import saien.someday.ui.SomedayBootstrapScreen
 import saien.someday.ui.i18n.applyAppLanguageTag
+import saien.someday.ui.media.MAX_MEDIA_PREVIEW_BYTE_COUNT
+import saien.someday.ui.media.MediaImportRunner
+import saien.someday.ui.media.MediaImportUiResult
+import saien.someday.ui.media.MediaMaterializationRunner
+import saien.someday.ui.media.MediaMaterializationUiResult
+import saien.someday.ui.media.MediaPreviewLoader
+import saien.someday.ui.media.MediaPreviewUiResult
+import saien.someday.ui.media.MediaUiFailureReason
+import saien.someday.ui.media.MediaUiPorts
 import saien.someday.ui.settings.DayOneImportRunner
 import saien.someday.ui.settings.SettingsImportSummary
 import saien.someday.ui.settings.WorkspacePairingScanner
 import java.util.Locale
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okio.buffer
+import okio.source
 
 class MainActivity : ComponentActivity() {
-    private val clientRepositories by lazy { createAndroidClientRepositories(applicationContext) }
+    private val clientRepositories: AndroidClientRepositories
+        get() = (application as SomedayApplication).clientRepositories
     private var hasDeliveredInitialResume = false
     private var foregroundSyncSignal by mutableIntStateOf(0)
     private var pendingOpenMemories by mutableStateOf(false)
     private var pendingDayOneImportCallback: ((SettingsImportSummary) -> Unit)? = null
+    private var pendingMediaImportCallback: ((MediaImportUiResult) -> Unit)? = null
     private var pendingPairingScanResult: ((String) -> Unit)? = null
     private var pendingPairingScanCancelled: (() -> Unit)? = null
     private val notificationPermissionBridge = AndroidNotificationPermissionBridge()
@@ -118,6 +138,42 @@ class MainActivity : ComponentActivity() {
                 )
             }
             runOnUiThread { callback(summary) }
+        }.start()
+    }
+    private val mediaImportLauncher = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        val callback = pendingMediaImportCallback ?: return@registerForActivityResult
+        pendingMediaImportCallback = null
+        if (uri == null) {
+            callback(MediaImportUiResult.Cancelled)
+            return@registerForActivityResult
+        }
+        Thread {
+            val result = runCatching {
+                val fileName = contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+                    ?.use { cursor ->
+                        if (cursor.moveToFirst()) cursor.getString(0) else null
+                    }
+                    ?.takeIf(::isSafeOriginalFileName)
+                val imported = contentResolver.openInputStream(uri)?.use { input ->
+                    input.source().use { source ->
+                        clientRepositories.localMediaAssetStore.importAsset(
+                            source = source,
+                            request = MediaAssetImportRequest(
+                                originalFileName = fileName,
+                                maxBytes = MAX_MEDIA_PREVIEW_BYTE_COUNT.toLong(),
+                                maxDecodedPixelCount = MAX_MEDIA_PREVIEW_PIXEL_COUNT,
+                            ),
+                        )
+                    }
+                } ?: error("The selected image could not be read.")
+                MediaImportUiResult.Imported(
+                    assetId = imported.asset.metadata.id,
+                    suggestedAltText = fileName?.substringBeforeLast('.')?.take(120).orEmpty(),
+                )
+            }.getOrElse {
+                MediaImportUiResult.Failed(MediaUiFailureReason.ImportFailed)
+            }
+            runOnUiThread { callback(result) }
         }.start()
     }
 
@@ -194,7 +250,6 @@ class MainActivity : ComponentActivity() {
             SomedayApp(
                 platformName = AndroidShellEntrypoint.platformName,
                 developerOptionsEnabled = BuildConfig.DEBUG,
-                systemV2ActivationEnabled = BuildConfig.SOMEDAY_SYSTEM_V2_RELEASE_ENABLED || BuildConfig.DEBUG,
                 initialSettings = loaded.initialSettings,
                 notesRepository = loaded.repositories.notesRepository,
                 locationCaptureAdapter = AndroidLocationCaptureAdapter(this),
@@ -221,21 +276,40 @@ class MainActivity : ComponentActivity() {
                         ),
                     )
                 },
-                webDavConnectionTester = loaded.repositories.webDavBackupService,
-                webDavCredentialStore = loaded.repositories.webDavCredentialStore,
-                webDavBackupRunner = loaded.repositories.webDavBackupService,
-                webDavBackupCatalogRunner = loaded.repositories.webDavBackupService,
-                webDavRestoreRunner = loaded.repositories.webDavBackupService,
+                mediaUiPorts = remember(loaded.repositories) {
+                    MediaUiPorts(
+                        importRunner = MediaImportRunner { _, onResult ->
+                            pendingMediaImportCallback = onResult
+                            mediaImportLauncher.launch(arrayOf("image/jpeg", "image/png", "image/webp"))
+                        },
+                        previewLoader = MediaPreviewLoader { assetId ->
+                            withContext(Dispatchers.IO) {
+                                loaded.repositories.localMediaAssetStore.loadBoundedPreview(assetId)
+                            }
+                        },
+                        materializationRunner = MediaMaterializationRunner { assetId, onResult ->
+                            Thread {
+                                val result = runCatching {
+                                    loaded.repositories.mediaCoordinator.materialize(assetId)
+                                    MediaMaterializationUiResult.Materialized
+                                }.getOrElse {
+                                    MediaMaterializationUiResult.Failed(
+                                        MediaUiFailureReason.MaterializationFailed,
+                                    )
+                                }
+                                runOnUiThread { onResult(result) }
+                            }.start()
+                        },
+                    )
+                },
                 selfHostedSetupClient = loaded.repositories.selfHostedSetupClient,
                 selfHostedSessionCredentialStore = loaded.repositories.selfHostedSessionCredentialStore,
                 manualSyncRunner = loaded.repositories.manualSyncRunner,
                 bindManualSyncProgressListener = loaded.repositories.bindManualSyncProgressListener,
-                syncV2MaintenanceRunner = loaded.repositories.syncV2MaintenanceRunner,
                 workspacePairingInvitationCreator = loaded.repositories.workspacePairingInvitationCreator,
                 workspacePairingInvitationJoiner = loaded.repositories.workspacePairingInvitationJoiner,
                 workspacePairingInvitationCanceller = loaded.repositories.workspacePairingInvitationCanceller,
                 workspacePairingScanner = workspacePairingScanner,
-                webDavDiscoveredDevicesRunner = loaded.repositories.webDavDiscoveredDevicesRunner,
                 foregroundSyncSignal = foregroundSyncSignal,
                 startupTrace = traceMark,
             )
@@ -270,6 +344,38 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+private fun AuthorityCoordinatedMediaAssetStore.loadBoundedPreview(assetId: MediaAssetId): MediaPreviewUiResult {
+    val asset = getAsset(assetId) ?: return MediaPreviewUiResult.Missing
+    when (asset.localState) {
+        MediaAssetLocalState.Missing -> return MediaPreviewUiResult.Missing
+        MediaAssetLocalState.Corrupt -> return MediaPreviewUiResult.Missing
+        MediaAssetLocalState.Available -> Unit
+    }
+    if (asset.metadata.byteSize > MAX_MEDIA_PREVIEW_BYTE_COUNT ||
+        asset.metadata.decodedPixelCount > MAX_MEDIA_PREVIEW_PIXEL_COUNT
+    ) {
+        return MediaPreviewUiResult.Failed(MediaUiFailureReason.PreviewTooLarge)
+    }
+    when (runCatching { verifyAsset(assetId) }.getOrElse {
+        return MediaPreviewUiResult.Failed(MediaUiFailureReason.PreviewLoadFailed)
+    }) {
+        is MediaAssetVerificationResult.Verified -> Unit
+        is MediaAssetVerificationResult.Missing,
+        is MediaAssetVerificationResult.Corrupt,
+        -> return MediaPreviewUiResult.Missing
+    }
+    return runCatching {
+        val bytes = openSource(assetId).buffer().use { it.readByteArray() }
+        MediaPreviewUiResult.Loaded(bytes)
+    }.getOrElse {
+        if (getAsset(assetId)?.localState == MediaAssetLocalState.Available) {
+            MediaPreviewUiResult.Failed(MediaUiFailureReason.PreviewLoadFailed)
+        } else {
+            MediaPreviewUiResult.Missing
+        }
+    }
+}
+
 private fun Intent.consumeOpenMemoriesRequest(): Boolean =
     getBooleanExtra(OnThisDayNotificationContract.ExtraOpenMemories, false).also { requested ->
         if (requested) {
@@ -284,6 +390,7 @@ private data class AndroidAppBootstrap(
 
 private const val SomedayLightSystemBarColor = 0xFFFAFBFC.toInt()
 private const val SomedayDarkSystemBarColor = 0xFF111315.toInt()
+private const val MAX_MEDIA_PREVIEW_PIXEL_COUNT = 12_000_000L
 private const val StatePendingOpenMemories = "saien.someday.app.state.PENDING_OPEN_MEMORIES"
 
 private fun ClientTheme.isDarkTheme(systemDark: Boolean): Boolean =

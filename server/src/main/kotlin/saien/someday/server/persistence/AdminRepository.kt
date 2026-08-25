@@ -191,11 +191,9 @@ class AdminRepository(
         connection().use { connection ->
             val totals = connection.prepareStatement(
                 """
-                SELECT COUNT(DISTINCT (o.user_id, o.epoch_id, o.object_id)) AS encrypted_objects,
-                       COALESCE(SUM(octet_length(r.encrypted_object_json)), 0) AS encrypted_bytes
+                SELECT COUNT(*) AS encrypted_objects,
+                       COALESCE(SUM(octet_length(o.encrypted_object_json)), 0) AS encrypted_bytes
                 FROM someday_sync_v2_objects o
-                LEFT JOIN someday_sync_v2_object_replicas r
-                  ON r.user_id = o.user_id AND r.epoch_id = o.epoch_id AND r.object_id = o.object_id
                 """.trimIndent(),
             ).use { statement ->
                 statement.executeQuery().use { result ->
@@ -466,12 +464,10 @@ class AdminRepository(
         connection.prepareStatement(
             """
             SELECT o.object_type,
-                   COUNT(DISTINCT (o.user_id, o.epoch_id, o.object_id)) AS objects,
-                   COALESCE(SUM(octet_length(r.encrypted_object_json)), 0) AS encrypted_bytes,
+                   COUNT(*) AS objects,
+                   COALESCE(SUM(octet_length(o.encrypted_object_json)), 0) AS encrypted_bytes,
                    MAX(o.cursor) AS latest_cursor
             FROM someday_sync_v2_objects o
-            LEFT JOIN someday_sync_v2_object_replicas r
-              ON r.user_id = o.user_id AND r.epoch_id = o.epoch_id AND r.object_id = o.object_id
             GROUP BY o.object_type
             ORDER BY o.object_type
             """.trimIndent(),
@@ -497,12 +493,10 @@ class AdminRepository(
             """
             SELECT u.id AS user_id,
                    u.email,
-                   COUNT(DISTINCT (o.epoch_id, o.object_id)) AS objects,
-                   COALESCE(SUM(octet_length(r.encrypted_object_json)), 0) AS encrypted_bytes
+                   COUNT(DISTINCT (o.workspace_id, o.epoch_id, o.object_id)) AS objects,
+                   COALESCE(SUM(octet_length(o.encrypted_object_json)), 0) AS encrypted_bytes
             FROM someday_users u
             LEFT JOIN someday_sync_v2_objects o ON o.user_id = u.id
-            LEFT JOIN someday_sync_v2_object_replicas r
-              ON r.user_id = o.user_id AND r.epoch_id = o.epoch_id AND r.object_id = o.object_id
             GROUP BY u.id
             ORDER BY objects DESC, u.email
             """.trimIndent(),
@@ -545,7 +539,14 @@ class AdminRepository(
         }
 
     private fun connection(): Connection =
-        DriverManager.getConnection(config.databaseUrl, config.databaseUser, config.databasePassword)
+        DriverManager.getConnection(config.databaseUrl, config.databaseUser, config.databasePassword).also { connection ->
+            connection.prepareStatement("SELECT set_config('someday.user_id', '*', false)").use { statement ->
+                statement.execute()
+            }
+            connection.prepareStatement("SELECT set_config('someday.workspace_id', '*', false)").use { statement ->
+                statement.execute()
+            }
+        }
 
     private fun ResultSet.toAdminUserSummary(): AdminUserSummary =
         AdminUserSummary(

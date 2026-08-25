@@ -5,10 +5,10 @@ package saien.someday.sync.causality.v2
 import saien.someday.data.crypto.WorkspaceMasterKey
 import saien.someday.data.local.SqlDelightLocalDataRepository
 import saien.someday.data.settings.ClientSettingsRepository
+import saien.someday.domain.settings.ManualSyncReason
 import saien.someday.domain.settings.ManualSyncResult
 import saien.someday.domain.settings.ManualSyncRunner
 import saien.someday.domain.settings.SyncMode
-import saien.someday.domain.settings.SyncV2MaintenanceRunner
 import saien.someday.sync.WorkspaceAuthorityMutationCoordinator
 import kotlin.time.Clock
 import kotlin.time.Instant
@@ -17,13 +17,8 @@ fun interface SyncRemoteTransportFactoryV2 {
     fun create(): WorkspaceSyncRemoteV2
 }
 
-/** Opens the original authority for retained-epoch late-writer monitoring. */
-fun interface RetainedEpochRemoteProviderV2 {
-    fun open(epoch: StoredSyncEpochV2): WorkspaceSyncRemoteV2?
-}
-
 /**
- * Product boundary for System V2 (DAG + epoch). This is the only sync start point.
+ * Internal entity-DAG runtime embedded by the product-facing System V3 coordinator.
  *
  * Local product rows feed a one-time genesis checkpoint when no epoch exists.
  */
@@ -34,26 +29,25 @@ class SyncV2RuntimeService(
     private val workspaceKeyProvider: () -> WorkspaceMasterKey?,
     private val writerDeviceIdProvider: () -> String,
     private val transportFactory: SyncRemoteTransportFactoryV2,
-    private val retainedEpochRemoteProvider: RetainedEpochRemoteProviderV2 =
-        RetainedEpochRemoteProviderV2 { null },
-    private val activationEnabled: Boolean,
     private val authorityMutationCoordinator: WorkspaceAuthorityMutationCoordinator,
     private val clock: () -> Instant = { Clock.System.now() },
     private val onPublishProgress: (WorkspaceCheckpointPublishProgressV2) -> Unit = {},
-) : ManualSyncRunner, SyncV2MaintenanceRunner {
+    /** Required product boundary; System V3 supplies its media reachability gate. */
+    private val beforeEntityPublication: (List<WorkspaceEntityVersionV2>) -> Unit,
+) : ManualSyncRunner {
     private val protocolStore = SqlDelightSyncProtocolStoreV2(localRepository.database)
-    private val epochRetention = WorkspaceEpochRetentionServiceV2(localRepository, protocolStore)
+    private val checkpointDraftCleanup = WorkspaceCheckpointDraftCleanupServiceV2(localRepository, protocolStore)
 
     override fun run(): ManualSyncResult {
         val configured = settingsRepository.load().syncConfiguration
         if (configured.mode != mode) {
-            return ManualSyncResult.failure(mode, "The selected sync provider changed before this run started.")
+            return ManualSyncResult.failure(mode, ManualSyncReason.ProviderChanged)
         }
         val authority = protocolStore.loadAuthoritativeEpoch()
         if (authority != null && authority.remoteProfile != mode.remoteProfileV2()) {
             return ManualSyncResult.failure(
-                mode,
-                "The selected provider is not the authenticated V2 authority. Use explicit remote migration; ordinary sync cannot change authority.",
+                mode = mode,
+                reason = ManualSyncReason.AuthorityMismatch,
             )
         }
         if (authority == null) {
@@ -63,8 +57,8 @@ class SyncV2RuntimeService(
                     initializeWorkspace()
                 } else if (authorityAfterLock.remoteProfile != mode.remoteProfileV2()) {
                     ManualSyncResult.failure(
-                        mode,
-                        "The selected provider is not the authenticated V2 authority. Use explicit remote migration; ordinary sync cannot change authority.",
+                        mode = mode,
+                        reason = ManualSyncReason.AuthorityMismatch,
                     )
                 } else {
                     runV2()
@@ -75,17 +69,12 @@ class SyncV2RuntimeService(
     }
 
     private fun initializeWorkspace(): ManualSyncResult {
-        if (!activationEnabled) {
-            return failedInitialization(
-                "Sync V2 is release-disabled in this build configuration; no first epoch was published.",
-            )
-        }
         val configured = settingsRepository.load()
         if (configured.syncConfiguration.mode != mode) {
-            return failedInitialization("Select $mode before running sync.")
+            return failedInitialization(reason = ManualSyncReason.ProviderChanged)
         }
         val workspaceKey = workspaceKeyProvider()
-            ?: return failedInitialization("Unlock the workspace before running sync.")
+            ?: return failedInitialization(reason = ManualSyncReason.WorkspaceLocked)
         val writerDeviceId = normalizedWriterIdOrFailure()
             .getOrElse { return failedInitialization(it.safeRuntimeMessage()) }
         val remote = createRemoteOrFailure()
@@ -93,7 +82,7 @@ class SyncV2RuntimeService(
         val capabilities = runCatching(remote::capabilities)
             .getOrElse { return failedInitialization(it.safeRuntimeMessage()) }
         capabilities.incompatibility()?.let { code ->
-            return failedInitialization("Remote V2 capabilities are incompatible ($code).")
+            return failedInitialization("Remote entity-sync capabilities are incompatible ($code).")
         }
 
         // Already on an active local epoch for this profile: ordinary sync.
@@ -118,6 +107,19 @@ class SyncV2RuntimeService(
                     )
                 }
                 is WorkspacePreparedCheckpointLoadResultV2.Loaded -> {
+                    when (val bound = protocolStore.persistPreparingEpoch(
+                        recovered.prepared.remoteProfile,
+                        recovered.prepared.descriptor,
+                        recovered.prepared.pointerObject.objectDigest,
+                        remote.authorityBindingId,
+                        writerDeviceId,
+                    )) {
+                        is SyncEpochPersistResultV2.ImmutableMismatch ->
+                            return failedInitialization(bound.safeMessage)
+                        is SyncEpochPersistResultV2.AlreadyStored,
+                        is SyncEpochPersistResultV2.Stored,
+                        -> Unit
+                    }
                     when (
                         val attempt = publishRecoveredOrFreshDraft(
                             remote = remote,
@@ -152,7 +154,9 @@ class SyncV2RuntimeService(
                 }
                 if (stillPreparing) {
                     return failedInitialization(
-                        "A prepared first-epoch checkpoint is waiting for pointer commit; run Sync again to resume.",
+                        diagnosticMessage =
+                            "A prepared first-epoch checkpoint is waiting for pointer commit; run Sync again to resume.",
+                        reason = ManualSyncReason.RetryRequired,
                     )
                 }
                 // First epoch: checkpoint from local product state (or rebuild after stale prepare).
@@ -187,7 +191,9 @@ class SyncV2RuntimeService(
                             }
                             FirstEpochPublishAttemptV2.RebuildAfterStale ->
                                 return failedInitialization(
-                                    "Local product state kept changing during first-epoch publish; try Sync again.",
+                                    diagnosticMessage =
+                                        "Local product state kept changing during first-epoch publish; try Sync again.",
+                                    reason = ManualSyncReason.RetryRequired,
                                 )
                             is FirstEpochPublishAttemptV2.KeepPreparingAndStop ->
                                 return failedInitialization(retry.safeMessage)
@@ -203,6 +209,14 @@ class SyncV2RuntimeService(
             }
         }
 
+        if (pointer != null && localDraftHasSemanticChanges(pointer)) {
+            return failedInitialization(
+                diagnosticMessage = "This server workspace already has an authoritative history. " +
+                    "The non-empty local workspace was not merged or replaced.",
+                reason = ManualSyncReason.RemoteHistoryConflict,
+            )
+        }
+
         var pushedObjects = 0
         var pulledObjects = 0
         var summary = coordinator(workspaceKey, writerDeviceId, remote).syncOnce()
@@ -210,7 +224,13 @@ class SyncV2RuntimeService(
         pulledObjects += summary.pulledObjects
         if (summary.status != SyncCoordinatorStatusV2.SUCCESS) {
             return failedInitialization(
-                summary.safeMessage ?: "V2 initialization stopped before local bootstrap completed.",
+                diagnosticMessage =
+                    summary.safeMessage ?: "Sync initialization stopped before local bootstrap completed.",
+                reason = if (summary.status == SyncCoordinatorStatusV2.BLOCKED) {
+                    ManualSyncReason.Blocked
+                } else {
+                    ManualSyncReason.Failed
+                },
                 conflicts = summary.activeConflicts,
                 pushedObjects = pushedObjects,
                 pulledObjects = pulledObjects,
@@ -221,385 +241,34 @@ class SyncV2RuntimeService(
             workspaceKey = workspaceKey,
         )
 
-        val importResult = WorkspaceJoiningDeviceImporterV2(
-            localRepository = localRepository,
-            settingsRepository = settingsRepository,
-            workspaceKey = workspaceKey,
-            writerDeviceId = writerDeviceId,
-            remoteProfile = remote.remoteProfile,
-            protocolStore = protocolStore,
-            clock = clock,
-        ).captureLocalProductState()
-        if (importResult is WorkspaceJoiningImportResultV2.Blocked) {
-            return failedInitialization(
-                importResult.safeMessage,
-                conflicts = summary.activeConflicts,
-                pushedObjects = pushedObjects,
-                pulledObjects = pulledObjects,
-            )
-        }
-        summary = coordinator(workspaceKey, writerDeviceId, remote).syncOnce()
-        pushedObjects += summary.pushedObjects
-        pulledObjects += summary.pulledObjects
-        if (summary.status != SyncCoordinatorStatusV2.SUCCESS) {
-            return failedInitialization(
-                summary.safeMessage ?: "V2 initialization stopped before local imports were acknowledged.",
-                conflicts = summary.activeConflicts,
-                pushedObjects = pushedObjects,
-                pulledObjects = pulledObjects,
-            )
-        }
-
         return ManualSyncResult.success(
             mode = mode,
-            message = "Whole-product Sync V2 is active; checkpoint, local imports, and first synchronization completed.",
+            reason = ManualSyncReason.Initialized,
             pushedObjects = pushedObjects,
             pulledObjects = pulledObjects,
             conflicts = summary.activeConflicts,
         )
     }
 
-    override fun rollEpoch(): ManualSyncResult {
-        val configured = settingsRepository.load().syncConfiguration
-        if (configured.mode != mode) {
-            return ManualSyncResult.failure(mode, "Whole-product Sync V2 must be active before epoch rollover.")
-        }
-        val workspaceKey = workspaceKeyProvider()
-            ?: return ManualSyncResult.failure(mode, "Unlock the workspace before epoch rollover.")
-        val writerDeviceId = normalizedWriterIdOrFailure()
-            .getOrElse { return ManualSyncResult.failure(mode, it.safeRuntimeMessage()) }
-        val remote = createRemoteOrFailure()
-            .getOrElse { return ManualSyncResult.failure(mode, it.safeRuntimeMessage()) }
-
-        repeat(MAX_FRONTIER_STABILIZATION_ROUNDS_V2) {
-            val drained = runV2(workspaceKey, writerDeviceId, remote)
-            if (!drained.success) return drained
-            val active = protocolStore.loadActiveEpoch(remote.remoteProfile)
-                ?: return ManualSyncResult.failure(mode, "A healthy active V2 epoch is required before rollover.")
-            if (active.health != SyncEpochHealthV2.HEALTHY ||
-                protocolStore.loadActiveDeadLetters(remote.remoteProfile, active.descriptor.syncEpochId).isNotEmpty()
-            ) {
-                return ManualSyncResult.failure(mode, "Repair the active V2 epoch before rollover.")
-            }
-            val context = activeContext(workspaceKey, writerDeviceId, remote.remoteProfile)
-            if (context.store.loadPending(remote.remoteProfile).isNotEmpty()) {
-                return@repeat
-            }
-            val firstFrontier = runCatching { remote.epochFrontiers(active.descriptor.syncEpochId) }
-                .getOrElse { return ManualSyncResult.failure(mode, it.safeRuntimeMessage()) }
-                .sortedBy { it.streamId }
-            if (!frontierIsApplied(context.store, remote.remoteProfile, firstFrontier)) return@repeat
-
-            val sources = context.store.loadEntityKeys()
-                .flatMap { context.store.loadHeads(it) }
-                .map { head ->
-                    WorkspaceCheckpointSourceHeadV2(
-                        entityType = head.entityType,
-                        entityId = head.entityId,
-                        content = head.contentPayload,
-                        deletion = head.deletionPayload,
-                        sourceProfile = remote.remoteProfile,
-                        sourceEpoch = active.descriptor.syncEpochId,
-                        sourceWriterId = null,
-                        sourceMutationId = null,
-                        sourceObjectId = head.versionId,
-                        sourceObjectDigest = head.objectDigest,
-                        sourceAuthoredAt = head.authoredAt,
-                    )
-                }
-                .sortedWith(CHECKPOINT_SOURCE_COMPARATOR_SYSTEM_V2)
-            val secondFrontier = runCatching { remote.epochFrontiers(active.descriptor.syncEpochId) }
-                .getOrElse { return ManualSyncResult.failure(mode, it.safeRuntimeMessage()) }
-                .sortedBy { it.streamId }
-            if (firstFrontier != secondFrontier || context.store.loadPending(remote.remoteProfile).isNotEmpty()) {
-                return@repeat
-            }
-            val prepared = runCatching {
-                WorkspaceCheckpointBuilderV2(workspaceKey, writerDeviceId).build(
-                    remoteProfile = remote.remoteProfile,
-                    sourceHeads = sources,
-                    createdAt = clock(),
-                    previousPointerDigest = active.descriptorDigest,
-                    previousEpochId = active.descriptor.syncEpochId,
-                    previousEpochFrontiers = firstFrontier,
-                )
-            }.getOrElse { return ManualSyncResult.failure(mode, it.safeRuntimeMessage()) }
-            when (val persisted = WorkspaceCheckpointPersistenceV2(
-                localRepository, workspaceKey, writerDeviceId, protocolStore,
-            ).persist(prepared)) {
-                is WorkspaceCheckpointPersistResultV2.Rejected ->
-                    return ManualSyncResult.failure(mode, persisted.safeMessage)
-                is WorkspaceCheckpointPersistResultV2.Ready -> Unit
-            }
-            return when (val published = checkpointPublisher(
-                remote = remote,
-                workspaceKey = workspaceKey,
-                writerDeviceId = writerDeviceId,
-                prepared = prepared,
-                requireNoPendingSource = true,
-            ).publish(prepared)) {
-                is WorkspaceCheckpointPublishResultV2.Rejected -> {
-                    if (published.safeErrorCode == "prepared_checkpoint_stale") {
-                        discardNeverAuthoritativeEpoch(
-                            remote.remoteProfile,
-                            prepared.descriptor.syncEpochId,
-                            published.safeErrorCode,
-                            published.safeMessage,
-                        )
-                    }
-                    ManualSyncResult.failure(mode, published.safeMessage)
-                }
-                is WorkspaceCheckpointPublishResultV2.LostRace -> runV2(workspaceKey, writerDeviceId, remote)
-                is WorkspaceCheckpointPublishResultV2.Published -> {
-                    val imported = WorkspacePriorEpochImporterV2(
-                        localRepository, workspaceKey, writerDeviceId, remote.remoteProfile, protocolStore, clock,
-                    ).importUncheckpointed(active.descriptor.syncEpochId)
-                    if (imported is WorkspacePriorEpochImportResultV2.Blocked) {
-                        ManualSyncResult.failure(mode, imported.safeMessage)
-                    } else {
-                        val completed = runV2(workspaceKey, writerDeviceId, remote)
-                        if (completed.success) completed.copy(
-                            message = "Sync V2 rolled to epoch ${prepared.descriptor.syncEpochId} and preserved every normalized head.",
-                        ) else completed
-                    }
-                }
-            }
-        }
-        return ManualSyncResult.failure(
-            mode,
-            "The authenticated frontier kept changing; rollover was deferred without changing the active epoch.",
-        )
-    }
-
-    override fun repairIntegrity(): ManualSyncResult {
-        val configured = settingsRepository.load().syncConfiguration
-        if (configured.mode != mode) {
-            return ManualSyncResult.failure(mode, "Whole-product Sync V2 must be active before integrity repair.")
-        }
-        val workspaceKey = workspaceKeyProvider()
-            ?: return ManualSyncResult.failure(mode, "Unlock the workspace before integrity repair.")
-        val writerDeviceId = normalizedWriterIdOrFailure()
-            .getOrElse { return ManualSyncResult.failure(mode, it.safeRuntimeMessage()) }
-        val remote = createRemoteOrFailure()
-            .getOrElse { return ManualSyncResult.failure(mode, it.safeRuntimeMessage()) }
-        val active = protocolStore.loadActiveEpoch(remote.remoteProfile)
-            ?: return ManualSyncResult.failure(mode, "No local authenticated V2 epoch exists to repair.")
-        val blockers = protocolStore.loadActiveDeadLetters(remote.remoteProfile, active.descriptor.syncEpochId)
-        if (blockers.isEmpty()) {
-            return ManualSyncResult.success(mode, 0, 0, 0, "Sync V2 integrity state is healthy; no repair is required.")
-        }
-        val repair = WorkspaceImmutableObjectRepairServiceV2(
-            localRepository, workspaceKey, writerDeviceId, remote, protocolStore, clock,
-        )
-        blockers.filter {
-            it.input.failureClass != SyncDeadLetterFailureClassV2.RETRYABLE_DEPENDENCY
-        }.forEach { deadLetter ->
-            when (val result = repair.repair(deadLetter)) {
-                is WorkspaceRepairResultV2.Repaired -> Unit
-                is WorkspaceRepairResultV2.RebootstrapRequired ->
-                    return ManualSyncResult.failure(mode, result.safeMessage)
-                is WorkspaceRepairResultV2.StillBlocked ->
-                    return ManualSyncResult.failure(mode, result.safeMessage)
-            }
-        }
-        return runV2(workspaceKey, writerDeviceId, remote)
-    }
-
-    override fun recoverWithVerifiedLocalCheckpoint(
-        userConfirmedPotentialDataLoss: Boolean,
-    ): ManualSyncResult {
-        if (!userConfirmedPotentialDataLoss) {
-            return ManualSyncResult.failure(
-                mode,
-                "Authorized V2 recovery requires explicit confirmation that this device is the selected healthy source. No pointer changed.",
-            )
-        }
-        val configured = settingsRepository.load().syncConfiguration
-        if (configured.mode != mode) {
-            return ManualSyncResult.failure(mode, "Whole-product Sync V2 must be active before authorized recovery.")
-        }
-        val workspaceKey = workspaceKeyProvider()
-            ?: return ManualSyncResult.failure(mode, "Unlock the workspace before authorized recovery.")
-        val writerDeviceId = normalizedWriterIdOrFailure()
-            .getOrElse { return ManualSyncResult.failure(mode, it.safeRuntimeMessage()) }
-        val remote = createRemoteOrFailure()
-            .getOrElse { return ManualSyncResult.failure(mode, it.safeRuntimeMessage()) }
-        val prior = protocolStore.loadAuthoritativeEpoch()
-            ?: return ManualSyncResult.failure(mode, "No authenticated V2 authority exists to recover.")
-        if (prior.remoteProfile != remote.remoteProfile ||
-            prior.authorityBindingId?.let { it != remote.authorityBindingId } == true
-        ) {
-            return ManualSyncResult.failure(mode, "The configured endpoint is not the authenticated V2 authority.")
-        }
-        val context = WorkspaceSystemV2ContextProvider(
-            localRepository,
-            { workspaceKey },
-            { writerDeviceId },
-            { prior.remoteProfile },
-        ).openOrNull() ?: return ManualSyncResult.failure(
-            mode,
-            "The local authenticated V2 DAG cannot be opened for verification.",
-        )
-        if (context.syncEpochId != prior.descriptor.syncEpochId) {
-            return ManualSyncResult.failure(mode, "The local recovery DAG is not the authoritative blocked epoch.")
-        }
-        val keys = context.store.loadEntityKeys()
-        val preferenceKey = WorkspaceEntityKeyV2(
-            WorkspaceEntityTypeV2.WORKSPACE_PREFERENCES,
-            WORKSPACE_PREFERENCES_ENTITY_ID_V2,
-        )
-        if (preferenceKey !in keys) {
-            return ManualSyncResult.failure(mode, "The local recovery DAG is incomplete: workspace preferences are missing.")
-        }
-        val validator = WorkspaceEntityValidatorV2(context.materializer)
-        val verifier = WorkspaceEntityCausalityEngineV2(context.materializer, validator)
-        for (key in keys) {
-            val storedHeads = context.store.loadHeads(key).map { it.versionId }.sorted()
-            val verified = verifier.reconcile(
-                context.syncEpochId,
-                key,
-                context.store.loadVersions(key),
-                context.store.loadConflicts(key).map { it.descriptor },
-            )
-            val plan = (verified as? WorkspaceReconciliationResultV2.Reconciled)?.plan
-                ?: return ManualSyncResult.failure(mode, "A local V2 entity graph failed deterministic verification.")
-            if (plan.generatedVersions.isNotEmpty() || plan.finalHeadVersionIds.sorted() != storedHeads) {
-                return ManualSyncResult.failure(
-                    mode,
-                    "The local V2 graph is not fully normalized; repair it before authorizing a recovery checkpoint.",
-                )
-            }
-        }
-        runCatching { context.store.rebuildProjections(clock()) }.getOrElse {
-            return ManualSyncResult.failure(mode, "The local V2 projections could not be rebuilt from the verified DAG.")
-        }
-        val currentPointer = runCatching(remote::loadEpochPointer).getOrElse {
-            return ManualSyncResult.failure(mode, it.safeRuntimeMessage())
-        } ?: return ManualSyncResult.failure(mode, "The authenticated V2 pointer is missing; restore the control register first.")
-        val decodedPointer = when (val decoded = WorkspaceSyncControlCodecV2(context.cipher).decodeEpochPointer(currentPointer)) {
-            is WorkspaceControlDecodeResultV2.Decoded -> decoded.value
-            is WorkspaceControlDecodeResultV2.Rejected -> return ManualSyncResult.failure(mode, decoded.error.safeMessage)
-        }
-        if (decodedPointer.descriptor != prior.descriptor || currentPointer.objectDigest != prior.descriptorDigest) {
-            return ManualSyncResult.failure(mode, "The remote pointer no longer matches the locally authenticated recovery source.")
-        }
-        val previousFrontiers = runCatching { remote.epochFrontiers(prior.descriptor.syncEpochId) }.getOrElse {
-            return ManualSyncResult.failure(mode, "The prior authenticated frontier could not be captured for recovery provenance.")
-        }
-        val sources = keys.flatMap { key ->
-            context.store.loadHeads(key).map { head ->
-                WorkspaceCheckpointSourceHeadV2(
-                    head.entityType,
-                    head.entityId,
-                    head.contentPayload,
-                    head.deletionPayload,
-                    "authorized-local-rebootstrap",
-                    prior.descriptor.syncEpochId,
-                    null,
-                    null,
-                    head.versionId,
-                    head.objectDigest,
-                    head.authoredAt,
-                )
-            }
-        }.sortedWith(CHECKPOINT_SOURCE_COMPARATOR_SYSTEM_V2)
-        val prepared = runCatching {
-            WorkspaceCheckpointBuilderV2(workspaceKey, writerDeviceId).build(
-                remoteProfile = remote.remoteProfile,
-                sourceHeads = sources,
-                createdAt = clock(),
-                previousPointerDigest = currentPointer.objectDigest,
-                previousEpochId = prior.descriptor.syncEpochId,
-                previousEpochFrontiers = previousFrontiers,
-            )
-        }.getOrElse { return ManualSyncResult.failure(mode, it.safeRuntimeMessage()) }
-        when (val persisted = WorkspaceCheckpointPersistenceV2(
-            localRepository,
-            workspaceKey,
-            writerDeviceId,
-            protocolStore,
-        ).persist(prepared)) {
-            is WorkspaceCheckpointPersistResultV2.Rejected -> return ManualSyncResult.failure(mode, persisted.safeMessage)
-            is WorkspaceCheckpointPersistResultV2.Ready -> Unit
-        }
-        return when (val published = checkpointPublisher(
-            remote = remote,
-            workspaceKey = workspaceKey,
-            writerDeviceId = writerDeviceId,
-            prepared = prepared,
-        ).publish(prepared)) {
-            is WorkspaceCheckpointPublishResultV2.Rejected -> {
-                if (published.safeErrorCode == "prepared_checkpoint_stale") {
-                    discardNeverAuthoritativeEpoch(
-                        remote.remoteProfile,
-                        prepared.descriptor.syncEpochId,
-                        published.safeErrorCode,
-                        published.safeMessage,
-                    )
-                }
-                ManualSyncResult.failure(mode, published.safeMessage)
-            }
-            is WorkspaceCheckpointPublishResultV2.LostRace -> runV2(workspaceKey, writerDeviceId, remote)
-            is WorkspaceCheckpointPublishResultV2.Published -> {
-                protocolStore.archiveAfterAuthorizedRebootstrap(
-                    prior.remoteProfile,
-                    prior.descriptor.syncEpochId,
-                    clock(),
-                )
-                val completed = runV2(workspaceKey, writerDeviceId, remote)
-                if (completed.success) completed.copy(
-                    message = "Authorized Sync V2 recovery committed a verified local checkpoint as epoch " +
-                        "${prepared.descriptor.syncEpochId}; the prior blocked epoch remains a time-bounded read-only archive.",
-                ) else completed
-            }
-        }
-    }
-
-    internal fun synchronizeBoundAuthorityForMigration(): ManualSyncResult {
-        val authority = protocolStore.loadAuthoritativeEpoch()
-            ?: return ManualSyncResult.failure(mode, "No authenticated V2 source authority exists.")
-        if (authority.remoteProfile != mode.remoteProfileV2()) {
-            return ManualSyncResult.failure(mode, "This runtime is not the authenticated V2 source authority.")
-        }
-        val workspaceKey = workspaceKeyProvider()
-            ?: return ManualSyncResult.failure(mode, "Unlock the workspace before remote migration.")
-        val writerDeviceId = normalizedWriterIdOrFailure()
-            .getOrElse { return ManualSyncResult.failure(mode, it.safeRuntimeMessage()) }
-        val remote = createRemoteOrFailure()
-            .getOrElse { return ManualSyncResult.failure(mode, it.safeRuntimeMessage()) }
-        if (authority.authorityBindingId?.let { it != remote.authorityBindingId } == true) {
-            return ManualSyncResult.failure(mode, "The source endpoint no longer matches the authenticated V2 authority binding.")
-        }
-        return runV2(workspaceKey, writerDeviceId, remote)
-    }
-
-    internal fun synchronizeRemoteForMigration(remote: WorkspaceSyncRemoteV2): ManualSyncResult {
-        val authority = protocolStore.loadAuthoritativeEpoch()
-            ?: return ManualSyncResult.failure(mode, "No authenticated V2 source authority exists.")
-        if (authority.remoteProfile != remote.remoteProfile ||
-            authority.authorityBindingId?.let { it != remote.authorityBindingId } == true
-        ) {
-            return ManualSyncResult.failure(mode, "The supplied source does not match the authenticated V2 authority binding.")
-        }
-        val workspaceKey = workspaceKeyProvider()
-            ?: return ManualSyncResult.failure(mode, "Unlock the workspace before remote migration.")
-        val writerDeviceId = normalizedWriterIdOrFailure()
-            .getOrElse { return ManualSyncResult.failure(mode, it.safeRuntimeMessage()) }
-        return runV2(workspaceKey, writerDeviceId, remote)
-    }
-
-    internal fun openRemoteForMigration(): Result<WorkspaceSyncRemoteV2> = createRemoteOrFailure()
-
-    internal fun configuredWriterIdForMigration(): Result<String> =
-        runCatching { normalizeWriterDeviceIdV2(writerDeviceIdProvider()) }
-
     private fun runV2(): ManualSyncResult {
         val workspaceKey = workspaceKeyProvider()
-            ?: return ManualSyncResult.failure(mode, "Unlock the workspace before running Sync V2.")
+            ?: return ManualSyncResult.failure(mode, ManualSyncReason.WorkspaceLocked)
         val writerDeviceId = normalizedWriterIdOrFailure()
-            .getOrElse { return ManualSyncResult.failure(mode, it.safeRuntimeMessage()) }
+            .getOrElse {
+                return ManualSyncResult.failure(
+                    mode,
+                    ManualSyncReason.Failed,
+                    it.safeRuntimeMessage(),
+                )
+            }
         val remote = createRemoteOrFailure()
-            .getOrElse { return ManualSyncResult.failure(mode, it.safeRuntimeMessage()) }
+            .getOrElse {
+                return ManualSyncResult.failure(
+                    mode,
+                    ManualSyncReason.Failed,
+                    it.safeRuntimeMessage(),
+                )
+            }
         return runV2(workspaceKey, writerDeviceId, remote)
     }
 
@@ -608,10 +277,14 @@ class SyncV2RuntimeService(
         writerDeviceId: String,
         remote: WorkspaceSyncRemoteV2,
     ): ManualSyncResult {
-        val restoredBackupPending = protocolStore.loadReconciliationState()?.reason ==
-            "restored_backup_pending_reconciliation"
         val pointer = runCatching(remote::loadEpochPointer)
-            .getOrElse { return ManualSyncResult.failure(mode, it.safeRuntimeMessage()) }
+            .getOrElse {
+                return ManualSyncResult.failure(
+                    mode,
+                    ManualSyncReason.Failed,
+                    it.safeRuntimeMessage(),
+                )
+            }
         when (val recovered = WorkspacePreparedCheckpointRecoveryV2(
             localRepository,
             workspaceKey,
@@ -621,8 +294,10 @@ class SyncV2RuntimeService(
             is WorkspacePreparedCheckpointLoadResultV2.Rejected -> {
                 if (pointer?.syncEpochId == recovered.epochId) {
                     return ManualSyncResult.failure(
-                        mode,
-                        "The committed V2 checkpoint cannot be reconstructed locally: ${recovered.safeMessage}",
+                        mode = mode,
+                        reason = ManualSyncReason.CheckpointInvalid,
+                        diagnosticMessage =
+                            "The committed sync checkpoint cannot be reconstructed locally: ${recovered.safeMessage}",
                     )
                 }
                 discardNeverAuthoritativeEpoch(
@@ -661,142 +336,60 @@ class SyncV2RuntimeService(
                                 FirstEpochPublishAttemptV2.RemoteWon -> Unit
                                 FirstEpochPublishAttemptV2.RebuildAfterStale ->
                                     return ManualSyncResult.failure(
-                                        mode,
-                                        "Local product state kept changing during first-epoch publish; try Sync again.",
+                                        mode = mode,
+                                        reason = ManualSyncReason.RetryRequired,
                                     )
                                 is FirstEpochPublishAttemptV2.KeepPreparingAndStop ->
-                                    return ManualSyncResult.failure(mode, rebuilt.safeMessage)
+                                    return ManualSyncResult.failure(
+                                        mode,
+                                        ManualSyncReason.RetryRequired,
+                                        rebuilt.safeMessage,
+                                    )
                                 is FirstEpochPublishAttemptV2.Failed ->
-                                    return ManualSyncResult.failure(mode, rebuilt.safeMessage)
+                                    return ManualSyncResult.failure(
+                                        mode,
+                                        ManualSyncReason.Failed,
+                                        rebuilt.safeMessage,
+                                    )
                             }
                         }
                     }
                     is FirstEpochPublishAttemptV2.KeepPreparingAndStop ->
-                        return ManualSyncResult.failure(mode, attempt.safeMessage)
+                        return ManualSyncResult.failure(
+                            mode,
+                            ManualSyncReason.RetryRequired,
+                            attempt.safeMessage,
+                        )
                     is FirstEpochPublishAttemptV2.Failed ->
-                        return ManualSyncResult.failure(mode, attempt.safeMessage)
+                        return ManualSyncResult.failure(
+                            mode,
+                            ManualSyncReason.Failed,
+                            attempt.safeMessage,
+                        )
                 }
             }
         }
-        val authorityBeforePush = protocolStore.loadActiveEpoch(remote.remoteProfile)
-        if (authorityBeforePush != null &&
-            authorityBeforePush.lifecycle == SyncEpochLifecycleV2.ACTIVE &&
-            authorityBeforePush.health == SyncEpochHealthV2.HEALTHY
-        ) {
-            val nowMillis = clock().toEpochMilliseconds()
-            val retainedPriorEpochs = buildSet {
-                protocolStore.loadAllEpochs()
-                    .filter { epoch ->
-                        epoch.lifecycle == SyncEpochLifecycleV2.READ_ONLY &&
-                            epoch.health == SyncEpochHealthV2.HEALTHY &&
-                            epoch.retainUntilEpochMilliseconds?.let { it > nowMillis } != false
-                    }
-                    .forEach(::add)
-            }.toList().sortedWith(compareBy({ it.remoteProfile }, { it.descriptor.syncEpochId }))
-            for (sourceEpoch in retainedPriorEpochs) {
-                val sourceRemote = if (sourceEpoch.remoteProfile == remote.remoteProfile &&
-                    sourceEpoch.authorityBindingId == remote.authorityBindingId
-                ) {
-                    remote
-                } else {
-                    runCatching { retainedEpochRemoteProvider.open(sourceEpoch) }
-                        .getOrElse {
-                            return ManualSyncResult.failure(
-                                mode,
-                                "Sync V2 paused current-epoch push because a retained prior authority " +
-                                    "could not be opened safely: ${it.safeRuntimeMessage()}",
-                            )
-                        }
-                }
-                if (sourceRemote == null || sourceRemote.remoteProfile != sourceEpoch.remoteProfile ||
-                    sourceEpoch.authorityBindingId?.let { it != sourceRemote.authorityBindingId } == true
-                ) {
-                    return ManualSyncResult.failure(
-                        mode,
-                        "Sync V2 paused current-epoch push because a retained prior authority cannot be authenticated for late-writer monitoring.",
-                    )
-                }
-                val monitor = WorkspacePriorEpochRemoteImporterV2(
-                    localRepository,
-                    workspaceKey,
-                    writerDeviceId,
-                    sourceRemote,
-                    protocolStore,
-                    clock,
-                )
-                when (val imported = monitor.importUntilStable(sourceEpoch.descriptor.syncEpochId)) {
-                    is WorkspacePriorEpochRemoteImportResultV2.Imported -> Unit
-                    is WorkspacePriorEpochRemoteImportResultV2.Blocked -> return ManualSyncResult.failure(
-                        mode,
-                        "Sync V2 paused current-epoch push while checking a retained epoch: ${imported.safeMessage}",
-                    )
-                }
-            }
-        }
-        var summary = coordinator(workspaceKey, writerDeviceId, remote).syncOnce()
-        if (summary.status == SyncCoordinatorStatusV2.SUCCESS) {
-            collectObsoleteCheckpointDraftsAfterAuthenticatedPointer(
-                remote = remote,
-                workspaceKey = workspaceKey,
-            )
-            val activeEpochId = summary.epochId
-            val oldEpochsWithPending = protocolStore.loadAllEpochs()
-                .filter {
-                    it.descriptor.syncEpochId != activeEpochId &&
-                        it.lifecycle == SyncEpochLifecycleV2.READ_ONLY
-                }
-                .filter { old ->
-                    workspaceStore(workspaceKey, writerDeviceId, old.remoteProfile, old.descriptor.syncEpochId)
-                        .loadPending(old.remoteProfile)
-                        .isNotEmpty()
-                }
-            for (old in oldEpochsWithPending) {
-                when (val imported = WorkspacePriorEpochImporterV2(
-                    localRepository,
-                    workspaceKey,
-                    writerDeviceId,
-                    remote.remoteProfile,
-                    protocolStore,
-                    clock,
-                ).importUncheckpointed(old.descriptor.syncEpochId, old.remoteProfile)) {
-                    is WorkspacePriorEpochImportResultV2.Blocked -> return ManualSyncResult.failure(
-                        mode,
-                        "Sync V2 prior-epoch import stopped safely: ${imported.safeMessage}",
-                        summary.pushedObjects,
-                        summary.pulledObjects,
-                        summary.activeConflicts,
-                    )
-                    is WorkspacePriorEpochImportResultV2.Imported -> Unit
-                }
-            }
-            if (oldEpochsWithPending.isNotEmpty()) {
-                summary = coordinator(workspaceKey, writerDeviceId, remote).syncOnce()
-            }
-        }
+        val summary = coordinator(workspaceKey, writerDeviceId, remote).syncOnce()
         return if (summary.status == SyncCoordinatorStatusV2.SUCCESS) {
-            if (restoredBackupPending) {
-                // Coordinator success proves pointer authentication, pull-
-                // first replay, stable frontier, exact outbox acks, and a
-                // durable current cursor before this flag is cleared.
-                protocolStore.clearBackupReconciliation()
-            }
             ManualSyncResult.success(
                 mode,
                 summary.pushedObjects,
                 summary.pulledObjects,
                 summary.activeConflicts,
-                "Sync V2 complete: pushed ${summary.pushedObjects}, pulled ${summary.pulledObjects}, " +
-                    "active conflicts ${summary.activeConflicts}." +
-                    if (restoredBackupPending) " Restored backup reconciliation completed." else "",
+                ManualSyncReason.Completed,
             )
         } else {
             ManualSyncResult.failure(
-                mode,
-                "Sync V2 ${if (summary.status == SyncCoordinatorStatusV2.BLOCKED) "is blocked" else "failed"} safely: " +
-                    "${summary.safeMessage ?: summary.safeErrorCode ?: "unknown error"}.",
-                summary.pushedObjects,
-                summary.pulledObjects,
-                summary.activeConflicts,
+                mode = mode,
+                reason = if (summary.status == SyncCoordinatorStatusV2.BLOCKED) {
+                    ManualSyncReason.Blocked
+                } else {
+                    ManualSyncReason.Failed
+                },
+                diagnosticMessage = summary.safeMessage ?: summary.safeErrorCode,
+                pushedObjects = summary.pushedObjects,
+                pulledObjects = summary.pulledObjects,
+                conflicts = summary.activeConflicts,
             )
         }
     }
@@ -806,7 +399,6 @@ class SyncV2RuntimeService(
         writerDeviceId: String,
         remote: WorkspaceSyncRemoteV2,
     ): WorkspaceSyncCoordinatorV2 {
-        val authorityBeforeBootstrap = protocolStore.loadAuthoritativeEpoch()
         return WorkspaceSyncCoordinatorV2(
             localRepository = localRepository,
             workspaceKey = workspaceKey,
@@ -815,54 +407,29 @@ class SyncV2RuntimeService(
             protocolStore = protocolStore,
             clock = clock,
             authorityMutationCoordinator = authorityMutationCoordinator,
-            bootstrapCommitHook = {
-                preserveLocalStateAtBootstrapCommit(
-                    workspaceKey,
-                    writerDeviceId,
-                    remote.remoteProfile,
-                    authorityBeforeBootstrap,
-                )
-            },
+            beforeEntityPublication = beforeEntityPublication,
         )
     }
 
-    private fun preserveLocalStateAtBootstrapCommit(
-        workspaceKey: WorkspaceMasterKey,
-        writerDeviceId: String,
-        targetRemoteProfile: String,
-        priorAuthority: StoredSyncEpochV2?,
-    ): Pair<String, String>? =
-        if (priorAuthority == null) {
-            when (val imported = WorkspaceJoiningDeviceImporterV2(
-                localRepository = localRepository,
-                settingsRepository = settingsRepository,
-                workspaceKey = workspaceKey,
-                writerDeviceId = writerDeviceId,
-                remoteProfile = targetRemoteProfile,
-                protocolStore = protocolStore,
-                clock = clock,
-            ).captureLocalProductState()) {
-                is WorkspaceJoiningImportResultV2.Captured -> null
-                is WorkspaceJoiningImportResultV2.Blocked ->
-                    imported.safeErrorCode to imported.safeMessage
+    private fun localDraftHasSemanticChanges(remotePointer: EncryptedWorkspaceObjectV2): Boolean {
+        val draft = protocolStore.loadAllEpochs().singleOrNull {
+            it.lifecycle == SyncEpochLifecycleV2.PREPARING &&
+                it.remoteProfile == SyncRemoteProfileV2.SELF_HOSTED.wireValue
+        } ?: return false
+        if (draft.descriptorDigest == remotePointer.objectDigest) return false
+        val key = workspaceKeyProvider() ?: return true
+        val context = WorkspaceSystemV2ContextProvider(
+            localRepository,
+            { key },
+            { normalizeWriterDeviceIdV2(localRepository.localDeviceId) },
+            { SyncRemoteProfileV2.SELF_HOSTED.wireValue },
+        ).openOrNull() ?: return true
+        return context.store.loadPending(context.remoteProfile).isNotEmpty() ||
+            context.store.loadEntityKeys().any {
+                it.entityType == WorkspaceEntityTypeV2.NOTEBOOK ||
+                    it.entityType == WorkspaceEntityTypeV2.NOTE
             }
-        } else {
-            when (val imported = WorkspacePriorEpochImporterV2(
-                localRepository,
-                workspaceKey,
-                writerDeviceId,
-                targetRemoteProfile,
-                protocolStore,
-                clock,
-            ).importUncheckpointed(
-                priorAuthority.descriptor.syncEpochId,
-                priorAuthority.remoteProfile,
-            )) {
-                is WorkspacePriorEpochImportResultV2.Imported -> null
-                is WorkspacePriorEpochImportResultV2.Blocked ->
-                    imported.safeErrorCode to imported.safeMessage
-            }
-        }
+    }
 
     private fun activeContext(
         workspaceKey: WorkspaceMasterKey,
@@ -925,22 +492,12 @@ class SyncV2RuntimeService(
         workspaceKey: WorkspaceMasterKey? = null,
         writerDeviceId: String? = null,
         prepared: PreparedWorkspaceEpochCheckpointV2? = null,
-        requireNoPendingSource: Boolean = false,
     ): WorkspaceCheckpointPublisherV2 {
         val genesisDraft = prepared?.takeIf(::isGenesisLocalProductDraft)
-        val sourceDraft = prepared?.takeIf { genesisDraft == null }
         val snapshotValidator: () -> Boolean = when {
             genesisDraft != null && workspaceKey != null && writerDeviceId != null ->
                 fun(): Boolean =
                     !isGenesisLocalProductDraftStale(workspaceKey, writerDeviceId, genesisDraft)
-            sourceDraft != null && workspaceKey != null && writerDeviceId != null ->
-                fun(): Boolean =
-                    !isV2SourceCheckpointDraftStale(
-                        workspaceKey,
-                        writerDeviceId,
-                        sourceDraft,
-                        requireNoPendingSource,
-                    )
             else -> fun(): Boolean = true
         }
         return WorkspaceCheckpointPublisherV2(
@@ -948,6 +505,7 @@ class SyncV2RuntimeService(
             remote = remote,
             protocolStore = protocolStore,
             onProgress = onPublishProgress,
+            beforeEntityPublication = beforeEntityPublication,
             localSnapshotStillMatches = snapshotValidator,
             commitPointerBarrier = { commit ->
                 authorityMutationCoordinator.productAccess(commit)
@@ -961,7 +519,6 @@ class SyncV2RuntimeService(
         writerDeviceId: String,
     ): FirstEpochPublishAttemptV2 {
         val genesis = WorkspaceGenesisCheckpointServiceV2(
-            localRepository = localRepository,
             settingsRepository = settingsRepository,
             workspaceKey = workspaceKey,
             writerDeviceId = writerDeviceId,
@@ -974,7 +531,11 @@ class SyncV2RuntimeService(
             is WorkspaceGenesisCheckpointResultV2.Prepared -> {
                 when (
                     val persisted = WorkspaceCheckpointPersistenceV2(
-                        localRepository, workspaceKey, writerDeviceId, protocolStore,
+                        localRepository,
+                        workspaceKey,
+                        writerDeviceId,
+                        protocolStore,
+                        remote.authorityBindingId,
                     ).persist(prepared.checkpoint)
                 ) {
                     is WorkspaceCheckpointPersistResultV2.Rejected ->
@@ -1044,23 +605,20 @@ class SyncV2RuntimeService(
         }
     }
 
-    /**
-     * True only for a first-epoch draft built from local product rows
-     * (not rollover / recovery / remote-migration successors).
-     */
+    /** True only for a locally prepared first-generation checkpoint. */
     private fun isGenesisLocalProductDraft(prepared: PreparedWorkspaceEpochCheckpointV2): Boolean {
         if (prepared.descriptor.previousEpochId != null) return false
         if (prepared.pointer.previousPointerDigest != null) return false
-        val localProductPrefix = "local-product:"
+        val localDraftPrefix = "local-draft:"
         return prepared.entities.any { entity ->
             val provenance = entity.version.provenance ?: return@any false
             provenance.type == WorkspaceVersionProvenanceTypeV2.EPOCH_CHECKPOINT &&
-                provenance.sourceProfile?.startsWith(localProductPrefix) == true
+                provenance.sourceProfile?.startsWith(localDraftPrefix) == true
         }
     }
 
     /**
-     * Genesis drafts are stale when the current local-product inventory fingerprint
+     * Genesis drafts are stale when the current local-draft inventory fingerprint
      * no longer matches the frozen EPOCH_CHECKPOINT source digests.
      * Non-genesis drafts always return false (callers must use other validation).
      */
@@ -1073,7 +631,6 @@ class SyncV2RuntimeService(
         val preparedFingerprint = preparedGenesisSourceFingerprint(prepared)
         val currentFingerprint = runCatching {
             WorkspaceGenesisCheckpointServiceV2(
-                localRepository = localRepository,
                 settingsRepository = settingsRepository,
                 workspaceKey = workspaceKey,
                 writerDeviceId = writerDeviceId,
@@ -1090,44 +647,10 @@ class SyncV2RuntimeService(
         prepared.entities.mapNotNull { entity ->
             val provenance = entity.version.provenance ?: return@mapNotNull null
             if (provenance.type != WorkspaceVersionProvenanceTypeV2.EPOCH_CHECKPOINT) return@mapNotNull null
-            if (provenance.sourceProfile?.startsWith("local-product:") != true) return@mapNotNull null
+            if (provenance.sourceProfile?.startsWith("local-draft:") != true) return@mapNotNull null
             val digest = provenance.sourceDigest ?: return@mapNotNull null
             genesisSourceFingerprint(entity.version.entityType, entity.version.entityId, digest)
         }.toSet()
-
-    private fun isV2SourceCheckpointDraftStale(
-        workspaceKey: WorkspaceMasterKey,
-        writerDeviceId: String,
-        prepared: PreparedWorkspaceEpochCheckpointV2,
-        requireNoPendingSource: Boolean,
-    ): Boolean {
-        val sourceEpochId = prepared.descriptor.previousEpochId ?: return false
-        val expected = prepared.checkpointSourceIdentitiesV2()
-        if (expected.isEmpty()) return true
-        return runCatching {
-            val sourceEpoch = protocolStore.loadAllEpochs().singleOrNull {
-                it.descriptor.syncEpochId == sourceEpochId
-            } ?: return@runCatching false
-            val contexts = WorkspaceSystemV2ContextProvider(
-                localRepository,
-                { workspaceKey },
-                { writerDeviceId },
-                { sourceEpoch.remoteProfile },
-            )
-            val context = when (sourceEpoch.lifecycle) {
-                SyncEpochLifecycleV2.READ_ONLY ->
-                    contexts.openRetainedEpochOrNull(sourceEpoch, workspaceKey)
-                else ->
-                    contexts.openOrNull()?.takeIf { it.syncEpochId == sourceEpochId }
-            } ?: return@runCatching false
-            checkpointSourceStateStillMatchesV2(
-                context.store,
-                sourceEpoch.remoteProfile,
-                expected,
-                requireNoPendingSource,
-            )
-        }.getOrDefault(false).not()
-    }
 
     private fun genesisSourceFingerprint(
         entityType: WorkspaceEntityTypeV2,
@@ -1157,12 +680,7 @@ class SyncV2RuntimeService(
         }
     }
 
-    /**
-     * Runs only after the coordinator authenticated and activated the current
-     * pointer. A draft whose expected predecessor is still current remains
-     * resumable; every other never-authoritative draft is remotely collected
-     * before its local cleanup identities are removed.
-     */
+    /** Cleans only never-authoritative first-generation CAS drafts. */
     private fun collectObsoleteCheckpointDraftsAfterAuthenticatedPointer(
         remote: WorkspaceSyncRemoteV2,
         workspaceKey: WorkspaceMasterKey,
@@ -1178,9 +696,7 @@ class SyncV2RuntimeService(
             }
             .forEach { epoch ->
                 val draft = loader.load(epoch).getOrNull() ?: return@forEach
-                if (draft.pointer.previousPointerDigest == active.descriptorDigest) {
-                    return@forEach
-                }
+                if (draft.pointer.previousPointerDigest == active.descriptorDigest) return@forEach
                 if (epoch.lifecycle == SyncEpochLifecycleV2.PREPARING) {
                     protocolStore.abandonPreparingEpoch(
                         remote.remoteProfile,
@@ -1189,27 +705,24 @@ class SyncV2RuntimeService(
                         "Another authenticated checkpoint won the pointer compare-and-set.",
                     )
                 }
-                when (runCatching { remote.cleanupCheckpointDraft(draft) }.getOrNull()) {
-                    is WorkspaceCheckpointDraftCleanupResultV2.Deleted ->
-                        epochRetention.collectAbandonedNeverAuthoritativeEpoch(
-                            remote.remoteProfile,
-                            epoch.descriptor.syncEpochId,
-                        )
-                    is WorkspaceCheckpointDraftCleanupResultV2.Retained,
-                    null,
-                    -> Unit
+                if (runCatching { remote.cleanupCheckpointDraft(draft) }.getOrNull()
+                    is WorkspaceCheckpointDraftCleanupResultV2.Deleted
+                ) {
+                    checkpointDraftCleanup.collect(remote.remoteProfile, epoch.descriptor.syncEpochId)
                 }
             }
     }
 
     private fun failedInitialization(
-        message: String,
+        diagnosticMessage: String? = null,
+        reason: ManualSyncReason = ManualSyncReason.Failed,
         conflicts: Int = 0,
         pushedObjects: Int = 0,
         pulledObjects: Int = 0,
     ) = ManualSyncResult.failure(
         mode = mode,
-        message = message,
+        reason = reason,
+        diagnosticMessage = diagnosticMessage,
         pushedObjects = pushedObjects,
         pulledObjects = pulledObjects,
         conflicts = conflicts,
@@ -1230,12 +743,11 @@ private sealed interface FirstEpochPublishAttemptV2 {
 }
 
 internal fun Throwable.safeRuntimeMessage(): String =
-    (message ?: "Sync V2 setup failed safely.")
+    (message ?: "System V3 sync setup failed safely.")
         .replace(Regex("(?i)(bearer|token|password|secret)\\s*[:=]\\s*\\S+"), "$1=<redacted>")
         .take(500)
 
 private fun SyncMode.remoteProfileV2(): String = when (this) {
-    SyncMode.WebDav -> SyncRemoteProfileV2.WEB_DAV.wireValue
     SyncMode.SelfHosted -> SyncRemoteProfileV2.SELF_HOSTED.wireValue
     SyncMode.Off -> error("SyncMode.Off has no network remote profile.")
 }

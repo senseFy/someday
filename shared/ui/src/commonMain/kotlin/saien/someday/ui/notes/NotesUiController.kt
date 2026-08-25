@@ -29,6 +29,7 @@ import saien.someday.domain.notes.noteCalendarDate
 import saien.someday.domain.settings.EditorPreferences
 import saien.someday.ui.i18n.NotesUiStrings
 import saien.someday.ui.i18n.formatUiString
+import saien.someday.ui.media.MediaImportUiResult
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -901,6 +902,49 @@ class NotesUiController(
         )
     }
 
+    /**
+     * Applies a completed picker result only to the editor session that opened
+     * it. Cancel/failure provide feedback without changing Markdown.
+     */
+    fun applyMediaImportResult(
+        editorSessionId: Long,
+        result: MediaImportUiResult,
+    ): Boolean {
+        val editor = state.editor?.takeIf { it.sessionId == editorSessionId } ?: return false
+        return when (result) {
+            is MediaImportUiResult.Imported -> {
+                val edit = insertImportedMarkdownImage(
+                    source = editor.markdownBody,
+                    selectionStart = editor.markdownSelectionStart,
+                    selectionEnd = editor.markdownSelectionEnd,
+                    assetUri = result.uri,
+                    suggestedAltText = result.suggestedAltText,
+                )
+                state = state.copy(
+                    editor = editor.copy(
+                        markdownBody = edit.text,
+                        markdownSelectionStart = edit.selectionStart,
+                        markdownSelectionEnd = edit.selectionEnd,
+                        markdownPreviewVisible = false,
+                        validationMessage = null,
+                    ),
+                    feedbackMessage = strings.imageAdded,
+                )
+                true
+            }
+
+            MediaImportUiResult.Cancelled -> {
+                state = state.copy(feedbackMessage = strings.imageImportCancelled)
+                false
+            }
+
+            is MediaImportUiResult.Failed -> {
+                state = state.copy(feedbackMessage = strings.imageImportFailed)
+                false
+            }
+        }
+    }
+
     suspend fun saveEditor(): Boolean =
         saveEditor(clearEditor = true)
 
@@ -1686,7 +1730,7 @@ class NotesUiController(
                     "Customer interview synthesis",
                     "Metrics review with support",
                     "Onboarding copy pass",
-                    "WebDAV restore edge cases",
+                    "Self-hosted sync recovery edge cases",
                     "Sprint planning constraints",
                     "Desktop sidebar polish",
                 ),
@@ -1699,7 +1743,7 @@ class NotesUiController(
                     "Support tickets clustered around sync setup, not editing; the settings screen should make that visible.",
                     "Shorter headings worked better, especially on mobile where every extra line pushed the form down.",
                     "Restore needs to handle missing folders, stale credentials, and a user switching devices mid-flow.",
-                    "The release window is tight because QA also needs Android install time and WebDAV account setup.",
+                    "The release window is tight because QA also needs Android install time and self-hosted server setup.",
                     "The drag target feels right at 8 dp, but the divider needs to stay quiet until hover or drag.",
                 ),
                 checklist = listOf(

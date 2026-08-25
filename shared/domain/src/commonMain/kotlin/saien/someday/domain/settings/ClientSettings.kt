@@ -120,311 +120,15 @@ data class OnThisDayNotificationPreferences(
 
 data class SyncConfiguration(
     val mode: SyncMode = SyncMode.Off,
-    val webDavEndpoint: String? = null,
-    val webDavUsername: String? = null,
-    val webDavAppDirectory: String = WebDavDefaults.appDirectory,
-    val webDavLastTest: WebDavConnectionStatus? = null,
-    val webDavAutoBackupEnabled: Boolean = false,
-    val webDavAutoBackupFrequency: WebDavAutoBackupFrequency = WebDavAutoBackupFrequency.Daily,
-    val webDavLastBackup: WebDavBackupStatus? = null,
     val selfHostedEndpoint: String? = null,
     val selfHostedSession: SelfHostedSessionSummary = SelfHostedSessionSummary(),
     val lastError: String? = null,
-    val lastErrorCode: SyncErrorCode? = null,
 )
 
 enum class SyncMode {
     Off,
-    WebDav,
     SelfHosted,
 }
-
-enum class SyncErrorCode {
-    WebDavWorkspaceKeyMismatch,
-}
-
-object WebDavDefaults {
-    const val appDirectory: String = "/someday/"
-}
-
-enum class WebDavAutoBackupFrequency {
-    Daily,
-    Weekly,
-}
-
-data class WebDavConnectionInput(
-    val endpoint: String,
-    val username: String? = null,
-    val password: String? = null,
-    val appDirectory: String = WebDavDefaults.appDirectory,
-) {
-    fun sanitized(): WebDavConnectionInput =
-        copy(
-            endpoint = endpoint.trim().trimEnd('/'),
-            username = username?.trim()?.takeIf { it.isNotBlank() },
-            password = password?.takeIf { it.isNotBlank() },
-            appDirectory = normalizeWebDavAppDirectory(appDirectory),
-        )
-
-    fun validate(): List<String> {
-        val sanitized = sanitized()
-        return buildList {
-            if (sanitized.endpoint.isBlank()) {
-                add("WebDAV endpoint is required.")
-            }
-            if (!sanitized.endpoint.startsWith("http://") && !sanitized.endpoint.startsWith("https://")) {
-                add("WebDAV endpoint must use http:// or https://.")
-            } else if (!isSecureSyncEndpoint(sanitized.endpoint)) {
-                add("WebDAV requires HTTPS unless the server is on this device's loopback interface.")
-            }
-            if (sanitized.appDirectory != WebDavDefaults.appDirectory && !sanitized.appDirectory.startsWith("/")) {
-                add("WebDAV app directory must be absolute.")
-            }
-            if (sanitized.appDirectory.contains("..")) {
-                add("WebDAV app directory must stay within the app-owned path.")
-            }
-        }
-    }
-
-    fun redactedDescription(): String =
-        "endpoint=${endpoint.trim().ifBlank { "missing" }} " +
-            "username=${username?.trim()?.takeIf { it.isNotBlank() } ?: "anonymous"} " +
-            "password=${if (password.isNullOrBlank()) "not-provided" else "redacted"} " +
-            "appDirectory=${normalizeWebDavAppDirectory(appDirectory)}"
-}
-
-data class WebDavConnectionStatus(
-    val ready: Boolean,
-    val message: String,
-    val appDirectory: String = WebDavDefaults.appDirectory,
-) {
-    init {
-        require(!message.contains("password", ignoreCase = true) || message.contains("redacted", ignoreCase = true)) {
-            "WebDAV connection status must not expose credential secrets."
-        }
-    }
-}
-
-data class WebDavConnectionTestResult(
-    val success: Boolean,
-    val status: WebDavConnectionStatus,
-) {
-    companion object {
-        fun validationFailed(errors: List<String>): WebDavConnectionTestResult =
-            WebDavConnectionTestResult(
-                success = false,
-                status = WebDavConnectionStatus(
-                    ready = false,
-                    message = errors.joinToString(separator = " "),
-                ),
-            )
-    }
-}
-
-fun interface WebDavConnectionTester {
-    fun testConnection(input: WebDavConnectionInput): WebDavConnectionTestResult
-}
-
-interface WebDavCredentialStore {
-    fun load(): String?
-
-    fun save(secret: String)
-
-    fun clear()
-
-    /**
-     * Loads the complete credential tuple for a retained V2 authority.  This
-     * is deliberately separate from [load]: endpoint migration must be able
-     * to authenticate both the old read-only authority and the configured
-     * target without treating one mutable "current password" slot as causal
-     * state.
-     */
-    fun loadForAuthority(authorityBindingId: String): WebDavAuthorityCredentials? = null
-
-    /** Stores an authority-scoped tuple in the platform secure store. */
-    fun saveForAuthority(credentials: WebDavAuthorityCredentials) {
-        error("Authority-scoped WebDAV credential storage is unavailable in this build.")
-    }
-
-    /** Removes one expired authority tuple without touching the current slot. */
-    fun clearAuthority(authorityBindingId: String) = Unit
-
-    fun hasSavedCredential(): Boolean = load()?.isNotBlank() == true
-}
-
-data class WebDavAuthorityCredentials(
-    val authorityBindingId: String,
-    val endpoint: String,
-    val username: String,
-    val appDirectory: String,
-    val secret: String,
-) {
-    init {
-        require(authorityBindingId == webDavV2AuthorityBindingId(endpoint, appDirectory)) {
-            "WebDAV authority credential does not match its endpoint binding."
-        }
-        require(username.isNotBlank()) { "WebDAV authority username must not be blank." }
-        require(secret.isNotBlank()) { "WebDAV authority credential must not be blank." }
-    }
-
-    fun encodeForSecureStorage(): String = listOf(
-        WebDavAuthorityCredentialsStorageVersion,
-        authorityBindingId,
-        endpoint.trim().trimEnd('/'),
-        username,
-        normalizeWebDavAppDirectory(appDirectory),
-        secret,
-    ).joinToString(separator = "\n") { Base64.encode(it.encodeToByteArray()) }
-}
-
-fun decodeWebDavAuthorityCredentials(value: String): WebDavAuthorityCredentials? {
-    val decoded = buildList {
-        value.lineSequence().filter(String::isNotBlank).forEach { line ->
-            add(runCatching { Base64.decode(line).decodeToString() }.getOrNull() ?: return null)
-        }
-    }
-    if (decoded.size != 6 || decoded[0] != WebDavAuthorityCredentialsStorageVersion) return null
-    return runCatching {
-        WebDavAuthorityCredentials(
-            authorityBindingId = decoded[1],
-            endpoint = decoded[2],
-            username = decoded[3],
-            appDirectory = decoded[4],
-            secret = decoded[5],
-        )
-    }.getOrNull()
-}
-
-fun webDavV2AuthorityBindingId(endpoint: String, appDirectory: String): String =
-    "webdav-log-v2|${endpoint.trim().trimEnd('/')}|${normalizeWebDavAppDirectory(appDirectory)}"
-
-private const val WebDavAuthorityCredentialsStorageVersion = "webdav-authority-credential-v2"
-
-object UnavailableWebDavCredentialStore : WebDavCredentialStore {
-    override fun load(): String? = null
-
-    override fun save(secret: String) {
-        require(secret.isNotBlank()) { "WebDAV credential must not be blank." }
-        error("WebDAV credential storage is unavailable in this build.")
-    }
-
-    override fun clear() = Unit
-}
-
-data class WebDavBackupResult(
-    val success: Boolean,
-    val message: String,
-    val notebookCount: Int = 0,
-    val noteCount: Int = 0,
-    val version: WebDavBackupVersion? = null,
-) {
-    companion object {
-        fun failure(message: String): WebDavBackupResult =
-            WebDavBackupResult(success = false, message = redactWebDavSecretWords(message))
-    }
-}
-
-data class WebDavBackupStatus(
-    val success: Boolean,
-    val message: String,
-    val versionLabel: String? = null,
-    val completedAtEpochMillis: Long? = null,
-) {
-    init {
-        require(!message.contains("password", ignoreCase = true) || message.contains("redacted", ignoreCase = true)) {
-            "WebDAV backup status must not expose credential secrets."
-        }
-    }
-}
-
-data class WebDavBackupVersion(
-    val id: String,
-    val label: String,
-    val path: String?,
-)
-
-data class WebDavBackupListResult(
-    val success: Boolean,
-    val message: String,
-    val versions: List<WebDavBackupVersion> = emptyList(),
-) {
-    companion object {
-        fun failure(message: String): WebDavBackupListResult =
-            WebDavBackupListResult(success = false, message = redactWebDavSecretWords(message))
-    }
-}
-
-data class WebDavRestoreResult(
-    val success: Boolean,
-    val message: String,
-    val notebooksCreated: Int = 0,
-    val notebooksReused: Int = 0,
-    val notesCreated: Int = 0,
-    val notesUpdated: Int = 0,
-    val notesMerged: Int = 0,
-    val noteConflictsCreated: Int = 0,
-    val notesSkipped: Int = 0,
-) {
-    companion object {
-        fun failure(message: String): WebDavRestoreResult =
-            WebDavRestoreResult(success = false, message = redactWebDavSecretWords(message))
-    }
-}
-
-fun interface WebDavBackupRunner {
-    fun backup(input: WebDavConnectionInput): WebDavBackupResult
-}
-
-fun interface WebDavRestoreRunner {
-    fun restore(
-        input: WebDavConnectionInput,
-        backupPath: String?,
-    ): WebDavRestoreResult
-}
-
-fun interface WebDavBackupCatalogRunner {
-    fun listBackups(input: WebDavConnectionInput): WebDavBackupListResult
-}
-
-data class WebDavDiscoveredDevice(
-    val deviceId: String,
-    val firstSeenAtEpochMillis: Long?,
-    val lastSeenAtEpochMillis: Long?,
-    val isCurrentDevice: Boolean,
-)
-
-data class WebDavDiscoveredDevicesResult(
-    val success: Boolean,
-    val devices: List<WebDavDiscoveredDevice> = emptyList(),
-    val message: String,
-) {
-    companion object {
-        fun success(devices: List<WebDavDiscoveredDevice>) =
-            WebDavDiscoveredDevicesResult(true, devices, "Discovered ${devices.size} WebDAV device(s).")
-
-        fun failure(message: String) = WebDavDiscoveredDevicesResult(false, message = message)
-    }
-}
-
-fun interface WebDavDiscoveredDevicesRunner {
-    fun listDiscoveredDevices(): WebDavDiscoveredDevicesResult
-}
-
-fun normalizeWebDavAppDirectory(value: String): String {
-    val trimmed = value.trim().ifBlank { WebDavDefaults.appDirectory }
-    val withLeadingSlash = if (trimmed.startsWith("/")) trimmed else "/$trimmed"
-    return if (withLeadingSlash.endsWith("/")) withLeadingSlash else "$withLeadingSlash/"
-}
-
-private fun redactWebDavSecretWords(message: String): String =
-    if (message.contains("password", ignoreCase = true) ||
-        message.contains("token", ignoreCase = true) ||
-        message.contains("secret", ignoreCase = true)
-    ) {
-        "WebDAV operation failed; credentials redacted."
-    } else {
-        message
-    }
 
 data class SelfHostedSessionSummary(
     val loggedIn: Boolean = false,
@@ -525,14 +229,14 @@ interface SelfHostedSessionCredentialStore {
     fun clear()
 
     fun loadForAuthority(authorityBindingId: String): SelfHostedSessionCredentials? =
-        load()?.takeIf { selfHostedV2AuthorityBindingId(it.endpoint) == authorityBindingId }
+        load()?.takeIf { it.authorityBindingId == authorityBindingId }
 
     fun saveForAuthority(authorityBindingId: String, credentials: SelfHostedSessionCredentials) {
-        require(authorityBindingId == selfHostedV2AuthorityBindingId(credentials.endpoint)) {
-            "Self-hosted authority credential does not match its endpoint binding."
+        require(authorityBindingId == credentials.authorityBindingId) {
+            "Self-hosted authority credential does not match its authenticated account binding."
         }
         val current = load()
-        if (current == null || selfHostedV2AuthorityBindingId(current.endpoint) == authorityBindingId) {
+        if (current == null || current.authorityBindingId == authorityBindingId) {
             save(credentials)
         } else {
             error("Authority-scoped self-hosted credential storage is unavailable in this build.")
@@ -542,8 +246,83 @@ interface SelfHostedSessionCredentialStore {
     fun clearAuthority(authorityBindingId: String) = Unit
 }
 
-fun selfHostedV2AuthorityBindingId(endpoint: String): String =
-    "self-hosted-v2|${normalizeSelfHostedEndpoint(endpoint)}"
+/**
+ * Stable identity of one authenticated self-hosted account.
+ *
+ * The endpoint alone is not an authority: one server can host many mutually
+ * isolated users. Length-prefixing keeps the value unambiguous without leaking
+ * tokens, email addresses, or device credentials into protocol metadata.
+ */
+fun selfHostedAuthorityBindingId(endpoint: String, authenticatedUserId: String): String {
+    val canonicalEndpoint = normalizeSelfHostedEndpoint(endpoint)
+    val canonicalUserId = authenticatedUserId.trim()
+    require(isSecureSyncEndpoint(canonicalEndpoint)) {
+        "Self-hosted authority endpoint must be a valid HTTPS origin or loopback HTTP origin."
+    }
+    require(canonicalUserId.isNotBlank()) { "Self-hosted authority user id must be present." }
+    return "self-hosted|${canonicalEndpoint.encodeToByteArray().size}:$canonicalEndpoint|" +
+        "${canonicalUserId.encodeToByteArray().size}:$canonicalUserId"
+}
+
+data class SelfHostedAuthorityBinding(
+    val endpoint: String,
+    val authenticatedUserId: String,
+)
+
+/**
+ * Decodes the canonical, length-prefixed account authority persisted with a workspace.
+ *
+ * Parsing the binding instead of trusting the currently selected session lets a bound
+ * workspace safely obtain fresh tokens: the endpoint is checked before authentication and
+ * the immutable server user id is checked before the stable device is re-registered.
+ */
+fun parseSelfHostedAuthorityBindingId(value: String): SelfHostedAuthorityBinding? {
+    val prefix = "self-hosted|".encodeToByteArray()
+    val encoded = value.encodeToByteArray()
+    if (encoded.size < prefix.size || !encoded.copyOfRange(0, prefix.size).contentEquals(prefix)) {
+        return null
+    }
+
+    var cursor = prefix.size
+    fun readLengthPrefixedField(): String? {
+        val lengthStart = cursor
+        while (cursor < encoded.size && encoded[cursor].toInt() in '0'.code..'9'.code) {
+            cursor += 1
+        }
+        if (cursor == lengthStart || cursor >= encoded.size || encoded[cursor].toInt() != ':'.code) {
+            return null
+        }
+        val byteLength = encoded.copyOfRange(lengthStart, cursor)
+            .decodeToString()
+            .toLongOrNull()
+            ?.takeIf { it in 0..Int.MAX_VALUE.toLong() }
+            ?.toInt()
+            ?: return null
+        cursor += 1
+        if (byteLength > encoded.size - cursor) return null
+        val fieldBytes = encoded.copyOfRange(cursor, cursor + byteLength)
+        cursor += byteLength
+        val field = fieldBytes.decodeToString()
+        return field.takeIf { it.encodeToByteArray().contentEquals(fieldBytes) }
+    }
+
+    val endpoint = readLengthPrefixedField() ?: return null
+    if (cursor >= encoded.size || encoded[cursor].toInt() != '|'.code) return null
+    cursor += 1
+    val authenticatedUserId = readLengthPrefixedField() ?: return null
+    if (cursor != encoded.size) return null
+
+    return runCatching {
+        SelfHostedAuthorityBinding(endpoint, authenticatedUserId).also { parsed ->
+            require(selfHostedAuthorityBindingId(parsed.endpoint, parsed.authenticatedUserId) == value) {
+                "Self-hosted authority binding is not canonical."
+            }
+        }
+    }.getOrNull()
+}
+
+val SelfHostedSessionCredentials.authorityBindingId: String
+    get() = selfHostedAuthorityBindingId(endpoint, userId)
 
 object UnavailableSelfHostedSessionCredentialStore : SelfHostedSessionCredentialStore {
     override fun load(): SelfHostedSessionCredentials? = null
@@ -571,28 +350,28 @@ data class SelfHostedSetupInput(
             platform = platform.trim().lowercase(),
         )
 
-    fun validate(): List<String> {
+    fun validate(): List<SelfHostedSetupValidationIssue> {
         val sanitized = sanitized()
         return buildList {
             if (sanitized.endpoint.isBlank()) {
-                add("Self-hosted endpoint is required.")
+                add(SelfHostedSetupValidationIssue.EndpointRequired)
             }
             if (!sanitized.endpoint.startsWith("http://") && !sanitized.endpoint.startsWith("https://")) {
-                add("Self-hosted endpoint must use http:// or https://.")
+                add(SelfHostedSetupValidationIssue.EndpointSchemeRequired)
             } else if (!isSecureSyncEndpoint(sanitized.endpoint)) {
-                add("Self-hosted requires HTTPS unless the server is on this device's loopback interface.")
+                add(SelfHostedSetupValidationIssue.HttpsRequired)
             }
             if (sanitized.email.isBlank() || "@" !in sanitized.email || "." !in sanitized.email.substringAfter("@")) {
-                add("Self-hosted email is invalid.")
+                add(SelfHostedSetupValidationIssue.EmailInvalid)
             }
             if (password.length < 8) {
-                add("Self-hosted password must be at least 8 characters.")
+                add(SelfHostedSetupValidationIssue.PasswordTooShort)
             }
             if (sanitized.deviceName.isBlank()) {
-                add("Self-hosted device name is required.")
+                add(SelfHostedSetupValidationIssue.DeviceNameRequired)
             }
             if (sanitized.platform.isBlank()) {
-                add("Self-hosted device platform is required.")
+                add(SelfHostedSetupValidationIssue.PlatformRequired)
             }
         }
     }
@@ -606,12 +385,39 @@ data class SelfHostedSetupInput(
             "mode=${if (createAccount) "register" else "login"}"
 }
 
+enum class SelfHostedSetupValidationIssue {
+    EndpointRequired,
+    EndpointSchemeRequired,
+    HttpsRequired,
+    EmailInvalid,
+    PasswordTooShort,
+    DeviceNameRequired,
+    PlatformRequired,
+}
+
+enum class SelfHostedSetupReason {
+    Ready,
+    BoundSessionRenewed,
+    AccountChangeBlocked,
+    AuthorityInvalid,
+    EndpointMismatch,
+    AuthorityMismatch,
+    DeviceRevoked,
+    Unavailable,
+    Failed,
+}
+
 data class SelfHostedSetupStatus(
     val ready: Boolean,
-    val message: String,
+    val reason: SelfHostedSetupReason,
+    val diagnosticMessage: String? = null,
 ) {
     init {
-        require(!message.contains("password", ignoreCase = true) || message.contains("redacted", ignoreCase = true)) {
+        require(
+            diagnosticMessage == null ||
+                !diagnosticMessage.contains("password", ignoreCase = true) ||
+                diagnosticMessage.contains("redacted", ignoreCase = true),
+        ) {
             "Self-hosted setup status must not expose credential secrets."
         }
     }
@@ -633,12 +439,16 @@ data class SelfHostedSetupResult(
                 session = session.copy(loggedIn = true),
             )
 
-        fun failure(message: String): SelfHostedSetupResult =
+        fun failure(
+            reason: SelfHostedSetupReason,
+            diagnosticMessage: String? = null,
+        ): SelfHostedSetupResult =
             SelfHostedSetupResult(
                 success = false,
                 status = SelfHostedSetupStatus(
                     ready = false,
-                    message = redactSelfHostedSecretWords(message),
+                    reason = reason,
+                    diagnosticMessage = diagnosticMessage?.let(::redactSelfHostedSecretWords),
                 ),
             )
     }
@@ -660,10 +470,10 @@ data class ManualSyncResult(
      * notes/settings controllers refresh. Transport contention, retries, corruption,
      * authentication failures, and non-persisted apply blockers are failures or ignored
      * states, not manual-sync conflicts.
-     */
+    */
     val conflicts: Int,
-    val message: String,
-    val errorCode: SyncErrorCode? = null,
+    val reason: ManualSyncReason,
+    val diagnosticMessage: String? = null,
 ) {
     companion object {
         fun success(
@@ -671,7 +481,8 @@ data class ManualSyncResult(
             pushedObjects: Int,
             pulledObjects: Int,
             conflicts: Int,
-            message: String,
+            reason: ManualSyncReason = ManualSyncReason.Completed,
+            diagnosticMessage: String? = null,
         ): ManualSyncResult =
             ManualSyncResult(
                 success = true,
@@ -679,17 +490,17 @@ data class ManualSyncResult(
                 pushedObjects = pushedObjects,
                 pulledObjects = pulledObjects,
                 conflicts = conflicts,
-                message = message,
-                errorCode = null,
+                reason = reason,
+                diagnosticMessage = diagnosticMessage,
             )
 
         fun failure(
             mode: SyncMode,
-            message: String,
+            reason: ManualSyncReason,
+            diagnosticMessage: String? = null,
             pushedObjects: Int = 0,
             pulledObjects: Int = 0,
             conflicts: Int = 0,
-            errorCode: SyncErrorCode? = null,
         ): ManualSyncResult =
             ManualSyncResult(
                 success = false,
@@ -697,10 +508,28 @@ data class ManualSyncResult(
                 pushedObjects = pushedObjects,
                 pulledObjects = pulledObjects,
                 conflicts = conflicts,
-                message = redactSelfHostedSecretWords(message),
-                errorCode = errorCode,
+                reason = reason,
+                diagnosticMessage = diagnosticMessage
+                    ?.let(::redactSelfHostedSecretWords)
+                    ?.replace(Regex("(?i)\\bV2\\b"), "entity-DAG"),
             )
     }
+}
+
+enum class ManualSyncReason {
+    Completed,
+    Initialized,
+    Disabled,
+    Unavailable,
+    AlreadyRunning,
+    ProviderChanged,
+    AuthorityMismatch,
+    WorkspaceLocked,
+    RemoteHistoryConflict,
+    CheckpointInvalid,
+    RetryRequired,
+    Blocked,
+    Failed,
 }
 
 fun interface ManualSyncRunner {
@@ -724,34 +553,6 @@ sealed interface ManualSyncPhase {
  */
 fun interface ManualSyncProgressListener {
     fun onProgress(phase: ManualSyncPhase)
-}
-
-/** Explicit maintenance operations for an already active causal-sync epoch. */
-interface SyncV2MaintenanceRunner {
-    fun rollEpoch(): ManualSyncResult
-
-    fun repairIntegrity(): ManualSyncResult
-
-    /**
-     * Last-resort recovery after exact repair is impossible. The caller must
-     * obtain explicit user confirmation because unseen remote branches may be
-     * absent from the verified local checkpoint.
-     */
-    fun recoverWithVerifiedLocalCheckpoint(userConfirmedPotentialDataLoss: Boolean): ManualSyncResult =
-        ManualSyncResult.failure(
-            SyncMode.Off,
-            "Authorized V2 checkpoint recovery is unavailable in this build.",
-        )
-
-    fun migrateToConfiguredRemote(): ManualSyncResult = ManualSyncResult.failure(
-        SyncMode.Off,
-        "Explicit V2 remote migration is unavailable in this build.",
-    )
-
-    fun collectExpiredLocalHistory(): ManualSyncResult = ManualSyncResult.failure(
-        SyncMode.Off,
-        "V2 retention maintenance is unavailable in this build.",
-    )
 }
 
 class WorkspaceJoinPackage(
@@ -781,24 +582,29 @@ class WorkspaceJoinPackage(
 
 data class WorkspaceJoinResult(
     val success: Boolean,
-    val message: String,
+    val reason: WorkspacePairingReason,
+    val diagnosticMessage: String? = null,
     val packageData: WorkspaceJoinPackage? = null,
 ) {
     companion object {
         fun success(
-            message: String,
+            reason: WorkspacePairingReason,
             packageData: WorkspaceJoinPackage? = null,
         ): WorkspaceJoinResult =
             WorkspaceJoinResult(
                 success = true,
-                message = message,
+                reason = reason,
                 packageData = packageData,
             )
 
-        fun failure(message: String): WorkspaceJoinResult =
+        fun failure(
+            reason: WorkspacePairingReason,
+            diagnosticMessage: String? = null,
+        ): WorkspaceJoinResult =
             WorkspaceJoinResult(
                 success = false,
-                message = redactSelfHostedSecretWords(message),
+                reason = reason,
+                diagnosticMessage = diagnosticMessage?.let(::redactSelfHostedSecretWords),
             )
     }
 }
@@ -809,6 +615,14 @@ fun interface WorkspaceJoinPackageProvider {
 
 fun interface WorkspaceJoiner {
     fun join(packageData: WorkspaceJoinPackage): WorkspaceJoinResult
+}
+
+/**
+ * Decides whether this installation may adopt another workspace identity.
+ * Null means replacement is safe; a non-null value is a stable refusal reason.
+ */
+fun interface LocalWorkspaceAdoptionPolicy {
+    fun refusalReason(): WorkspacePairingReason?
 }
 
 class WorkspacePairingInvitation private constructor(
@@ -839,26 +653,53 @@ class WorkspacePairingInvitation private constructor(
 
 data class WorkspacePairingInvitationResult(
     val success: Boolean,
-    val message: String,
+    val reason: WorkspacePairingReason,
+    val diagnosticMessage: String? = null,
     val invitation: WorkspacePairingInvitation? = null,
 ) {
     companion object {
         fun success(
-            message: String,
+            reason: WorkspacePairingReason,
             invitation: WorkspacePairingInvitation,
         ): WorkspacePairingInvitationResult =
             WorkspacePairingInvitationResult(
                 success = true,
-                message = message,
+                reason = reason,
                 invitation = invitation,
             )
 
-        fun failure(message: String): WorkspacePairingInvitationResult =
+        fun failure(
+            reason: WorkspacePairingReason,
+            diagnosticMessage: String? = null,
+        ): WorkspacePairingInvitationResult =
             WorkspacePairingInvitationResult(
                 success = false,
-                message = redactSelfHostedSecretWords(message),
+                reason = reason,
+                diagnosticMessage = diagnosticMessage?.let(::redactSelfHostedSecretWords),
             )
     }
+}
+
+enum class WorkspacePairingReason {
+    PackageCreated,
+    InvitationCreated,
+    InvitationCancelled,
+    InvitationUnavailable,
+    Joined,
+    PublishRequired,
+    SessionRequired,
+    InvalidToken,
+    InvitationNotFound,
+    InvitationAlreadyUsed,
+    InvitationExpired,
+    VerificationFailed,
+    AuthorityMismatch,
+    WorkspaceLocked,
+    LocalWorkspaceNotReplaceable,
+    LocalContentPresent,
+    AdoptionFailed,
+    Unavailable,
+    Failed,
 }
 
 fun interface WorkspacePairingInvitationCreator {
@@ -882,28 +723,34 @@ data class ManualSyncProgress(
     val conflicts: Int = 0,
 ) {
     companion object {
-        fun idle(mode: SyncMode = SyncMode.Off): ManualSyncProgress =
+        fun idle(
+            mode: SyncMode,
+            displayMessage: String,
+        ): ManualSyncProgress =
             ManualSyncProgress(
                 running = false,
                 mode = mode,
-                message = "Ready when sync is configured.",
+                message = displayMessage,
             )
 
         fun inProgress(
             mode: SyncMode,
-            message: String = "Syncing changes now.",
+            displayMessage: String,
         ): ManualSyncProgress =
             ManualSyncProgress(
                 running = true,
                 mode = mode,
-                message = message,
+                message = displayMessage,
             )
 
-        fun fromResult(result: ManualSyncResult): ManualSyncProgress =
+        fun fromResult(
+            result: ManualSyncResult,
+            displayMessage: String,
+        ): ManualSyncProgress =
             ManualSyncProgress(
                 running = false,
                 mode = result.mode,
-                message = result.message,
+                message = displayMessage,
                 pushedObjects = result.pushedObjects,
                 pulledObjects = result.pulledObjects,
                 conflicts = result.conflicts,
@@ -911,31 +758,16 @@ data class ManualSyncProgress(
     }
 }
 
-fun normalizeSelfHostedEndpoint(value: String): String =
-    value.trim().trimEnd('/')
+fun normalizeSelfHostedEndpoint(value: String): String {
+    val trimmed = value.trim()
+    return parseSelfHostedOriginOrNull(trimmed)?.canonicalValue ?: trimmed.trimEnd('/')
+}
 
 /** Credentials and mutations may use plaintext HTTP only over true loopback. */
 fun isSecureSyncEndpoint(value: String): Boolean {
-    val endpoint = value.trim().trimEnd('/')
-    if (endpoint.startsWith("https://")) return true
-    if (!endpoint.startsWith("http://")) return false
-    val authority = endpoint.removePrefix("http://")
-        .substringBefore('/')
-        .substringBefore('?')
-        .substringBefore('#')
-    if (authority.isBlank() || '@' in authority) return false
-    val host = if (authority.startsWith('[')) {
-        val closingBracket = authority.indexOf(']')
-        if (closingBracket <= 1) return false
-        val suffix = authority.substring(closingBracket + 1)
-        if (suffix.isNotEmpty() && !suffix.isValidEndpointPortSuffix()) return false
-        authority.substring(1, closingBracket).lowercase()
-    } else {
-        if (authority.count { it == ':' } > 1) return false
-        val suffix = authority.substringAfter(':', missingDelimiterValue = "")
-        if (':' in authority && !":$suffix".isValidEndpointPortSuffix()) return false
-        authority.substringBefore(':').lowercase()
-    }
+    val origin = parseSelfHostedOriginOrNull(value.trim()) ?: return false
+    if (origin.scheme == "https") return true
+    val host = origin.host
     return host == "localhost" || host.endsWith(".localhost") || host == "::1" ||
         host.split('.').let { parts ->
             parts.size == 4 && parts.firstOrNull() == "127" && parts.all { part ->
@@ -944,8 +776,67 @@ fun isSecureSyncEndpoint(value: String): Boolean {
         }
 }
 
-private fun String.isValidEndpointPortSuffix(): Boolean =
-    startsWith(':') && drop(1).toIntOrNull()?.let { it in 1..65_535 } == true
+private data class ParsedSelfHostedOrigin(
+    val scheme: String,
+    val host: String,
+    val canonicalValue: String,
+)
+
+/** Strict origin parser shared by validation and authority identity. */
+private fun parseSelfHostedOriginOrNull(value: String): ParsedSelfHostedOrigin? {
+    if (value.isBlank() || value.any { it.isWhitespace() || it.isISOControl() || it == '\\' }) return null
+    val schemeEnd = value.indexOf("://")
+    if (schemeEnd <= 0) return null
+    val scheme = value.substring(0, schemeEnd).lowercase()
+    if (scheme != "https" && scheme != "http") return null
+    val remainder = value.substring(schemeEnd + 3)
+    val suffixStart = remainder.indexOfFirst { it == '/' || it == '?' || it == '#' }
+        .let { if (it < 0) remainder.length else it }
+    val authority = remainder.substring(0, suffixStart)
+    val suffix = remainder.substring(suffixStart)
+    if (authority.isBlank() || '@' in authority || '%' in authority || (suffix.isNotEmpty() && suffix != "/")) {
+        return null
+    }
+
+    val (host, port) = if (authority.startsWith('[')) {
+        val closing = authority.indexOf(']')
+        if (closing <= 1) return null
+        val literal = authority.substring(1, closing)
+        if (literal.none { it == ':' } || literal.any { it !in "0123456789abcdefABCDEF:." }) return null
+        val portValue = authority.substring(closing + 1).parseEndpointPortOrNull() ?: return null
+        "[${literal.lowercase()}]" to portValue
+    } else {
+        if (authority.count { it == ':' } > 1) return null
+        val separator = authority.indexOf(':')
+        val hostValue = (if (separator < 0) authority else authority.substring(0, separator)).lowercase()
+        if (hostValue.isBlank() || hostValue.any { it !in 'a'..'z' && it !in '0'..'9' && it !in ".-" }) {
+            return null
+        }
+        val portValue = (if (separator < 0) "" else authority.substring(separator)).parseEndpointPortOrNull()
+            ?: return null
+        hostValue to portValue
+    }
+    val canonicalPort = when {
+        port == NO_EXPLICIT_ENDPOINT_PORT -> ""
+        scheme == "https" && port == 443 -> ""
+        scheme == "http" && port == 80 -> ""
+        else -> ":$port"
+    }
+    return ParsedSelfHostedOrigin(
+        scheme = scheme,
+        host = host.removePrefix("[").removeSuffix("]"),
+        canonicalValue = "$scheme://$host$canonicalPort",
+    )
+}
+
+/** Empty means no explicit port; every non-empty value must be canonical. */
+private fun String.parseEndpointPortOrNull(): Int? = when {
+    isEmpty() -> NO_EXPLICIT_ENDPOINT_PORT
+    !startsWith(':') -> null
+    else -> drop(1).toIntOrNull()?.takeIf { it in 1..65_535 && ":$it" == this }
+}
+
+private const val NO_EXPLICIT_ENDPOINT_PORT: Int = -1
 
 private fun redactSelfHostedSecretWords(message: String): String =
     message

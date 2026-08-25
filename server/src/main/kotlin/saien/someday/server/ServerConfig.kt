@@ -1,6 +1,7 @@
 package saien.someday.server
 
 import java.net.URI
+import java.nio.file.Path
 import java.security.SecureRandom
 import java.time.Duration
 import java.util.Base64
@@ -18,6 +19,8 @@ data class ServerConfig(
     val databaseUrl: String,
     val databaseUser: String,
     val databasePassword: String,
+    val mediaBlobDirectory: String,
+    val mediaQuotaBytes: Long,
     val jwtIssuer: String,
     val jwtAudience: String,
     val jwtSecret: String,
@@ -28,7 +31,7 @@ data class ServerConfig(
     val rateLimitMaxAttempts: Int,
     val rateLimitWindow: Duration,
     val rateLimitMaxBuckets: Int,
-    val syncV2RateLimitMaxAttempts: Int,
+    val systemV3RateLimitMaxAttempts: Int,
     val argon2MaxConcurrent: Int,
 ) {
     val secureAdminCookies: Boolean
@@ -43,6 +46,8 @@ data class ServerConfig(
         require(databaseUrl.isNotBlank()) { "SOMEDAY_DB_URL must not be blank." }
         require(databaseUser.isNotBlank()) { "SOMEDAY_DB_USER must not be blank." }
         require(databasePassword.isNotBlank()) { "SOMEDAY_DB_PASSWORD must not be blank." }
+        require(mediaBlobDirectory.isNotBlank()) { "SOMEDAY_MEDIA_BLOB_DIR must not be blank." }
+        require(mediaQuotaBytes > 0L) { "SOMEDAY_MEDIA_QUOTA_BYTES must be positive." }
         require(jwtIssuer.isNotBlank()) { "SOMEDAY_JWT_ISSUER must not be blank." }
         require(jwtAudience.isNotBlank()) { "SOMEDAY_JWT_AUDIENCE must not be blank." }
         require(jwtSecret.encodeToByteArray().size >= MINIMUM_JWT_SECRET_BYTES) {
@@ -59,8 +64,8 @@ data class ServerConfig(
             "SOMEDAY_RATE_LIMIT_WINDOW_SECONDS must be positive."
         }
         require(rateLimitMaxBuckets > 0) { "SOMEDAY_RATE_LIMIT_MAX_BUCKETS must be positive." }
-        require(syncV2RateLimitMaxAttempts > 0) {
-            "SOMEDAY_SYNC_V2_RATE_LIMIT_MAX_ATTEMPTS must be positive."
+        require(systemV3RateLimitMaxAttempts > 0) {
+            "SOMEDAY_SYSTEM_V3_RATE_LIMIT_MAX_ATTEMPTS must be positive."
         }
         require(argon2MaxConcurrent > 0) { "SOMEDAY_ARGON2_MAX_CONCURRENT must be positive." }
 
@@ -71,6 +76,9 @@ data class ServerConfig(
             }
             require(jwtSecret != LOCAL_DEVELOPMENT_JWT_SECRET) {
                 "The local development JWT secret cannot be used in production mode."
+            }
+            require(Path.of(mediaBlobDirectory).isAbsolute) {
+                "SOMEDAY_MEDIA_BLOB_DIR must be an absolute path in production mode."
             }
         }
     }
@@ -118,6 +126,15 @@ data class ServerConfig(
                     production = production,
                     localDefault = "someday",
                 ),
+                mediaBlobDirectory = environment.productionValue(
+                    name = "SOMEDAY_MEDIA_BLOB_DIR",
+                    production = production,
+                    localDefault = "build/local-media-blobs",
+                ),
+                mediaQuotaBytes = environment.longValue(
+                    "SOMEDAY_MEDIA_QUOTA_BYTES",
+                    DEFAULT_MEDIA_QUOTA_BYTES,
+                ),
                 jwtIssuer = environment.nonBlank("SOMEDAY_JWT_ISSUER") ?: "someday-local",
                 jwtAudience = environment.nonBlank("SOMEDAY_JWT_AUDIENCE") ?: "someday-clients",
                 jwtSecret = environment.nonBlank("SOMEDAY_JWT_SECRET")
@@ -145,12 +162,12 @@ data class ServerConfig(
                     environment.longValue("SOMEDAY_RATE_LIMIT_WINDOW_SECONDS", 60),
                 ),
                 rateLimitMaxBuckets = environment.intValue("SOMEDAY_RATE_LIMIT_MAX_BUCKETS", 10_000),
-                // A single bounded V2 coordinator pass can issue two sets of up
+                // A single bounded System V3 coordinator pass can issue two sets of up
                 // to eight paged pulls, in addition to checkpoint/outbox work.
                 // Keep this budget independent from the deliberately tight
                 // authentication brute-force budget above.
-                syncV2RateLimitMaxAttempts =
-                    environment.intValue("SOMEDAY_SYNC_V2_RATE_LIMIT_MAX_ATTEMPTS", 256),
+                systemV3RateLimitMaxAttempts =
+                    environment.intValue("SOMEDAY_SYSTEM_V3_RATE_LIMIT_MAX_ATTEMPTS", 256),
                 argon2MaxConcurrent = environment.intValue("SOMEDAY_ARGON2_MAX_CONCURRENT", 2),
             )
         }
@@ -236,3 +253,4 @@ private fun randomLocalJwtSecret(): String {
 
 private const val MINIMUM_JWT_SECRET_BYTES = 32
 private const val LOCAL_DEVELOPMENT_JWT_SECRET = "someday-local-development-secret-change-before-production"
+private const val DEFAULT_MEDIA_QUOTA_BYTES = 5L * 1024L * 1024L * 1024L

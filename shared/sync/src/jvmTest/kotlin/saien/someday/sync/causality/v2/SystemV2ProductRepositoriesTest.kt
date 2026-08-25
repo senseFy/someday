@@ -6,7 +6,6 @@ import saien.someday.data.crypto.SodiumWorkspaceCrypto
 import saien.someday.data.export.LocalDataExporter
 import saien.someday.data.export.LocalDataImporter
 import saien.someday.data.local.SqlDelightLocalDataRepository
-import saien.someday.data.local.SqlDelightNotesRepository
 import saien.someday.data.local.createSomedayJdbcDriver
 import saien.someday.data.local.db.SomedayDatabase
 import saien.someday.data.settings.SqlDelightClientSettingsRepository
@@ -162,7 +161,7 @@ class SystemV2ProductRepositoriesTest {
         fixture.notes.deleteNote(note.id, checkNotNull(note.causalToken))
         fixture.notes.deleteNotebook(notebook.id, checkNotNull(notebook.causalToken))
 
-        val deleted = fixture.routedNotes.listDeletedWorkspaceItems()
+        val deleted = fixture.notes.listDeletedWorkspaceItems()
 
         assertEquals(setOf(DeletedWorkspaceItemType.Note, DeletedWorkspaceItemType.Notebook), deleted.map { it.type }.toSet())
         assertTrue(deleted.all { it.canRestore })
@@ -779,7 +778,6 @@ class SystemV2ProductRepositoriesTest {
                 location = NotesLocationInput(31.2, 121.4, "V2 place", capturedAt = T1),
             ),
         )
-        assertNull(fixture.local.getNote(note.id))
         val transfer = WorkspaceLocalDataTransferV2(
             fixture.local,
             fixture.rawSettings,
@@ -788,9 +786,8 @@ class SystemV2ProductRepositoriesTest {
             { PROFILE },
         )
         val exporter = LocalDataExporter(
-            fixture.local,
-            clock = { T2 },
             authoritativeDocumentProvider = transfer::exportDocument,
+            clock = { T2 },
         )
 
         val exported = exporter.exportDocument()
@@ -802,12 +799,10 @@ class SystemV2ProductRepositoriesTest {
             notes = listOf(exported.notes.single().copy(title = "Restored branch")),
         )
         val summary = LocalDataImporter(
-            fixture.local,
             authoritativeImporter = transfer::importDocument,
         ).importDocument(restored)
 
         assertEquals(1, summary.noteConflictsCreated)
-        assertNull(fixture.local.getNote(note.id))
         val key = WorkspaceEntityKeyV2(WorkspaceEntityTypeV2.NOTE, note.id)
         assertEquals(2, fixture.context().store.loadHeads(key).size)
         assertEquals(1, fixture.context().store.loadConflicts(key).count {
@@ -826,7 +821,7 @@ class SystemV2ProductRepositoriesTest {
             rawSettings.saveLocalSnapshot(
                 ClientSettings(
                     activeDeviceId = WRITER_A,
-                    syncConfiguration = SyncConfiguration(mode = SyncMode.WebDav),
+                    syncConfiguration = SyncConfiguration(mode = SyncMode.SelfHosted),
                 ),
             )
             val protocol = SqlDelightSyncProtocolStoreV2(database)
@@ -842,11 +837,6 @@ class SystemV2ProductRepositoriesTest {
             protocol.activateEpoch(PROFILE, EPOCH, T1)
             val contextProvider = WorkspaceSystemV2ContextProvider(local, { key }, { WRITER_A }, { PROFILE })
             val notes = SystemV2NotesRepository(local, { key }, { WRITER_A }, { PROFILE }, clock = { T1 })
-            val routedNotes = ProtocolRoutingNotesRepository(
-                SqlDelightNotesRepository(local),
-                notes,
-                { true },
-            )
             val settings = SystemV2ClientSettingsRepository(
                 local,
                 rawSettings,
@@ -855,7 +845,7 @@ class SystemV2ProductRepositoriesTest {
                 { PROFILE },
                 clock = { T1 },
             )
-            block(Fixture(database, EPOCH, local, key, rawSettings, contextProvider, notes, routedNotes, settings))
+            block(Fixture(database, EPOCH, local, key, rawSettings, contextProvider, notes, settings))
         } finally {
             driver.close()
         }
@@ -869,7 +859,6 @@ class SystemV2ProductRepositoriesTest {
         val rawSettings: SqlDelightClientSettingsRepository,
         val contextProvider: WorkspaceSystemV2ContextProvider,
         val notes: SystemV2NotesRepository,
-        val routedNotes: ProtocolRoutingNotesRepository,
         val settings: SystemV2ClientSettingsRepository,
     ) {
         private var remoteCursor: String? = null
@@ -941,7 +930,7 @@ class SystemV2ProductRepositoriesTest {
         WorkspaceEntityKeyV2(WorkspaceEntityTypeV2.NOTEBOOK, notebookId)
 
     private companion object {
-        const val PROFILE = "webdav-log-v2"
+        const val PROFILE = "self-hosted-v2"
         const val WRITER_A = "00000000-0000-4000-8000-000000000001"
         const val WRITER_B = "00000000-0000-4000-8000-000000000002"
         const val EPOCH = "00000000-0000-4000-8000-000000000010"

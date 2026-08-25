@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+GRADLEW="${GRADLEW:-$ROOT_DIR/gradlew}"
+GATE_PROPERTY="-Psomeday.systemV3ReliabilityGate=true"
+RESULT_DIR="$ROOT_DIR/build/system-v3-apple-gate"
+REPORT="$RESULT_DIR/report.json"
+STARTED_AT="$(date +%s)"
+mkdir -p "$RESULT_DIR"
+rm -f "$REPORT"
+
+die() {
+    printf 'system-v3 apple gate error: %s\n' "$*" >&2
+    exit 1
+}
+
+require_java_21() {
+    local java_bin feature_version
+    if [[ -n "${JAVA_HOME:-}" ]]; then
+        java_bin="$JAVA_HOME/bin/java"
+    else
+        java_bin="$(command -v java)"
+    fi
+    [[ -x "$java_bin" ]] || die "JAVA_HOME does not provide an executable Java runtime"
+    feature_version="$(
+        "$java_bin" -XshowSettings:properties -version 2>&1 |
+            sed -n 's/^[[:space:]]*java\.specification\.version = \([0-9][0-9]*\).*$/\1/p' |
+            head -1
+    )"
+    [[ "$feature_version" =~ ^[0-9]+$ ]] || die "could not determine the Java feature version"
+    ((feature_version >= 21)) || die "JDK 21 or newer is required"
+}
+
+[[ "$(uname -s)" == "Darwin" ]] || die "iOS simulator evidence requires a macOS host"
+[[ "$(uname -m)" == "arm64" ]] || die "iosSimulatorArm64Test requires an Apple Silicon host"
+command -v python3 >/dev/null 2>&1 || die "missing required command: python3"
+require_java_21
+[[ -x "$GRADLEW" ]] || die "Gradle wrapper is not executable: $GRADLEW"
+
+cd "$ROOT_DIR"
+"$GRADLEW" \
+    :shared:domain:iosSimulatorArm64Test \
+    :shared:data:iosSimulatorArm64Test \
+    :shared:sync:iosSimulatorArm64Test \
+    :shared:ui:iosSimulatorArm64Test \
+    :app:ios:iosSimulatorArm64Test \
+    :app:ios:compileKotlinIosSimulatorArm64 \
+    "$GATE_PROPERTY" \
+    --dependency-verification=strict \
+    --stacktrace
+
+FINISHED_AT="$(date +%s)"
+python3 - "$ROOT_DIR" "$REPORT" "$STARTED_AT" "$FINISHED_AT" <<'PY'
+import json
+import pathlib
+import subprocess
+import sys
+import xml.etree.ElementTree as ET
+
+root = pathlib.Path(sys.argv[1])
+report_path = pathlib.Path(sys.argv[2])
+started = int(sys.argv[3])
+finished = int(sys.argv[4])
+targets = {
+    "domain-ios-simulator-arm64": root / "shared/domain/build/test-results/iosSimulatorArm64Test",
+    "data-ios-simulator-arm64": root / "shared/data/build/test-results/iosSimulatorArm64Test",
+    "sync-ios-simulator-arm64": root / "shared/sync/build/test-results/iosSimulatorArm64Test",
+    "ui-ios-simulator-arm64": root / "shared/ui/build/test-results/iosSimulatorArm64Test",
+    "app-ios-simulator-arm64": root / "app/ios/build/test-results/iosSimulatorArm64Test",
+}
+
+evidence = []
+for target, result_root in targets.items():
+    if not result_root.is_dir():
+        raise SystemExit(f"missing JUnit result root for {target}: {result_root}")
+    files = [
+        path for path in sorted(result_root.rglob("*.xml"))
+        if path.stat().st_mtime >= started - 1
+    ]
+    if not files:
+        raise SystemExit(f"no fresh JUnit XML for {target}")
+    tests = failures = errors = skipped = 0
+    for path in files:
+        cases = list(ET.parse(path).getroot().iter("testcase"))
+        tests += len(cases)
+        for case in cases:
+            failures += case.find("failure") is not None
+            errors += case.find("error") is not None
+            skipped += case.find("skipped") is not None
+    if tests == 0 or failures or errors or skipped:
+        raise SystemExit(
+            f"non-passing evidence for {target}: "
+            f"tests={tests} failures={failures} errors={errors} skipped={skipped}"
+        )
+    evidence.append({
+        "target": target,
+        "result": "passed",
+        "tests": tests,
+        "resultFiles": [str(path.relative_to(root)) for path in files],
+    })
+
+commit = subprocess.run(
+    ["git", "rev-parse", "HEAD"], cwd=root, text=True,
+    capture_output=True, check=True,
+).stdout.strip()
+report = {
+    "contractId": "someday-system-v3-apple",
+    "commit": commit,
+    "startedAtEpochSeconds": started,
+    "finishedAtEpochSeconds": finished,
+    "durationSeconds": finished - started,
+    "host": "macos-arm64",
+    "suiteEvidence": evidence,
+    "compileEvidence": ["app-ios-compileKotlinIosSimulatorArm64"],
+    "result": "passed",
+}
+report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+PY
+
+printf '[system-v3 apple gate] passed; report: %s\n' "$REPORT" >&2

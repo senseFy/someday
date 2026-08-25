@@ -77,16 +77,34 @@ class SodiumWorkspaceCrypto(
         key: ByteArray,
         associatedData: ByteArray,
         plaintext: ByteArray,
+    ): AeadCiphertext = encryptAeadWithNonce(
+        key,
+        randomBytes(crypto_aead_xchacha20poly1305_ietf_NPUBBYTES),
+        associatedData,
+        plaintext,
+    )
+
+    /**
+     * Encrypts with an explicitly supplied XChaCha20 nonce. The caller must derive a unique nonce
+     * for every distinct plaintext under [key]; this method rejects every non-canonical size.
+     */
+    fun encryptAeadWithNonce(
+        key: ByteArray,
+        nonce: ByteArray,
+        associatedData: ByteArray,
+        plaintext: ByteArray,
     ): AeadCiphertext {
         require(key.size == WorkspaceMasterKey.WORKSPACE_KEY_BYTES) { "AEAD key must be 32 bytes." }
-        val nonce = randomBytes(crypto_aead_xchacha20poly1305_ietf_NPUBBYTES)
+        require(nonce.size == crypto_aead_xchacha20poly1305_ietf_NPUBBYTES) {
+            "XChaCha20-Poly1305 nonces must be $crypto_aead_xchacha20poly1305_ietf_NPUBBYTES bytes."
+        }
         val ciphertext = AuthenticatedEncryptionWithAssociatedData.xChaCha20Poly1305IetfEncrypt(
             message = plaintext.toUByteArrayCopy(),
             associatedData = associatedData.toUByteArrayCopy(),
             nonce = nonce.toUByteArrayCopy(),
             key = key.toUByteArrayCopy(),
         ).toByteArrayCopy()
-        return AeadCiphertext(nonce = nonce, ciphertext = ciphertext)
+        return AeadCiphertext(nonce = nonce.copyOf(), ciphertext = ciphertext)
     }
 
     fun decryptAead(

@@ -24,39 +24,13 @@ val generatedDesktopBuildConfigDir = layout.buildDirectory.dir("generated/source
 val desktopDeveloperOptionsEnabled = providers
     .gradleProperty("someday.desktop.developerOptions")
     .orElse("true")
-val desktopSystemV2ReleaseEnabled = providers
-    .gradleProperty("someday.systemV2ReleaseEnabled")
-    .orElse("false")
-val desktopSystemV2DevelopmentEnabled = providers
-    .gradleProperty("someday.systemV2DevelopmentEnabled")
-    .orElse("false")
-val desktopReleasePackagingRequested = gradle.startParameter.taskNames.any { taskName ->
-    val normalizedTaskName = taskName.removePrefix(":")
-    val targetsDesktop = ':' !in normalizedTaskName || normalizedTaskName.startsWith("app:desktop:")
-    val simpleName = taskName.substringAfterLast(':').lowercase()
-    targetsDesktop && "release" in simpleName &&
-        listOf("package", "distributable", "notarize").any(simpleName::contains)
-}
-if (desktopReleasePackagingRequested) {
-    check(desktopSystemV2ReleaseEnabled.get().toBooleanStrictOrNull() == true) {
-        "Desktop release packaging requires -Psomeday.systemV2ReleaseEnabled=true. " +
-            "Use the canonical scripts/package-macos-release entrypoint."
-    }
-}
-
 val generateDesktopBuildConfig by tasks.registering {
     inputs.property("developerOptionsEnabled", desktopDeveloperOptionsEnabled)
-    inputs.property("systemV2ReleaseEnabled", desktopSystemV2ReleaseEnabled)
-    inputs.property("systemV2DevelopmentEnabled", desktopSystemV2DevelopmentEnabled)
     outputs.dir(generatedDesktopBuildConfigDir)
 
     doLast {
         val enabled = desktopDeveloperOptionsEnabled.get().toBooleanStrictOrNull()
             ?: error("someday.desktop.developerOptions must be true or false.")
-        val v2ReleaseEnabled = desktopSystemV2ReleaseEnabled.get().toBooleanStrictOrNull()
-            ?: error("someday.systemV2ReleaseEnabled must be true or false.")
-        val v2DevelopmentEnabled = desktopSystemV2DevelopmentEnabled.get().toBooleanStrictOrNull()
-            ?: error("someday.systemV2DevelopmentEnabled must be true or false.")
         val outputDir = generatedDesktopBuildConfigDir.get().asFile
         outputDir.deleteRecursively()
         val packageDir = outputDir.resolve("saien/someday/app/desktop")
@@ -67,8 +41,6 @@ val generateDesktopBuildConfig by tasks.registering {
 
             internal object DesktopBuildConfig {
                 const val DEVELOPER_OPTIONS_ENABLED: Boolean = $enabled
-                const val SOMEDAY_SYSTEM_V2_RELEASE_ENABLED: Boolean = $v2ReleaseEnabled
-                const val SOMEDAY_SYSTEM_V2_DEVELOPMENT_ENABLED: Boolean = $v2DevelopmentEnabled
             }
             """.trimIndent(),
         )
@@ -91,6 +63,7 @@ kotlin {
             implementation(project(":shared:ui"))
             implementation(project(":shared:data"))
             implementation(project(":shared:sync"))
+            implementation(compose.components.resources)
             implementation(compose.desktop.currentOs)
             implementation(libs.sqldelight.sqlite.driver)
         }

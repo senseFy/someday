@@ -23,12 +23,13 @@ data class LocalFirstBoundary(
 }
 
 val requiredLocalTables: List<String> = listOf(
-    "notebooks",
-    "notes",
-    "note_versions",
-    "tombstones",
-    "locations",
-    "sync_metadata",
+    "workspace_entity_versions_v2",
+    "workspace_entity_version_parents_v2",
+    "workspace_entity_heads_v2",
+    "note_projections_system_v2",
+    "notebook_projections_v2",
+    "workspace_preferences_projection_v2",
+    "media_assets",
     "settings",
     "devices",
 )

@@ -549,7 +549,7 @@ class SqlDelightWorkspaceEntityStoreV2Test {
         const val ACTOR = "device:40000000-0000-4000-8000-000000000001"
         const val WRITER = "50000000-0000-4000-8000-000000000001"
         const val OTHER_WRITER = "50000000-0000-4000-8000-000000000002"
-        const val PROFILE = "webdav-log-v2:test"
+        const val PROFILE = "self-hosted-v2:test"
         const val STREAM = "writer-stream"
 
         fun at(seconds: Long): Instant = Instant.fromEpochSeconds(seconds)

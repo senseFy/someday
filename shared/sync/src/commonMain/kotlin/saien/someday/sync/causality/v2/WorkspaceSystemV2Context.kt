@@ -20,29 +20,17 @@ class WorkspaceSystemV2ContextProvider(
     fun openOrNull(): ActiveWorkspaceSystemV2? {
         val workspaceKey = workspaceKeyProvider() ?: return null
         val configuredProfile = remoteProfileProvider().takeIf(String::isNotBlank)
-        // SyncMode.Off and an uncommitted provider settings change are network
-        // choices, not authority changes. Local mutations must keep targeting
-        // the one authenticated active/blocked epoch until an explicit profile
-        // migration commits another pointer.
+        // SyncMode.Off and an uncommitted endpoint setting are network choices,
+        // not authority changes. Local mutations keep targeting the one
+        // authenticated active/blocked generation.
         val epoch = protocolStore.loadAuthoritativeEpoch()
             ?: configuredProfile?.let(protocolStore::loadActiveEpoch)
+            ?: protocolStore.loadAllEpochs().singleOrNull {
+                it.remoteProfile == configuredProfile &&
+                    it.lifecycle == SyncEpochLifecycleV2.PREPARING &&
+                    it.health == SyncEpochHealthV2.HEALTHY
+            }
             ?: return null
-        return openExactEpoch(epoch, workspaceKey)
-    }
-
-    /**
-     * Opens an exact retained epoch for read-only history and undelete.
-     *
-     * This deliberately takes the already-resolved epoch and its exact key;
-     * it never substitutes the current authority or guesses after key
-     * rotation. Product callers use it only for locally retained read-only
-     * epochs, while all mutations still go through [requireActive].
-     */
-    fun openRetainedEpochOrNull(
-        epoch: StoredSyncEpochV2,
-        workspaceKey: WorkspaceMasterKey,
-    ): ActiveWorkspaceSystemV2? {
-        if (epoch.lifecycle != SyncEpochLifecycleV2.READ_ONLY) return null
         return openExactEpoch(epoch, workspaceKey)
     }
 
@@ -65,10 +53,7 @@ class WorkspaceSystemV2ContextProvider(
                 "Local V2 authority binding does not match the authenticated pointer."
             }
         }
-        // A retained epoch no longer owns the singleton authority binding,
-        // but the binding still carries this installation's durable writer
-        // identity. Reusing it keeps read-only archive access working while
-        // network mode is Off without inventing an epoch-specific actor.
+        // The singleton binding carries this installation's durable writer identity.
         val durableWriterDeviceId = localAuthority?.localWriterDeviceId
             ?: protocolStore.loadLocalAuthority()?.localWriterDeviceId
         val writerDeviceId = normalizeWriterDeviceIdV2(
@@ -120,10 +105,22 @@ class WorkspaceSystemV2ContextProvider(
 
     fun requireActive(): ActiveWorkspaceSystemV2 {
         val context = checkNotNull(openOrNull()) {
-            "Sync V2 is selected but this device has no authoritative authenticated whole-product epoch."
+            "Sync is selected but this device has no authoritative authenticated workspace epoch."
         }
         check(context.lifecycle == SyncEpochLifecycleV2.ACTIVE && context.health == SyncEpochHealthV2.HEALTHY) {
-            "Sync V2 is read-only until the authoritative epoch integrity blocker is repaired."
+            "Sync is read-only until the authoritative epoch integrity blocker is repaired."
+        }
+        return context
+    }
+
+    fun requireWritable(): ActiveWorkspaceSystemV2 {
+        val context = checkNotNull(openOrNull()) {
+            "The local workspace DAG is unavailable."
+        }
+        check(context.health == SyncEpochHealthV2.HEALTHY &&
+            context.lifecycle in setOf(SyncEpochLifecycleV2.PREPARING, SyncEpochLifecycleV2.ACTIVE)
+        ) {
+            "The workspace DAG is read-only because its durable integrity blocker is active."
         }
         return context
     }

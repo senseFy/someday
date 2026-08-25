@@ -30,7 +30,7 @@ data class WorkspaceSyncCapabilitiesV2(
     val supportsCheckpoints: Boolean,
 ) {
     fun incompatibility(): String? = when {
-        profile !in setOf(SyncRemoteProfileV2.WEB_DAV.wireValue, SyncRemoteProfileV2.SELF_HOSTED.wireValue) ->
+        profile != SyncRemoteProfileV2.SELF_HOSTED.wireValue ->
             "remote_profile_mismatch"
         contractId != SYNC_V2_CONTRACT_ID -> "unsupported_contract"
         semanticProtocolVersion != SEMANTIC_SYNC_PROTOCOL_VERSION_V2 -> "unsupported_contract"
@@ -57,7 +57,6 @@ data class WorkspaceEncryptedCursorUnitV2(
 data class WorkspaceSyncPullResultV2(
     val units: List<WorkspaceEncryptedCursorUnitV2>,
     val frontierStable: Boolean,
-    val rebootstrapRequired: Boolean = false,
     val safeErrorCode: String? = null,
 )
 
@@ -145,8 +144,6 @@ interface WorkspaceSyncRemoteV2 {
 
     fun capabilities(): WorkspaceSyncCapabilitiesV2
     fun loadEpochPointer(): EncryptedWorkspaceObjectV2?
-    /** Exact retained pointer used to prove a multi-epoch successor chain. */
-    fun loadRetainedEpochPointer(syncEpochId: String): EncryptedWorkspaceObjectV2?
     fun fetchCheckpoint(pointer: EncryptedWorkspaceObjectV2, descriptor: SyncEpochDescriptorV2): WorkspaceRemoteCheckpointBundleV2
     fun putCheckpointChunk(
         descriptor: SyncEpochDescriptorV2,
@@ -167,8 +164,8 @@ interface WorkspaceSyncRemoteV2 {
 
     /**
      * Deletes only the exact immutable objects of a never-authoritative draft.
-     * Implementations must fail closed while the draft is current, retained, or
-     * still publishable from the authenticated current pointer.
+     * Implementations must fail closed while the draft is current or still
+     * publishable from the authenticated current pointer.
      */
     fun cleanupCheckpointDraft(
         draft: WorkspaceCheckpointDraftCleanupV2,
@@ -177,8 +174,6 @@ interface WorkspaceSyncRemoteV2 {
     fun pull(syncEpochId: String, cursors: Map<String, String?>, limit: Int): WorkspaceSyncPullResultV2
     fun push(syncEpochId: String, objects: List<EncryptedWorkspaceObjectV2>): WorkspaceSyncPushResultV2
     fun epochFrontiers(syncEpochId: String): List<SyncStreamFrontierV2>
-    fun fetchRepairReplicas(syncEpochId: String, objectId: String, objectDigest: String): List<EncryptedWorkspaceObjectV2>
-    fun publishRepairReplica(objectValue: EncryptedWorkspaceObjectV2): WorkspaceImmutablePutResultV2
 }
 
 data class WorkspaceSyncSummaryV2(
@@ -200,14 +195,10 @@ class WorkspaceSyncCoordinatorV2(
     private val workspaceKey: WorkspaceMasterKey,
     private val localWriterDeviceId: String,
     private val remote: WorkspaceSyncRemoteV2,
+    /** Product-level prerequisite for each exact immutable outbox batch. */
+    private val beforeEntityPublication: (List<WorkspaceEntityVersionV2>) -> Unit,
     private val protocolStore: SqlDelightSyncProtocolStoreV2 = SqlDelightSyncProtocolStoreV2(localRepository.database),
     private val clock: () -> Instant = { Clock.System.now() },
-    /**
-     * Exact source authority authorized to hand off to an authenticated
-     * checkpoint winner.  Used only by explicit migration/empty-remote CAS
-     * recovery; ordinary sync never supplies it.
-     */
-    private val authorityHandoffFrom: StoredLocalAuthorityV2? = null,
     /**
      * Required by product-facing runtimes so an authenticated remote bootstrap
      * cannot switch the active epoch while a repository operation is still
@@ -224,7 +215,7 @@ class WorkspaceSyncCoordinatorV2(
 ) {
     init {
         require(UUID_V4_PATTERN_SYSTEM_V2.matches(localWriterDeviceId))
-        require(remote.remoteProfile in setOf(SyncRemoteProfileV2.WEB_DAV.wireValue, SyncRemoteProfileV2.SELF_HOSTED.wireValue))
+        require(remote.remoteProfile == SyncRemoteProfileV2.SELF_HOSTED.wireValue)
     }
 
     fun syncOnce(): WorkspaceSyncSummaryV2 {
@@ -235,10 +226,10 @@ class WorkspaceSyncCoordinatorV2(
             val capabilities = remote.capabilities()
             val incompatibility = capabilities.incompatibility()
             if (capabilities.profile != remote.remoteProfile || incompatibility != null) {
-                return blocked(run.runId, counts, null, incompatibility ?: "remote_profile_mismatch", "Remote V2 capabilities are incompatible.")
+                return blocked(run.runId, counts, null, incompatibility ?: "remote_profile_mismatch", "Remote entity-sync capabilities are incompatible.")
             }
             val pointerOuter = remote.loadEpochPointer()
-                ?: return blocked(run.runId, counts, null, "v2_epoch_not_initialized", "No authenticated whole-product V2 epoch exists.")
+                ?: return blocked(run.runId, counts, null, "v2_epoch_not_initialized", "No authenticated workspace sync epoch exists.")
             val epoch = crypto(pointerOuter.syncEpochId)
             val pointer = when (val decoded = epoch.control.decodeEpochPointer(pointerOuter)) {
                 is WorkspaceControlDecodeResultV2.Decoded -> decoded.value
@@ -247,6 +238,17 @@ class WorkspaceSyncCoordinatorV2(
                 )
             }
             val descriptor = pointer.descriptor
+            if (descriptor.previousEpochId != null || descriptor.previousEpochPointerDigest != null ||
+                descriptor.previousEpochFrontiers.isNotEmpty()
+            ) {
+                return blocked(
+                    run.runId,
+                    counts,
+                    descriptor.syncEpochId,
+                    "unsupported_generation_ancestry",
+                    "This client supports only a first-generation workspace checkpoint.",
+                )
+            }
             if (descriptor.remoteProfile != remote.remoteProfile) {
                 return blocked(run.runId, counts, descriptor.syncEpochId, "remote_profile_mismatch", "Authenticated epoch names another remote profile.")
             }
@@ -269,23 +271,19 @@ class WorkspaceSyncCoordinatorV2(
                         remote.authorityBindingId,
                         clock(),
                     )
-                } else if (authorityHandoffFrom == null ||
-                    !sameAuthorityIdentityV2(boundAuthority, authorityHandoffFrom)
-                ) {
+                } else {
                     return blocked(
                         run.runId,
                         counts,
                         descriptor.syncEpochId,
-                        "remote_migration_required",
-                        "The configured endpoint is not the locally bound V2 authority; explicit remote migration is required.",
+                        "authority_binding_mismatch",
+                        "The configured self-hosted account is not the authority bound to this workspace.",
                     )
                 }
             }
 
             val localActive = protocolStore.loadActiveEpoch(remote.remoteProfile)
-            val ancestryAnchor = localActive ?: authorityHandoffFrom?.let { handoff ->
-                protocolStore.loadEpoch(handoff.remoteProfile, handoff.epochId)
-            }
+            val ancestryAnchor = localActive
             if (ancestryAnchor?.descriptor?.syncEpochId == descriptor.syncEpochId &&
                 ancestryAnchor.descriptorDigest != pointerOuter.objectDigest
             ) {
@@ -295,16 +293,22 @@ class WorkspaceSyncCoordinatorV2(
                     "remote_rollback_detected",
                     "Authenticated epoch pointer changed without a new epoch.",
                 )
-                return blocked(run.runId, counts, descriptor.syncEpochId, "remote_rollback_detected", "Authenticated epoch pointer changed without a new epoch.")
+                return blocked(
+                    run.runId,
+                    counts,
+                    descriptor.syncEpochId,
+                    "remote_rollback_detected",
+                    "Authenticated epoch pointer changed without a new epoch.",
+                )
             }
-            val independentlyInitializedTargetWonAuthorizedRace =
-                localActive == null && authorityHandoffFrom != null && descriptor.previousEpochId == null
-            if (ancestryAnchor != null && ancestryAnchor.descriptor.syncEpochId != descriptor.syncEpochId &&
-                !independentlyInitializedTargetWonAuthorizedRace
-            ) {
-                verifySuccessorChain(pointer, ancestryAnchor)?.let { failure ->
-                    return blocked(run.runId, counts, descriptor.syncEpochId, failure.first, failure.second)
-                }
+            if (ancestryAnchor != null && ancestryAnchor.descriptor.syncEpochId != descriptor.syncEpochId) {
+                return blocked(
+                    run.runId,
+                    counts,
+                    ancestryAnchor.descriptor.syncEpochId,
+                    "incompatible_epoch",
+                    "The remote authority changed its immutable initial sync generation.",
+                )
             }
 
             val store = entityStore(epoch, descriptor.syncEpochId)
@@ -326,15 +330,15 @@ class WorkspaceSyncCoordinatorV2(
             if (active?.lifecycle == SyncEpochLifecycleV2.BLOCKED || active?.health == SyncEpochHealthV2.BLOCKED) {
                 return blocked(
                     run.runId, counts, descriptor.syncEpochId,
-                    active.safeErrorCode ?: "repair_required",
-                    active.safeErrorMessage ?: "Workspace integrity repair is required before sync can continue.",
+                    active.safeErrorCode ?: "blocked_remote_input",
+                    active.safeErrorMessage ?: "Workspace sync is blocked by unresolved authenticated remote input.",
                 )
             }
-            if (protocolStore.loadActiveDeadLetters(remote.remoteProfile, descriptor.syncEpochId).any {
+            if (protocolStore.loadUnresolvedDeadLetters(remote.remoteProfile, descriptor.syncEpochId).any {
                     it.input.failureClass != SyncDeadLetterFailureClassV2.RETRYABLE_DEPENDENCY
                 }
             ) {
-                return blocked(run.runId, counts, descriptor.syncEpochId, "repair_required", "A blocking cursor unit must be repaired before push.")
+                return blocked(run.runId, counts, descriptor.syncEpochId, "remote_input_unresolved", "A blocking cursor unit remains unresolved.")
             }
 
             val pullError = pullUntilStable(descriptor, epoch, store, capabilities, counts)
@@ -356,7 +360,7 @@ class WorkspaceSyncCoordinatorV2(
             )
             counts.summary(SyncCoordinatorStatusV2.SUCCESS, remote.remoteProfile, descriptor.syncEpochId)
         } catch (failure: Exception) {
-            val message = (failure.message ?: "Whole-product V2 sync failed safely.").safeSyncMessageV2()
+            val message = (failure.message ?: "Workspace sync failed safely.").safeSyncMessageV2()
             protocolStore.finishRun(
                 run.runId,
                 SyncRunStatusV2.FAILED,
@@ -405,7 +409,13 @@ class WorkspaceSyncCoordinatorV2(
         if (bundle.chunks.size != manifest.chunks.size) {
             return "missing_remote_object" to "Checkpoint chunk set is incomplete."
         }
-        when (protocolStore.persistPreparingEpoch(remote.remoteProfile, descriptor, pointerOuter.objectDigest)) {
+        when (protocolStore.persistAuthenticatedRemotePreparingEpoch(
+            remote.remoteProfile,
+            descriptor,
+            pointerOuter.objectDigest,
+            remote.authorityBindingId,
+            localWriterDeviceId,
+        )) {
             is SyncEpochPersistResultV2.ImmutableMismatch ->
                 return "immutable_object_mismatch" to "The checkpoint epoch identity is already bound differently."
             is SyncEpochPersistResultV2.AlreadyStored,
@@ -428,7 +438,6 @@ class WorkspaceSyncCoordinatorV2(
             }
             val decodedObjects = decodeEntityObjects(epoch, descriptor.syncEpochId, chunk.objects)
             if (decodedObjects is DecodeEntityObjectsResultV2.Rejected) {
-                quarantine(descriptor.syncEpochId, "checkpoint", ref.chunkId, decodedObjects.outer, decodedObjects.code)
                 return decodedObjects.code to decodedObjects.message
             }
             decodedObjects as DecodeEntityObjectsResultV2.Decoded
@@ -477,7 +486,7 @@ class WorkspaceSyncCoordinatorV2(
             } == true
             if (!targetAlreadyActive && !sameAuthorityIdentityV2(currentAuthority, expectedAuthority)) {
                 "local_authority_changed" to
-                    "The local V2 authority changed before checkpoint activation; retry against the current authority."
+                    "The local workspace authority changed before checkpoint activation; retry against the current authority."
             } else {
                 val queries = localRepository.database.somedayQueries
                 val encodedManifest = epoch.cipher.encodeJson(bundle.manifest)
@@ -539,7 +548,7 @@ class WorkspaceSyncCoordinatorV2(
         capabilities: WorkspaceSyncCapabilitiesV2,
         counts: MutableWorkspaceSyncCountsV2,
     ): Pair<String, String>? {
-        val retryableBlockers = protocolStore.loadActiveDeadLetters(
+        val retryableBlockers = protocolStore.loadUnresolvedDeadLetters(
             remote.remoteProfile,
             descriptor.syncEpochId,
         ).filter {
@@ -554,8 +563,6 @@ class WorkspaceSyncCoordinatorV2(
                 descriptor.syncEpochId,
                 key.first,
                 key.second,
-                SyncDeadLetterLifecycleV2.REPAIRED,
-                clock(),
             )
             retryableBlockers.remove(key)
         }
@@ -593,7 +600,6 @@ class WorkspaceSyncCoordinatorV2(
                     else -> "The remote rejected this cursor without allowing push."
                 }
             }
-            if (pulled.rebootstrapRequired) return "rebootstrap_required" to "Remote history is older than the supported 180-day horizon."
             if (pulled.units.size > capabilities.maxPullUnits) return "transport_metadata_mismatch" to "Remote exceeded its advertised pull-unit bound."
             if (pulled.units.isEmpty()) {
                 if (pulled.frontierStable) return null
@@ -628,7 +634,6 @@ class WorkspaceSyncCoordinatorV2(
                         val value = decodeEntityObjects(epoch, descriptor.syncEpochId, unit.objects)
                     ) {
                         is DecodeEntityObjectsResultV2.Rejected -> {
-                            quarantine(descriptor.syncEpochId, unit.streamId, unit.unitId, value.outer, value.code)
                             recordBlocker(descriptor.syncEpochId, unit, value)
                             return value.code to value.message
                         }
@@ -697,8 +702,8 @@ class WorkspaceSyncCoordinatorV2(
         capabilities: WorkspaceSyncCapabilitiesV2,
         counts: MutableWorkspaceSyncCountsV2,
     ): Pair<String, String>? {
-        if (protocolStore.loadActiveDeadLetters(remote.remoteProfile, descriptor.syncEpochId).isNotEmpty()) {
-            return "repair_required" to "Push is blocked while a cursor unit is unresolved."
+        if (protocolStore.loadUnresolvedDeadLetters(remote.remoteProfile, descriptor.syncEpochId).isNotEmpty()) {
+            return "remote_input_unresolved" to "Push is blocked while a cursor unit is unresolved."
         }
         while (true) {
             val pending = store.loadPending(remote.remoteProfile)
@@ -709,6 +714,19 @@ class WorkspaceSyncCoordinatorV2(
                 { store.loadVersion(it.objectId)?.entityId ?: "" },
                 { it.objectId },
             )).take(capabilities.maxPushObjects)
+            val versions = batch.map { pendingValue ->
+                val version = store.loadVersion(pendingValue.objectId)
+                    ?: return "local_transaction_failed" to "A durable outbox entity is missing."
+                if (version.objectDigest != pendingValue.objectDigest) {
+                    return "mutation_reuse_mismatch" to
+                        "A durable outbox tuple no longer matches its immutable entity."
+                }
+                version
+            }
+            runCatching { beforeEntityPublication(versions) }.getOrElse {
+                return "entity_publication_prerequisite_failed" to
+                    "A referenced media asset is not fully published for this workspace authority."
+            }
             val objects = batch.map { pendingValue ->
                 epoch.cipher.decodeJson(pendingValue.encodedOuter).getOrElse {
                     return "local_transaction_failed" to "A durable outbox outer object is malformed."
@@ -722,7 +740,7 @@ class WorkspaceSyncCoordinatorV2(
                 is WorkspaceSyncPushResultV2.Rejected -> return pushed.safeErrorCode to pushed.safeMessage
                 is WorkspaceSyncPushResultV2.Accepted -> {
                     if (pushed.acknowledgements.size != batch.size) {
-                        return "transport_metadata_mismatch" to "Remote returned an incomplete V2 acknowledgement set."
+                        return "transport_metadata_mismatch" to "Remote returned an incomplete entity acknowledgement set."
                     }
                     batch.zip(pushed.acknowledgements).forEach { (pendingValue, ack) ->
                         if (ack.mutationId != pendingValue.mutationId || ack.objectId != pendingValue.objectId ||
@@ -810,25 +828,6 @@ class WorkspaceSyncCoordinatorV2(
         )
     }
 
-    private fun quarantine(epochId: String, streamId: String, unitId: String, outer: EncryptedWorkspaceObjectV2?, code: String) {
-        if (outer == null) return
-        val encoded = runCatching { crypto(epochId).cipher.encodeJson(outer) }.getOrDefault("<invalid-outer>")
-        val now = clock().toEpochMilliseconds()
-        localRepository.database.somedayQueries.insertQuarantinedObjectV2(
-            remote.remoteProfile,
-            epochId,
-            streamId,
-            unitId,
-            outer.objectId,
-            outer.objectDigest,
-            encoded,
-            code,
-            now,
-            now,
-            "active",
-        )
-    }
-
     private fun crypto(epochId: String): WorkspaceEpochCryptoV2 {
         val keys = SyncEpochKeyDerivationV2().derive(workspaceKey, epochId)
         val materializer = CanonicalWorkspaceCausalityMaterializerV2(keys)
@@ -861,48 +860,6 @@ class WorkspaceSyncCoordinatorV2(
             },
         )
 
-    /** Proves a forward epoch transition from exact authenticated pointer digests. */
-    private fun verifySuccessorChain(
-        newest: WorkspaceSyncEpochPointerV2,
-        trusted: StoredSyncEpochV2,
-    ): Pair<String, String>? {
-        var cursor = newest
-        val seenEpochs = mutableSetOf<String>()
-        repeat(MAX_POINTER_ANCESTRY_DEPTH_SYSTEM_V2) {
-            val previousEpochId = cursor.descriptor.previousEpochId
-                ?: return "remote_rollback_detected" to
-                    "The authenticated remote pointer does not descend from this device's trusted epoch."
-            val previousDigest = cursor.descriptor.previousEpochPointerDigest
-                ?: return "remote_rollback_detected" to
-                    "The authenticated remote pointer omits its predecessor digest."
-            if (!seenEpochs.add(previousEpochId)) {
-                return "cyclic_epoch_history" to "The authenticated epoch-pointer history contains a cycle."
-            }
-            if (previousEpochId == trusted.descriptor.syncEpochId) {
-                return if (previousDigest == trusted.descriptorDigest) null else {
-                    "remote_rollback_detected" to
-                        "The remote successor names a different representation of the trusted predecessor."
-                }
-            }
-            val retained = runCatching { remote.loadRetainedEpochPointer(previousEpochId) }.getOrElse {
-                return "missing_remote_object" to
-                    "A retained epoch pointer required to prove the successor chain is unavailable."
-            } ?: return "missing_remote_object" to
-                "A retained epoch pointer required to prove the successor chain is unavailable."
-            if (retained.syncEpochId != previousEpochId || retained.objectDigest != previousDigest) {
-                return "remote_rollback_detected" to
-                    "A retained pointer does not match the authenticated successor link."
-            }
-            cursor = when (val decoded = crypto(previousEpochId).control.decodeEpochPointer(retained)) {
-                is WorkspaceControlDecodeResultV2.Decoded -> decoded.value
-                is WorkspaceControlDecodeResultV2.Rejected ->
-                    return decoded.error.code.wireValue to decoded.error.safeMessage
-            }
-        }
-        return "epoch_history_bound_exceeded" to
-            "The successor proof exceeds the retained epoch-history bound; authorized rebootstrap is required."
-    }
-
     private fun blocked(
         runId: String,
         counts: MutableWorkspaceSyncCountsV2,
@@ -916,14 +873,11 @@ class WorkspaceSyncCoordinatorV2(
                 val descriptor = protocolStore.loadEpoch(remote.remoteProfile, id)?.descriptor
                 val store = entityStore(crypto(id), id)
                 if (descriptor != null) {
-                    counts.captureWorkspaceState(store, protocolStore, remote.remoteProfile, descriptor, code)
+                    counts.captureWorkspaceState(store, protocolStore, remote.remoteProfile, descriptor)
                 } else {
                     counts.activeConflicts = store.loadActiveConflicts().size
                 }
             }
-        }
-        if (code in setOf("rebootstrap_required", "epoch_history_bound_exceeded", "missing_remote_object")) {
-            counts.repairState = SyncRunRepairStateV2.REBOOTSTRAP_REQUIRED
         }
         protocolStore.finishRun(
             runId,
@@ -939,7 +893,6 @@ class WorkspaceSyncCoordinatorV2(
 
     private companion object {
         const val MAX_PULL_ROUNDS_SYSTEM_V2 = 8
-        const val MAX_POINTER_ANCESTRY_DEPTH_SYSTEM_V2 = 256
     }
 }
 
@@ -992,8 +945,6 @@ private data class MutableWorkspaceSyncCountsV2(
     var projectionWarnings: Int = 0,
     var deadLetters: Int = 0,
     var pushedMutations: Int = 0,
-    var checkpointHorizonEpochMilliseconds: Long? = null,
-    var repairState: SyncRunRepairStateV2 = SyncRunRepairStateV2.HEALTHY,
 ) {
     fun observeApplied(
         applied: WorkspaceRemoteUnitApplyResultV2.Applied,
@@ -1023,7 +974,6 @@ private data class MutableWorkspaceSyncCountsV2(
         protocolStore: SqlDelightSyncProtocolStoreV2,
         remoteProfile: String,
         descriptor: SyncEpochDescriptorV2,
-        blockingCode: String? = null,
     ) {
         val conflicts = store.loadActiveConflicts()
         activeConflicts = conflicts.size
@@ -1033,18 +983,7 @@ private data class MutableWorkspaceSyncCountsV2(
             it.descriptor.entityType == WorkspaceEntityTypeV2.WORKSPACE_PREFERENCES
         }
         projectionWarnings = store.loadProjections().count { it.warning != null }
-        deadLetters = protocolStore.loadActiveDeadLetters(remoteProfile, descriptor.syncEpochId).size
-        checkpointHorizonEpochMilliseconds = safeRunHorizonV2(
-            descriptor.createdAt.toEpochMilliseconds(),
-            descriptor.supportedOfflineWindowSeconds,
-        )
-        repairState = when {
-            blockingCode == "rebootstrap_required" || blockingCode == "epoch_history_bound_exceeded" ->
-                SyncRunRepairStateV2.REBOOTSTRAP_REQUIRED
-            deadLetters > 0 || protocolStore.loadEpoch(remoteProfile, descriptor.syncEpochId)?.health == SyncEpochHealthV2.BLOCKED ->
-                SyncRunRepairStateV2.REPAIR_REQUIRED
-            else -> SyncRunRepairStateV2.HEALTHY
-        }
+        deadLetters = protocolStore.loadUnresolvedDeadLetters(remoteProfile, descriptor.syncEpochId).size
     }
 
     fun toStored() = SyncRunCountersV2(
@@ -1066,8 +1005,6 @@ private data class MutableWorkspaceSyncCountsV2(
         projectionWarnings = projectionWarnings.toLong(),
         deadLetters = deadLetters.toLong(),
         pushedMutations = pushedMutations.toLong(),
-        checkpointHorizonEpochMilliseconds = checkpointHorizonEpochMilliseconds,
-        repairState = repairState,
     )
 
     fun summary(

@@ -14,7 +14,6 @@ SMOKE_WORKERS ?= 2
 RELEASE_READINESS_WORKERS ?= 2
 SERVER_PORT ?= 3180
 DB_PORT ?= 54329
-WEBDAV_PORT ?= 3182
 SERVER_DB_URL ?= jdbc:postgresql://127.0.0.1:$(DB_PORT)/someday
 ANDROID_ARTIFACT_NAME ?= someday-android-debug-apk
 ANDROID_ARTIFACT_DIR ?= artifacts/android-$(RUN_ID)
@@ -67,7 +66,6 @@ APP_VERSION_ARGS := $(if $(VERSION_NAME),--version-name "$(VERSION_NAME)",)
 MOBILE_RELEASE_ARGS ?=
 MOBILE_RELEASE_LOG_ROOT ?=
 ANDROID_PLAY_DRY_RUN_ENABLED := $(if $(filter yes y true 1,$(ANDROID_PLAY_DRY_RUN)),yes,)
-SYSTEM_V2_SHIPPING_ARGS := -Psomeday.systemV2ReleaseEnabled=true -Psomeday.systemV2DevelopmentEnabled=false
 ANDROID_PLAY_UPLOAD_ARGS = --aab "$(abspath $(ANDROID_PLAY_AAB))"
 ANDROID_PLAY_UPLOAD_ARGS += --package-name "$(ANDROID_PLAY_PACKAGE_NAME)"
 ANDROID_PLAY_UPLOAD_ARGS += --track "$(ANDROID_PLAY_TRACK)"
@@ -85,24 +83,23 @@ help: ## Show available commands
 gradle-version: ## Print Gradle and toolchain version information
 	$(GRADLE) --version
 
-setup: ## Check Gradle and start local PostgreSQL/WebDAV services
+setup: ## Check Gradle and start local PostgreSQL
 	$(GRADLE) --version
-	docker compose up -d postgres webdav
+	docker compose up -d postgres
 
 ##@ Local services
 .PHONY: services-up services-stop services-down services-health server-run server-health
-services-up: ## Start local PostgreSQL and WebDAV containers
-	docker compose up -d postgres webdav
+services-up: ## Start the local PostgreSQL container
+	docker compose up -d postgres
 
-services-stop: ## Stop local PostgreSQL and WebDAV containers
-	docker compose stop postgres webdav
+services-stop: ## Stop the local PostgreSQL container
+	docker compose stop postgres
 
 services-down: ## Remove local service containers and network
 	docker compose down
 
-services-health: ## Check local PostgreSQL and WebDAV health
+services-health: ## Check local PostgreSQL health
 	pg_isready -h 127.0.0.1 -p $(DB_PORT) -U someday
-	curl -sf -u someday:someday -X OPTIONS http://127.0.0.1:$(WEBDAV_PORT)/
 
 server-run: ## Run the local Ktor server
 	SOMEDAY_PORT=$(SERVER_PORT) SOMEDAY_DB_URL=$(SERVER_DB_URL) $(GRADLE) :server:run
@@ -180,7 +177,7 @@ check-android-play-publisher-env: check-release-control-options
 	fi
 
 build-android-play-aab: check-android-play-release-env
-	$(GRADLE) :app:android:bundleRelease $(SYSTEM_V2_SHIPPING_ARGS) --dependency-verification=strict --stacktrace
+	$(GRADLE) :app:android:bundleRelease --dependency-verification=strict --stacktrace
 	@test -f "$(ANDROID_PLAY_AAB)" || (echo "ERROR: Google Play AAB was not produced: $(ANDROID_PLAY_AAB)"; exit 1)
 
 android-release-play: build-android-play-aab ## Build and verify a signed Play AAB without uploading
@@ -206,7 +203,7 @@ ios-simulator-test: ## Run all iOS simulator unit tests
 ios-framework: ## Link the iOS simulator debug framework
 	$(GRADLE) :app:ios:linkDebugFrameworkIosSimulatorArm64 --max-workers=1
 
-ios-framework-release: ## Link the iOS device release framework with shipping V2 activation enabled
+ios-framework-release: ## Link the iOS device release framework
 	SDK_NAME=iphoneos CONFIGURATION=Release GRADLEW="$(GRADLE)" SOMEDAY_IOS_GRADLE_MAX_WORKERS=2 \
 		./scripts/build-ios-framework-for-xcode.sh
 
@@ -266,16 +263,11 @@ test-verify-play-aab: ## Verify Play AAB native-alignment tool discovery
 
 ##@ Desktop
 .PHONY: desktop-run desktop-smoke desktop-package-smoke desktop-release-macos desktop-test
-desktop-run: ## Run the desktop app through Gradle (V2 development activation on)
-	$(GRADLE) :app:desktop:run \
-		-Psomeday.systemV2DevelopmentEnabled=true \
-		-Psomeday.systemV2ReleaseEnabled=false
+desktop-run: ## Run the desktop app through Gradle
+	$(GRADLE) :app:desktop:run
 
 desktop-smoke: ## Run non-interactive desktop startup smoke
-	$(GRADLE) :app:desktop:runUiSmoke \
-		-Psomeday.systemV2DevelopmentEnabled=true \
-		-Psomeday.systemV2ReleaseEnabled=false \
-		--stacktrace
+	$(GRADLE) :app:desktop:runUiSmoke --stacktrace
 
 desktop-package-smoke: ## Run desktop Windows/Linux package-readiness smoke
 	$(GRADLE) :app:desktop:desktopWindowsLinuxPackageSmoke --stacktrace
@@ -287,7 +279,7 @@ desktop-test: ## Run desktop JVM tests
 	$(GRADLE) :app:desktop:jvmTest --stacktrace
 
 ##@ Validation
-.PHONY: lint compile check client-smoke shared-smoke server-test integration-test real-remote-test sync-v2-gate release-readiness validate android-lint
+.PHONY: lint compile check client-smoke shared-smoke server-test integration-test real-remote-test sync-v3-gate sync-v3-apple-gate release-readiness validate android-lint
 lint: ## Run source hygiene and Android lint
 	$(GRADLE) sourceHygieneCheck :app:android:lintDebug
 
@@ -312,11 +304,14 @@ server-test: ## Run server unit and integration tests
 integration-test: ## Run hermetic repository topology tests
 	$(GRADLE) :integration-tests:test --max-workers=$(SMOKE_WORKERS)
 
-real-remote-test: ## Run live WebDAV/self-hosted tests; explicit SOMEDAY_* service environment is required
+real-remote-test: ## Run live self-hosted tests; explicit SOMEDAY_* service environment is required
 	$(GRADLE) :integration-tests:realRemoteTest --max-workers=$(SMOKE_WORKERS)
 
-sync-v2-gate: ## Run the Sync V2 reliability gate (open-source baseline)
-	./scripts/sync-v2-reliability-gate
+sync-v3-gate: ## Run the Linux/PostgreSQL System V3 release gate
+	./scripts/sync-v3-reliability-gate
+
+sync-v3-apple-gate: ## Run System V3 shared behavior and app shell tests on an iOS simulator
+	./scripts/sync-v3-apple-gate
 
 release-readiness: ## Resolve and compile unsigned Android/iOS/macOS release inputs with strict verification
 	GRADLEW="$(GRADLE)" RELEASE_READINESS_WORKERS="$(RELEASE_READINESS_WORKERS)" ./scripts/verify-release-readiness

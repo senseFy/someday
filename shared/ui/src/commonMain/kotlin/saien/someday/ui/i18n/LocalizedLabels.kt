@@ -8,7 +8,6 @@ import saien.someday.domain.notes.NoteSyncBadge
 import saien.someday.domain.settings.AppLanguage
 import saien.someday.domain.settings.ClientTheme
 import saien.someday.domain.settings.SyncMode
-import saien.someday.domain.settings.WebDavAutoBackupFrequency
 import saien.someday.ui.resources.Res
 import saien.someday.ui.resources.badge_conflict
 import saien.someday.ui.resources.badge_pending
@@ -17,8 +16,6 @@ import saien.someday.ui.resources.badge_synced
 import saien.someday.ui.resources.badge_syncing
 import saien.someday.ui.resources.badge_syncing_details
 import saien.someday.ui.resources.badge_pending_details
-import saien.someday.ui.resources.backup_frequency_daily
-import saien.someday.ui.resources.backup_frequency_weekly
 import saien.someday.ui.resources.conflict_action_delete_copy
 import saien.someday.ui.resources.conflict_action_keep_copy
 import saien.someday.ui.resources.conflict_action_merge
@@ -30,7 +27,6 @@ import saien.someday.ui.resources.settings_language_korean
 import saien.someday.ui.resources.settings_language_system
 import saien.someday.ui.resources.sync_mode_off
 import saien.someday.ui.resources.sync_mode_self_hosted
-import saien.someday.ui.resources.sync_mode_webdav
 import saien.someday.ui.resources.tab_memories
 import saien.someday.ui.resources.tab_notes
 import saien.someday.ui.resources.tab_settings
@@ -68,15 +64,7 @@ fun AppLanguage.localizedLabel(): String =
 fun SyncMode.localizedLabel(): String =
     when (this) {
         SyncMode.Off -> stringResource(Res.string.sync_mode_off)
-        SyncMode.WebDav -> stringResource(Res.string.sync_mode_webdav)
         SyncMode.SelfHosted -> stringResource(Res.string.sync_mode_self_hosted)
-    }
-
-@Composable
-fun WebDavAutoBackupFrequency.localizedLabel(): String =
-    when (this) {
-        WebDavAutoBackupFrequency.Daily -> stringResource(Res.string.backup_frequency_daily)
-        WebDavAutoBackupFrequency.Weekly -> stringResource(Res.string.backup_frequency_weekly)
     }
 
 @Composable

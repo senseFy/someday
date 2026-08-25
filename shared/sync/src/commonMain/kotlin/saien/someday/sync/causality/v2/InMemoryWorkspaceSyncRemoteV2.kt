@@ -12,16 +12,13 @@ data class WorkspaceSyncFaultPlanV2(
     var dropNextAcknowledgement: Boolean = false,
     var corruptNextAcknowledgement: Boolean = false,
     var corruptNextPulledObject: Boolean = false,
-    var requireRebootstrapOnNextPull: Boolean = false,
     var failNextPointerCompareAndSet: Boolean = false,
     var beforeNextPointerCompareAndSet: (() -> Unit)? = null,
 )
 
 /**
  * Semantic in-memory implementation of the exact whole-product remote contract.
- * It deliberately stores ciphertext replicas separately from semantic identity,
- * just like the self-hosted profile, so coordinator tests exercise replay and
- * immutable-object mismatch rules rather than Kotlin object equality.
+ * It stores one canonical encrypted outer for each immutable identity.
  */
 class InMemoryWorkspaceSyncRemoteV2(
     override val remoteProfile: String = SyncRemoteProfileV2.SELF_HOSTED.wireValue,
@@ -34,15 +31,11 @@ class InMemoryWorkspaceSyncRemoteV2(
     override val authorityBindingId: String = bindingId
         ?: "$remoteProfile|in-memory|${RandomUuidCausalityIdGeneratorV2().newId()}"
     init {
-        require(remoteProfile in setOf(
-            SyncRemoteProfileV2.WEB_DAV.wireValue,
-            SyncRemoteProfileV2.SELF_HOSTED.wireValue,
-        ))
+        require(remoteProfile == SyncRemoteProfileV2.SELF_HOSTED.wireValue)
         require(maxPushObjects in 1..100 && maxPullUnits in 1..500)
     }
 
     private var pointer: EncryptedWorkspaceObjectV2? = null
-    private val retainedPointers = linkedMapOf<String, EncryptedWorkspaceObjectV2>()
     private val checkpointManifests = linkedMapOf<Pair<String, String>, EncryptedWorkspaceObjectV2>()
     private val checkpointChunks = linkedMapOf<Triple<String, String, String>, EncryptedWorkspaceObjectV2>()
     /** chunkIndex -> chunkId so read-back stays ordered under concurrent puts. */
@@ -51,8 +44,6 @@ class InMemoryWorkspaceSyncRemoteV2(
     private val semanticObjects = linkedMapOf<Pair<String, String>, StoredSemanticObjectV2>()
     private val mutationIdentities = linkedMapOf<Pair<String, String>, Pair<String, String>>()
     private val changes = mutableListOf<StoredWorkspaceChangeV2>()
-    private val repairReplicas = linkedMapOf<Triple<String, String, String>, LinkedHashMap<String, EncryptedWorkspaceObjectV2>>()
-    private val collectedEpochs = mutableSetOf<String>()
     /** Guards concurrent first-epoch chunk puts against non-thread-safe map mutation. */
     private val checkpointMutationMutex = Mutex()
 
@@ -75,11 +66,6 @@ class InMemoryWorkspaceSyncRemoteV2(
     )
 
     override fun loadEpochPointer(): EncryptedWorkspaceObjectV2? = withCheckpointLock { pointer }
-
-    override fun loadRetainedEpochPointer(syncEpochId: String): EncryptedWorkspaceObjectV2? =
-        withCheckpointLock {
-            pointer?.takeIf { it.syncEpochId == syncEpochId } ?: retainedPointers[syncEpochId]
-        }
 
     override fun fetchCheckpoint(
         pointer: EncryptedWorkspaceObjectV2,
@@ -149,11 +135,19 @@ class InMemoryWorkspaceSyncRemoteV2(
         }
         return withCheckpointLock {
             val current = this.pointer
-            if (current?.objectDigest != expectedCurrentDigest) {
-                if (current?.objectDigest == pointer.objectDigest) {
+            if (current != null) {
+                if (current == pointer) {
                     return@withCheckpointLock WorkspacePointerPublishResultV2.Published(idempotentReplay = true)
                 }
                 return@withCheckpointLock WorkspacePointerPublishResultV2.CompareAndSetFailed(current)
+            }
+            if (expectedCurrentDigest != null || descriptor.previousEpochId != null ||
+                descriptor.previousEpochPointerDigest != null
+            ) {
+                return@withCheckpointLock WorkspacePointerPublishResultV2.Rejected(
+                    "previous_epoch_mismatch",
+                    "The initial pointer cannot name a predecessor.",
+                )
             }
             val manifest = checkpointManifests[descriptor.syncEpochId to descriptor.checkpointId]
                 ?: return@withCheckpointLock WorkspacePointerPublishResultV2.Rejected(
@@ -166,7 +160,6 @@ class InMemoryWorkspaceSyncRemoteV2(
                     "The pointer does not identify its stored checkpoint.",
                 )
             }
-            current?.let { retainedPointers[it.syncEpochId] = it }
             this.pointer = pointer
             WorkspacePointerPublishResultV2.Published(idempotentReplay = false)
         }
@@ -186,9 +179,7 @@ class InMemoryWorkspaceSyncRemoteV2(
                 "checkpoint_still_publishable",
                 "An empty remote cannot prove that this checkpoint draft is obsolete.",
             )
-        if (current.syncEpochId == draft.descriptor.syncEpochId ||
-            retainedPointers.containsKey(draft.descriptor.syncEpochId)
-        ) {
+        if (current.syncEpochId == draft.descriptor.syncEpochId) {
             return@withCheckpointLock WorkspaceCheckpointDraftCleanupResultV2.Retained(
                 "checkpoint_referenced",
                 "The checkpoint is current or retained by authenticated pointer history.",
@@ -241,13 +232,6 @@ class InMemoryWorkspaceSyncRemoteV2(
         if (faults.failNextPull) {
             faults.failNextPull = false
             error("Injected pull failure.")
-        }
-        if (faults.requireRebootstrapOnNextPull) {
-            faults.requireRebootstrapOnNextPull = false
-            return WorkspaceSyncPullResultV2(emptyList(), frontierStable = true, rebootstrapRequired = true)
-        }
-        if (syncEpochId in collectedEpochs) {
-            return WorkspaceSyncPullResultV2(emptyList(), frontierStable = true, rebootstrapRequired = true)
         }
         val after = cursors[GLOBAL_STREAM_ID]?.toLongOrNull() ?: 0L
         var previousCursor = cursors[GLOBAL_STREAM_ID]
@@ -305,8 +289,8 @@ class InMemoryWorkspaceSyncRemoteV2(
                 }
             }
             semanticObjects[syncEpochId to value.objectId]?.let { existing ->
-                if (existing.objectDigest != value.objectDigest) {
-                    return WorkspaceSyncPushResultV2.Rejected("immutable_object_mismatch", "Object id names another semantic digest.")
+                if (existing.objectValue != value) {
+                    return WorkspaceSyncPushResultV2.Rejected("immutable_object_mismatch", "Object id names another encrypted outer.")
                 }
             }
             val replay = mutationIdentities.containsKey(mutationKey)
@@ -316,12 +300,7 @@ class InMemoryWorkspaceSyncRemoteV2(
             val mutationId = checkNotNull(value.mutationId)
             mutationIdentities[syncEpochId to mutationId] = value.objectId to value.objectDigest
             val key = syncEpochId to value.objectId
-            val semantic = semanticObjects.getOrPut(key) {
-                StoredSemanticObjectV2(value.objectDigest, linkedMapOf())
-            }
-            if (semantic.replicas.size < MAX_REPLICAS_PER_OBJECT || value.ciphertextDigest in semantic.replicas) {
-                semantic.replicas[value.ciphertextDigest] = value
-            }
+            semanticObjects.getOrPut(key) { StoredSemanticObjectV2(value) }
             if (!replay) {
                 changes += StoredWorkspaceChangeV2(syncEpochId, changes.size.toLong() + 1L, value)
             }
@@ -355,72 +334,11 @@ class InMemoryWorkspaceSyncRemoteV2(
         )
     }
 
-    override fun fetchRepairReplicas(
-        syncEpochId: String,
-        objectId: String,
-        objectDigest: String,
-    ): List<EncryptedWorkspaceObjectV2> {
-        val ordinary = semanticObjects[syncEpochId to objectId]
-            ?.takeIf { it.objectDigest == objectDigest }
-            ?.replicas
-            ?.values
-            .orEmpty()
-        val repairs = repairReplicas[Triple(syncEpochId, objectId, objectDigest)]?.values.orEmpty()
-        return (ordinary + repairs).distinctBy { it.writerDeviceId to it.ciphertextDigest }.take(MAX_REPAIR_CANDIDATES)
-    }
-
-    override fun publishRepairReplica(objectValue: EncryptedWorkspaceObjectV2): WorkspaceImmutablePutResultV2 {
-        val key = Triple(objectValue.syncEpochId, objectValue.objectId, objectValue.objectDigest)
-        val values = repairReplicas.getOrPut(key) { linkedMapOf() }
-        val existing = values[objectValue.writerDeviceId]
-        if (existing?.ciphertextDigest == objectValue.ciphertextDigest) {
-            return WorkspaceImmutablePutResultV2.Stored(idempotentReplay = true)
-        }
-        if (values.size >= MAX_REPAIR_CANDIDATES && existing == null) {
-            return WorkspaceImmutablePutResultV2.Rejected("repair_replica_set_invalid", "Repair replica bound exceeded.")
-        }
-        values[objectValue.writerDeviceId] = objectValue
-        return WorkspaceImmutablePutResultV2.Stored(idempotentReplay = false)
-    }
-
     fun allChanges(): List<EncryptedWorkspaceObjectV2> = changes.map { it.objectValue }
 
     /** Fault injection only: exposes an authenticated provider rollback. */
     internal fun forceEpochPointerForTest(value: EncryptedWorkspaceObjectV2) {
         pointer = value
-    }
-
-    /** Simulates an already-published stale WebDAV writer after epoch rollover. */
-    internal fun injectRetainedEpochObjectForTest(value: EncryptedWorkspaceObjectV2) {
-        require(pointer?.syncEpochId != value.syncEpochId)
-        require(value.objectType == WORKSPACE_ENTITY_VERSION_OBJECT_TYPE_V2 && value.mutationId != null)
-        val mutationKey = value.syncEpochId to value.mutationId
-        val identity = value.objectId to value.objectDigest
-        require(mutationIdentities[mutationKey]?.let { it == identity } != false)
-        val semanticKey = value.syncEpochId to value.objectId
-        val semantic = semanticObjects[semanticKey]
-        require(semantic?.objectDigest?.let { it == value.objectDigest } != false)
-        if (mutationKey !in mutationIdentities) {
-            mutationIdentities[mutationKey] = identity
-            val stored = semanticObjects.getOrPut(semanticKey) {
-                StoredSemanticObjectV2(value.objectDigest, linkedMapOf())
-            }
-            stored.replicas[value.ciphertextDigest] = value
-            changes += StoredWorkspaceChangeV2(value.syncEpochId, changes.size.toLong() + 1L, value)
-        }
-    }
-
-    /** Simulates authorized collection after the disclosed offline horizon. */
-    internal fun collectReadOnlyEpochForTest(epochId: String) {
-        require(pointer?.syncEpochId != epochId)
-        checkpointManifests.keys.removeAll { it.first == epochId }
-        checkpointChunks.keys.removeAll { it.first == epochId }
-        checkpointChunkOrder.keys.removeAll { it.first == epochId }
-        semanticObjects.keys.removeAll { it.first == epochId }
-        mutationIdentities.keys.removeAll { it.first == epochId }
-        changes.removeAll { it.epochId == epochId }
-        repairReplicas.keys.removeAll { it.first == epochId }
-        collectedEpochs += epochId
     }
 
     internal fun hasCheckpointDraftForTest(epochId: String): Boolean = withCheckpointLock {
@@ -448,8 +366,7 @@ class InMemoryWorkspaceSyncRemoteV2(
     }
 
     private data class StoredSemanticObjectV2(
-        val objectDigest: String,
-        val replicas: LinkedHashMap<String, EncryptedWorkspaceObjectV2>,
+        val objectValue: EncryptedWorkspaceObjectV2,
     )
 
     private data class StoredWorkspaceChangeV2(
@@ -460,8 +377,6 @@ class InMemoryWorkspaceSyncRemoteV2(
 
     private companion object {
         const val GLOBAL_STREAM_ID = "global"
-        const val MAX_REPLICAS_PER_OBJECT = 4
-        const val MAX_REPAIR_CANDIDATES = 64
         const val EMPTY_FRONTIER_DIGEST = "ct2:sha256:0000000000000000000000000000000000000000000000000000000000000000"
     }
 }

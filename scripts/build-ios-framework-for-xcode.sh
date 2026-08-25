@@ -42,16 +42,11 @@ case "${CONFIGURATION:-Debug}" in
     kmp_build_type="Release"
     kmp_variant="release"
     developer_options="false"
-    release_activation_args=(
-      -Psomeday.systemV2ReleaseEnabled=true
-      -Psomeday.systemV2DevelopmentEnabled=false
-    )
     ;;
   *)
     kmp_build_type="Debug"
     kmp_variant="debug"
     developer_options="true"
-    release_activation_args=()
     ;;
 esac
 
@@ -113,7 +108,6 @@ fi
   ":app:ios:link${kmp_build_type}Framework${kmp_target}" \
   ":app:ios:${kmp_dir_target}ProcessResources" \
   -Psomeday.ios.developerOptions="$developer_options" \
-  "${release_activation_args[@]}" \
   --dependency-verification=strict \
   --max-workers="$gradle_max_workers" \
   --stacktrace

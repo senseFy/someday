@@ -3,10 +3,8 @@
 package saien.someday.sync.causality.v2
 
 import saien.someday.data.crypto.SodiumWorkspaceCrypto
-import saien.someday.data.local.SqlDelightLocalDataRepository
-import saien.someday.data.local.createSomedayJdbcDriver
-import saien.someday.data.local.db.SomedayDatabase
 import saien.someday.sync.WorkspaceAuthorityMutationCoordinator
+import saien.someday.sync.causality.v2.testkit.FileBackedSyncDevice
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertIs
@@ -15,6 +13,125 @@ import kotlin.test.assertTrue
 import kotlin.time.Instant
 
 class WorkspaceSyncCoordinatorV2Test {
+    @Test
+    fun authenticatedSuccessorDescriptorIsRejectedBeforeCheckpointFetch() {
+        val key = SodiumWorkspaceCrypto().workspaceKeyFromBytes(ByteArray(32) { (it + 16).toByte() })
+        val baseRemote = InMemoryWorkspaceSyncRemoteV2()
+        val fixture = fixture(WRITER_A)
+        try {
+            val source = listOf(WorkspaceCheckpointSourceHeadV2(
+                WorkspaceEntityTypeV2.WORKSPACE_PREFERENCES,
+                WORKSPACE_PREFERENCES_ENTITY_ID_V2,
+                WorkspacePreferencesV2(),
+                null,
+                "unsupported-successor-test",
+                null,
+                WRITER_A,
+                null,
+                "unsupported-successor-source",
+                "unsupported-successor-digest",
+                T0,
+            ))
+            val first = WorkspaceCheckpointBuilderV2(key, WRITER_A).build(
+                remoteProfile = baseRemote.remoteProfile,
+                sourceHeads = source,
+                createdAt = T0,
+            )
+            val successor = WorkspaceCheckpointBuilderV2(key, WRITER_A).build(
+                remoteProfile = baseRemote.remoteProfile,
+                sourceHeads = source,
+                createdAt = T1,
+                previousPointerDigest = first.pointerObject.objectDigest,
+                previousEpochId = first.descriptor.syncEpochId,
+                previousEpochPointerDigest = first.pointerObject.objectDigest,
+                previousEpochFrontiers = listOf(
+                    SyncStreamFrontierV2(WRITER_A, "1", first.pointerObject.objectDigest),
+                ),
+            )
+            val remote = object : WorkspaceSyncRemoteV2 by baseRemote {
+                override fun loadEpochPointer(): EncryptedWorkspaceObjectV2 = successor.pointerObject
+            }
+
+            val result = WorkspaceSyncCoordinatorV2(fixture.local, key, WRITER_A, remote, {}).syncOnce()
+
+            assertEquals(SyncCoordinatorStatusV2.BLOCKED, result.status)
+            assertEquals("unsupported_generation_ancestry", result.safeErrorCode)
+        } finally {
+            fixture.close()
+        }
+    }
+
+    @Test
+    fun exactOutboxBatchRunsPublicationPrerequisiteBeforeRemotePush() {
+        val key = SodiumWorkspaceCrypto().workspaceKeyFromBytes(ByteArray(32) { (it + 17).toByte() })
+        val remote = InMemoryWorkspaceSyncRemoteV2()
+        val fixture = fixture(WRITER_A)
+        try {
+            val prepared = WorkspaceCheckpointBuilderV2(key, WRITER_A).build(
+                remoteProfile = remote.remoteProfile,
+                sourceHeads = listOf(WorkspaceCheckpointSourceHeadV2(
+                    WorkspaceEntityTypeV2.WORKSPACE_PREFERENCES,
+                    WORKSPACE_PREFERENCES_ENTITY_ID_V2,
+                    WorkspacePreferencesV2(),
+                    null,
+                    "publication-gate-test",
+                    null,
+                    WRITER_A,
+                    null,
+                    "publication-gate-source",
+                    "publication-gate-digest",
+                    T0,
+                )),
+                createdAt = T0,
+            )
+            assertIs<WorkspaceCheckpointPersistResultV2.Ready>(
+                WorkspaceCheckpointPersistenceV2(fixture.local, key, WRITER_A).persist(prepared),
+            )
+            assertIs<WorkspaceCheckpointPublishResultV2.Published>(
+                WorkspaceCheckpointPublisherV2(fixture.local, remote, {}).publish(prepared),
+            )
+            val context = WorkspaceSystemV2ContextProvider(
+                fixture.local, { key }, { WRITER_A }, { remote.remoteProfile },
+            ).requireActive()
+            val preferenceKey = WorkspaceEntityKeyV2(
+                WorkspaceEntityTypeV2.WORKSPACE_PREFERENCES,
+                WORKSPACE_PREFERENCES_ENTITY_ID_V2,
+            )
+            val parent = context.store.loadHeads(preferenceKey).single()
+            val child = context.factory.createContentChild(
+                parent,
+                (parent.contentPayload as WorkspacePreferencesV2).copy(previewByDefault = true),
+                context.deviceActorId,
+                T1,
+            )
+            assertIs<WorkspaceLocalCommitResultV2.Committed>(
+                context.store.commitLocalMutations(listOf(
+                    LocalWorkspaceMutationV2(remote.remoteProfile, context.factory.newMutationId(), child, T1),
+                )),
+            )
+            var gatedVersionIds = emptyList<String>()
+
+            val blocked = WorkspaceSyncCoordinatorV2(
+                fixture.local,
+                key,
+                WRITER_A,
+                remote,
+                beforeEntityPublication = { versions ->
+                    gatedVersionIds = versions.map { it.versionId }
+                    error("missing media")
+                },
+            ).syncOnce()
+
+            assertEquals(SyncCoordinatorStatusV2.BLOCKED, blocked.status)
+            assertEquals("entity_publication_prerequisite_failed", blocked.safeErrorCode)
+            assertEquals(listOf(child.versionId), gatedVersionIds)
+            assertEquals(1, context.store.loadPending(remote.remoteProfile).size)
+            assertTrue(remote.allChanges().isEmpty())
+        } finally {
+            fixture.close()
+        }
+    }
+
     @Test
     fun missingSelfHostedCursorObjectRequiresRebootstrapAndPreservesPendingUpload() {
         val key = SodiumWorkspaceCrypto().workspaceKeyFromBytes(ByteArray(32) { (it + 18).toByte() })
@@ -43,11 +160,11 @@ class WorkspaceSyncCoordinatorV2Test {
                 WorkspaceCheckpointPersistenceV2(publisher.local, key, WRITER_A).persist(prepared),
             )
             assertIs<WorkspaceCheckpointPublishResultV2.Published>(
-                WorkspaceCheckpointPublisherV2(publisher.local, remote).publish(prepared),
+                WorkspaceCheckpointPublisherV2(publisher.local, remote, {}).publish(prepared),
             )
             assertEquals(
                 SyncCoordinatorStatusV2.SUCCESS,
-                WorkspaceSyncCoordinatorV2(client.local, key, WRITER_B, remote).syncOnce().status,
+                WorkspaceSyncCoordinatorV2(client.local, key, WRITER_B, remote, {}).syncOnce().status,
             )
             val context = WorkspaceSystemV2ContextProvider(
                 client.local,
@@ -77,6 +194,7 @@ class WorkspaceSyncCoordinatorV2Test {
                 key,
                 WRITER_B,
                 MissingCursorObjectRemoteV2(remote),
+                {},
             ).syncOnce()
 
             assertEquals(SyncCoordinatorStatusV2.BLOCKED, blocked.status)
@@ -85,7 +203,6 @@ class WorkspaceSyncCoordinatorV2Test {
             assertEquals(1, context.store.loadPending(remote.remoteProfile).size)
             assertTrue(remote.allChanges().isEmpty())
             val run = SqlDelightSyncProtocolStoreV2(client.local.database).loadRuns(remote.remoteProfile).first()
-            assertEquals(SyncRunRepairStateV2.REBOOTSTRAP_REQUIRED, run.counters.repairState)
         } finally {
             publisher.close()
             client.close()
@@ -136,7 +253,7 @@ class WorkspaceSyncCoordinatorV2Test {
                     ),
                 )
 
-                val result = WorkspaceSyncCoordinatorV2(joining.local, key, WRITER_B, remote).syncOnce()
+                val result = WorkspaceSyncCoordinatorV2(joining.local, key, WRITER_B, remote, {}).syncOnce()
 
                 assertEquals(SyncCoordinatorStatusV2.BLOCKED, result.status)
                 assertEquals(0, result.pulledObjects)
@@ -177,11 +294,11 @@ class WorkspaceSyncCoordinatorV2Test {
                 WorkspaceCheckpointPersistenceV2(publisher.local, correctKey, WRITER_A).persist(prepared),
             )
             assertIs<WorkspaceCheckpointPublishResultV2.Published>(
-                WorkspaceCheckpointPublisherV2(publisher.local, remote).publish(prepared),
+                WorkspaceCheckpointPublisherV2(publisher.local, remote, {}).publish(prepared),
             )
             assertTrue(remote.allChanges().isEmpty())
 
-            val result = WorkspaceSyncCoordinatorV2(joining.local, wrongKey, WRITER_B, remote).syncOnce()
+            val result = WorkspaceSyncCoordinatorV2(joining.local, wrongKey, WRITER_B, remote, {}).syncOnce()
 
             assertEquals(SyncCoordinatorStatusV2.BLOCKED, result.status)
             assertEquals(0, result.pushedObjects)
@@ -221,7 +338,7 @@ class WorkspaceSyncCoordinatorV2Test {
                 WorkspaceCheckpointPersistenceV2(publisher.local, key, WRITER_A).persist(prepared),
             )
             assertIs<WorkspaceCheckpointPublishResultV2.Published>(
-                WorkspaceCheckpointPublisherV2(publisher.local, remote).publish(prepared),
+                WorkspaceCheckpointPublisherV2(publisher.local, remote, {}).publish(prepared),
             )
 
             val blocked = WorkspaceSyncCoordinatorV2(
@@ -229,6 +346,7 @@ class WorkspaceSyncCoordinatorV2Test {
                 key,
                 WRITER_B,
                 remote,
+                beforeEntityPublication = {},
                 bootstrapCommitHook = {
                     "local_fallback_import_failed" to "Local fallback state was not committed."
                 },
@@ -249,6 +367,7 @@ class WorkspaceSyncCoordinatorV2Test {
                 key,
                 WRITER_B,
                 remote,
+                beforeEntityPublication = {},
                 authorityMutationCoordinator = WorkspaceAuthorityMutationCoordinator(),
                 bootstrapCommitHook = {
                     successfulHookCalls += 1
@@ -296,7 +415,7 @@ class WorkspaceSyncCoordinatorV2Test {
                 WorkspaceCheckpointPersistenceV2(publisher.local, key, WRITER_A).persist(remoteCheckpoint),
             )
             assertIs<WorkspaceCheckpointPublishResultV2.Published>(
-                WorkspaceCheckpointPublisherV2(publisher.local, remote).publish(remoteCheckpoint),
+                WorkspaceCheckpointPublisherV2(publisher.local, remote, {}).publish(remoteCheckpoint),
             )
 
             val competing = WorkspaceCheckpointBuilderV2(key, WRITER_B).build(
@@ -350,6 +469,7 @@ class WorkspaceSyncCoordinatorV2Test {
                 key,
                 WRITER_B,
                 racingRemote,
+                {},
                 protocol,
                 authorityMutationCoordinator = WorkspaceAuthorityMutationCoordinator(),
             ).syncOnce()
@@ -428,7 +548,7 @@ class WorkspaceSyncCoordinatorV2Test {
                 WorkspaceCheckpointPersistenceV2(first.local, key, WRITER_A).persist(prepared),
             )
             assertIs<WorkspaceCheckpointPublishResultV2.Published>(
-                WorkspaceCheckpointPublisherV2(first.local, remote).publish(prepared),
+                WorkspaceCheckpointPublisherV2(first.local, remote, {}).publish(prepared),
             )
 
             val firstContext = WorkspaceSystemV2ContextProvider(
@@ -437,7 +557,7 @@ class WorkspaceSyncCoordinatorV2Test {
             assertEquals(3, firstContext.store.loadEntityKeys().size)
             assertEquals("Place", (firstContext.store.loadProjection(noteKey())?.content as NoteContentV2).location?.placeText)
 
-            val bootstrap = WorkspaceSyncCoordinatorV2(second.local, key, WRITER_B, remote).syncOnce()
+            val bootstrap = WorkspaceSyncCoordinatorV2(second.local, key, WRITER_B, remote, {}).syncOnce()
             assertEquals(SyncCoordinatorStatusV2.SUCCESS, bootstrap.status)
             val secondContext = WorkspaceSystemV2ContextProvider(
                 second.local, { key }, { WRITER_B }, { SyncRemoteProfileV2.SELF_HOSTED.wireValue },
@@ -465,10 +585,10 @@ class WorkspaceSyncCoordinatorV2Test {
                 )),
             )
             assertEquals(SyncCoordinatorStatusV2.SUCCESS, WorkspaceSyncCoordinatorV2(
-                first.local, key, WRITER_A, remote,
+                first.local, key, WRITER_A, remote, {},
             ).syncOnce().status)
             val pulled = WorkspaceSyncCoordinatorV2(
-                second.local, key, WRITER_B, remote,
+                second.local, key, WRITER_B, remote, {},
             ).syncOnce()
             assertEquals(SyncCoordinatorStatusV2.SUCCESS, pulled.status)
             assertEquals(
@@ -490,11 +610,11 @@ class WorkspaceSyncCoordinatorV2Test {
             })
             assertEquals(
                 SyncCoordinatorStatusV2.SUCCESS,
-                WorkspaceSyncCoordinatorV2(first.local, key, WRITER_A, remote).syncOnce().status,
+                WorkspaceSyncCoordinatorV2(first.local, key, WRITER_A, remote, {}).syncOnce().status,
             )
             assertEquals(
                 SyncCoordinatorStatusV2.SUCCESS,
-                WorkspaceSyncCoordinatorV2(second.local, key, WRITER_B, remote).syncOnce().status,
+                WorkspaceSyncCoordinatorV2(second.local, key, WRITER_B, remote, {}).syncOnce().status,
             )
             assertEquals(
                 "Created while sync is off",
@@ -514,8 +634,6 @@ class WorkspaceSyncCoordinatorV2Test {
             assertTrue(run.counters.storedVersions >= 1)
             assertTrue(run.counters.fastForwards >= 1)
             assertEquals(0, run.counters.deadLetters)
-            assertEquals(SyncRunRepairStateV2.HEALTHY, run.counters.repairState)
-            assertTrue(run.counters.checkpointHorizonEpochMilliseconds != null)
         } finally {
             first.close()
             second.close()
@@ -623,11 +741,11 @@ class WorkspaceSyncCoordinatorV2Test {
                 WorkspaceCheckpointPersistenceV2(first.local, key, WRITER_A).persist(prepared),
             )
             assertIs<WorkspaceCheckpointPublishResultV2.Published>(
-                WorkspaceCheckpointPublisherV2(first.local, remote).publish(prepared),
+                WorkspaceCheckpointPublisherV2(first.local, remote, {}).publish(prepared),
             )
             assertEquals(
                 SyncCoordinatorStatusV2.SUCCESS,
-                WorkspaceSyncCoordinatorV2(second.local, key, WRITER_B, remote).syncOnce().status,
+                WorkspaceSyncCoordinatorV2(second.local, key, WRITER_B, remote, {}).syncOnce().status,
             )
 
             val firstContext = WorkspaceSystemV2ContextProvider(
@@ -698,78 +816,6 @@ class WorkspaceSyncCoordinatorV2Test {
     }
 
     @Test
-    fun retainedPointerChainProvesMissedRolloversAndRejectsAuthenticatedRollback() {
-        val key = SodiumWorkspaceCrypto().workspaceKeyFromBytes(ByteArray(32) { (it + 51).toByte() })
-        val remote = InMemoryWorkspaceSyncRemoteV2()
-        val fixture = fixture(WRITER_A)
-        try {
-            fun source(label: String, prior: PreparedWorkspaceEpochCheckpointV2? = null) =
-                listOf(WorkspaceCheckpointSourceHeadV2(
-                    WorkspaceEntityTypeV2.WORKSPACE_PREFERENCES,
-                    WORKSPACE_PREFERENCES_ENTITY_ID_V2,
-                    WorkspacePreferencesV2(),
-                    null,
-                    "pointer-chain-test",
-                    prior?.descriptor?.syncEpochId,
-                    WRITER_A,
-                    null,
-                    "source-$label",
-                    "source-digest-$label",
-                    T0,
-                ))
-
-            fun build(label: String, prior: PreparedWorkspaceEpochCheckpointV2? = null) =
-                WorkspaceCheckpointBuilderV2(key, WRITER_A).build(
-                    remoteProfile = remote.remoteProfile,
-                    sourceHeads = source(label, prior),
-                    createdAt = T0,
-                    previousPointerDigest = prior?.pointerObject?.objectDigest,
-                    previousEpochId = prior?.descriptor?.syncEpochId,
-                    previousEpochFrontiers = prior?.let { remote.epochFrontiers(it.descriptor.syncEpochId) }.orEmpty(),
-                )
-
-            fun publish(value: PreparedWorkspaceEpochCheckpointV2) {
-                value.chunks.forEach { chunk ->
-                    assertIs<WorkspaceImmutablePutResultV2.Stored>(
-                        remote.putCheckpointChunk(value.descriptor, chunk.ref, chunk.encryptedObject),
-                    )
-                }
-                assertIs<WorkspaceImmutablePutResultV2.Stored>(
-                    remote.putCheckpointManifest(value.descriptor, value.manifestObject),
-                )
-                assertIs<WorkspacePointerPublishResultV2.Published>(
-                    remote.compareAndSetEpochPointer(
-                        value.descriptor,
-                        value.pointer.previousPointerDigest,
-                        value.pointerObject,
-                    ),
-                )
-            }
-
-            val first = build("first")
-            assertIs<WorkspaceCheckpointPersistResultV2.Ready>(
-                WorkspaceCheckpointPersistenceV2(fixture.local, key, WRITER_A).persist(first),
-            )
-            assertIs<WorkspaceCheckpointPublishResultV2.Published>(
-                WorkspaceCheckpointPublisherV2(fixture.local, remote).publish(first),
-            )
-            val second = build("second", first).also(::publish)
-            val third = build("third", second).also(::publish)
-
-            val caughtUp = WorkspaceSyncCoordinatorV2(fixture.local, key, WRITER_A, remote).syncOnce()
-            assertEquals(SyncCoordinatorStatusV2.SUCCESS, caughtUp.status)
-            assertEquals(third.descriptor.syncEpochId, caughtUp.epochId)
-
-            remote.forceEpochPointerForTest(first.pointerObject)
-            val rollback = WorkspaceSyncCoordinatorV2(fixture.local, key, WRITER_A, remote).syncOnce()
-            assertEquals(SyncCoordinatorStatusV2.BLOCKED, rollback.status)
-            assertEquals("remote_rollback_detected", rollback.safeErrorCode)
-        } finally {
-            fixture.close()
-        }
-    }
-
-    @Test
     fun selfHostedCursorRollbackBlocksBeforeAnyUpload() {
         val key = SodiumWorkspaceCrypto().workspaceKeyFromBytes(ByteArray(32) { (it + 61).toByte() })
         val backing = InMemoryWorkspaceSyncRemoteV2(SyncRemoteProfileV2.SELF_HOSTED.wireValue)
@@ -798,17 +844,17 @@ class WorkspaceSyncCoordinatorV2Test {
                 WorkspaceCheckpointPersistenceV2(leader.local, key, WRITER_A).persist(prepared),
             )
             assertIs<WorkspaceCheckpointPublishResultV2.Published>(
-                WorkspaceCheckpointPublisherV2(leader.local, remote).publish(prepared),
+                WorkspaceCheckpointPublisherV2(leader.local, remote, {}).publish(prepared),
             )
             assertEquals(
                 SyncCoordinatorStatusV2.SUCCESS,
-                WorkspaceSyncCoordinatorV2(follower.local, key, WRITER_B, remote).syncOnce().status,
+                WorkspaceSyncCoordinatorV2(follower.local, key, WRITER_B, remote, {}).syncOnce().status,
             )
 
             remote.emitOneValidCursorAdvance = true
             assertEquals(
                 SyncCoordinatorStatusV2.SUCCESS,
-                WorkspaceSyncCoordinatorV2(follower.local, key, WRITER_B, remote).syncOnce().status,
+                WorkspaceSyncCoordinatorV2(follower.local, key, WRITER_B, remote, {}).syncOnce().status,
             )
             val followerContext = WorkspaceSystemV2ContextProvider(
                 follower.local, { key }, { WRITER_B }, { remote.remoteProfile },
@@ -817,7 +863,7 @@ class WorkspaceSyncCoordinatorV2Test {
 
             remote.emitRollback = true
             val pushesBefore = remote.pushCalls
-            val blocked = WorkspaceSyncCoordinatorV2(follower.local, key, WRITER_B, remote).syncOnce()
+            val blocked = WorkspaceSyncCoordinatorV2(follower.local, key, WRITER_B, remote, {}).syncOnce()
             assertEquals(SyncCoordinatorStatusV2.BLOCKED, blocked.status)
             assertEquals("remote_rollback_detected", blocked.safeErrorCode)
             assertEquals("1", followerContext.store.loadCursor(remote.remoteProfile, "global")?.cursorValue)
@@ -829,7 +875,7 @@ class WorkspaceSyncCoordinatorV2Test {
     }
 
     @Test
-    fun persistentCipherMismatchBlocksPushAndExactReplicaRepairReplaysOriginalCursorUnit() {
+    fun persistentCipherMismatchIsDurablyDeadLetteredAndRemainsBlocked() {
         val key = SodiumWorkspaceCrypto().workspaceKeyFromBytes(ByteArray(32) { (it + 71).toByte() })
         val remote = InMemoryWorkspaceSyncRemoteV2()
         val first = fixture(WRITER_A)
@@ -858,11 +904,11 @@ class WorkspaceSyncCoordinatorV2Test {
                 WorkspaceCheckpointPersistenceV2(first.local, key, WRITER_A).persist(prepared),
             )
             assertIs<WorkspaceCheckpointPublishResultV2.Published>(
-                WorkspaceCheckpointPublisherV2(first.local, remote).publish(prepared),
+                WorkspaceCheckpointPublisherV2(first.local, remote, {}).publish(prepared),
             )
             assertEquals(
                 SyncCoordinatorStatusV2.SUCCESS,
-                WorkspaceSyncCoordinatorV2(second.local, key, WRITER_B, remote).syncOnce().status,
+                WorkspaceSyncCoordinatorV2(second.local, key, WRITER_B, remote, {}).syncOnce().status,
             )
             val firstContext = WorkspaceSystemV2ContextProvider(
                 first.local,
@@ -888,44 +934,25 @@ class WorkspaceSyncCoordinatorV2Test {
             )
             assertEquals(
                 SyncCoordinatorStatusV2.SUCCESS,
-                WorkspaceSyncCoordinatorV2(first.local, key, WRITER_A, remote).syncOnce().status,
+                WorkspaceSyncCoordinatorV2(first.local, key, WRITER_A, remote, {}).syncOnce().status,
             )
 
             remote.faults.corruptNextPulledObject = true
-            val blocked = WorkspaceSyncCoordinatorV2(second.local, key, WRITER_B, remote).syncOnce()
+            val blocked = WorkspaceSyncCoordinatorV2(second.local, key, WRITER_B, remote, {}).syncOnce()
 
             assertEquals(SyncCoordinatorStatusV2.BLOCKED, blocked.status)
             val protocol = SqlDelightSyncProtocolStoreV2(second.local.database)
-            val deadLetter = protocol.loadActiveDeadLetters(remote.remoteProfile, prepared.descriptor.syncEpochId).single()
+            val deadLetter = protocol.loadUnresolvedDeadLetters(remote.remoteProfile, prepared.descriptor.syncEpochId).single()
             assertEquals(SyncDeadLetterFailureClassV2.PERSISTENT_INTEGRITY, deadLetter.input.failureClass)
             assertEquals(
                 SyncEpochHealthV2.BLOCKED,
                 protocol.loadEpoch(remote.remoteProfile, prepared.descriptor.syncEpochId)?.health,
             )
-            val repaired = WorkspaceImmutableObjectRepairServiceV2(
-                second.local,
-                key,
-                WRITER_B,
-                remote,
-                protocol,
-                clock = { T1 },
-            ).repair(deadLetter)
-            assertIs<WorkspaceRepairResultV2.Repaired>(repaired)
-            assertTrue(repaired.repairedObjectIds.isNotEmpty())
-            assertTrue(protocol.loadActiveDeadLetters(remote.remoteProfile, prepared.descriptor.syncEpochId).isEmpty())
-
-            val resumed = WorkspaceSyncCoordinatorV2(second.local, key, WRITER_B, remote).syncOnce()
-
-            assertEquals(SyncCoordinatorStatusV2.SUCCESS, resumed.status)
-            val secondContext = WorkspaceSystemV2ContextProvider(
-                second.local,
-                { key },
-                { WRITER_B },
-                { remote.remoteProfile },
-            ).requireActive()
+            val stillBlocked = WorkspaceSyncCoordinatorV2(second.local, key, WRITER_B, remote, {}).syncOnce()
+            assertEquals(SyncCoordinatorStatusV2.BLOCKED, stillBlocked.status)
             assertEquals(
-                false,
-                (secondContext.store.loadProjection(preferenceKey)?.content as WorkspacePreferencesV2).markdownToolbarVisible,
+                deadLetter,
+                protocol.loadUnresolvedDeadLetters(remote.remoteProfile, prepared.descriptor.syncEpochId).single(),
             )
         } finally {
             first.close()
@@ -933,18 +960,8 @@ class WorkspaceSyncCoordinatorV2Test {
         }
     }
 
-    private fun fixture(writer: String): Fixture {
-        val driver = createSomedayJdbcDriver("jdbc:sqlite::memory:")
-        val database = SomedayDatabase(driver)
-        return Fixture(driver, SqlDelightLocalDataRepository(database, "test-$writer", clock = { T0 }))
-    }
-
-    private data class Fixture(
-        val driver: app.cash.sqldelight.db.SqlDriver,
-        val local: SqlDelightLocalDataRepository,
-    ) {
-        fun close() = driver.close()
-    }
+    private fun fixture(writer: String): FileBackedSyncDevice =
+        FileBackedSyncDevice.create(writer) { T0 }
 
     private fun noteKey() = WorkspaceEntityKeyV2(WorkspaceEntityTypeV2.NOTE, NOTE_ID)
 
@@ -975,7 +992,6 @@ private class MissingCursorObjectRemoteV2(
     ): WorkspaceSyncPullResultV2 = WorkspaceSyncPullResultV2(
         units = emptyList(),
         frontierStable = false,
-        rebootstrapRequired = true,
         safeErrorCode = "missing_remote_object",
     )
 }

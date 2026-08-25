@@ -3,7 +3,7 @@
 Status: implementation and interoperability contract.
 
 This protocol gives one additional device a workspace master key without
-revealing that key to WebDAV or the self-hosted service. The user transfers one
+revealing that key to the self-hosted service. The user transfers one
 high-entropy capability by QR code or manual entry. The capability is
 single-use, expires after at most ten minutes, and is never written to logs.
 
@@ -29,8 +29,8 @@ capability and can claim it during its lifetime. The checksum detects typing
 errors; it is not an authentication factor.
 
 The protocol protects confidentiality and authenticated state transitions. It
-cannot prevent denial of service by a storage provider, server operator, or
-another party with write access to the same WebDAV directory.
+cannot prevent denial of service by the server operator or another authenticated
+device on the same account.
 
 ## 2. Capability encoding
 
@@ -100,15 +100,35 @@ Any change to this vector is a protocol change.
 
 ## 4. Authority binding
 
-Pairing is bound to the configured remote authority. Each component is encoded
-as `<UTF-8 byte length>:<value>`, then components are joined with `|`.
+Pairing is bound to the configured self-hosted remote account. Each component
+is encoded as `<UTF-8 byte length>:<value>`, then components are joined with
+`|`.
 
-- WebDAV components: normalized endpoint, username, normalized app directory.
-- Self-hosted components: endpoint with trailing slash removed, authenticated
-  user id.
+- Self-hosted components: canonical endpoint (lowercase scheme/host, default
+  port and trailing slash removed), authenticated user id.
 
 The authority binding is authenticated but is not included in encrypted
 plaintext.
+
+The envelope uses endpoint plus account because those values must be identical
+on the inviting and joining devices. Separately, each published local
+workspace has a publication-session binding:
+
+```text
+canonical endpoint + authenticated userId + workspaceId + local writer deviceId
+```
+
+The shared session guard enforces all four values before an already published
+workspace creates or cancels pairing state. An inviter must have an `ACTIVE`
+published pointer; a merely local `PREPARING` draft is not an invitation
+authority. A wrong account, workspace, or device fails before join-package
+creation and before an invite request.
+
+A fresh installation claims with its own registered device session. Successful
+local adoption binds that stable installation device id as the new DAG writer.
+The writer id and workspace id are deliberately not part of envelope AAD:
+inviter and joiner have different device ids, and the authenticated encrypted
+payload already carries the exact workspace id being adopted.
 
 ## 5. Encrypted envelope
 
@@ -118,7 +138,6 @@ The exact outer JSON field set is:
 {
   "format": "someday.workspace-pairing",
   "protocolVersion": 1,
-  "remoteProfile": "webdav",
   "inviteId": "<22-character id>",
   "createdAtEpochMillis": 1000,
   "expiresAtEpochMillis": 601000,
@@ -129,15 +148,14 @@ The exact outer JSON field set is:
 }
 ```
 
-`remoteProfile` is either `webdav` or `self-hosted`. The nonce is 24 random
-bytes. Encrypt with XChaCha20-Poly1305 using the envelope key.
+The nonce is 24 random bytes. Encrypt with XChaCha20-Poly1305 using the
+envelope key.
 
 Associated data is these values joined by `\n`, without a final newline:
 
 ```text
 someday.workspace-pairing
 1
-<remote profile>
 <invitation identifier>
 <created milliseconds>
 <expiry milliseconds>
@@ -169,44 +187,7 @@ when `now >= expiresAtEpochMillis`.
 The envelope digest is unpadded Base64url SHA-256 of the exact outer JSON
 bytes.
 
-## 6. WebDAV state machine
-
-The record path is:
-
-```text
-workspace-pairing/1/<invitation-id>.json.enc
-```
-
-Creation uses `PUT` with `If-None-Match: *`. A collision generates a new
-capability, up to three attempts.
-
-Claim performs:
-
-1. reject any key-bound local System V2 state;
-2. acquire the shared workspace-authority mutation lock and check local state
-   again;
-3. `GET` the record and retain its exact ETag;
-4. validate expiry, authority, digest, and authenticated envelope;
-5. create a random 16-byte claim id;
-6. replace the envelope with an authenticated `claimed` tombstone using the
-   exact `If-Match` ETag;
-7. commit the workspace adoption only after the conditional update succeeds.
-
-Cancellation replaces an available envelope with an authenticated `cancelled`
-tombstone using the same conditional update. A lost update response is
-resolved by reading and comparing the complete authenticated tombstone.
-
-The tombstone fields are format, protocol version, invitation id, state,
-optional claim id, envelope digest, expiry, and authenticator. The
-authenticator is HMAC-SHA-256 under the state key over those fields plus the
-authority binding. Claimed tombstones require a claim id; cancelled
-tombstones forbid one.
-
-Pairing never sends WebDAV `DELETE`. Claimed, cancelled, and expired records
-remain as replay tombstones or unavailable envelopes. Retention collection is
-not part of this protocol revision.
-
-## 7. Self-hosted state machine
+## 6. Self-hosted state machine
 
 All routes require an authenticated, non-revoked device session with `sync`
 scope. Records are keyed by `(user id, invitation id)`, so an invitation
@@ -239,26 +220,38 @@ The client checks the server digest, expiry, authority-bound envelope, and
 workspace package itself. Completion is attempted after every successful
 claim even when validation or local adoption fails, preserving single-use
 behavior. Pairing uses the same serialized access-token refresh executor as
-normal self-hosted sync.
+normal self-hosted sync. Creation requires the inviter's active publication
+binding. Claiming on a fresh installation is intentionally possible before a
+local publication binding exists.
 
-## 8. Local workspace adoption
+## 7. Local workspace adoption
 
-Joining is forbidden when any local key-bound System V2 lifecycle exists:
-`preparing`, `active`, `blocked`, or `read_only`. The check happens before
-remote claim and again while holding the shared authority mutation lock.
-First-epoch activation uses that same lock, so activation and workspace
-adoption cannot overlap.
+Joining is allowed only when the current local workspace is semantically
+empty. A normal fresh installation already owns a healthy `PREPARING` DAG
+draft, so key-bound state alone is not a refusal reason. Semantic content
+means any note, notebook, deletion history, non-default synchronized state,
+pending semantic mutation, conflict branch, or local image. An `ACTIVE`,
+`BLOCKED`, unhealthy, ambiguous, or non-empty generation is always refused.
+
+The semantic-emptiness check happens before remote claim and again while
+holding the shared authority-mutation lock. Inside that same transaction the
+empty draft is discarded before the staged workspace key becomes current.
+First publication uses the same lock, so adoption cannot race a local edit or
+publication. Existing content is never silently merged into the invited
+workspace.
 
 The imported recovery package must authenticate the workspace metadata,
 workspace id, and expected key fingerprint. The new key is first written
-under a fresh secure-storage alias. Local metadata is then committed. If that
-commit fails, the staged alias is removed and the prior workspace remains
-active. The prior alias is removed only after the new metadata commit.
+under a fresh secure-storage alias. Local metadata and empty-draft disposal
+then commit as one adoption operation. If that operation fails, the staged
+alias is removed and the prior empty workspace remains usable. The prior alias
+is removed only after the new metadata commit.
 
-There is no DAG-rebinding transaction. A device with key-bound history must
-clear its local app data before joining a different workspace.
+There is no general DAG merge or rebinding mechanism. A device with semantic
+history must export and clear its local workspace, or later select a separate
+workspace, before joining another one.
 
-## 9. UI and release rules
+## 8. UI and release rules
 
 - Android and iOS request camera access only after the user selects Scan.
 - Android accepts QR metadata through CameraX and ZXing; iOS accepts QR
@@ -270,22 +263,22 @@ clear its local app data before joining a different workspace.
 - English, Simplified Chinese, Japanese, and Korean use the same pairing
   semantics.
 
-Workspace pairing does not override the sync activation release gate. Both
-activation properties remain off by default. The accepted complete System V2
-gate permits canonical shipping entrypoints to set release activation on while
-forcing development activation off; ad-hoc low-level builds do not inherit
-that permission.
+There is no feature activation switch for the local DAG. It is the product
+data model from workspace creation onward, including while network sync is
+off. Pairing is available only with a valid self-hosted session and, for the
+inviter, an active published workspace.
 
-## 10. Required evidence
+## 9. Required evidence
 
 The reliability gate must cover:
 
 - token normalization, checksum, golden derivation vector, strict envelope
   decoding, authority binding, and expiry;
-- WebDAV append-only create, conditional one-use claim, authenticated
-  cancellation, missing-ETag failure, and absence of delete;
 - self-hosted account/device scoping, atomic claim, replay behavior,
   completion, cancellation, expiry, and absence of read/delete routes;
-- local key-bound-state refusal and authority-mutation serialization;
+- semantic-empty adoption, atomic empty-draft disposal, non-empty refusal, and
+  authority-mutation serialization;
+- inviter rejection before active publication and stable UUIDv4 writer
+  binding on the joining device;
 - encrypted end-to-end join followed by follower bootstrap and Notes refresh;
 - Android, iOS, Desktop, shared UI, server, and real-remote builds/tests.

@@ -9,27 +9,6 @@ import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
 import kotlin.time.Clock
 
-data class PreparedWorkspaceKeyRotation(
-    val token: String,
-    val sourceEpochId: String,
-    val sourceKeyFingerprint: String,
-    val targetKeyFingerprint: String,
-    val targetMetadataJson: String,
-    val recoveryMaterial: RecoveryMaterial,
-)
-
-data class PendingWorkspaceKeyRotation(
-    val token: String,
-    val sourceEpochId: String,
-    val sourceKeyFingerprint: String,
-    val targetKeyFingerprint: String,
-)
-
-sealed interface WorkspaceKeyRotationStageResult {
-    data class Staged(val pending: PendingWorkspaceKeyRotation) : WorkspaceKeyRotationStageResult
-    data class Failed(val reason: WorkspaceUnlockFailure) : WorkspaceKeyRotationStageResult
-}
-
 class WorkspaceKeyRepository(
     private val localRepository: SqlDelightLocalDataRepository,
     private val secureKeyStore: SecureWorkspaceKeyStore,
@@ -88,189 +67,8 @@ class WorkspaceKeyRepository(
 
     fun unlockedKeyOrNull(): WorkspaceMasterKey? = unlockedKey?.copy()
 
-    /**
-     * Stages a different workspace key in secure storage without changing the
-     * active key. The returned recovery material is intentionally one-shot;
-     * it is never persisted in settings or the sync graph.
-     */
-    fun prepareWorkspaceKeyRotation(sourceEpochId: String): PreparedWorkspaceKeyRotation {
-        require(sourceEpochId.isNotBlank() && sourceEpochId.length <= 128)
-        require(loadRotationState() == null) { "A workspace-key rotation is already pending." }
-        val sourceMetadata = requireNotNull(loadMetadata()) { "No workspace exists." }
-        val sourceKey = unlockedKeyOrNull()
-            ?: secureKeyStore.get(sourceMetadata.secureStorageAlias)
-            ?: error("The active workspace key is unavailable.")
-        require(verifyWorkspaceKey(sourceMetadata, sourceKey)) { "The active workspace key failed authentication." }
-
-        val targetKey = crypto.generateWorkspaceKey()
-        require(targetKey.fingerprint != sourceKey.fingerprint)
-        val recovery = crypto.generateRecoveryMaterial()
-        val targetAlias = aliasGenerator.newAlias("${sourceMetadata.workspaceId}-rotation")
-        val targetMetadata = createMetadata(
-            workspaceId = sourceMetadata.workspaceId,
-            workspaceKey = targetKey,
-            recoveryMaterial = recovery,
-            secureStorageAlias = targetAlias,
-        )
-        val targetMetadataJson = encodeMetadata(targetMetadata)
-        val token = aliasGenerator.newAlias("workspace-key-rotation")
-        val state = PersistedWorkspaceKeyRotationState(
-            token = token,
-            sourceEpochId = sourceEpochId,
-            sourceSecureStorageAlias = sourceMetadata.secureStorageAlias,
-            sourceKeyFingerprint = sourceKey.fingerprint,
-            targetSecureStorageAlias = targetAlias,
-            targetKeyFingerprint = targetKey.fingerprint,
-            targetMetadataJson = targetMetadataJson,
-        )
-        secureKeyStore.put(targetAlias, targetKey)
-        try {
-            persistRotationState(state)
-        } catch (failure: Exception) {
-            secureKeyStore.remove(targetAlias)
-            throw failure
-        }
-        return PreparedWorkspaceKeyRotation(
-            token,
-            sourceEpochId,
-            sourceKey.fingerprint,
-            targetKey.fingerprint,
-            targetMetadataJson,
-            recovery,
-        )
-    }
-
-    /** Stages a rotation package received out of band on a retained device. */
-    fun stageWorkspaceKeyRotation(
-        sourceEpochId: String,
-        targetMetadataJson: String,
-        recoveryMaterial: String,
-    ): WorkspaceKeyRotationStageResult {
-        if (loadRotationState() != null) {
-            return WorkspaceKeyRotationStageResult.Failed(WorkspaceUnlockFailure.WORKSPACE_ALREADY_EXISTS)
-        }
-        val sourceMetadata = loadMetadata()
-            ?: return WorkspaceKeyRotationStageResult.Failed(WorkspaceUnlockFailure.NO_WORKSPACE)
-        val imported = decodeMetadata(targetMetadataJson)
-            ?: return WorkspaceKeyRotationStageResult.Failed(WorkspaceUnlockFailure.INVALID_METADATA)
-        if (imported.workspaceId != sourceMetadata.workspaceId) {
-            return WorkspaceKeyRotationStageResult.Failed(WorkspaceUnlockFailure.AUTHENTICATION_FAILED)
-        }
-        val targetKey = unwrapRecoveryKey(imported, recoveryMaterial)
-            ?: return WorkspaceKeyRotationStageResult.Failed(WorkspaceUnlockFailure.AUTHENTICATION_FAILED)
-        if (!verifyWorkspaceKey(imported, targetKey)) {
-            return WorkspaceKeyRotationStageResult.Failed(WorkspaceUnlockFailure.AUTHENTICATION_FAILED)
-        }
-        val sourceKey = unlockedKeyOrNull()
-            ?: secureKeyStore.get(sourceMetadata.secureStorageAlias)
-            ?: return WorkspaceKeyRotationStageResult.Failed(WorkspaceUnlockFailure.SECURE_STORAGE_UNAVAILABLE)
-        val targetAlias = aliasGenerator.newAlias("${sourceMetadata.workspaceId}-rotation")
-        val localTargetMetadata = imported.copy(secureStorageAlias = targetAlias)
-        val localTargetJson = encodeMetadata(localTargetMetadata)
-        val state = PersistedWorkspaceKeyRotationState(
-            token = aliasGenerator.newAlias("workspace-key-rotation"),
-            sourceEpochId = sourceEpochId,
-            sourceSecureStorageAlias = sourceMetadata.secureStorageAlias,
-            sourceKeyFingerprint = sourceKey.fingerprint,
-            targetSecureStorageAlias = targetAlias,
-            targetKeyFingerprint = targetKey.fingerprint,
-            targetMetadataJson = localTargetJson,
-        )
-        secureKeyStore.put(targetAlias, targetKey)
-        return try {
-            persistRotationState(state)
-            WorkspaceKeyRotationStageResult.Staged(state.toPublic())
-        } catch (_: Exception) {
-            secureKeyStore.remove(targetAlias)
-            WorkspaceKeyRotationStageResult.Failed(WorkspaceUnlockFailure.SECURE_STORAGE_UNAVAILABLE)
-        }
-    }
-
-    fun pendingWorkspaceKeyRotation(): PendingWorkspaceKeyRotation? =
-        loadRotationState()?.toPublic()
-
-    fun pendingWorkspaceKeyOrNull(token: String): WorkspaceMasterKey? {
-        val pending = loadRotationState()?.takeIf { it.token == token } ?: return null
-        return secureKeyStore.get(pending.targetSecureStorageAlias)
-            ?.takeIf { it.fingerprint == pending.targetKeyFingerprint }
-    }
-
-    /**
-     * Commits the already-published successor key locally. The old key stays
-     * in secure storage and is indexed only by its source epoch for bounded
-     * archive/late-writer verification.
-     */
-    fun commitWorkspaceKeyRotation(token: String, targetEpochId: String): WorkspaceUnlockResult {
-        require(targetEpochId.isNotBlank() && targetEpochId.length <= 128)
-        val pending = loadRotationState()?.takeIf { it.token == token }
-            ?: return WorkspaceUnlockResult.Failed(WorkspaceUnlockFailure.INVALID_METADATA)
-        val targetMetadata = decodeMetadata(pending.targetMetadataJson)
-            ?: return WorkspaceUnlockResult.Failed(WorkspaceUnlockFailure.INVALID_METADATA)
-        val targetKey = secureKeyStore.get(pending.targetSecureStorageAlias)
-            ?: return WorkspaceUnlockResult.Failed(WorkspaceUnlockFailure.SECURE_STORAGE_UNAVAILABLE)
-        if (targetKey.fingerprint != pending.targetKeyFingerprint || !verifyWorkspaceKey(targetMetadata, targetKey)) {
-            return WorkspaceUnlockResult.Failed(WorkspaceUnlockFailure.AUTHENTICATION_FAILED)
-        }
-
-        // Persist the target verifier first. If the process stops before the
-        // rotation state is cleared, a retry is idempotent and both aliases
-        // remain available.
-        persistMetadata(
-            pending.targetMetadataJson,
-            localRepository.getDevice(localRepository.localDeviceId)?.name ?: "Someday device",
-            localRepository.getDevice(localRepository.localDeviceId)?.platform ?: "unknown",
-        )
-        val archive = loadKeyArchives().copy(
-            entries = (loadKeyArchives().entries.filterNot { it.epochId == pending.sourceEpochId } +
-                PersistedWorkspaceKeyArchiveEntry(
-                    pending.sourceEpochId,
-                    pending.sourceSecureStorageAlias,
-                    pending.sourceKeyFingerprint,
-                )).sortedBy { it.epochId },
-            currentEpochId = targetEpochId,
-        )
-        localRepository.putLocalOnlySetting(WORKSPACE_KEY_ARCHIVES_SETTING_KEY, json.encodeToString(archive))
-        localRepository.deleteLocalOnlySetting(WORKSPACE_KEY_ROTATION_SETTING_KEY)
-        unlockedKey = targetKey.copy()
-        return WorkspaceUnlockResult.Unlocked(
-            WorkspaceUnlockState.Unlocked(targetMetadata.workspaceId, targetKey.fingerprint),
-        )
-    }
-
-    /** Returns the active, staged, or retained key for an exact local epoch. */
-    fun workspaceKeyForEpochOrNull(epochId: String): WorkspaceMasterKey? {
-        val pending = loadRotationState()
-        if (pending?.sourceEpochId == epochId) {
-            return secureKeyStore.get(pending.sourceSecureStorageAlias)
-        }
-        val archives = loadKeyArchives()
-        archives.entries.firstOrNull { it.epochId == epochId }?.let { archived ->
-            return secureKeyStore.get(archived.secureStorageAlias)
-                ?.takeIf { it.fingerprint == archived.keyFingerprint }
-        }
-        if (archives.currentEpochId != null && archives.currentEpochId != epochId) return null
-        return unlockedKeyOrNull() ?: loadMetadata()?.let { secureKeyStore.get(it.secureStorageAlias) }
-    }
-
-    /** Releases only a key already indexed to an expired read-only epoch. */
-    fun releaseWorkspaceKeyForEpoch(epochId: String): Boolean {
-        val archives = loadKeyArchives()
-        if (archives.currentEpochId == epochId) return false
-        val archived = archives.entries.singleOrNull { it.epochId == epochId } ?: return false
-        val remaining = archives.copy(entries = archives.entries.filterNot { it.epochId == epochId })
-        localRepository.putLocalOnlySetting(WORKSPACE_KEY_ARCHIVES_SETTING_KEY, json.encodeToString(remaining))
-        secureKeyStore.remove(archived.secureStorageAlias)
-        return true
-    }
-
-    /** Abort is allowed only after the caller proves the old pointer remains authoritative. */
-    fun abortWorkspaceKeyRotation(token: String, oldPointerStillAuthoritative: Boolean): Boolean {
-        if (!oldPointerStillAuthoritative) return false
-        val pending = loadRotationState()?.takeIf { it.token == token } ?: return false
-        localRepository.deleteLocalOnlySetting(WORKSPACE_KEY_ROTATION_SETTING_KEY)
-        secureKeyStore.remove(pending.targetSecureStorageAlias)
-        return true
-    }
+    /** Stable local workspace identity; available independently of network login state. */
+    fun workspaceIdOrNull(): String? = loadMetadata()?.workspaceId
 
     fun exportRecoveryMetadataJson(): String? =
         localRepository.getSetting(WORKSPACE_KEY_METADATA_SETTING_KEY)?.value
@@ -345,7 +143,14 @@ class WorkspaceKeyRepository(
         replaceExistingWorkspace: Boolean = false,
         expectedWorkspaceId: String? = null,
         expectedKeyFingerprint: String? = null,
+        beforeMetadataReplacement: (() -> Unit)? = null,
+        afterMetadataReplacement: ((WorkspaceMasterKey, String) -> Unit)? = null,
     ): WorkspaceRestoreResult {
+        require(!replaceExistingWorkspace ||
+            (beforeMetadataReplacement != null && afterMetadataReplacement != null)
+        ) {
+            "Replacing a workspace requires transactional DAG cleanup and authority binding hooks."
+        }
         val existingMetadata = loadMetadata()
         if (existingMetadata != null && !replaceExistingWorkspace) {
             return WorkspaceRestoreResult.Failed(WorkspaceUnlockFailure.WORKSPACE_ALREADY_EXISTS)
@@ -373,7 +178,11 @@ class WorkspaceKeyRepository(
 
         secureKeyStore.put(secureStorageAlias, workspaceKey)
         try {
-            persistMetadata(restoredMetadataJson, deviceName, platform)
+            localRepository.database.transaction {
+                beforeMetadataReplacement?.invoke()
+                persistMetadata(restoredMetadataJson, deviceName, platform)
+                afterMetadataReplacement?.invoke(workspaceKey, importedMetadata.workspaceId)
+            }
         } catch (failure: Throwable) {
             runCatching { secureKeyStore.remove(secureStorageAlias) }
             throw failure
@@ -515,20 +324,6 @@ class WorkspaceKeyRepository(
             ?.value
             ?.let(::decodeMetadata)
 
-    private fun loadRotationState(): PersistedWorkspaceKeyRotationState? =
-        localRepository.getSetting(WORKSPACE_KEY_ROTATION_SETTING_KEY)?.value?.let { encoded ->
-            runCatching { json.decodeFromString<PersistedWorkspaceKeyRotationState>(encoded) }.getOrNull()
-        }
-
-    private fun persistRotationState(state: PersistedWorkspaceKeyRotationState) {
-        localRepository.putLocalOnlySetting(WORKSPACE_KEY_ROTATION_SETTING_KEY, json.encodeToString(state))
-    }
-
-    private fun loadKeyArchives(): PersistedWorkspaceKeyArchives =
-        localRepository.getSetting(WORKSPACE_KEY_ARCHIVES_SETTING_KEY)?.value?.let { encoded ->
-            runCatching { json.decodeFromString<PersistedWorkspaceKeyArchives>(encoded) }.getOrNull()
-        } ?: PersistedWorkspaceKeyArchives()
-
     private fun decodeMetadata(metadataJson: String): PersistedWorkspaceKeyMetadata? =
         try {
             json.decodeFromString(PersistedWorkspaceKeyMetadata.serializer(), metadataJson)
@@ -552,8 +347,6 @@ class WorkspaceKeyRepository(
 
     companion object {
         const val WORKSPACE_KEY_METADATA_SETTING_KEY = "encryption.workspace.key_metadata"
-        const val WORKSPACE_KEY_ROTATION_SETTING_KEY = "encryption.workspace.key_rotation_v2"
-        const val WORKSPACE_KEY_ARCHIVES_SETTING_KEY = "encryption.workspace.key_archives_v2"
         private const val RECOVERY_SALT_BYTES = 16
 
         private val json = Json {
@@ -608,36 +401,3 @@ internal data class PersistedRecoveryWrapper(
             )
         }.getOrNull()
 }
-
-@Serializable
-private data class PersistedWorkspaceKeyRotationState(
-    val version: Int = 1,
-    val token: String,
-    val sourceEpochId: String,
-    val sourceSecureStorageAlias: String,
-    val sourceKeyFingerprint: String,
-    val targetSecureStorageAlias: String,
-    val targetKeyFingerprint: String,
-    val targetMetadataJson: String,
-) {
-    fun toPublic(): PendingWorkspaceKeyRotation = PendingWorkspaceKeyRotation(
-        token,
-        sourceEpochId,
-        sourceKeyFingerprint,
-        targetKeyFingerprint,
-    )
-}
-
-@Serializable
-private data class PersistedWorkspaceKeyArchiveEntry(
-    val epochId: String,
-    val secureStorageAlias: String,
-    val keyFingerprint: String,
-)
-
-@Serializable
-private data class PersistedWorkspaceKeyArchives(
-    val version: Int = 1,
-    val currentEpochId: String? = null,
-    val entries: List<PersistedWorkspaceKeyArchiveEntry> = emptyList(),
-)

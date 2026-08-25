@@ -1,298 +1,211 @@
-# Someday System V2 Sync Contract
+# Entity DAG V2 Subsystem Contract
 
-Status: implementation contract for the open-source codebase.
+Status: frozen internal wire contract embedded in System V3.
 
-System V2 is the only multi-device sync protocol implemented by Someday.
-Clients and the self-hosted server exchange encrypted epoch, checkpoint, and
-workspace-DAG objects. There is no alternate protocol, dual-write mode, or
-transport bridge.
+The `someday-system-v2` identifiers name Someday's independently versioned
+entity-DAG encoding and merge engine. They do not name a selectable product
+mode, remote provider, release switch, or second synchronization architecture.
+The only public deployment profile is System V3 self-hosting at:
+
+```text
+/sync/v3/workspaces/{workspaceId}/entities
+```
 
 ## 1. Product boundary
 
-The synchronized workspace contains exactly three entity types:
+The closed synchronized entity set is:
 
-- `note`
-- `notebook`
-- `workspace_preferences`
+- `note`;
+- `notebook`;
+- `workspace_preferences`.
 
-A note version contains notebook membership, title, Markdown body, creation
-time, time-zone id, and the complete optional location value. A notebook
-version contains title, sort order, and creation time. Workspace preferences
-contain only:
+A note contains notebook membership, title, Markdown body, creation time,
+time-zone id, and the complete optional location value. A notebook contains
+title, sort order, and creation time. Synchronized preferences contain theme,
+preview-by-default, Markdown-toolbar visibility, and default notebook id.
 
-- theme
-- preview-by-default
-- Markdown-toolbar visibility
-- default notebook id
+Credentials, endpoints, sessions, device-local settings, workspace keys,
+recovery material, and navigation state never enter the entity graph. Image
+bytes use the sibling V3 media plane. Notes refer to immutable images only by
+`someday-asset://` URI in Markdown.
 
-Credentials, endpoints, device-local notification settings, session state,
-workspace keys, recovery material, and UI navigation state never enter the
-synchronized workspace.
-
-Attachments and media are outside this schema set. Adding an entity type or
-field is a reviewed schema-set change.
-
-## 2. Wire identity
-
-The fixed contract identifiers are:
+## 2. Frozen wire identity
 
 | Item | Value |
 | --- | --- |
-| Contract | `someday-system-v2` |
+| Subsystem contract | `someday-system-v2` |
 | Entity schema set | `workspace-entity-schema-set-v2` |
 | Semantic protocol | `2` |
 | Minimum writer protocol | `2` |
-| Epoch key set | `sync-key-set-v2` |
+| Key set | `sync-key-set-v2` |
 | Metadata privacy | `opaque` |
 | Cipher suite | `xchacha20-poly1305-ietf` |
 
-Entity and control plaintext use deterministic CBOR. The encrypted outer
-envelope uses strict bounded JSON. Decoders reject:
+Entity and control plaintext use deterministic CBOR. Encrypted outer objects
+use strict, bounded JSON. Decoders reject unknown or duplicate fields,
+non-canonical encodings, invalid identifiers, unsupported contract values,
+excessive bounds, and any mismatch between authenticated metadata and decoded
+plaintext. Golden canonical and key-derivation vectors make a wire change
+explicit.
 
-- unknown fields, duplicate keys, invalid enum values, and non-canonical CBOR;
-- unsupported contract, schema-set, key-set, algorithm, or cipher values;
-- invalid identifiers, malformed digests, excessive nesting, and oversized
-  plaintext or ciphertext;
-- a mismatch between authenticated metadata and decoded plaintext.
+`workspaceId` is supplied by the System V3 path and is part of server storage
+scope. It is not duplicated inside strict entity request bodies and is not an
+epoch alias.
 
-The canonical corpus and epoch-key derivation are protected by cross-platform
-golden tests. Changing either requires an intentional wire-contract update.
+## 3. One local source of truth
 
-## 3. Workspace entity DAG
+Creating a workspace also creates one healthy local `PREPARING` generation.
+Notes, notebooks, deletions, and synchronized preferences use the DAG-backed
+repositories from the first offline mutation. Turning network synchronization
+off pauses transport only; it does not switch product repositories or copy
+data between tables.
 
-Each immutable `WorkspaceEntityVersionV2` identifies one entity and contains:
+A local mutation commits atomically:
 
-- its epoch id and immutable version id;
-- a sorted, bounded parent-version set;
-- `content` or `deletion`, never both;
-- the complete typed payload for content versions;
-- author, authored time, generation, payload digest, object digest, and merge
-  algorithm;
-- optional source-import or checkpoint provenance.
+1. one immutable entity version and its parent edges;
+2. the derived head set and explicit conflict state;
+3. the typed product projection;
+4. one durable pending transport mutation.
 
-Parents must exist, belong to the same entity and epoch, be acyclic, and have a
-lower generation. Replaying the same immutable id is accepted only when the
-canonical bytes are identical.
+A pulled cursor unit commits the same semantic effects, replay identity, and
+cursor advancement in one transaction. A projection is rebuildable output,
+never a second authority. Product and UI code cannot write protocol tables or
+projection rows directly.
 
-The current state of an entity is derived from DAG ancestry, not timestamps.
-Concurrent heads are reconciled using deterministic typed rules:
+Portable structured export reads this same DAG product view. Import creates
+normal DAG mutations in the selected writable local generation; it does not
+revive a pre-DAG compatibility data plane. Media bytes are excluded from the
+current portable format.
 
-- equivalent content converges;
-- independent field edits merge when every changed field has a usable common
-  base;
-- concurrent deletions converge;
-- delete/edit, same-field edits, ambiguous bases, and incompatible locations
-  remain explicit conflicts;
-- manual resolution names the exact head set it resolves.
+## 4. Entity causality and conflicts
 
-Conflict records and product projections are rebuildable from immutable DAG
-state. A projection is never a second authority.
+Each immutable version identifies one entity and contains a sorted, bounded
+parent set; either typed content or a deletion; author and authored time;
+generation and provenance; and authenticated payload/object digests. Parents
+must exist in the same workspace generation, belong to the same entity, be
+acyclic, and have lower generation numbers. Exact replay succeeds only when
+canonical bytes match.
 
-## 4. Local transactions
+Current state is derived from ancestry, not wall-clock order. Deterministic
+typed reconciliation:
 
-A local product mutation atomically persists:
+- converges equivalent content and concurrent deletions;
+- merges independent field edits only with an unambiguous common base;
+- preserves delete/edit, same-field, incompatible-location, and ambiguous-base
+  cases as explicit conflicts;
+- requires a manual resolution to name the exact head set it resolves.
 
-1. the immutable entity version and its parent edges;
-2. the new head set;
-3. conflict lifecycle changes;
-4. the typed product projection;
-5. one durable pending transport mutation.
+The server stores opaque ciphertext and transport metadata. It never decrypts
+entities or classifies semantic conflicts.
 
-A remote cursor unit atomically persists the same semantic effects plus replay
-identity and cursor advancement. A failure at any boundary rolls back the
-entire unit. Missing parents block the unit without advancing its cursor.
+## 5. Initial checkpoint and publication
 
-When an epoch is authoritative, Notes and synchronized-preference reads and
-writes are routed through the System V2 repositories. Export and import use the
-same DAG-backed product view.
+One authenticated pointer selects the workspace's single generation. A fresh
+installation keeps its locally prepared checkpoint and offline mutations. On
+first connection:
 
-## 5. Epochs and checkpoints
+- an empty remote workspace accepts that same generation by one
+  compare-and-set; or
+- an existing remote pointer can replace only a semantically empty local
+  draft.
 
-An authenticated epoch pointer selects one `SyncEpochDescriptorV2`. The
-descriptor binds:
+A non-empty local workspace is refused rather than silently merged. Stable
+installation UUIDv4 is used as the local DAG writer and is claimed exactly by
+device registration before first publication.
 
-- contract, schema set, protocol and key-set versions;
-- remote profile and opaque-metadata policy;
-- checkpoint id and authenticated checkpoint digest;
-- creator, creation time, and supported offline window;
-- the preceding pointer digest and captured stream frontiers when rolling to a
-  successor epoch.
+A checkpoint manifest references immutable bounded chunks containing the
+complete entity graph needed to bootstrap another device, including live and
+deleted versions, conflict branches, projections, and provenance. Every chunk
+must exist before its manifest or pointer becomes visible. When selected
+versions reference media, the System V3 publication boundary first proves or
+uploads each immutable media object in the same account and workspace.
 
-A checkpoint is a complete workspace snapshot. Its manifest references
-immutable, bounded chunks. Chunks include every live or deleted entity,
-retained conflict branch, projection warning, and required provenance. The
-manifest is published only after every referenced immutable chunk exists.
+The initial release has no generation rollover. Initial pointer CAS requires
+all predecessor and retention fields to be absent. The frozen descriptor may
+retain nullable fields for decoder compatibility, but clients and the server
+reject non-null lineage rather than implementing history.
 
-The first epoch is created from a full local product snapshot. Invalid or
-oversized state fails before any pointer is published. A follower that already
-has the shared workspace key bootstraps the current checkpoint, then pulls
-incremental units before pushing local work.
+## 6. Normal synchronization
 
-The local lifecycle is `preparing`, `active`, `blocked`, or `read_only`.
-Replacing a workspace key is refused while any key-bound lifecycle exists.
+A run performs these bounded operations:
 
-## 6. Coordinator ordering and failure behavior
+1. load and authenticate the current workspace pointer;
+2. bootstrap the current checkpoint when local state is semantically empty;
+3. pull cursor units and apply causally eligible units atomically;
+4. reconcile heads and materialize explicit conflicts;
+5. prove referenced media durability for the exact versions being sent;
+6. upload immutable entity objects idempotently;
+7. conditionally advance the writer stream;
+8. report actual pull, push, conflict, and blocked counts.
 
-A normal run:
+Order is authoritative within a writer stream only. Units from different
+writers may arrive in any order. Missing-parent units remain deferred while
+eligible units progress; a run that cannot make causal progress does not push
+unsafe work or advance the blocked cursor.
 
-1. loads and authenticates the current pointer;
-2. verifies pointer ancestry and local authority binding;
-3. bootstraps a missing local epoch from the complete checkpoint;
-4. pulls bounded cursor units and applies them atomically;
-5. reconciles DAG heads and records explicit conflicts;
-6. uploads immutable objects idempotently;
-7. conditionally advances the writer stream;
-8. records real pull, push, conflict, and repair counts.
+An immutable-object identifier may be replayed only with its exact encrypted
+outer bytes. Authenticated malformed data, a different value at an existing
+identity, a cursor gap, missing checkpoint data, or an incompatible pointer is
+recorded as bounded durable failure evidence and leaves synchronization
+`BLOCKED`. There is no replica selection, repair endpoint, quarantine workflow,
+or client-authored replacement ciphertext.
 
-Authentication failures, rollback evidence, missing referenced objects,
-immutable-id byte mismatches, cursor gaps, and persistent replica corruption
-block the run before unsafe upload or cursor advancement.
+## 7. Server storage contract
 
-Cursor order is authoritative only within one writer stream. A bounded pull
-may return causally related units from different writer streams in any order.
-The coordinator preserves each stream's cursor order, defers a unit whose
-authenticated entity parent is not yet local, and applies eligible units from
-the other returned streams before retrying the deferred unit. If no unit can
-make progress, the missing-parent unit remains a retryable dependency blocker
-and push stays disabled. A later pull may resume past that blocker and resolves
-it only after the exact cursor unit applies atomically.
+Entity storage is keyed by authenticated `userId`, canonical `workspaceId`,
+and protocol identity. Every repository statement includes both account and
+workspace predicates; PostgreSQL row-level security is defense in depth, not
+the source of workspace isolation. The server provides only the primitives
+required for the single generation:
 
-Successful manual sync always refreshes the Notes product view, including a
-zero-delta bootstrap. This is required for pair, join, sync, and immediately
-view the leader workspace.
+- current pointer read and initial compare-and-set;
+- immutable encrypted object put/get;
+- bounded checkpoint manifest/chunk fetch and abandoned-draft cleanup;
+- writer cursor append, frontier, and pull;
+- status/capability reporting.
 
-## 7. WebDAV profile
+Every route is authenticated, device-bound, workspace-scoped, strict-JSON
+decoded, and size bounded. Device/session revocation is checked before access.
+There is no epoch-history, object-repair, remote-migration, rotation, or
+retained-generation API.
 
-The WebDAV profile treats the server as a weak conditional object store. Its
-application-owned tree is rooted at `log-v2/`:
+## 8. Keys, pairing, and adoption
 
-```text
-log-v2/
-  control/
-    epoch-pointer.enc
-    pointer-history/<epoch-id>.enc
-  epochs/<epoch-id>/
-    checkpoints/...
-    writers/<device-id>/...
-    repairs/...
-```
-
-Required operations are `MKCOL`, depth-one `PROPFIND`, `GET`, and conditional
-`PUT`. Immutable creation uses `If-None-Match: *`; mutable control objects use
-an exact `If-Match` ETag. Lost responses are resolved by reading and comparing
-the exact stored bytes.
-
-WebDAV workspace reset is unavailable. Neither the runner nor the UI may issue
-a recursive or tree DELETE. A reset can return only after a future
-DAG-preserving checkpoint-and-pointer transition is implemented.
-
-Pairing invitations live outside `log-v2/` under
-`workspace-pairing/1/<invite-id>.json.enc`. Creation is append-only and claim
-or cancellation conditionally replaces the envelope with an authenticated
-tombstone. Pairing never sends WebDAV `DELETE`. The complete wire and state
-contract is [`workspace-pairing-protocol.md`](workspace-pairing-protocol.md).
-
-## 8. Self-hosted profile
-
-The self-hosted service stores opaque encrypted bytes and protocol metadata.
-It must not decrypt workspace content or classify semantic conflicts.
-
-Authenticated routes provide:
-
-- current pointer read and compare-and-swap;
-- immutable object put/get;
-- bounded checkpoint fetch;
-- writer cursor append/pull;
-- exact repair replicas;
-- device-bound workspace-pairing create/claim/complete/cancel transitions.
-
-Every request is size bounded and strict-JSON decoded. Device revocation takes
-effect before access to V2 workspace routes. Access tokens used by sync follow
-one serialized refresh path shared by sync and pairing.
-
-## 9. Workspace keys and pairing
-
-The workspace master key is generated on device and stored only in platform
-secure storage. Epoch convergence and object-digest keys are derived from the
-master key, epoch id, purpose, and `sync-key-set-v2`. Content encryption uses a
-random 24-byte XChaCha20-Poly1305 nonce and authenticated outer metadata.
-
-Pairing transfers the workspace key inside an end-to-end encrypted,
-single-use invitation addressed by a 128-bit random capability. Its
-28-character Crockford Base32 token contains a checksum and is normally
-transferred as a QR payload. Independent HKDF-SHA-256 domains derive the
-opaque invitation id, envelope key, and remote-state authentication key.
-WebDAV and the self-hosted service store ciphertext only.
-
-Joining authenticates the exact remote authority, expiry, envelope, workspace
-id, and key fingerprint before committing a staged secure-storage key.
-Workspace adoption and first-epoch activation share one serialization lock.
-A failed join cannot partially replace the current workspace, and a device
-with any key-bound local lifecycle is refused. The frozen wire contract and
-threat model are in
+The workspace master key is generated on-device and stays in platform secure
+storage. Subkeys bind purpose, generation identity, and the frozen key-set
+version. Pairing transfers recovery material through the end-to-end encrypted,
+single-use capability in
 [`workspace-pairing-protocol.md`](workspace-pairing-protocol.md).
 
-## 10. Remote migration, key rotation, and retention
+An inviter needs an active published pointer. A joining installation may
+replace its normal default `PREPARING` draft only when that draft is
+semantically empty. The emptiness check runs before remote claim and again
+inside the same authority lock that guards product writes and first
+publication; empty-draft removal and key adoption are atomic. Any local note,
+notebook, deletion history, pending semantic mutation, conflict, or image
+causes refusal.
 
-Moving between supported remotes creates one successor epoch from the current
-V2 DAG and publishes a complete checkpoint on the target. There is no
-dual-write interval. Pointer ancestry binds the successor to the exact prior
-pointer and captured stream frontiers.
+Master-key rotation and cryptographic device revocation are not first-release
+features. Server device/session token revocation remains supported. Adding key
+rotation later requires an explicit whole-workspace design that also migrates
+media encryption; it must not appear as an entity-only lifecycle patch.
 
-Master-key rotation stages recovery material out of band, publishes one
-authenticated successor epoch, and retains the exact prior epoch key for its
-retention window. Recovery is explicit and verifies the local DAG before
-archiving a blocked epoch.
+## 9. Required evidence
 
-The supported offline window is 180 days. A prior epoch can be collected only
-after its retention horizon and only when no pending mutation, import, repair,
-or required checkpoint reference pins it.
+`scripts/sync-v3-reliability-gate` and `scripts/sync-v3-apple-gate` are the
+host-specific product acceptance gates. Together they verify:
 
-## 11. Activation and release safety
+- frozen canonical encoding and crypto vectors;
+- local and remote transaction rollback behavior;
+- first-offline-edit, first publication, bootstrap, restart, and conflict
+  convergence;
+- empty-workspace adoption and non-empty refusal;
+- stable device identity and real multi-workspace isolation;
+- media-before-entity ordering and immutable media replay;
+- strict TLS, opaque-server, and route-scope boundaries;
+- SQLDelight/Flyway checks, client platform compilation, PostgreSQL integration,
+  and end-to-end self-hosted behavior.
 
-`systemV2ActivationEnabled` is a required composition argument; it has no
-default. Shipping activation is:
-
-```text
-SOMEDAY_SYSTEM_V2_RELEASE_ENABLED ||
-SOMEDAY_SYSTEM_V2_DEVELOPMENT_ENABLED
-```
-
-Both Gradle properties default to `false`. After the complete V2 gate was
-accepted, the canonical Android Play, macOS packaging, and iOS Release
-entrypoints began explicitly setting release to `true` and development to
-`false`. Release readiness verifies the generated platform constants. Direct
-release packaging fails when the shipping release flag was not supplied.
-Local development activation remains deliberate.
-
-When activation is disabled and no authority exists, sync fails closed without
-creating an epoch. Existing authority can still be read and synchronized.
-
-Before key-bound V2 state exists, Day One and local-backup import/export use
-the local product rows from which genesis is built. That routing is serialized
-by the same authority-mutation coordinator as first activation, so import
-cannot land after genesis captured its source state. Once any key-bound epoch
-exists, including a prepared checkpoint, import/export remains on V2 and fails
-closed when the workspace key or writable epoch is unavailable; it never
-creates a second local history.
-
-## 12. Required evidence
-
-`scripts/sync-v2-reliability-gate` is the executable acceptance gate. It must:
-
-- run the no-retired-surface architecture/privacy scan;
-- verify SQLDelight migrations and run data, domain, sync, UI, and server JVM
-  suites;
-- run Android, iOS simulator, and Desktop compile/test coverage;
-- run the self-hosted PostgreSQL integration suite;
-- run the real WebDAV and self-hosted whole-product corpus;
-- prove a fresh Day One import and pre-authority backup restore survive first
-  WebDAV epoch publication and follower bootstrap;
-- verify high-entropy pairing derivation, strict encrypted envelopes,
-  one-use transport transitions, local adoption guards, and secret redaction;
-- reject skipped, failed, or stale required evidence;
-- run `git diff --check`.
-
-`scripts/sync-v2-test-evidence.tsv` binds each contract area to at least one
-current JUnit test or architecture assertion. The gate validates every row
-against results produced in that same run.
+The gates require fresh passing suites for each target and architecture-level
+contract assertions. It intentionally does not pin individual test method
+names, so ordinary test refactoring does not rewrite the acceptance contract.

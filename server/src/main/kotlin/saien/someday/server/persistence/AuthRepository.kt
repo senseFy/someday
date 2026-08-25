@@ -28,6 +28,9 @@ data class DeviceRecord(
     val revokedAt: Instant?,
 )
 
+class DeviceIdAlreadyClaimedException : RuntimeException("Device id is already claimed.")
+class DeviceRevokedException : RuntimeException("Device is revoked.")
+
 data class AuthSessionSnapshot(
     val userId: UUID,
     val email: String,
@@ -309,8 +312,7 @@ class AuthRepository(
 
     fun registerDevice(
         userId: UUID,
-        currentSessionId: UUID,
-        currentDeviceId: UUID?,
+        deviceId: UUID,
         name: String,
         platform: String,
         refreshTokenHash: String,
@@ -318,25 +320,12 @@ class AuthRepository(
         refreshExpiresAt: Instant,
     ): DeviceSessionRecord =
         transaction { connection ->
-            val device = insertDevice(connection, userId, name, platform)
-            val sessionId = if (currentDeviceId == null) {
-                connection.prepareStatement(
-                    """
-                    UPDATE someday_sessions
-                    SET device_id = ?
-                    WHERE id = ? AND user_id = ? AND revoked_at IS NULL
-                    """.trimIndent(),
-                ).use { statement ->
-                    statement.setObject(1, device.id)
-                    statement.setObject(2, currentSessionId)
-                    statement.setObject(3, userId)
-                    statement.executeUpdate()
-                }
-                revokeRefreshTokensForSession(connection, currentSessionId)
-                currentSessionId
-            } else {
-                insertSession(connection, UUID.randomUUID(), userId, device.id, sessionExpiresAt)
-            }
+            val device = claimOrRecoverDevice(connection, deviceId, userId, name, platform)
+            revokeDeviceSessions(
+                connection = connection,
+                deviceId = device.id,
+            )
+            val sessionId = insertSession(connection, UUID.randomUUID(), userId, device.id, sessionExpiresAt)
             insertRefreshToken(connection, sessionId, refreshTokenHash, refreshExpiresAt)
             DeviceSessionRecord(device = device, sessionId = sessionId)
         }
@@ -418,17 +407,18 @@ class AuthRepository(
         }
     }
 
-    private fun insertDevice(
+    private fun claimOrRecoverDevice(
         connection: Connection,
+        deviceId: UUID,
         userId: UUID,
         name: String,
         platform: String,
     ): DeviceRecord {
-        val deviceId = UUID.randomUUID()
         connection.prepareStatement(
             """
             INSERT INTO someday_devices (id, user_id, name, platform)
             VALUES (?, ?, ?, ?)
+            ON CONFLICT (id) DO NOTHING
             """.trimIndent(),
         ).use { statement ->
             statement.setObject(1, deviceId)
@@ -437,13 +427,52 @@ class AuthRepository(
             statement.setString(4, platform)
             statement.executeUpdate()
         }
-        return DeviceRecord(
-            id = deviceId,
-            userId = userId,
-            name = name,
-            platform = platform,
-            revokedAt = null,
-        )
+        return connection.prepareStatement(
+            """
+            SELECT id, user_id, name, platform, revoked_at
+            FROM someday_devices
+            WHERE id = ?
+            FOR UPDATE
+            """.trimIndent(),
+        ).use { statement ->
+            statement.setObject(1, deviceId)
+            statement.executeQuery().use { result ->
+                check(result.next()) { "Claimed device disappeared inside its registration transaction." }
+                result.toDeviceRecord().also { existing ->
+                    if (existing.userId != userId) throw DeviceIdAlreadyClaimedException()
+                    if (existing.revokedAt != null) throw DeviceRevokedException()
+                }
+            }
+        }
+    }
+
+    private fun revokeDeviceSessions(
+        connection: Connection,
+        deviceId: UUID,
+    ) {
+        connection.prepareStatement(
+            """
+            UPDATE someday_sessions
+            SET revoked_at = COALESCE(revoked_at, NOW())
+            WHERE device_id = ? AND revoked_at IS NULL
+            """.trimIndent(),
+        ).use { statement ->
+            statement.setObject(1, deviceId)
+            statement.executeUpdate()
+        }
+        connection.prepareStatement(
+            """
+            UPDATE someday_refresh_tokens
+            SET revoked_at = COALESCE(revoked_at, NOW())
+            WHERE revoked_at IS NULL AND session_id IN (
+                SELECT id FROM someday_sessions
+                WHERE device_id = ?
+            )
+            """.trimIndent(),
+        ).use { statement ->
+            statement.setObject(1, deviceId)
+            statement.executeUpdate()
+        }
     }
 
     private fun insertSession(

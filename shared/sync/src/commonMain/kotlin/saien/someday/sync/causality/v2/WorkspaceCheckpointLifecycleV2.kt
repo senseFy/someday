@@ -42,30 +42,6 @@ data class PreparedWorkspaceCheckpointEntityV2(
     val encryptedObject: EncryptedWorkspaceObjectV2,
 )
 
-data class WorkspaceCheckpointSourceImportV2(
-    val entityType: WorkspaceEntityTypeV2,
-    val entityId: String,
-    val content: WorkspaceEntityContentV2?,
-    val deletion: WorkspaceDeletionV2?,
-    val sourceProfile: String,
-    val sourceEpoch: String?,
-    val sourceWriterId: String?,
-    val sourceMutationId: String?,
-    val sourceObjectId: String,
-    val sourceObjectDigest: String,
-    /** Exact sourceObjectId of a checkpoint root whose state was verified. */
-    val verifiedCheckpointSourceObjectId: String?,
-    val authoredAt: Instant,
-) {
-    init {
-        require((content == null) != (deletion == null))
-        require(content == null || content.entityType == entityType)
-        require(entityType != WorkspaceEntityTypeV2.WORKSPACE_PREFERENCES || deletion == null)
-        require(entityId.isWholeProductProtocolIdentifierV2())
-        require(sourceProfile.isNotBlank() && sourceObjectId.isNotBlank() && sourceObjectDigest.isNotBlank())
-    }
-}
-
 data class PreparedWorkspaceCheckpointChunkV2(
     val value: WorkspaceCheckpointChunkV2,
     val ref: WorkspaceCheckpointChunkRefV2,
@@ -108,7 +84,6 @@ class WorkspaceCheckpointBuilderV2(
     fun build(
         remoteProfile: String,
         sourceHeads: List<WorkspaceCheckpointSourceHeadV2>,
-        sourceImports: List<WorkspaceCheckpointSourceImportV2> = emptyList(),
         createdAt: Instant,
         previousPointerDigest: String? = null,
         previousEpochId: String? = null,
@@ -117,10 +92,7 @@ class WorkspaceCheckpointBuilderV2(
         syncEpochId: String = idGenerator.newId(),
         checkpointId: String = idGenerator.newId(),
     ): PreparedWorkspaceEpochCheckpointV2 {
-        require(remoteProfile in setOf(
-            SyncRemoteProfileV2.WEB_DAV.wireValue,
-            SyncRemoteProfileV2.SELF_HOSTED.wireValue,
-        ))
+        require(remoteProfile == SyncRemoteProfileV2.SELF_HOSTED.wireValue)
         require(sourceHeads.isNotEmpty())
         require(sourceHeads.any {
             it.entityType == WorkspaceEntityTypeV2.WORKSPACE_PREFERENCES &&
@@ -128,8 +100,6 @@ class WorkspaceCheckpointBuilderV2(
         }) { "Every checkpoint must include the workspace-preferences singleton." }
         require(sourceHeads == sourceHeads.sortedWith(CHECKPOINT_SOURCE_COMPARATOR_SYSTEM_V2))
         require(sourceHeads.map { Triple(it.entityType, it.entityId, it.sourceObjectId) }.distinct().size == sourceHeads.size)
-        require(sourceImports == sourceImports.sortedWith(CHECKPOINT_IMPORT_COMPARATOR_SYSTEM_V2))
-        require(sourceImports.map { Triple(it.entityType, it.entityId, it.sourceObjectId) }.distinct().size == sourceImports.size)
 
         val keys = keyDerivation.derive(workspaceKey, syncEpochId)
         val materializer = CanonicalWorkspaceCausalityMaterializerV2(keys)
@@ -158,33 +128,7 @@ class WorkspaceCheckpointBuilderV2(
                 authoredAt = createdAt,
             )
         }
-        val rootBySource = sourceHeads.zip(roots).associate { (source, root) ->
-            Triple(source.entityType, source.entityId, source.sourceObjectId) to root
-        }
-        val imports = sourceImports.map { source ->
-            val parent = source.verifiedCheckpointSourceObjectId?.let { sourceObjectId ->
-                rootBySource[Triple(source.entityType, source.entityId, sourceObjectId)]
-                    ?: error("Verified checkpoint import parent is not part of this checkpoint.")
-            }
-            factory.createSourceImport(
-                source.entityType,
-                source.entityId,
-                source.content,
-                source.deletion,
-                WorkspaceVersionProvenanceV2(
-                    WorkspaceVersionProvenanceTypeV2.SOURCE_IMPORT,
-                    source.sourceProfile,
-                    source.sourceEpoch,
-                    source.sourceWriterId,
-                    source.sourceMutationId,
-                    source.sourceObjectId,
-                    source.sourceObjectDigest,
-                ),
-                source.authoredAt,
-                parent,
-            )
-        }
-        val initialVersions = roots + imports
+        val initialVersions = roots
         val groupedVersions = initialVersions.groupBy { it.key }
         val generated = groupedVersions.keys
             .sortedWith(compareBy({ it.entityType.wireValue }, { it.entityId }))
@@ -321,6 +265,7 @@ class WorkspaceCheckpointPersistenceV2(
     private val workspaceKey: WorkspaceMasterKey,
     private val writerDeviceId: String,
     private val protocolStore: SqlDelightSyncProtocolStoreV2 = SqlDelightSyncProtocolStoreV2(localRepository.database),
+    private val authorityBindingId: String? = null,
 ) {
     fun persist(prepared: PreparedWorkspaceEpochCheckpointV2): WorkspaceCheckpointPersistResultV2 {
         val descriptor = prepared.descriptor
@@ -333,6 +278,8 @@ class WorkspaceCheckpointPersistenceV2(
                     prepared.remoteProfile,
                     descriptor,
                     prepared.pointerObject.objectDigest,
+                    authorityBindingId,
+                    authorityBindingId?.let { writerDeviceId },
                 )) {
                     is SyncEpochPersistResultV2.ImmutableMismatch -> error(epoch.safeMessage)
                     is SyncEpochPersistResultV2.AlreadyStored,
@@ -795,7 +742,7 @@ sealed interface WorkspaceCheckpointPublishProgressV2 {
     data object CommittingPointer : WorkspaceCheckpointPublishProgressV2
 }
 
-/** Default WebDAV-friendly concurrency for independent immutable chunk PUTs. */
+/** Default concurrency for independent immutable checkpoint chunk uploads. */
 const val DEFAULT_CHECKPOINT_CHUNK_PUBLISH_PARALLELISM_V2: Int = 4
 const val MAX_CHECKPOINT_CHUNK_PUBLISH_PARALLELISM_V2: Int = 8
 
@@ -803,6 +750,12 @@ const val MAX_CHECKPOINT_CHUNK_PUBLISH_PARALLELISM_V2: Int = 8
 class WorkspaceCheckpointPublisherV2(
     private val localRepository: SqlDelightLocalDataRepository,
     private val remote: WorkspaceSyncRemoteV2,
+    /**
+     * Product-level reachability prerequisite for the exact immutable entity
+     * set. System V3 uses this to prove every referenced media object is fully
+     * present before any checkpoint byte or pointer becomes remotely visible.
+     */
+    private val beforeEntityPublication: (List<WorkspaceEntityVersionV2>) -> Unit,
     private val protocolStore: SqlDelightSyncProtocolStoreV2 = SqlDelightSyncProtocolStoreV2(localRepository.database),
     private val chunkPublishParallelism: Int = DEFAULT_CHECKPOINT_CHUNK_PUBLISH_PARALLELISM_V2,
     private val onProgress: (WorkspaceCheckpointPublishProgressV2) -> Unit = {},
@@ -829,6 +782,14 @@ class WorkspaceCheckpointPublisherV2(
         val descriptor = prepared.descriptor
         if (remote.remoteProfile != prepared.remoteProfile) {
             return WorkspaceCheckpointPublishResultV2.Rejected("remote_profile_mismatch", "Checkpoint targets another remote profile.")
+        }
+        runCatching {
+            beforeEntityPublication(prepared.entities.map { it.version })
+        }.getOrElse {
+            return WorkspaceCheckpointPublishResultV2.Rejected(
+                "entity_publication_prerequisite_failed",
+                "A referenced media asset is not fully published for this workspace authority.",
+            )
         }
         when (val chunkResult = publishChunks(descriptor, prepared.chunks)) {
             is ChunkPublishBatchResultV2.Rejected -> return WorkspaceCheckpointPublishResultV2.Rejected(
@@ -1047,62 +1008,6 @@ private data class WorkspaceCheckpointComponentsV2(
 
 val CHECKPOINT_SOURCE_COMPARATOR_SYSTEM_V2: Comparator<WorkspaceCheckpointSourceHeadV2> =
     compareBy<WorkspaceCheckpointSourceHeadV2>({ it.entityType.wireValue }, { it.entityId }, { it.sourceObjectId }, { it.sourceObjectDigest })
-
-val CHECKPOINT_IMPORT_COMPARATOR_SYSTEM_V2: Comparator<WorkspaceCheckpointSourceImportV2> =
-    compareBy<WorkspaceCheckpointSourceImportV2>({ it.entityType.wireValue }, { it.entityId }, { it.sourceObjectId }, { it.sourceObjectDigest })
-
-internal data class WorkspaceCheckpointSourceIdentityV2(
-    val entityType: WorkspaceEntityTypeV2,
-    val entityId: String,
-    val sourceObjectId: String,
-    val sourceObjectDigest: String,
-)
-
-internal fun List<WorkspaceCheckpointSourceHeadV2>.checkpointSourceIdentitiesV2():
-    Set<WorkspaceCheckpointSourceIdentityV2> =
-    mapTo(linkedSetOf()) { source ->
-        WorkspaceCheckpointSourceIdentityV2(
-            source.entityType,
-            source.entityId,
-            source.sourceObjectId,
-            source.sourceObjectDigest,
-        )
-    }
-
-internal fun PreparedWorkspaceEpochCheckpointV2.checkpointSourceIdentitiesV2():
-    Set<WorkspaceCheckpointSourceIdentityV2> =
-    entities.mapNotNullTo(linkedSetOf()) { entity ->
-        val provenance = entity.version.provenance ?: return@mapNotNullTo null
-        if (provenance.type != WorkspaceVersionProvenanceTypeV2.EPOCH_CHECKPOINT) {
-            return@mapNotNullTo null
-        }
-        WorkspaceCheckpointSourceIdentityV2(
-            entity.version.entityType,
-            entity.version.entityId,
-            provenance.sourceObjectId ?: return@mapNotNullTo null,
-            provenance.sourceDigest ?: return@mapNotNullTo null,
-        )
-    }
-
-internal fun checkpointSourceStateStillMatchesV2(
-    store: SqlDelightWorkspaceEntityStoreV2,
-    remoteProfile: String,
-    expected: Set<WorkspaceCheckpointSourceIdentityV2>,
-    requireNoPending: Boolean = false,
-): Boolean {
-    if (expected.isEmpty()) return false
-    val current = store.loadEntityKeys()
-        .flatMap(store::loadHeads)
-        .mapTo(linkedSetOf()) { head ->
-            WorkspaceCheckpointSourceIdentityV2(
-                head.entityType,
-                head.entityId,
-                head.versionId,
-                head.objectDigest,
-            )
-        }
-    return current == expected && (!requireNoPending || store.loadPending(remoteProfile).isEmpty())
-}
 
 private val CHECKPOINT_VERSION_COMPARATOR_SYSTEM_V2: Comparator<WorkspaceEntityVersionV2> =
     compareBy<WorkspaceEntityVersionV2>({ it.entityType.wireValue }, { it.entityId }, { it.generation }, { it.versionId })

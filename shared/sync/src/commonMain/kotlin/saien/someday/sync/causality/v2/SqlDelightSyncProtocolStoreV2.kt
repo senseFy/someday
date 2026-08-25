@@ -6,7 +6,6 @@ import saien.someday.data.local.db.SomedayDatabase
 import saien.someday.data.local.db.Sync_dead_letters_v2
 import saien.someday.data.local.db.Sync_epochs_v2
 import saien.someday.data.local.db.Sync_run_history_v2
-import saien.someday.data.local.db.Sync_transport_units_system_v2
 import kotlin.time.Instant
 import kotlin.uuid.Uuid
 import kotlinx.serialization.decodeFromString
@@ -16,14 +15,12 @@ import kotlinx.serialization.json.Json
 enum class SyncEpochLifecycleV2(val storageValue: String) {
     PREPARING("preparing"),
     ACTIVE("active"),
-    READ_ONLY("read_only"),
     BLOCKED("blocked"),
     ABANDONED("abandoned"),
 }
 
 enum class SyncEpochHealthV2(val storageValue: String) {
     HEALTHY("healthy"),
-    DEGRADED("degraded"),
     BLOCKED("blocked"),
 }
 
@@ -35,8 +32,6 @@ data class StoredSyncEpochV2(
     val lifecycle: SyncEpochLifecycleV2,
     val health: SyncEpochHealthV2,
     val activatedAtEpochMilliseconds: Long?,
-    val readOnlyAtEpochMilliseconds: Long?,
-    val retainUntilEpochMilliseconds: Long?,
     val safeErrorCode: String?,
     val safeErrorMessage: String?,
 )
@@ -50,11 +45,6 @@ data class StoredLocalAuthorityV2(
     val updatedAtEpochMilliseconds: Long,
 )
 
-data class StoredSyncReconciliationStateV2(
-    val reason: String,
-    val markedAtEpochMilliseconds: Long,
-)
-
 sealed interface SyncEpochPersistResultV2 {
     data class Stored(val epoch: StoredSyncEpochV2) : SyncEpochPersistResultV2
     data class AlreadyStored(val epoch: StoredSyncEpochV2) : SyncEpochPersistResultV2
@@ -66,12 +56,6 @@ enum class SyncDeadLetterFailureClassV2(val storageValue: String) {
     PERSISTENT_INTEGRITY("persistent_integrity"),
     INCOMPATIBLE_EPOCH("incompatible_epoch"),
     TRANSPORT("transport"),
-}
-
-enum class SyncDeadLetterLifecycleV2(val storageValue: String) {
-    ACTIVE("active"),
-    REPAIRED("repaired"),
-    REBOOTSTRAP("rebootstrap"),
 }
 
 data class SyncDeadLetterInputV2(
@@ -91,7 +75,6 @@ data class SyncDeadLetterInputV2(
 
 data class StoredSyncDeadLetterV2(
     val input: SyncDeadLetterInputV2,
-    val lifecycle: SyncDeadLetterLifecycleV2,
     val firstSeenAtEpochMilliseconds: Long,
     val lastSeenAtEpochMilliseconds: Long,
     val lastRetryAtEpochMilliseconds: Long?,
@@ -124,15 +107,7 @@ data class SyncRunCountersV2(
     val projectionWarnings: Long = 0,
     val deadLetters: Long = 0,
     val pushedMutations: Long = 0,
-    val checkpointHorizonEpochMilliseconds: Long? = null,
-    val repairState: SyncRunRepairStateV2 = SyncRunRepairStateV2.HEALTHY,
 )
-
-enum class SyncRunRepairStateV2(val storageValue: String) {
-    HEALTHY("healthy"),
-    REPAIR_REQUIRED("repair_required"),
-    REBOOTSTRAP_REQUIRED("rebootstrap_required"),
-}
 
 data class StoredSyncRunV2(
     val runId: String,
@@ -147,32 +122,6 @@ data class StoredSyncRunV2(
     val safeErrorMessage: String?,
 )
 
-data class SyncRetentionPlanV2(
-    val retainedEpochIds: List<String>,
-    val eligibleReadOnlyEpochIds: List<String>,
-    val blockedEpochIds: List<String>,
-)
-
-data class StoredWorkspaceTransportUnitV2(
-    val remoteProfile: String,
-    val epochId: String,
-    val streamId: String,
-    val unitId: String,
-    val unitDigest: String,
-    val previousUnitDigest: String?,
-    val ordinal: Long,
-    val encodedUnitOuter: String,
-    val orderedMutationTuples: String,
-    val state: String,
-    val createdAtEpochMilliseconds: Long,
-    val publishedAtEpochMilliseconds: Long?,
-)
-
-sealed interface SealWorkspaceTransportUnitResultV2 {
-    data class Sealed(val value: StoredWorkspaceTransportUnitV2, val replayed: Boolean) : SealWorkspaceTransportUnitResultV2
-    data class ImmutableMismatch(val safeMessage: String) : SealWorkspaceTransportUnitResultV2
-}
-
 /** Durable control-plane/outbox/dead-letter state shared by every v2 remote profile. */
 class SqlDelightSyncProtocolStoreV2(
     private val database: SomedayDatabase,
@@ -184,81 +133,79 @@ class SqlDelightSyncProtocolStoreV2(
 ) {
     private val queries = database.somedayQueries
 
-    fun sealWorkspaceTransportUnit(value: StoredWorkspaceTransportUnitV2): SealWorkspaceTransportUnitResultV2 {
-        require(value.state == "sealed" && value.ordinal >= 1)
-        val atOrdinal = queries.selectTransportUnitsSystemV2(value.remoteProfile, value.epochId, value.streamId)
-            .executeAsList()
-            .firstOrNull { it.ordinal_value == value.ordinal }
-            ?.toWorkspaceDomainV2()
-        val byId = queries.selectTransportUnitSystemV2(
-            value.remoteProfile, value.epochId, value.streamId, value.unitId,
-        ).executeAsOneOrNull()?.toWorkspaceDomainV2()
-        val existing = byId ?: atOrdinal
-        if (existing != null) {
-            return if (existing.sameSealedIdentityV2(value)) {
-                SealWorkspaceTransportUnitResultV2.Sealed(existing, replayed = true)
-            } else {
-                SealWorkspaceTransportUnitResultV2.ImmutableMismatch(
-                    "A durable V2 transport ordinal or unit id is already sealed differently.",
-                )
-            }
-        }
-        queries.insertTransportUnitSystemV2(
-            value.remoteProfile, value.epochId, value.streamId, value.unitId, value.unitDigest,
-            value.previousUnitDigest, value.ordinal, value.encodedUnitOuter,
-            value.orderedMutationTuples, value.state, value.createdAtEpochMilliseconds,
-            value.publishedAtEpochMilliseconds,
-        )
-        return SealWorkspaceTransportUnitResultV2.Sealed(
-            checkNotNull(queries.selectTransportUnitSystemV2(
-                value.remoteProfile, value.epochId, value.streamId, value.unitId,
-            ).executeAsOneOrNull()?.toWorkspaceDomainV2()),
-            replayed = false,
-        )
-    }
-
-    fun loadOpenWorkspaceTransportUnits(
-        remoteProfile: String,
-        epochId: String,
-        streamId: String,
-    ): List<StoredWorkspaceTransportUnitV2> = queries.selectOpenTransportUnitsSystemV2(
-        remoteProfile, epochId, streamId,
-    ).executeAsList().map { it.toWorkspaceDomainV2() }
-
-    fun loadWorkspaceTransportUnits(
-        remoteProfile: String,
-        epochId: String,
-        streamId: String,
-    ): List<StoredWorkspaceTransportUnitV2> = queries.selectTransportUnitsSystemV2(
-        remoteProfile, epochId, streamId,
-    ).executeAsList().map { it.toWorkspaceDomainV2() }
-
-    fun updateWorkspaceTransportUnitState(
-        remoteProfile: String,
-        epochId: String,
-        streamId: String,
-        unitId: String,
-        state: String,
-        publishedAt: Instant?,
-    ) {
-        require(state in setOf("sealed", "object_published", "committed", "superseded"))
-        queries.updateTransportUnitStateSystemV2(
-            state, publishedAt?.toEpochMilliseconds(), remoteProfile, epochId, streamId, unitId,
-        )
-    }
-
     fun persistPreparingEpoch(
         remoteProfile: String,
         descriptor: SyncEpochDescriptorV2,
         descriptorDigest: String,
+        authorityBindingId: String? = null,
+        localWriterDeviceId: String? = null,
+    ): SyncEpochPersistResultV2 {
+        require((authorityBindingId == null) == (localWriterDeviceId == null)) {
+            "A prepared authority binding and its local writer must be persisted together."
+        }
+        authorityBindingId?.let {
+            require(it.isNotBlank() && it.length <= 2_048)
+            require(UUID_V4_PATTERN_SYSTEM_V2.matches(checkNotNull(localWriterDeviceId)))
+        }
+        var outcome: SyncEpochPersistResultV2? = null
+        database.transaction {
+            outcome = persistPreparingEpochInCurrentTransaction(
+                remoteProfile = remoteProfile,
+                descriptor = descriptor,
+                descriptorDigest = descriptorDigest,
+                authorityBindingId = authorityBindingId,
+                localWriterDeviceId = localWriterDeviceId,
+            )
+            if (outcome is SyncEpochPersistResultV2.ImmutableMismatch) {
+                rollback()
+            }
+        }
+        return checkNotNull(outcome)
+    }
+
+    /** Epoch metadata and its first local authority are one crash-consistent SQLite fact. */
+    private fun persistPreparingEpochInCurrentTransaction(
+        remoteProfile: String,
+        descriptor: SyncEpochDescriptorV2,
+        descriptorDigest: String,
+        authorityBindingId: String?,
+        localWriterDeviceId: String?,
     ): SyncEpochPersistResultV2 {
         val existing = loadEpoch(remoteProfile, descriptor.syncEpochId)
         if (existing != null) {
-            return if (existing.descriptor == descriptor && existing.descriptorDigest == descriptorDigest) {
-                SyncEpochPersistResultV2.AlreadyStored(existing)
+            if (existing.descriptor != descriptor || existing.descriptorDigest != descriptorDigest) {
+                return SyncEpochPersistResultV2.ImmutableMismatch(
+                    "The same v2 epoch id already identifies another authenticated descriptor.",
+                )
+            }
+            if (authorityBindingId != null &&
+                existing.authorityBindingId?.let { it != authorityBindingId } == true
+            ) {
+                return SyncEpochPersistResultV2.ImmutableMismatch(
+                    "The prepared epoch is already bound to another authenticated authority.",
+                )
+            }
+            if (authorityBindingId != null && existing.authorityBindingId == null) {
+                queries.updateSyncEpochAuthorityBindingV2(
+                    authorityBindingId,
+                    remoteProfile,
+                    descriptor.syncEpochId,
+                )
+            }
+            val bindingError = bindFirstPreparingLocalAuthority(
+                remoteProfile,
+                descriptor.syncEpochId,
+                descriptorDigest,
+                authorityBindingId,
+                localWriterDeviceId,
+            )
+            return if (bindingError == null) {
+                SyncEpochPersistResultV2.AlreadyStored(
+                    checkNotNull(loadEpoch(remoteProfile, descriptor.syncEpochId)),
+                )
             } else {
                 SyncEpochPersistResultV2.ImmutableMismatch(
-                    "The same v2 epoch id already identifies another authenticated descriptor.",
+                    bindingError,
                 )
             }
         }
@@ -275,15 +222,152 @@ class SqlDelightSyncProtocolStoreV2(
             descriptor_digest = descriptorDigest,
             checkpoint_id = descriptor.checkpointId,
             checkpoint_digest = descriptor.checkpointDigest,
-            previous_epoch_id = descriptor.previousEpochId,
             created_at = descriptor.createdAt.toEpochMilliseconds(),
             activated_at = null,
-            read_only_at = null,
-            retain_until = null,
             safe_error_code = null,
             safe_error_message = null,
+            authority_binding_id = authorityBindingId,
         )
+        bindFirstPreparingLocalAuthority(
+            remoteProfile,
+            descriptor.syncEpochId,
+            descriptorDigest,
+            authorityBindingId,
+            localWriterDeviceId,
+        )?.let { bindingError ->
+            return SyncEpochPersistResultV2.ImmutableMismatch(bindingError)
+        }
         return SyncEpochPersistResultV2.Stored(checkNotNull(loadEpoch(remoteProfile, descriptor.syncEpochId)))
+    }
+
+    /**
+     * Persists an epoch obtained from an already-authenticated remote pointer.
+     *
+     * The only replacement this permits is the first-initialization CAS race: this device has no
+     * authoritative epoch, its local singleton still names its own never-activated genesis draft,
+     * and another device published a different genesis on the exact same account authority. The
+     * losing draft is retained as ABANDONED for exact remote cleanup while the singleton moves to
+     * the authenticated winner in the same SQLite transaction.
+     */
+    fun persistAuthenticatedRemotePreparingEpoch(
+        remoteProfile: String,
+        descriptor: SyncEpochDescriptorV2,
+        descriptorDigest: String,
+        authorityBindingId: String,
+        localWriterDeviceId: String,
+    ): SyncEpochPersistResultV2 {
+        val current = loadLocalAuthority()
+        if (current == null ||
+            (current.remoteProfile == remoteProfile &&
+                current.epochId == descriptor.syncEpochId &&
+                current.pointerDigest == descriptorDigest) ||
+            loadAuthoritativeEpoch() != null
+        ) {
+            return persistPreparingEpoch(
+                remoteProfile,
+                descriptor,
+                descriptorDigest,
+                authorityBindingId,
+                localWriterDeviceId,
+            )
+        }
+
+        var outcome: SyncEpochPersistResultV2? = null
+        database.transaction {
+            val lockedAuthority = loadLocalAuthority()
+            val losingEpoch = lockedAuthority?.let { loadEpoch(it.remoteProfile, it.epochId) }
+            val existingWinner = loadEpoch(remoteProfile, descriptor.syncEpochId)
+            val canHandoff = loadAuthoritativeEpoch() == null &&
+                descriptor.remoteProfile == remoteProfile &&
+                descriptor.previousEpochId == null &&
+                lockedAuthority != null &&
+                lockedAuthority.remoteProfile == remoteProfile &&
+                lockedAuthority.epochId != descriptor.syncEpochId &&
+                lockedAuthority.authorityBindingId == authorityBindingId &&
+                lockedAuthority.localWriterDeviceId == localWriterDeviceId &&
+                losingEpoch != null &&
+                losingEpoch.lifecycle == SyncEpochLifecycleV2.PREPARING &&
+                losingEpoch.activatedAtEpochMilliseconds == null &&
+                losingEpoch.descriptor.previousEpochId == null &&
+                losingEpoch.descriptor.createdByDeviceId == localWriterDeviceId &&
+                losingEpoch.authorityBindingId == authorityBindingId &&
+                losingEpoch.descriptorDigest == lockedAuthority.pointerDigest &&
+                (existingWinner == null ||
+                    (existingWinner.lifecycle == SyncEpochLifecycleV2.PREPARING &&
+                        existingWinner.activatedAtEpochMilliseconds == null &&
+                        existingWinner.descriptor == descriptor &&
+                        existingWinner.descriptorDigest == descriptorDigest &&
+                        existingWinner.authorityBindingId?.let { it == authorityBindingId } != false))
+
+            if (!canHandoff) {
+                outcome = SyncEpochPersistResultV2.ImmutableMismatch(
+                    "The authenticated first epoch cannot replace the locally pinned authority.",
+                )
+                return@transaction
+            }
+            val loser = checkNotNull(losingEpoch)
+
+            queries.updateSyncEpochLifecycleV2(
+                lifecycle = SyncEpochLifecycleV2.ABANDONED.storageValue,
+                health = SyncEpochHealthV2.HEALTHY.storageValue,
+                activated_at = null,
+                safe_error_code = "epoch_pointer_compare_and_set_lost",
+                safe_error_message = "Another authenticated first checkpoint won the pointer compare-and-set.",
+                remote_profile = loser.remoteProfile,
+                epoch_id = loser.descriptor.syncEpochId,
+            )
+            queries.deleteExactLocalAuthoritySystemV2(
+                loser.remoteProfile,
+                loser.descriptor.syncEpochId,
+            )
+            outcome = persistPreparingEpoch(
+                remoteProfile,
+                descriptor,
+                descriptorDigest,
+                authorityBindingId,
+                localWriterDeviceId,
+            ).also { persisted ->
+                check(persisted !is SyncEpochPersistResultV2.ImmutableMismatch) {
+                    "The authenticated first-epoch handoff could not be committed atomically."
+                }
+            }
+        }
+        return checkNotNull(outcome)
+    }
+
+    /**
+     * Before the first pointer is authoritative, retain the exact account and
+     * writer next to the crash-recoverable checkpoint. Successor drafts do not
+     * replace the already-active singleton authority.
+     */
+    private fun bindFirstPreparingLocalAuthority(
+        remoteProfile: String,
+        epochId: String,
+        pointerDigest: String,
+        authorityBindingId: String?,
+        localWriterDeviceId: String?,
+    ): String? {
+        if (authorityBindingId == null || localWriterDeviceId == null || loadAuthoritativeEpoch() != null) {
+            return null
+        }
+        val current = loadLocalAuthority()
+        if (current != null &&
+            (current.remoteProfile != remoteProfile || current.epochId != epochId ||
+                current.pointerDigest != pointerDigest ||
+                current.authorityBindingId != authorityBindingId ||
+                current.localWriterDeviceId != localWriterDeviceId)
+        ) {
+            return "A different first-epoch authority is already prepared on this device."
+        }
+        queries.upsertLocalAuthoritySystemV2(
+            remote_profile = remoteProfile,
+            epoch_id = epochId,
+            local_writer_device_id = localWriterDeviceId,
+            authority_binding_id = authorityBindingId,
+            pointer_digest = pointerDigest,
+            updated_at = kotlin.time.Clock.System.now().toEpochMilliseconds(),
+        )
+        return null
     }
 
     fun activateEpoch(
@@ -299,51 +383,20 @@ class SqlDelightSyncProtocolStoreV2(
                 "Only a prepared v2 epoch can become active."
             }
             val activatedAtMillis = activatedAt.toEpochMilliseconds()
-            // A late device must not restart the archive window on the day it
-            // finally observes a rollover.  The authenticated successor
-            // checkpoint time is the durable publication evidence shared by
-            // every device, so all devices derive the same retention horizon.
-            val successorCreatedAtMillis = target.descriptor.createdAt.toEpochMilliseconds()
             val binding = authorityBindingId
                 ?: loadLocalAuthority()?.takeIf {
                     it.remoteProfile == remoteProfile
                 }?.authorityBindingId
                 ?: "unbound:$remoteProfile"
             require(binding.isNotBlank() && binding.length <= 2_048)
-            val previousCandidates = loadAllEpochs().filter { previous ->
-                !(previous.remoteProfile == remoteProfile && previous.descriptor.syncEpochId == epochId) &&
-                    previous.activatedAtEpochMilliseconds != null &&
-                    previous.lifecycle != SyncEpochLifecycleV2.READ_ONLY &&
-                    previous.lifecycle != SyncEpochLifecycleV2.ABANDONED &&
-                    (
-                        previous.lifecycle == SyncEpochLifecycleV2.ACTIVE ||
-                            previous.lifecycle == SyncEpochLifecycleV2.BLOCKED ||
-                            target.descriptor.previousEpochId == previous.descriptor.syncEpochId
-                    )
-            }
-            previousCandidates.forEach { previous ->
-                val retainUntil = safeAddMilliseconds(
-                    successorCreatedAtMillis,
-                    previous.descriptor.supportedOfflineWindowSeconds * 1_000L,
-                )
-                queries.updateSyncEpochLifecycleV2(
-                    lifecycle = SyncEpochLifecycleV2.READ_ONLY.storageValue,
-                    health = SyncEpochHealthV2.HEALTHY.storageValue,
-                    activated_at = previous.activatedAtEpochMilliseconds,
-                    read_only_at = activatedAtMillis,
-                    retain_until = retainUntil,
-                    safe_error_code = null,
-                    safe_error_message = null,
-                    remote_profile = previous.remoteProfile,
-                    epoch_id = previous.descriptor.syncEpochId,
-                )
-            }
+            val currentAuthority = loadAuthoritativeEpoch()
+            require(currentAuthority == null ||
+                (currentAuthority.remoteProfile == remoteProfile && currentAuthority.descriptor.syncEpochId == epochId)
+            ) { "A single-generation workspace cannot activate a successor epoch." }
             queries.updateSyncEpochLifecycleV2(
                 lifecycle = SyncEpochLifecycleV2.ACTIVE.storageValue,
                 health = SyncEpochHealthV2.HEALTHY.storageValue,
                 activated_at = target.activatedAtEpochMilliseconds ?: activatedAtMillis,
-                read_only_at = null,
-                retain_until = null,
                 safe_error_code = null,
                 safe_error_message = null,
                 remote_profile = remoteProfile,
@@ -380,107 +433,11 @@ class SqlDelightSyncProtocolStoreV2(
             lifecycle = SyncEpochLifecycleV2.BLOCKED.storageValue,
             health = SyncEpochHealthV2.BLOCKED.storageValue,
             activated_at = epoch.activatedAtEpochMilliseconds,
-            read_only_at = epoch.readOnlyAtEpochMilliseconds,
-            retain_until = epoch.retainUntilEpochMilliseconds,
             safe_error_code = safeErrorCode,
             safe_error_message = safeErrorMessage,
             remote_profile = remoteProfile,
             epoch_id = epochId,
         )
-        return checkNotNull(loadEpoch(remoteProfile, epochId))
-    }
-
-    fun setEpochHealth(
-        remoteProfile: String,
-        epochId: String,
-        health: SyncEpochHealthV2,
-        safeErrorCode: String? = null,
-        safeErrorMessage: String? = null,
-    ): StoredSyncEpochV2 {
-        require(health != SyncEpochHealthV2.BLOCKED) { "Use blockEpoch for a blocking v2 integrity failure." }
-        require((safeErrorCode == null) == (safeErrorMessage == null))
-        val epoch = requireNotNull(loadEpoch(remoteProfile, epochId))
-        require(epoch.lifecycle == SyncEpochLifecycleV2.ACTIVE || epoch.lifecycle == SyncEpochLifecycleV2.PREPARING)
-        queries.updateSyncEpochLifecycleV2(
-            lifecycle = epoch.lifecycle.storageValue,
-            health = health.storageValue,
-            activated_at = epoch.activatedAtEpochMilliseconds,
-            read_only_at = epoch.readOnlyAtEpochMilliseconds,
-            retain_until = epoch.retainUntilEpochMilliseconds,
-            safe_error_code = safeErrorCode,
-            safe_error_message = safeErrorMessage,
-            remote_profile = remoteProfile,
-            epoch_id = epochId,
-        )
-        return checkNotNull(loadEpoch(remoteProfile, epochId))
-    }
-
-    fun resumeBlockedEpochAfterRepair(
-        remoteProfile: String,
-        epochId: String,
-    ): StoredSyncEpochV2 {
-        require(loadActiveDeadLetters(remoteProfile, epochId).none {
-            it.input.failureClass == SyncDeadLetterFailureClassV2.PERSISTENT_INTEGRITY ||
-                it.input.failureClass == SyncDeadLetterFailureClassV2.INCOMPATIBLE_EPOCH
-        }) {
-            "Cannot resume a v2 epoch while a blocking integrity dead letter remains."
-        }
-        val epoch = requireNotNull(loadEpoch(remoteProfile, epochId))
-        require(epoch.lifecycle == SyncEpochLifecycleV2.BLOCKED)
-        queries.updateSyncEpochLifecycleV2(
-            lifecycle = if (epoch.activatedAtEpochMilliseconds == null) {
-                SyncEpochLifecycleV2.PREPARING.storageValue
-            } else {
-                SyncEpochLifecycleV2.ACTIVE.storageValue
-            },
-            health = SyncEpochHealthV2.HEALTHY.storageValue,
-            activated_at = epoch.activatedAtEpochMilliseconds,
-            read_only_at = epoch.readOnlyAtEpochMilliseconds,
-            retain_until = epoch.retainUntilEpochMilliseconds,
-            safe_error_code = null,
-            safe_error_message = null,
-            remote_profile = remoteProfile,
-            epoch_id = epochId,
-        )
-        return checkNotNull(loadEpoch(remoteProfile, epochId))
-    }
-
-    /**
-     * Releases protocol-work pins only after an explicitly authorized
-     * successor checkpoint has committed every locally verified head. The old
-     * semantic DAG remains read-only until its normal retention horizon.
-     */
-    fun archiveAfterAuthorizedRebootstrap(
-        remoteProfile: String,
-        epochId: String,
-        archivedAt: Instant,
-    ): StoredSyncEpochV2 {
-        val epoch = requireNotNull(loadEpoch(remoteProfile, epochId))
-        require(epoch.lifecycle == SyncEpochLifecycleV2.READ_ONLY) {
-            "Authorized recovery cleanup requires a committed successor epoch."
-        }
-        val at = archivedAt.toEpochMilliseconds()
-        database.transaction {
-            queries.markEpochDeadLettersRebootstrapV2(at, remoteProfile, epochId)
-            queries.markEpochQuarantinesRebootstrapV2(at, remoteProfile, epochId)
-            queries.markEpochSourceImportsPublishedV2(at, remoteProfile, epochId)
-            // These are retry/cache state, not semantic history. Every current
-            // head they could publish was included in the committed successor.
-            queries.deleteEpochPendingMutationsSystemV2(remoteProfile, epochId)
-            queries.deleteEpochTransportUnitsSystemV2(remoteProfile, epochId)
-            queries.deleteEpochRepairReplicasSystemV2(remoteProfile, epochId)
-            queries.updateSyncEpochLifecycleV2(
-                lifecycle = SyncEpochLifecycleV2.READ_ONLY.storageValue,
-                health = SyncEpochHealthV2.BLOCKED.storageValue,
-                activated_at = epoch.activatedAtEpochMilliseconds,
-                read_only_at = epoch.readOnlyAtEpochMilliseconds ?: at,
-                retain_until = epoch.retainUntilEpochMilliseconds,
-                safe_error_code = "authorized_rebootstrap_archive",
-                safe_error_message = "This prior epoch is retained as a read-only recovery archive and is not monitored for new writes.",
-                remote_profile = remoteProfile,
-                epoch_id = epochId,
-            )
-        }
         return checkNotNull(loadEpoch(remoteProfile, epochId))
     }
 
@@ -495,17 +452,22 @@ class SqlDelightSyncProtocolStoreV2(
         require(epoch.lifecycle == SyncEpochLifecycleV2.PREPARING || epoch.lifecycle == SyncEpochLifecycleV2.ABANDONED) {
             "Only a non-authoritative prepared V2 epoch may be abandoned."
         }
-        queries.updateSyncEpochLifecycleV2(
-            lifecycle = SyncEpochLifecycleV2.ABANDONED.storageValue,
-            health = SyncEpochHealthV2.HEALTHY.storageValue,
-            activated_at = null,
-            read_only_at = epoch.readOnlyAtEpochMilliseconds,
-            retain_until = epoch.retainUntilEpochMilliseconds,
-            safe_error_code = safeErrorCode,
-            safe_error_message = safeErrorMessage,
-            remote_profile = remoteProfile,
-            epoch_id = epochId,
-        )
+        database.transaction {
+            queries.updateSyncEpochLifecycleV2(
+                lifecycle = SyncEpochLifecycleV2.ABANDONED.storageValue,
+                health = SyncEpochHealthV2.HEALTHY.storageValue,
+                activated_at = null,
+                safe_error_code = safeErrorCode,
+                safe_error_message = safeErrorMessage,
+                remote_profile = remoteProfile,
+                epoch_id = epochId,
+            )
+            loadLocalAuthority()?.takeIf {
+                it.remoteProfile == remoteProfile && it.epochId == epochId
+            }?.let {
+                queries.deleteExactLocalAuthoritySystemV2(remoteProfile, epochId)
+            }
+        }
         return checkNotNull(loadEpoch(remoteProfile, epochId))
     }
 
@@ -541,7 +503,7 @@ class SqlDelightSyncProtocolStoreV2(
         val current = requireNotNull(loadLocalAuthority())
         require(current.remoteProfile == remoteProfile && current.epochId == epochId &&
             current.pointerDigest == pointerDigest
-        ) { "Only an endpoint exposing the exact authenticated authority may be rebound without migration." }
+        ) { "Only an endpoint exposing the exact authenticated authority may be rebound." }
         queries.upsertLocalAuthoritySystemV2(
             remote_profile = current.remoteProfile,
             epoch_id = current.epochId,
@@ -551,19 +513,6 @@ class SqlDelightSyncProtocolStoreV2(
             updated_at = updatedAt.toEpochMilliseconds(),
         )
         return checkNotNull(loadLocalAuthority())
-    }
-
-    fun markBackupReconciliationPending(markedAt: Instant) {
-        queries.markBackupReconciliationPendingSystemV2(markedAt.toEpochMilliseconds())
-    }
-
-    fun loadReconciliationState(): StoredSyncReconciliationStateV2? =
-        queries.selectReconciliationStateSystemV2().executeAsOneOrNull()?.let { row ->
-            StoredSyncReconciliationStateV2(row.reason, row.marked_at)
-        }
-
-    fun clearBackupReconciliation() {
-        queries.clearBackupReconciliationSystemV2()
     }
 
     fun loadEpochs(remoteProfile: String): List<StoredSyncEpochV2> =
@@ -576,8 +525,8 @@ class SqlDelightSyncProtocolStoreV2(
      * True when this device still holds V2 protocol state encrypted under the
      * current workspace key for [remoteProfile] (or any profile when null).
      *
-     * Includes preparing (checkpoint not yet activated), active, blocked, and
-     * read-only retained epochs. Abandoned rows are ignored.
+     * Includes preparing (checkpoint not yet activated), active, and blocked
+     * state. Abandoned first-CAS loser drafts are ignored.
      */
     fun hasKeyBoundLocalV2State(remoteProfile: String? = null): Boolean {
         val epochs = if (remoteProfile == null) loadAllEpochs() else loadEpochs(remoteProfile)
@@ -586,27 +535,8 @@ class SqlDelightSyncProtocolStoreV2(
                 SyncEpochLifecycleV2.PREPARING,
                 SyncEpochLifecycleV2.ACTIVE,
                 SyncEpochLifecycleV2.BLOCKED,
-                SyncEpochLifecycleV2.READ_ONLY,
             )
         }
-    }
-
-    fun retentionPlan(remoteProfile: String, now: Instant): SyncRetentionPlanV2 {
-        val nowMillis = now.toEpochMilliseconds()
-        val epochs = loadEpochs(remoteProfile)
-        return SyncRetentionPlanV2(
-            retainedEpochIds = epochs.filterNot { epoch ->
-                epoch.lifecycle == SyncEpochLifecycleV2.READ_ONLY &&
-                    epoch.retainUntilEpochMilliseconds?.let { it <= nowMillis } == true
-            }.map { it.descriptor.syncEpochId }.sorted(),
-            eligibleReadOnlyEpochIds = epochs.filter { epoch ->
-                epoch.lifecycle == SyncEpochLifecycleV2.READ_ONLY &&
-                    epoch.retainUntilEpochMilliseconds?.let { it <= nowMillis } == true
-            }.map { it.descriptor.syncEpochId }.sorted(),
-            blockedEpochIds = epochs.filter { it.lifecycle == SyncEpochLifecycleV2.BLOCKED }
-                .map { it.descriptor.syncEpochId }
-                .sorted(),
-        )
     }
 
     fun recordDeadLetter(input: SyncDeadLetterInputV2, observedAt: Instant): StoredSyncDeadLetterV2 {
@@ -628,7 +558,6 @@ class SqlDelightSyncProtocolStoreV2(
             object_digest = input.objectDigest,
             authenticated_unit = input.authenticatedUnit,
             failure_class = input.failureClass.storageValue,
-            lifecycle = SyncDeadLetterLifecycleV2.ACTIVE.storageValue,
             safe_error_code = input.safeErrorCode,
             safe_error_message = input.safeErrorMessage,
             first_seen_at = existing?.firstSeenAtEpochMilliseconds ?: now,
@@ -648,21 +577,16 @@ class SqlDelightSyncProtocolStoreV2(
         )
     }
 
-    fun loadActiveDeadLetters(remoteProfile: String, epochId: String): List<StoredSyncDeadLetterV2> =
-        queries.selectActiveSyncDeadLettersV2(remoteProfile, epochId).executeAsList().map { it.toDomain() }
+    fun loadUnresolvedDeadLetters(remoteProfile: String, epochId: String): List<StoredSyncDeadLetterV2> =
+        queries.selectUnresolvedSyncDeadLettersV2(remoteProfile, epochId).executeAsList().map { it.toDomain() }
 
     fun resolveDeadLetter(
         remoteProfile: String,
         epochId: String,
         streamId: String,
         unitId: String,
-        lifecycle: SyncDeadLetterLifecycleV2,
-        resolvedAt: Instant,
     ) {
-        require(lifecycle != SyncDeadLetterLifecycleV2.ACTIVE)
-        queries.updateSyncDeadLetterLifecycleV2(
-            lifecycle.storageValue,
-            resolvedAt.toEpochMilliseconds(),
+        queries.deleteSyncDeadLetterV2(
             remoteProfile,
             epochId,
             streamId,
@@ -712,8 +636,6 @@ class SqlDelightSyncProtocolStoreV2(
             projection_warnings = 0,
             dead_letters = 0,
             pushed_mutations = 0,
-            checkpoint_horizon = null,
-            repair_state = SyncRunRepairStateV2.HEALTHY.storageValue,
         )
         return run
     }
@@ -753,8 +675,6 @@ class SqlDelightSyncProtocolStoreV2(
             projection_warnings = counters.projectionWarnings,
             dead_letters = counters.deadLetters,
             pushed_mutations = counters.pushedMutations,
-            checkpoint_horizon = counters.checkpointHorizonEpochMilliseconds,
-            repair_state = counters.repairState.storageValue,
             run_id = runId,
         )
         queries.pruneSyncRunHistoryV2(
@@ -775,8 +695,6 @@ class SqlDelightSyncProtocolStoreV2(
         lifecycle = enumValues<SyncEpochLifecycleV2>().first { it.storageValue == lifecycle },
         health = enumValues<SyncEpochHealthV2>().first { it.storageValue == health },
         activatedAtEpochMilliseconds = activated_at,
-        readOnlyAtEpochMilliseconds = read_only_at,
-        retainUntilEpochMilliseconds = retain_until,
         safeErrorCode = safe_error_code,
         safeErrorMessage = safe_error_message,
     )
@@ -796,7 +714,6 @@ class SqlDelightSyncProtocolStoreV2(
             safeErrorCode = safe_error_code,
             safeErrorMessage = safe_error_message,
         ),
-        lifecycle = enumValues<SyncDeadLetterLifecycleV2>().first { it.storageValue == lifecycle },
         firstSeenAtEpochMilliseconds = first_seen_at,
         lastSeenAtEpochMilliseconds = last_seen_at,
         lastRetryAtEpochMilliseconds = last_retry_at,
@@ -830,29 +747,15 @@ class SqlDelightSyncProtocolStoreV2(
             projectionWarnings = projection_warnings,
             deadLetters = dead_letters,
             pushedMutations = pushed_mutations,
-            checkpointHorizonEpochMilliseconds = checkpoint_horizon,
-            repairState = enumValues<SyncRunRepairStateV2>().first { it.storageValue == repair_state },
         ),
         safeErrorCode = safe_error_code,
         safeErrorMessage = safe_error_message,
     )
 
-    private fun Sync_transport_units_system_v2.toWorkspaceDomainV2() = StoredWorkspaceTransportUnitV2(
-        remote_profile, epoch_id, stream_id, unit_id, unit_digest, previous_unit_digest,
-        ordinal_value, encoded_unit_outer, ordered_mutation_tuples, state, created_at, published_at,
-    )
 }
 
-private fun safeAddMilliseconds(value: Long, increment: Long): Long =
-    if (Long.MAX_VALUE - value < increment) Long.MAX_VALUE else value + increment
 
 private fun safeSubtractMilliseconds(value: Long, decrement: Long): Long =
     if (value < Long.MIN_VALUE + decrement) Long.MIN_VALUE else value - decrement
 
 private const val RUN_HISTORY_RETENTION_MILLISECONDS_V2: Long = 30L * 24L * 60L * 60L * 1_000L
-
-private fun StoredWorkspaceTransportUnitV2.sameSealedIdentityV2(other: StoredWorkspaceTransportUnitV2): Boolean =
-    remoteProfile == other.remoteProfile && epochId == other.epochId && streamId == other.streamId &&
-        unitId == other.unitId && unitDigest == other.unitDigest && previousUnitDigest == other.previousUnitDigest &&
-        ordinal == other.ordinal && encodedUnitOuter == other.encodedUnitOuter &&
-        orderedMutationTuples == other.orderedMutationTuples && createdAtEpochMilliseconds == other.createdAtEpochMilliseconds

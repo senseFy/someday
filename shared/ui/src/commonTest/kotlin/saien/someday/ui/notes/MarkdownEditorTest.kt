@@ -1,5 +1,7 @@
 package saien.someday.ui.notes
 
+import saien.someday.domain.media.MediaAssetId
+import saien.someday.domain.media.SomedayAssetUri
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -8,7 +10,7 @@ import kotlin.test.assertTrue
 
 class MarkdownEditorTest {
     @Test
-    fun toolbarActionsCoverCommonMarkdownSyntaxAndExcludeAttachments() {
+    fun toolbarActionsCoverCommonMarkdownSyntaxAndImportedImages() {
         assertEquals(
             listOf(
                 MarkdownToolbarAction.Heading,
@@ -18,16 +20,9 @@ class MarkdownEditorTest {
                 MarkdownToolbarAction.Quote,
                 MarkdownToolbarAction.CodeBlock,
                 MarkdownToolbarAction.Link,
+                MarkdownToolbarAction.Image,
             ),
             markdownToolbarActions,
-        )
-
-        val excludedAttachmentTerms = listOf("attachment", "attach", "image", "file", "upload", "photo")
-        assertFalse(
-            markdownToolbarActions.any { action ->
-                excludedAttachmentTerms.any { term -> action.label.contains(term, ignoreCase = true) }
-            },
-            "The editor toolbar must not expose image/file attachment insertion",
         )
     }
 
@@ -62,6 +57,47 @@ class MarkdownEditorTest {
         val insertedHeading = applyMarkdownToolbarAction("", 0, 0, MarkdownToolbarAction.Heading)
         assertEquals("# Heading", insertedHeading.text)
         assertEquals("Heading", insertedHeading.selectedText)
+
+        val imageRequiresImportedIdentity = applyMarkdownToolbarAction(
+            "unchanged",
+            0,
+            9,
+            MarkdownToolbarAction.Image,
+        )
+        assertEquals("unchanged", imageRequiresImportedIdentity.text)
+    }
+
+    @Test
+    fun importedImageInsertionUsesCanonicalIdentityAndCurrentSelection() {
+        val assetUri = SomedayAssetUri(MediaAssetId.fromCanonicalValue("ab".repeat(32)))
+
+        val selectedAlt = insertImportedMarkdownImage(
+            source = "Before sunset after",
+            selectionStart = 7,
+            selectionEnd = 13,
+            assetUri = assetUri,
+            suggestedAltText = "ignored.jpg",
+        )
+
+        assertEquals(
+            "Before \n![sunset](someday-asset://${"ab".repeat(32)})\n after",
+            selectedAlt.text,
+        )
+        assertEquals(selectedAlt.text.length - " after".length, selectedAlt.selectionStart)
+        assertEquals(selectedAlt.selectionStart, selectedAlt.selectionEnd)
+
+        val suggestedAlt = insertImportedMarkdownImage(
+            source = "",
+            selectionStart = 0,
+            selectionEnd = 0,
+            assetUri = assetUri,
+            suggestedAltText = "Family ] photo.jpg",
+        )
+        assertEquals(
+            "![Family \\] photo.jpg](someday-asset://${"ab".repeat(32)})",
+            suggestedAlt.text,
+        )
+        assertEquals("Family ] photo.jpg", renderMarkdownPreview(suggestedAlt.text).single().plainText)
     }
 
     @Test
@@ -99,6 +135,33 @@ class MarkdownEditorTest {
     }
 
     @Test
+    fun previewParsesStandaloneOpaqueAssetImagesWithoutPerformingIo() {
+        val blocks = renderMarkdownPreview(
+            "![Sunset](someday-asset://${"01".repeat(32)})",
+        )
+
+        val image = assertIs<MarkdownPreviewBlock.Image>(blocks.single())
+        assertEquals("Sunset", image.altText)
+        assertEquals("someday-asset://${"01".repeat(32)}", image.destination)
+        assertEquals("Sunset", image.plainText)
+        assertEquals("01".repeat(32), image.localAssetUri?.assetId?.value)
+
+        val remote = assertIs<MarkdownPreviewBlock.Image>(
+            renderMarkdownPreview("![Remote](https://example.com/image.jpg)").single(),
+        )
+        assertEquals(null, remote.localAssetUri)
+    }
+
+    @Test
+    fun malformedImageSyntaxRemainsPlainText() {
+        val block = assertIs<MarkdownPreviewBlock.Paragraph>(
+            renderMarkdownPreview("![missing destination]()").single(),
+        )
+
+        assertEquals("![missing destination]()", block.plainText)
+    }
+
+    @Test
     fun editPreviewSpansStyleMarkdownWithoutChangingSourceOffsets() {
         val source = """
             |# Today
@@ -129,14 +192,15 @@ class MarkdownEditorTest {
     }
 
     @Test
-    fun markdownEditorCapabilitiesAdvertisePreviewToolbarAndNoAttachments() {
+    fun markdownEditorCapabilitiesAdvertiseImportedAssetImages() {
         val log = markdownEditorCapabilityLog()
 
         assertTrue(log.contains("markdown-source=plain-text"))
         assertTrue(log.contains("preview=toggle"))
-        assertTrue(log.contains("toolbar=heading|bold|italic|list|quote|code-block|link"))
+        assertTrue(log.contains("toolbar=heading|bold|italic|list|quote|code-block|link|image"))
         assertTrue(log.contains("wysiwyg-assist=live-edit-preview+selection-aware-toolbar+preview-feedback"))
-        assertTrue(log.contains("attachments=absent"))
+        assertTrue(log.contains("images=app-owned-assets+local-preview+user-requested-materialization"))
+        assertFalse(log.contains("attachments=absent"))
     }
 
     private fun assertHasSpan(
