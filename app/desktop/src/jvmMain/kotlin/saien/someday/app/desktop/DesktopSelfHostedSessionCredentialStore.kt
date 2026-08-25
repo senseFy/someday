@@ -81,7 +81,7 @@ internal class DesktopSelfHostedSessionKeychainStore private constructor() {
             "-w",
         )
         return if (result.exitCode == 0) {
-            result.output.trimEnd('\n').takeIf { it.isNotBlank() }
+            normalizeSelfHostedKeychainOutput(result.output)
         } else {
             null
         }
@@ -91,18 +91,24 @@ internal class DesktopSelfHostedSessionKeychainStore private constructor() {
 
     fun saveText(accountName: String, value: String) {
         require(value.isNotBlank()) { "Self-hosted session payload must not be blank." }
-        runSecurity("delete-generic-password", "-a", accountName, "-s", service)
+        require('\n' !in value && '\r' !in value) {
+            "Self-hosted session payload must use the single-line secure-storage envelope."
+        }
         val result = runSecurity(
             "add-generic-password",
             "-a",
             accountName,
             "-s",
             service,
-            "-w",
-            value,
             "-U",
+            "-w",
+            // Prompted input is length-limited by `security` and can silently truncate JWTs.
+            // Supplying the value directly is its supported non-interactive, arbitrary-length path.
+            value,
         )
-        require(result.exitCode == 0) { "macOS Keychain rejected the self-hosted session." }
+        require(result.exitCode == 0 && loadText(accountName) == value) {
+            "macOS Keychain rejected the self-hosted session."
+        }
     }
 
     fun clear() {
@@ -147,6 +153,29 @@ internal class DesktopSelfHostedSessionKeychainStore private constructor() {
             }
         }
     }
+}
+
+/**
+ * The macOS `security` CLI renders generic-password values containing newlines as hexadecimal
+ * text. Current credentials use a single-line envelope, but development builds may have written
+ * the previous multiline payload. Only accept a hexadecimal recovery when it decodes to a valid
+ * Someday credential, so arbitrary Keychain values remain fail-closed.
+ */
+internal fun normalizeSelfHostedKeychainOutput(output: String): String? {
+    val stored = output.trimEnd('\n', '\r').takeIf { it.isNotBlank() } ?: return null
+    if (decodeSelfHostedSessionCredentials(stored) != null) return stored
+    val decodedHex = stored.decodeHexUtf8OrNull() ?: return stored
+    return decodedHex.takeIf { decodeSelfHostedSessionCredentials(it) != null } ?: stored
+}
+
+private fun String.decodeHexUtf8OrNull(): String? {
+    if (length % 2 != 0) return null
+    return runCatching {
+        ByteArray(length / 2) { index ->
+            val offset = index * 2
+            ((this[offset].digitToInt(16) shl 4) or this[offset + 1].digitToInt(16)).toByte()
+        }.decodeToString(throwOnInvalidSequence = true)
+    }.getOrNull()
 }
 
 @OptIn(ExperimentalEncodingApi::class)

@@ -641,6 +641,7 @@ private fun headingLevelFor(trimmedLine: String): Int? {
 private fun isMarkdownBlockStart(line: String): Boolean {
     val trimmed = line.trimStart()
     return trimmed.startsWith("```") ||
+        parseStandaloneMarkdownImage(trimmed) != null ||
         headingLevelFor(trimmed) != null ||
         trimmed.startsWith("- ") ||
         trimmed.startsWith("> ")

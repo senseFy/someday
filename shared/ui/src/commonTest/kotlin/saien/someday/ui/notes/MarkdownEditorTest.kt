@@ -153,6 +153,25 @@ class MarkdownEditorTest {
     }
 
     @Test
+    fun previewKeepsToolbarInsertedImageStandaloneAfterText() {
+        val assetUri = SomedayAssetUri(MediaAssetId.fromCanonicalValue("02".repeat(32)))
+        val inserted = insertImportedMarkdownImage(
+            source = "Before image",
+            selectionStart = "Before image".length,
+            selectionEnd = "Before image".length,
+            assetUri = assetUri,
+            suggestedAltText = "Photo",
+        )
+
+        val blocks = renderMarkdownPreview(inserted.text)
+
+        assertEquals("Before image", assertIs<MarkdownPreviewBlock.Paragraph>(blocks[0]).plainText)
+        val image = assertIs<MarkdownPreviewBlock.Image>(blocks[1])
+        assertEquals("Photo", image.altText)
+        assertEquals(assetUri, image.localAssetUri)
+    }
+
+    @Test
     fun malformedImageSyntaxRemainsPlainText() {
         val block = assertIs<MarkdownPreviewBlock.Paragraph>(
             renderMarkdownPreview("![missing destination]()").single(),

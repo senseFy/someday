@@ -64,7 +64,10 @@ class WorkspaceBoundSessionCredentialStore(
     private val delegate: SelfHostedSessionCredentialStore,
     private val activeWorkspaceSessionGuard: ActiveWorkspaceSessionGuard,
 ) : SelfHostedSessionCredentialStore {
-    override fun load(): SelfHostedSessionCredentials? = delegate.load()
+    override fun load(): SelfHostedSessionCredentials? {
+        val requirement = activeWorkspaceSessionGuard.currentRequirement() ?: return delegate.load()
+        return delegate.loadForAuthority(requirement.authorityBindingId)
+    }
 
     override fun save(credentials: SelfHostedSessionCredentials) = delegate.save(credentials)
 

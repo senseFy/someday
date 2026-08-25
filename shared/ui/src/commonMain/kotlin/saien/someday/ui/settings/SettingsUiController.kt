@@ -5,10 +5,10 @@ package saien.someday.ui.settings
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withContext
 import saien.someday.domain.notes.NotebookSummary
 import saien.someday.domain.notifications.OnThisDayNotificationScheduler
@@ -16,9 +16,6 @@ import saien.someday.domain.notifications.UnavailableOnThisDayNotificationSchedu
 import saien.someday.domain.settings.AppLanguage
 import saien.someday.domain.settings.ClientSettings
 import saien.someday.domain.settings.ClientTheme
-import saien.someday.domain.settings.ManualSyncPhase
-import saien.someday.domain.settings.ManualSyncProgress
-import saien.someday.domain.settings.ManualSyncProgressListener
 import saien.someday.domain.settings.ManualSyncReason
 import saien.someday.domain.settings.ManualSyncResult
 import saien.someday.domain.settings.ManualSyncRunner
@@ -30,7 +27,6 @@ import saien.someday.domain.settings.SelfHostedSetupInput
 import saien.someday.domain.settings.SelfHostedSetupReason
 import saien.someday.domain.settings.SelfHostedSetupResult
 import saien.someday.domain.settings.SelfHostedSetupValidationIssue
-import saien.someday.domain.settings.SyncConfiguration
 import saien.someday.domain.settings.SyncMode
 import saien.someday.domain.settings.UnavailableSelfHostedSessionCredentialStore
 import saien.someday.domain.settings.WorkspaceJoinResult
@@ -41,8 +37,6 @@ import saien.someday.domain.settings.WorkspacePairingInvitationCreator
 import saien.someday.domain.settings.WorkspacePairingInvitationJoiner
 import saien.someday.domain.settings.WorkspacePairingInvitationResult
 import saien.someday.domain.settings.WorkspacePairingReason
-import saien.someday.domain.settings.isSecureSyncEndpoint
-import saien.someday.domain.settings.normalizeSelfHostedEndpoint
 import saien.someday.ui.i18n.SettingsUiStrings
 import saien.someday.ui.i18n.formatUiString
 
@@ -54,6 +48,13 @@ data class OnThisDayNotificationStrings(
     val invalidTime: String = "Choose a valid notification time.",
     val timeUpdated: String = "On This Day notification time updated.",
 )
+
+enum class SettingsFeedbackSeverity {
+    Info,
+    Success,
+    Warning,
+    Error,
+}
 
 class SettingsUiController(
     initialSettings: ClientSettings = ClientSettings(),
@@ -70,13 +71,14 @@ class SettingsUiController(
     },
     private val selfHostedSessionCredentialStore: SelfHostedSessionCredentialStore =
         UnavailableSelfHostedSessionCredentialStore,
+    selfHostedDeviceName: String = "Someday device",
+    private val selfHostedDevicePlatform: String = "shared",
     private val manualSyncRunner: ManualSyncRunner = ManualSyncRunner {
         ManualSyncResult.failure(
             mode = SyncMode.Off,
             reason = ManualSyncReason.Unavailable,
         )
     },
-    private val bindManualSyncProgressListener: (ManualSyncProgressListener?) -> Unit = {},
     private val workspacePairingInvitationCreator: WorkspacePairingInvitationCreator =
         WorkspacePairingInvitationCreator {
             WorkspacePairingInvitationResult.failure(WorkspacePairingReason.Unavailable)
@@ -91,38 +93,129 @@ class SettingsUiController(
         },
     private val onThisDayNotificationScheduler: OnThisDayNotificationScheduler =
         UnavailableOnThisDayNotificationScheduler,
-    private val onThisDayNotificationStrings: OnThisDayNotificationStrings =
-        OnThisDayNotificationStrings(),
-    private val uiStrings: SettingsUiStrings = SettingsUiStrings(),
+    onThisDayNotificationStrings: OnThisDayNotificationStrings = OnThisDayNotificationStrings(),
+    uiStrings: SettingsUiStrings = SettingsUiStrings(),
     private val currentEpochMillis: () -> Long = { kotlin.time.Clock.System.now().toEpochMilliseconds() },
     private val backgroundDispatcher: CoroutineDispatcher = Dispatchers.Default,
-    private val uiDispatcher: CoroutineDispatcher = Dispatchers.Main,
 ) {
     val onThisDayNotificationsSupported: Boolean = onThisDayNotificationScheduler.isSupported
+    private var onThisDayNotificationStrings = onThisDayNotificationStrings
+    private var uiStrings = uiStrings
+    private var selfHostedDeviceName = selfHostedDeviceName
 
     private var currentWorkspacePairingInvitation: WorkspacePairingInvitationUi? = null
+    private var currentSyncOperation: SyncUiOperation? = null
+    /**
+     * Serializes every read-modify-write of [ClientSettings] with sync and pairing.
+     * The persistence callback stores the whole immutable settings value, so a
+     * narrower "sync-only" lock would allow unrelated preference writes to
+     * silently restore stale session metadata.
+     */
+    private val settingsMutationMutex = Mutex()
+    private var secureSessionAccess: SecureSessionAccess = SecureSessionAccess.Unknown
+    private var currentSyncIssue: SyncIssueUi? =
+        syncIssueFromLastError(initialSettings.syncConfiguration.lastError)
     private var currentImportSummary: SettingsImportSummary? = null
     private var importRunning: Boolean = false
     private var nextFeedbackEventId = 0L
 
-    var state: SettingsUiState by mutableStateOf(
-        buildState(
-            settings = initialSettings,
-            manualSyncProgress = ManualSyncProgress.idle(
-                initialSettings.syncConfiguration.mode,
-                uiStrings.syncReady,
-            ),
-        ),
-    )
+    var state: SettingsUiState by mutableStateOf(buildState(settings = initialSettings))
         private set
 
-    suspend fun refresh() {
+    fun updateLocalizedStrings(
+        settings: SettingsUiStrings,
+        notifications: OnThisDayNotificationStrings,
+        hostDeviceName: String? = null,
+    ) {
+        uiStrings = settings
+        onThisDayNotificationStrings = notifications
+        if (hostDeviceName != null) {
+            selfHostedDeviceName = hostDeviceName
+        }
+    }
+
+    suspend fun refresh() = withSettingsMutation { refreshLocked() }
+
+    private suspend fun refreshLocked() {
+        val previousSettings = state.settings
+        val previousConfiguration = previousSettings.syncConfiguration
+        val credentialsResult = runCatching {
+            withContext(backgroundDispatcher) { selfHostedSessionCredentialStore.load() }
+        }
+        val reconciledSettings = credentialsResult.fold(
+            onSuccess = { credentials ->
+                val recovered = previousSettings.copy(
+                    activeDeviceId = credentials?.deviceId ?: previousSettings.activeDeviceId,
+                    syncConfiguration = previousConfiguration.copy(
+                        mode = if (credentials != null) SyncMode.SelfHosted else previousConfiguration.mode,
+                        selfHostedEndpoint = credentials?.endpoint ?: previousConfiguration.selfHostedEndpoint,
+                        selfHostedSession = credentials?.toSummary() ?: SelfHostedSessionSummary(),
+                    ),
+                )
+                val persistenceResult = if (recovered == previousSettings) {
+                    Result.success(recovered)
+                } else {
+                    runCatching {
+                        withContext(backgroundDispatcher) { persistSettings(recovered) }
+                    }
+                }
+                persistenceResult.fold(
+                    onSuccess = { persisted ->
+                        secureSessionAccess = if (credentials == null) {
+                            SecureSessionAccess.Missing
+                        } else {
+                            SecureSessionAccess.Available
+                        }
+                        when {
+                            credentials == null &&
+                                (
+                                    previousConfiguration.selfHostedSession.loggedIn ||
+                                        !previousConfiguration.selfHostedEndpoint.isNullOrBlank()
+                                ) -> {
+                                currentSyncIssue = SyncIssueUi(SyncIssueReason.SignInRequired)
+                            }
+                            credentials != null && currentSyncIssue?.reason in setOf(
+                                SyncIssueReason.SignInRequired,
+                                SyncIssueReason.SecureSessionUnavailable,
+                            ) -> currentSyncIssue = null
+                            credentials == null &&
+                                currentSyncIssue?.reason == SyncIssueReason.SecureSessionUnavailable -> {
+                                currentSyncIssue = null
+                            }
+                        }
+                        persisted
+                    },
+                    onFailure = { failure ->
+                        failure.rethrowCancellation()
+                        secureSessionAccess = if (credentials == null) {
+                            SecureSessionAccess.Missing
+                        } else {
+                            SecureSessionAccess.Unavailable
+                        }
+                        currentSyncIssue = SyncIssueUi(
+                            if (credentials == null) {
+                                SyncIssueReason.SignInRequired
+                            } else {
+                                SyncIssueReason.SecureSessionUnavailable
+                            },
+                        )
+                        previousSettings
+                    },
+                )
+            },
+            onFailure = { failure ->
+                failure.rethrowCancellation()
+                secureSessionAccess = SecureSessionAccess.Unavailable
+                currentSyncIssue = SyncIssueUi(SyncIssueReason.SecureSessionUnavailable)
+                previousSettings
+            },
+        )
         state = buildState(
-            settings = state.settings,
+            settings = reconciledSettings,
             exportSummary = state.exportSummary,
             feedbackMessage = state.feedbackMessage,
+            feedbackSeverity = state.feedbackSeverity,
             feedbackEventId = state.feedbackEventId,
-            manualSyncProgress = state.manualSyncProgress,
         )
         rescheduleOnThisDayNotifications()
     }
@@ -137,7 +230,7 @@ class SettingsUiController(
                 settings = state.settings,
                 exportSummary = state.exportSummary,
                 feedbackMessage = onThisDayNotificationStrings.unavailable,
-                manualSyncProgress = state.manualSyncProgress,
+                feedbackSeverity = SettingsFeedbackSeverity.Error,
             )
             return false
         }
@@ -150,24 +243,26 @@ class SettingsUiController(
                     settings = state.settings,
                     exportSummary = state.exportSummary,
                     feedbackMessage = onThisDayNotificationStrings.permissionRequired,
-                    manualSyncProgress = state.manualSyncProgress,
+                    feedbackSeverity = SettingsFeedbackSeverity.Warning,
                 )
                 return false
             }
         }
-        val updatedPreferences = state.settings.onThisDayNotifications.copy(enabled = enabled)
-        val persisted = persist(
-            updated = state.settings.copy(onThisDayNotifications = updatedPreferences),
-            successMessage = if (enabled) {
-                onThisDayNotificationStrings.enabled
-            } else {
-                onThisDayNotificationStrings.disabled
-            },
-        )
-        if (persisted) {
-            syncOnThisDayNotificationSchedule(updatedPreferences)
+        return withSettingsMutation {
+            val updatedPreferences = state.settings.onThisDayNotifications.copy(enabled = enabled)
+            val persisted = persistLocked(
+                updated = state.settings.copy(onThisDayNotifications = updatedPreferences),
+                successMessage = if (enabled) {
+                    onThisDayNotificationStrings.enabled
+                } else {
+                    onThisDayNotificationStrings.disabled
+                },
+            )
+            if (persisted) {
+                syncOnThisDayNotificationSchedule(updatedPreferences)
+            }
+            persisted
         }
-        return persisted
     }
 
     suspend fun setOnThisDayNotificationTime(
@@ -182,22 +277,24 @@ class SettingsUiController(
                 settings = state.settings,
                 exportSummary = state.exportSummary,
                 feedbackMessage = onThisDayNotificationStrings.invalidTime,
-                manualSyncProgress = state.manualSyncProgress,
+                feedbackSeverity = SettingsFeedbackSeverity.Error,
             )
             return false
         }
-        val updatedPreferences = state.settings.onThisDayNotifications.copy(
-            hour = hour,
-            minute = minute,
-        )
-        val persisted = persist(
-            updated = state.settings.copy(onThisDayNotifications = updatedPreferences),
-            successMessage = onThisDayNotificationStrings.timeUpdated,
-        )
-        if (persisted) {
-            syncOnThisDayNotificationSchedule(updatedPreferences)
+        return withSettingsMutation {
+            val updatedPreferences = state.settings.onThisDayNotifications.copy(
+                hour = hour,
+                minute = minute,
+            )
+            val persisted = persistLocked(
+                updated = state.settings.copy(onThisDayNotifications = updatedPreferences),
+                successMessage = onThisDayNotificationStrings.timeUpdated,
+            )
+            if (persisted) {
+                syncOnThisDayNotificationSchedule(updatedPreferences)
+            }
+            persisted
         }
-        return persisted
     }
 
     private suspend fun syncOnThisDayNotificationSchedule(preferences: OnThisDayNotificationPreferences) {
@@ -212,338 +309,434 @@ class SettingsUiController(
     }
 
     suspend fun selectTheme(theme: ClientTheme): Boolean =
-        persist(
-            updated = state.settings.copy(theme = theme),
-            successMessage = uiStrings.themeUpdated,
-        )
+        withSettingsMutation {
+            persistLocked(
+                updated = state.settings.copy(theme = theme),
+                successMessage = uiStrings.themeUpdated,
+            )
+        }
 
     /**
      * Device-local language override. Always editable, including during workspace
      * preferences conflicts, because it is not workspace-synced.
      */
     suspend fun selectLanguage(language: AppLanguage): Boolean =
-        persist(
-            updated = state.settings.copy(appLanguage = language),
-            successMessage = uiStrings.languageUpdated,
-        )
+        withSettingsMutation {
+            persistLocked(
+                updated = state.settings.copy(appLanguage = language),
+                successMessage = uiStrings.languageUpdated,
+            )
+        }
 
     suspend fun togglePreviewByDefault(enabled: Boolean): Boolean =
-        persist(
-            updated = state.settings.copy(
-                editorPreferences = state.settings.editorPreferences.copy(previewByDefault = enabled),
-            ),
-            successMessage = uiStrings.previewUpdated,
-        )
+        withSettingsMutation {
+            persistLocked(
+                updated = state.settings.copy(
+                    editorPreferences = state.settings.editorPreferences.copy(previewByDefault = enabled),
+                ),
+                successMessage = uiStrings.previewUpdated,
+            )
+        }
 
     suspend fun toggleMarkdownToolbarVisible(enabled: Boolean): Boolean =
-        persist(
-            updated = state.settings.copy(
-                editorPreferences = state.settings.editorPreferences.copy(markdownToolbarVisible = enabled),
-            ),
-            successMessage = uiStrings.toolbarUpdated,
-        )
-
-    suspend fun selectDefaultNotebook(notebookId: String?): Boolean {
-        val validNotebookId = notebookId?.takeIf { candidate ->
-            state.defaultNotebookOptions.any { it.id == candidate }
-        }
-        if (notebookId != null && validNotebookId == null) {
-            state = buildState(
-                settings = state.settings,
-                exportSummary = state.exportSummary,
-                feedbackMessage = uiStrings.missingNotebook,
+        withSettingsMutation {
+            persistLocked(
+                updated = state.settings.copy(
+                    editorPreferences = state.settings.editorPreferences.copy(markdownToolbarVisible = enabled),
+                ),
+                successMessage = uiStrings.toolbarUpdated,
             )
-            return false
         }
 
-        return persist(
-            updated = state.settings.copy(defaultNotebookId = validNotebookId),
-            successMessage = if (validNotebookId == null) {
-                uiStrings.defaultNotebookCleared
-            } else {
-                uiStrings.defaultNotebookUpdated
-            },
-        )
-    }
-
-    suspend fun resolveWorkspacePreferencesBranch(versionId: String): Boolean {
-        val conflict = state.settings.workspacePreferencesState.conflict ?: return false
-        val resolver = workspacePreferencesConflictResolver ?: run {
-            state = buildState(
-                settings = state.settings,
-                exportSummary = state.exportSummary,
-                feedbackMessage = uiStrings.prefsConflictUnavailable,
-                manualSyncProgress = state.manualSyncProgress,
-            )
-            return false
-        }
-        return runCatching {
-            withContext(backgroundDispatcher) {
-                resolver.resolveWorkspacePreferencesBranch(
-                    conflict.conflictId,
-                    versionId,
-                    conflict.expectedHeadVersionIds,
-                )
+    suspend fun selectDefaultNotebook(notebookId: String?): Boolean =
+        withSettingsMutation {
+            val validNotebookId = notebookId?.takeIf { candidate ->
+                state.defaultNotebookOptions.any { it.id == candidate }
             }
-        }.fold(
-            onSuccess = { resolved ->
-                state = buildState(
-                    settings = resolved,
-                    exportSummary = state.exportSummary,
-                    feedbackMessage = uiStrings.prefsConflictResolved,
-                    manualSyncProgress = state.manualSyncProgress,
-                )
-                true
-            },
-            onFailure = { failure ->
+            if (notebookId != null && validNotebookId == null) {
                 state = buildState(
                     settings = state.settings,
                     exportSummary = state.exportSummary,
-                    feedbackMessage = formatUiString(uiStrings.cannotResolvePrefs, failure.message ?: uiStrings.unknownError),
-                    manualSyncProgress = state.manualSyncProgress,
+                    feedbackMessage = uiStrings.missingNotebook,
+                    feedbackSeverity = SettingsFeedbackSeverity.Error,
                 )
                 false
-            },
-        )
-    }
-
-    suspend fun recordLastSelectedNotebook(notebookId: String): Boolean {
-        if (state.settings.lastSelectedNotebookId == notebookId) {
-            return true
-        }
-        val validNotebookId = notebookId.takeIf { candidate ->
-            notebooksProvider().any { it.id == candidate }
-        } ?: return false
-
-        return runCatching {
-            withContext(backgroundDispatcher) {
-                persistSettings(state.settings.copy(lastSelectedNotebookId = validNotebookId))
-            }
-        }.fold(
-            onSuccess = { persisted ->
-                state = buildState(
-                    settings = persisted,
-                    exportSummary = state.exportSummary,
-                    feedbackMessage = state.feedbackMessage,
-                    feedbackEventId = state.feedbackEventId,
-                    manualSyncProgress = if (persisted.syncConfiguration.mode == state.manualSyncProgress.mode) {
-                        state.manualSyncProgress
+            } else {
+                persistLocked(
+                    updated = state.settings.copy(defaultNotebookId = validNotebookId),
+                    successMessage = if (validNotebookId == null) {
+                        uiStrings.defaultNotebookCleared
                     } else {
-                        ManualSyncProgress.idle(persisted.syncConfiguration.mode, uiStrings.syncReady)
+                        uiStrings.defaultNotebookUpdated
                     },
                 )
-                true
-            },
-            onFailure = { false },
-        )
-    }
-
-    suspend fun selectSyncMode(mode: SyncMode): Boolean =
-        persist(
-            updated = state.settings.copy(
-                syncConfiguration = state.settings.syncConfiguration.copy(mode = mode),
-            ),
-            successMessage = uiStrings.syncModeUpdated,
-        )
-
-    suspend fun saveSelfHostedEndpoint(endpoint: String): Boolean {
-        val normalizedEndpoint = normalizeSelfHostedEndpoint(endpoint)
-        if (!isSecureSyncEndpoint(normalizedEndpoint)) {
-            state = buildState(
-                settings = state.settings,
-                exportSummary = state.exportSummary,
-                feedbackMessage = uiStrings.selfHostedHttps,
-                manualSyncProgress = state.manualSyncProgress,
-            )
-            return false
+            }
         }
-        return persist(
-            updated = state.settings.copy(
-                syncConfiguration = state.settings.syncConfiguration.copy(
-                    mode = SyncMode.SelfHosted,
-                    selfHostedEndpoint = normalizedEndpoint,
-                ),
-            ),
-            successMessage = uiStrings.selfHostedSaved,
-        )
+
+    suspend fun resolveWorkspacePreferencesBranch(versionId: String): Boolean =
+        withSettingsMutation {
+            val conflict = state.settings.workspacePreferencesState.conflict ?: return@withSettingsMutation false
+            val resolver = workspacePreferencesConflictResolver
+            if (resolver == null) {
+                state = buildState(
+                    settings = state.settings,
+                    exportSummary = state.exportSummary,
+                    feedbackMessage = uiStrings.prefsConflictUnavailable,
+                    feedbackSeverity = SettingsFeedbackSeverity.Error,
+                )
+                false
+            } else {
+                runCatching {
+                    withContext(backgroundDispatcher) {
+                        resolver.resolveWorkspacePreferencesBranch(
+                            conflict.conflictId,
+                            versionId,
+                            conflict.expectedHeadVersionIds,
+                        )
+                    }
+                }.fold(
+                    onSuccess = { resolved ->
+                        state = buildState(
+                            settings = resolved,
+                            exportSummary = state.exportSummary,
+                            feedbackMessage = uiStrings.prefsConflictResolved,
+                            feedbackSeverity = SettingsFeedbackSeverity.Success,
+                        )
+                        true
+                    },
+                    onFailure = { failure ->
+                        failure.rethrowCancellation()
+                        state = buildState(
+                            settings = state.settings,
+                            exportSummary = state.exportSummary,
+                            feedbackMessage = formatUiString(
+                                uiStrings.cannotResolvePrefs,
+                                failure.message ?: uiStrings.unknownError,
+                            ),
+                            feedbackSeverity = SettingsFeedbackSeverity.Error,
+                        )
+                        false
+                    },
+                )
+            }
+        }
+
+    suspend fun recordLastSelectedNotebook(notebookId: String): Boolean =
+        withSettingsMutation {
+            if (state.settings.lastSelectedNotebookId == notebookId) {
+                return@withSettingsMutation true
+            }
+            val validNotebookId = notebookId.takeIf { candidate ->
+                notebooksProvider().any { it.id == candidate }
+            } ?: return@withSettingsMutation false
+
+            runCatching {
+                withContext(backgroundDispatcher) {
+                    persistSettings(state.settings.copy(lastSelectedNotebookId = validNotebookId))
+                }
+            }.fold(
+                onSuccess = { persisted ->
+                    state = buildState(
+                        settings = persisted,
+                        exportSummary = state.exportSummary,
+                        feedbackMessage = state.feedbackMessage,
+                        feedbackSeverity = state.feedbackSeverity,
+                        feedbackEventId = state.feedbackEventId,
+                    )
+                    true
+                },
+                onFailure = { failure ->
+                    failure.rethrowCancellation()
+                    false
+                },
+            )
+        }
+
+    suspend fun setupSelfHosted(
+        endpoint: String,
+        email: String,
+        password: String,
+        createAccount: Boolean,
+    ): Boolean = runExclusiveSyncLifecycle(false) {
+        setupSelfHostedLocked(endpoint, email, password, createAccount)
     }
 
-    suspend fun setupSelfHosted(input: SelfHostedSetupInput): Boolean {
-        val sanitized = input.sanitized()
+    private suspend fun setupSelfHostedLocked(
+        endpoint: String,
+        email: String,
+        password: String,
+        createAccount: Boolean,
+    ): Boolean {
+        val currentSession = state.settings.syncConfiguration.selfHostedSession
+        val sanitized = SelfHostedSetupInput(
+            endpoint = endpoint,
+            email = email,
+            password = password,
+            deviceName = currentSession.deviceName ?: hostDeviceLabel(),
+            platform = currentSession.devicePlatform ?: selfHostedDevicePlatform,
+            createAccount = createAccount,
+        ).sanitized()
         val validationErrors = sanitized.validate()
         if (validationErrors.isNotEmpty()) {
             state = buildState(
                 settings = state.settings,
                 exportSummary = state.exportSummary,
                 feedbackMessage = validationErrors.joinToString(separator = " ", transform = ::selfHostedValidationMessage),
-                manualSyncProgress = state.manualSyncProgress,
+                feedbackSeverity = SettingsFeedbackSeverity.Error,
             )
             return false
         }
 
-        val result = runCatching {
-            withContext(backgroundDispatcher) { selfHostedSetupClient.setup(sanitized) }
-        }.getOrElse { failure ->
-            SelfHostedSetupResult.failure(
-                reason = SelfHostedSetupReason.Failed,
-                diagnosticMessage = failure.message,
-            )
-        }
-        val displayMessage = selfHostedSetupMessage(result.status.reason)
-        if (!result.success || result.session == null) {
-            // Failed account/device replacement must not damage the previously
-            // bound endpoint or its usable session summary.
-            val preserved = state.settings.copy(
-                syncConfiguration = state.settings.syncConfiguration.copy(
-                    lastError = "setup:${result.status.reason.name}",
-                ),
-            )
-            persist(updated = preserved, successMessage = displayMessage)
-            return false
-        }
-        val session = checkNotNull(result.session)
-        val updatedSettings = state.settings.copy(
-            activeDeviceId = session.deviceId ?: state.settings.activeDeviceId,
-            syncConfiguration = state.settings.syncConfiguration.copy(
-                mode = SyncMode.SelfHosted,
-                selfHostedEndpoint = sanitized.endpoint,
-                selfHostedSession = session,
-                lastError = null,
-            ),
-        )
-        return persist(
-            updated = updatedSettings,
-            successMessage = displayMessage,
-        )
-    }
-
-    suspend fun clearSelfHostedSession(): Boolean {
-        runCatching {
-            withContext(backgroundDispatcher) { selfHostedSessionCredentialStore.clear() }
-        }.getOrElse { failure ->
-            state = buildState(
-                settings = state.settings,
-                exportSummary = state.exportSummary,
-                feedbackMessage = formatUiString(uiStrings.sessionRemoveFailed, failure.message ?: uiStrings.unknownError),
-                manualSyncProgress = state.manualSyncProgress,
-            )
-            return false
-        }
-        return persist(
-            updated = state.settings.copy(
-                syncConfiguration = state.settings.syncConfiguration.copy(
-                    mode = SyncMode.SelfHosted,
-                    selfHostedSession = SelfHostedSessionSummary(),
-                ),
-            ),
-            successMessage = uiStrings.sessionCleared,
-        )
-    }
-
-    fun canRunAutomaticSync(): Boolean =
-        !state.manualSyncProgress.running &&
-            state.settings.syncConfiguration.mode != SyncMode.Off &&
-            syncBlockingMessage(state.settings.syncConfiguration.mode) == null
-
-    fun beginManualSync(): Boolean =
-        beginManualSync(showFeedback = true)
-
-    private fun beginManualSync(showFeedback: Boolean): Boolean {
-        if (state.manualSyncProgress.running) {
-            return false
-        }
-        val mode = state.settings.syncConfiguration.mode
-        val blockingMessage = syncBlockingMessage(mode)
-        if (blockingMessage != null) {
-            state = buildState(
-                settings = state.settings,
-                exportSummary = state.exportSummary,
-                feedbackMessage = if (showFeedback) blockingMessage else state.feedbackMessage,
-                feedbackEventId = if (showFeedback) null else state.feedbackEventId,
-                manualSyncProgress = ManualSyncProgress.idle(mode, uiStrings.syncReady),
-            )
-            return false
+        if (currentSyncOperation != null) return false
+        currentSyncOperation = if (createAccount) {
+            SyncUiOperation.CreatingAccount
+        } else {
+            SyncUiOperation.Authenticating
         }
         state = buildState(
             settings = state.settings,
             exportSummary = state.exportSummary,
+            feedbackMessage = state.feedbackMessage,
+            feedbackSeverity = state.feedbackSeverity,
+            feedbackEventId = state.feedbackEventId,
+        )
+
+        return try {
+            val result = try {
+                withContext(backgroundDispatcher) { selfHostedSetupClient.setup(sanitized) }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Throwable) {
+                SelfHostedSetupResult.failure(
+                    reason = SelfHostedSetupReason.Failed,
+                    diagnosticMessage = failure.message,
+                )
+            }
+            val displayMessage = selfHostedSetupMessage(result.status.reason)
+            if (!result.success || result.session == null) {
+                val rejectedReplacement = currentSession.loggedIn &&
+                    result.status.reason in setOf(
+                        SelfHostedSetupReason.AccountChangeBlocked,
+                        SelfHostedSetupReason.EndpointMismatch,
+                    )
+                if (!rejectedReplacement) {
+                    currentSyncIssue = SyncIssueUi(SyncIssueReason.SetupFailed)
+                }
+                // Failed account/device replacement must not damage the previously
+                // bound endpoint or its usable session summary.
+                val preserved = state.settings.copy(
+                    syncConfiguration = state.settings.syncConfiguration.copy(
+                        lastError = if (rejectedReplacement) {
+                            state.settings.syncConfiguration.lastError
+                        } else {
+                            "setup:${result.status.reason.name}"
+                        },
+                    ),
+                )
+                persistLocked(
+                    updated = preserved,
+                    successMessage = displayMessage,
+                    successSeverity = SettingsFeedbackSeverity.Error,
+                )
+                false
+            } else {
+                val session = checkNotNull(result.session)
+                secureSessionAccess = SecureSessionAccess.Available
+                currentSyncIssue = null
+                val updatedSettings = state.settings.copy(
+                    activeDeviceId = session.deviceId ?: state.settings.activeDeviceId,
+                    syncConfiguration = state.settings.syncConfiguration.copy(
+                        mode = SyncMode.SelfHosted,
+                        selfHostedEndpoint = sanitized.endpoint,
+                        selfHostedSession = session,
+                        lastError = null,
+                    ),
+                )
+                val persisted = persistLocked(
+                    updated = updatedSettings,
+                    successMessage = displayMessage,
+                )
+                if (!persisted) {
+                    secureSessionAccess = SecureSessionAccess.Unavailable
+                    currentSyncIssue = SyncIssueUi(SyncIssueReason.SecureSessionUnavailable)
+                    publishCurrentState()
+                }
+                persisted
+            }
+        } finally {
+            currentSyncOperation = null
+            publishCurrentState()
+        }
+    }
+
+    fun canRunAutomaticSync(): Boolean =
+        !settingsMutationMutex.isLocked && canStartSync()
+
+    private fun canStartSync(): Boolean =
+        currentSyncOperation == null &&
+            state.sync.connection is SyncConnectionUi.Connected &&
+            (currentSyncIssue == null || currentSyncIssue?.action == SyncIssueAction.RetrySync)
+
+    private fun canUseWorkspacePairing(): Boolean =
+        state.sync.pairingAvailable
+
+    private fun beginSync(showFeedback: Boolean): Boolean {
+        if (currentSyncOperation != null) return false
+        val connected = state.sync.connection is SyncConnectionUi.Connected
+        val blockingIssue = currentSyncIssue
+            ?.takeUnless { it.action == SyncIssueAction.RetrySync }
+        val blockingMessage = when {
+            !connected -> uiStrings.signInBeforeSync
+            blockingIssue != null -> syncIssueMessage(blockingIssue.reason)
+            else -> null
+        }
+        if (blockingMessage != null) {
+            if (!connected && currentSyncIssue == null) {
+                currentSyncIssue = SyncIssueUi(reason = SyncIssueReason.SignInRequired)
+            }
+            state = buildState(
+                settings = state.settings,
+                exportSummary = state.exportSummary,
+                feedbackMessage = if (showFeedback) blockingMessage else state.feedbackMessage,
+                feedbackSeverity = if (showFeedback) SettingsFeedbackSeverity.Error else state.feedbackSeverity,
+                feedbackEventId = if (showFeedback) null else state.feedbackEventId,
+            )
+            return false
+        }
+        currentSyncOperation = SyncUiOperation.Syncing
+        state = buildState(
+            settings = state.settings,
+            exportSummary = state.exportSummary,
             feedbackMessage = if (showFeedback) uiStrings.syncStarted else state.feedbackMessage,
+            feedbackSeverity = if (showFeedback) SettingsFeedbackSeverity.Info else state.feedbackSeverity,
             feedbackEventId = if (showFeedback) null else state.feedbackEventId,
-            manualSyncProgress = ManualSyncProgress.inProgress(mode, uiStrings.syncInProgress),
         )
         return true
     }
 
-    suspend fun completeManualSync(result: ManualSyncResult): Boolean =
-        completeManualSync(result, showFeedback = true)
-
-    private suspend fun completeManualSync(
+    private suspend fun completeSync(
         result: ManualSyncResult,
         showFeedback: Boolean,
     ): Boolean {
-        val displayMessage = manualSyncMessage(result)
+        val displayMessage = syncResultMessage(result)
+        if (result.reason == ManualSyncReason.AlreadyRunning) {
+            state = buildState(
+                settings = state.settings,
+                exportSummary = state.exportSummary,
+                feedbackMessage = if (showFeedback) displayMessage else state.feedbackMessage,
+                feedbackSeverity = if (showFeedback) SettingsFeedbackSeverity.Info else state.feedbackSeverity,
+                feedbackEventId = if (showFeedback) null else state.feedbackEventId,
+            )
+            return false
+        }
+        currentSyncIssue = if (result.success) {
+            null
+        } else {
+            SyncIssueUi(
+                reason = syncIssueReason(result.reason),
+            )
+        }
         val updatedSettings = state.settings.copy(
             syncConfiguration = state.settings.syncConfiguration.copy(
                 lastError = if (result.success) null else "sync:${result.reason.name}",
             ),
         )
-        val persisted = runCatching {
+        val persistenceResult = runCatching {
             withContext(backgroundDispatcher) { persistSettings(updatedSettings) }
-        }.getOrElse { state.settings }
+        }
+        persistenceResult.exceptionOrNull()?.rethrowCancellation()
+        val persistenceFailure = persistenceResult.exceptionOrNull()
+        if (persistenceFailure != null && result.success) {
+            currentSyncIssue = SyncIssueUi(SyncIssueReason.SyncFailed)
+        }
         state = buildState(
-            settings = persisted,
+            settings = persistenceResult.getOrNull() ?: state.settings,
             exportSummary = state.exportSummary,
-            feedbackMessage = if (showFeedback) displayMessage else state.feedbackMessage,
-            feedbackEventId = if (showFeedback) null else state.feedbackEventId,
-            manualSyncProgress = ManualSyncProgress.fromResult(result, displayMessage),
-        )
-        // Always refresh product lists after a successful sync: first-time V2
-        // activation / join bootstrap can materialize notebooks and notes even
-        // when a later no-op pass reports zero transport deltas. Partial
-        // failures that already surfaced conflicts or pulls also need a refresh.
-        if (result.success || result.hasVisibleSyncChanges) {
-            onDataRestored()
-        }
-        return result.success
-    }
-
-    suspend fun runManualSync(): Boolean {
-        if (!beginManualSync()) {
-            return false
-        }
-        return completeManualSync(executeManualSyncRunner())
-    }
-
-    private suspend fun executeManualSyncRunner(): ManualSyncResult {
-        val mode = state.settings.syncConfiguration.mode
-        return runCatching {
-            coroutineScope {
-                bindManualSyncProgressListener(
-                    ManualSyncProgressListener { phase ->
-                        val message = formatManualSyncPhase(phase)
-                        launch(uiDispatcher) {
-                            if (state.manualSyncProgress.running &&
-                                state.manualSyncProgress.mode == mode
-                            ) {
-                                state = buildState(
-                                    settings = state.settings,
-                                    exportSummary = state.exportSummary,
-                                    feedbackMessage = state.feedbackMessage,
-                                    feedbackEventId = state.feedbackEventId,
-                                    manualSyncProgress = ManualSyncProgress.inProgress(mode, message),
-                                )
-                            }
-                        }
-                    },
+            feedbackMessage = when {
+                persistenceFailure != null -> formatUiString(
+                    uiStrings.settingsSaveFailed,
+                    persistenceFailure.message ?: uiStrings.unknownError,
                 )
-                try {
-                    withContext(backgroundDispatcher) { manualSyncRunner.run() }
-                } finally {
-                    bindManualSyncProgressListener(null)
+                showFeedback -> displayMessage
+                else -> state.feedbackMessage
+            },
+            feedbackSeverity = when {
+                persistenceFailure != null -> SettingsFeedbackSeverity.Error
+                showFeedback && result.success -> SettingsFeedbackSeverity.Success
+                showFeedback -> SettingsFeedbackSeverity.Error
+                else -> state.feedbackSeverity
+            },
+            feedbackEventId = if (showFeedback || persistenceFailure != null) null else state.feedbackEventId,
+        )
+        return result.success && persistenceFailure == null
+    }
+
+    suspend fun runUserSync(): Boolean = runSync(userInitiated = true)
+
+    suspend fun runAutomaticSync(): Boolean = runSync(userInitiated = false)
+
+    suspend fun recoverSyncIssue(): Boolean =
+        when (currentSyncIssue?.action) {
+            SyncIssueAction.RetrySync -> runUserSync()
+            SyncIssueAction.ReloadSession -> {
+                if (currentSyncOperation != null) {
+                    false
+                } else {
+                    runExclusiveSyncLifecycle(false) {
+                        currentSyncOperation = SyncUiOperation.ReloadingSession
+                        publishCurrentState()
+                        try {
+                            refreshLocked()
+                            currentSyncIssue?.reason != SyncIssueReason.SecureSessionUnavailable
+                        } finally {
+                            currentSyncOperation = null
+                            publishCurrentState()
+                        }
+                    }
                 }
             }
+            SyncIssueAction.Reauthenticate,
+            null,
+            -> false
+        }
+
+    private suspend fun runSync(userInitiated: Boolean): Boolean {
+        val completion = runExclusiveSyncLifecycle(SyncCompletion()) {
+            runSyncLocked(userInitiated)
+        }
+        if (completion.refreshProductData) {
+            onDataRestored()
+        }
+        return completion.success
+    }
+
+    private suspend fun runSyncLocked(userInitiated: Boolean): SyncCompletion {
+        if (!userInitiated && !canStartSync()) return SyncCompletion()
+        if (!beginSync(showFeedback = userInitiated)) return SyncCompletion()
+        return try {
+            val result = executeSyncRunner()
+            val shouldShowFeedback = userInitiated || !result.success
+            SyncCompletion(
+                success = completeSync(result, showFeedback = shouldShowFeedback),
+                // First-time activation can materialize product data even when
+                // a later transport pass reports zero deltas. Partial failures
+                // with pulls or conflicts also need a product refresh.
+                refreshProductData = result.success || result.hasVisibleSyncChanges,
+            )
+        } finally {
+            if (currentSyncOperation == SyncUiOperation.Syncing) {
+                currentSyncOperation = null
+                publishCurrentState()
+            }
+        }
+    }
+
+    private suspend fun executeSyncRunner(): ManualSyncResult {
+        val mode = state.settings.syncConfiguration.mode
+        return runCatching {
+            withContext(backgroundDispatcher) { manualSyncRunner.run() }
         }.getOrElse { failure ->
-            bindManualSyncProgressListener(null)
+            failure.rethrowCancellation()
             ManualSyncResult.failure(
                 mode = mode,
                 reason = ManualSyncReason.Failed,
@@ -551,29 +744,6 @@ class SettingsUiController(
             )
         }
     }
-
-    suspend fun runAutomaticSync(): Boolean {
-        if (!canRunAutomaticSync() || !beginManualSync(showFeedback = false)) {
-            return false
-        }
-        val result = executeManualSyncRunner()
-        val shouldShowFeedback = !result.success || result.pulledObjects > 0 || result.conflicts > 0
-        return completeManualSync(result, showFeedback = shouldShowFeedback)
-    }
-
-    suspend fun recordSyncError(error: String?): Boolean =
-        persist(
-            updated = state.settings.copy(
-                syncConfiguration = state.settings.syncConfiguration.copy(
-                    lastError = error?.takeIf { it.isNotBlank() },
-                ),
-            ),
-            successMessage = if (error.isNullOrBlank()) {
-                uiStrings.syncStatusCleared
-            } else {
-                uiStrings.syncStatusUpdated
-            },
-        )
 
     suspend fun runLocalExport(): Boolean =
         runCatching {
@@ -588,16 +758,17 @@ class SettingsUiController(
                     } else {
                         formatUiString(uiStrings.exportSaved, summary.notebookCount, summary.noteCount)
                     },
-                    manualSyncProgress = state.manualSyncProgress,
+                    feedbackSeverity = SettingsFeedbackSeverity.Success,
                 )
                 true
             },
             onFailure = { failure ->
+                failure.rethrowCancellation()
                 state = buildState(
                     settings = state.settings,
                     exportSummary = state.exportSummary,
                     feedbackMessage = formatUiString(uiStrings.exportFailed, failure.message ?: uiStrings.unknownError),
-                    manualSyncProgress = state.manualSyncProgress,
+                    feedbackSeverity = SettingsFeedbackSeverity.Error,
                 )
                 false
             },
@@ -612,7 +783,6 @@ class SettingsUiController(
             settings = state.settings,
             exportSummary = state.exportSummary,
             feedbackMessage = uiStrings.chooseDayOne,
-            manualSyncProgress = state.manualSyncProgress,
         )
         return runCatching {
             dayOneImportRunner.start { summary ->
@@ -622,7 +792,11 @@ class SettingsUiController(
                     settings = state.settings,
                     exportSummary = state.exportSummary,
                     feedbackMessage = summary.message,
-                    manualSyncProgress = state.manualSyncProgress,
+                    feedbackSeverity = if (summary.success) {
+                        SettingsFeedbackSeverity.Success
+                    } else {
+                        SettingsFeedbackSeverity.Error
+                    },
                 )
                 if (summary.success) {
                     onDataRestored()
@@ -641,51 +815,79 @@ class SettingsUiController(
                     settings = state.settings,
                     exportSummary = state.exportSummary,
                     feedbackMessage = summary.message,
-                    manualSyncProgress = state.manualSyncProgress,
+                    feedbackSeverity = SettingsFeedbackSeverity.Error,
                 )
                 false
             },
         )
     }
 
-    suspend fun createWorkspacePairingInvitation(): Boolean {
-        val result = runCatching {
-            withContext(backgroundDispatcher) { workspacePairingInvitationCreator.createInvitation() }
-        }.getOrElse {
-            WorkspacePairingInvitationResult.failure(WorkspacePairingReason.Failed)
+    suspend fun createWorkspacePairingInvitation(): Boolean =
+        runExclusiveSyncLifecycle(false) { createWorkspacePairingInvitationLocked() }
+
+    private suspend fun createWorkspacePairingInvitationLocked(): Boolean {
+        if (!canUseWorkspacePairing()) return false
+        if (currentSyncOperation != null) return false
+        currentSyncOperation = SyncUiOperation.CreatingInvitation
+        publishCurrentState()
+        return try {
+            val result = try {
+                withContext(backgroundDispatcher) { workspacePairingInvitationCreator.createInvitation() }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Throwable) {
+                WorkspacePairingInvitationResult.failure(WorkspacePairingReason.Failed)
+            }
+            currentWorkspacePairingInvitation = result.invitation?.let(::WorkspacePairingInvitationUi)
+            state = buildState(
+                settings = state.settings,
+                exportSummary = state.exportSummary,
+                feedbackMessage = workspacePairingMessage(result.reason, invitationOperation = true),
+                feedbackSeverity = if (result.success) SettingsFeedbackSeverity.Success else SettingsFeedbackSeverity.Error,
+            )
+            result.success
+        } finally {
+            currentSyncOperation = null
+            publishCurrentState()
         }
-        currentWorkspacePairingInvitation = result.invitation?.let(::WorkspacePairingInvitationUi)
-        state = buildState(
-            settings = state.settings,
-            exportSummary = state.exportSummary,
-            feedbackMessage = workspacePairingMessage(result.reason, invitationOperation = true),
-            manualSyncProgress = state.manualSyncProgress,
-        )
-        return result.success
     }
 
-    suspend fun cancelWorkspacePairingInvitation(): Boolean {
+    suspend fun cancelWorkspacePairingInvitation(): Boolean =
+        runExclusiveSyncLifecycle(false) { cancelWorkspacePairingInvitationLocked() }
+
+    private suspend fun cancelWorkspacePairingInvitationLocked(): Boolean {
         val invitation = currentWorkspacePairingInvitation?.domainInvitation()
         if (invitation == null) {
             return true
         }
-        val result = runCatching {
-            withContext(backgroundDispatcher) {
-                workspacePairingInvitationCanceller.cancelInvitation(invitation)
+        if (!canUseWorkspacePairing()) return false
+        if (currentSyncOperation != null) return false
+        currentSyncOperation = SyncUiOperation.CancellingInvitation
+        publishCurrentState()
+        return try {
+            val result = try {
+                withContext(backgroundDispatcher) {
+                    workspacePairingInvitationCanceller.cancelInvitation(invitation)
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Throwable) {
+                WorkspaceJoinResult.failure(WorkspacePairingReason.Failed)
             }
-        }.getOrElse {
-            WorkspaceJoinResult.failure(WorkspacePairingReason.Failed)
+            if (result.success) {
+                currentWorkspacePairingInvitation = null
+            }
+            state = buildState(
+                settings = state.settings,
+                exportSummary = state.exportSummary,
+                feedbackMessage = workspacePairingMessage(result.reason),
+                feedbackSeverity = if (result.success) SettingsFeedbackSeverity.Success else SettingsFeedbackSeverity.Error,
+            )
+            result.success
+        } finally {
+            currentSyncOperation = null
+            publishCurrentState()
         }
-        if (result.success) {
-            currentWorkspacePairingInvitation = null
-        }
-        state = buildState(
-            settings = state.settings,
-            exportSummary = state.exportSummary,
-            feedbackMessage = workspacePairingMessage(result.reason),
-            manualSyncProgress = state.manualSyncProgress,
-        )
-        return result.success
     }
 
     fun discardWorkspacePairingInvitationAtExpiry(expiresAtEpochMillis: Long) {
@@ -700,55 +902,88 @@ class SettingsUiController(
             settings = state.settings,
             exportSummary = state.exportSummary,
             feedbackMessage = state.feedbackMessage,
+            feedbackSeverity = state.feedbackSeverity,
             feedbackEventId = state.feedbackEventId,
-            manualSyncProgress = state.manualSyncProgress,
         )
     }
 
     suspend fun joinWorkspaceWithToken(tokenInput: String): Boolean {
+        val completion = runExclusiveSyncLifecycle(WorkspaceJoinCompletion()) {
+            joinWorkspaceWithTokenLocked(tokenInput)
+        }
+        if (completion.refreshProductData) {
+            onDataRestored()
+        }
+        return completion.joined
+    }
+
+    private suspend fun joinWorkspaceWithTokenLocked(tokenInput: String): WorkspaceJoinCompletion {
         if (tokenInput.isBlank()) {
             state = buildState(
                 settings = state.settings,
                 exportSummary = state.exportSummary,
                 feedbackMessage = uiStrings.enterPairingToken,
-                manualSyncProgress = state.manualSyncProgress,
+                feedbackSeverity = SettingsFeedbackSeverity.Warning,
             )
-            return false
+            return WorkspaceJoinCompletion()
         }
-        val result = runCatching {
-            withContext(backgroundDispatcher) {
-                workspacePairingInvitationJoiner.joinWithToken(tokenInput)
+        if (!canUseWorkspacePairing()) return WorkspaceJoinCompletion()
+        if (currentSyncOperation != null) return WorkspaceJoinCompletion()
+        currentSyncOperation = SyncUiOperation.JoiningInvitation
+        publishCurrentState()
+        return try {
+            val result = try {
+                withContext(backgroundDispatcher) {
+                    workspacePairingInvitationJoiner.joinWithToken(tokenInput)
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Throwable) {
+                WorkspaceJoinResult.failure(WorkspacePairingReason.Failed)
             }
-        }.getOrElse {
-            WorkspaceJoinResult.failure(WorkspacePairingReason.Failed)
+            if (result.success) {
+                currentWorkspacePairingInvitation = null
+                currentSyncIssue = null
+                // Prior sync failures (wrong first-run key against a remote epoch)
+                // are stale after a successful join package restore.
+                val cleared = state.settings.copy(
+                    syncConfiguration = state.settings.syncConfiguration.copy(
+                        lastError = null,
+                    ),
+                )
+                val persisted = runCatching {
+                    withContext(backgroundDispatcher) { persistSettings(cleared) }
+                }.getOrElse { failure ->
+                    failure.rethrowCancellation()
+                    cleared
+                }
+                state = buildState(
+                    settings = persisted,
+                    exportSummary = state.exportSummary,
+                    feedbackMessage = workspacePairingMessage(result.reason),
+                    feedbackSeverity = SettingsFeedbackSeverity.Success,
+                )
+                currentSyncOperation = SyncUiOperation.Syncing
+                publishCurrentState()
+                val syncResult = executeSyncRunner()
+                completeSync(syncResult, showFeedback = !syncResult.success)
+                WorkspaceJoinCompletion(
+                    joined = true,
+                    refreshProductData = syncResult.success || syncResult.hasVisibleSyncChanges,
+                )
+            } else {
+                state = buildState(
+                    settings = state.settings,
+                    exportSummary = state.exportSummary,
+                    feedbackMessage = workspacePairingMessage(result.reason),
+                    feedbackSeverity = SettingsFeedbackSeverity.Error,
+                )
+                WorkspaceJoinCompletion()
+            }
+        } finally {
+            currentSyncOperation = null
+            publishCurrentState()
         }
-        if (result.success) {
-            currentWorkspacePairingInvitation = null
-            // Prior sync failures (wrong first-run key against a remote epoch)
-            // are stale after a successful join package restore.
-            val cleared = state.settings.copy(
-                syncConfiguration = state.settings.syncConfiguration.copy(
-                    lastError = null,
-                ),
-            )
-            val persisted = runCatching {
-                withContext(backgroundDispatcher) { persistSettings(cleared) }
-            }.getOrElse { cleared }
-            state = buildState(
-                settings = persisted,
-                exportSummary = state.exportSummary,
-                feedbackMessage = workspacePairingMessage(result.reason),
-                manualSyncProgress = state.manualSyncProgress,
-            )
-            return true
-        }
-        state = buildState(
-            settings = state.settings,
-            exportSummary = state.exportSummary,
-            feedbackMessage = workspacePairingMessage(result.reason),
-            manualSyncProgress = state.manualSyncProgress,
-        )
-        return false
     }
 
     private fun selfHostedValidationMessage(issue: SelfHostedSetupValidationIssue): String =
@@ -761,6 +996,14 @@ class SettingsUiController(
             SelfHostedSetupValidationIssue.DeviceNameRequired -> uiStrings.selfHostedDeviceNameRequired
             SelfHostedSetupValidationIssue.PlatformRequired -> uiStrings.selfHostedPlatformRequired
         }
+
+    private fun hostDeviceLabel(): String {
+        val stableSuffix = state.settings.activeDeviceId
+            .trim()
+            .takeUnless { it.isBlank() || it == ClientSettings.DefaultActiveDeviceId }
+            ?.takeLast(6)
+        return stableSuffix?.let { "$selfHostedDeviceName · $it" } ?: selfHostedDeviceName
+    }
 
     private fun selfHostedSetupMessage(reason: SelfHostedSetupReason): String =
         when (reason) {
@@ -776,20 +1019,10 @@ class SettingsUiController(
             -> uiStrings.selfHostedSetupFailed
         }
 
-    private fun manualSyncMessage(result: ManualSyncResult): String =
+    private fun syncResultMessage(result: ManualSyncResult): String =
         when (result.reason) {
-            ManualSyncReason.Completed -> formatUiString(
-                uiStrings.syncCompleted,
-                result.pushedObjects,
-                result.pulledObjects,
-                result.conflicts,
-            )
-            ManualSyncReason.Initialized -> formatUiString(
-                uiStrings.syncInitialized,
-                result.pushedObjects,
-                result.pulledObjects,
-                result.conflicts,
-            )
+            ManualSyncReason.Completed -> uiStrings.syncCompleted
+            ManualSyncReason.Initialized -> uiStrings.syncInitialized
             ManualSyncReason.Disabled -> uiStrings.syncDisabled
             ManualSyncReason.Unavailable -> uiStrings.syncUnavailable
             ManualSyncReason.AlreadyRunning -> uiStrings.syncAlreadyRunning
@@ -799,9 +1032,43 @@ class SettingsUiController(
             ManualSyncReason.RemoteHistoryConflict -> uiStrings.syncRemoteHistoryConflict
             ManualSyncReason.RetryRequired -> uiStrings.syncRetryRequired
             ManualSyncReason.Blocked -> uiStrings.syncBlocked
-            ManualSyncReason.CheckpointInvalid,
+            ManualSyncReason.CheckpointInvalid -> uiStrings.syncCheckpointInvalid
+            ManualSyncReason.Failed -> uiStrings.syncFailed
+        }
+
+    private fun syncIssueReason(reason: ManualSyncReason): SyncIssueReason =
+        when (reason) {
+            ManualSyncReason.AuthorityMismatch -> SyncIssueReason.AuthorityMismatch
+            ManualSyncReason.WorkspaceLocked -> SyncIssueReason.WorkspaceLocked
+            ManualSyncReason.RemoteHistoryConflict -> SyncIssueReason.RemoteHistoryConflict
+            ManualSyncReason.CheckpointInvalid -> SyncIssueReason.CheckpointInvalid
+            ManualSyncReason.RetryRequired -> SyncIssueReason.RetryRequired
+            ManualSyncReason.Blocked -> SyncIssueReason.Blocked
+            ManualSyncReason.Disabled,
+            ManualSyncReason.Unavailable,
+            -> SyncIssueReason.SyncUnavailable
+            ManualSyncReason.ProviderChanged -> SyncIssueReason.ConfigurationChanged
+            ManualSyncReason.Completed,
+            ManualSyncReason.Initialized,
+            ManualSyncReason.AlreadyRunning,
             ManualSyncReason.Failed,
-            -> uiStrings.syncFailed
+            -> SyncIssueReason.SyncFailed
+        }
+
+    private fun syncIssueMessage(reason: SyncIssueReason): String =
+        when (reason) {
+            SyncIssueReason.SignInRequired -> uiStrings.signInBeforeSync
+            SyncIssueReason.SecureSessionUnavailable -> uiStrings.secureSessionUnavailable
+            SyncIssueReason.SetupFailed -> uiStrings.selfHostedSetupFailed
+            SyncIssueReason.ConfigurationChanged -> uiStrings.syncConfigurationChanged
+            SyncIssueReason.SyncUnavailable -> uiStrings.syncUnavailable
+            SyncIssueReason.AuthorityMismatch -> uiStrings.syncAuthorityMismatch
+            SyncIssueReason.WorkspaceLocked -> uiStrings.syncWorkspaceLocked
+            SyncIssueReason.RemoteHistoryConflict -> uiStrings.syncRemoteHistoryConflict
+            SyncIssueReason.CheckpointInvalid -> uiStrings.syncCheckpointInvalid
+            SyncIssueReason.RetryRequired -> uiStrings.syncRetryRequired
+            SyncIssueReason.Blocked -> uiStrings.syncBlocked
+            SyncIssueReason.SyncFailed -> uiStrings.syncFailed
         }
 
     private fun workspacePairingMessage(
@@ -833,36 +1100,42 @@ class SettingsUiController(
             -> if (invitationOperation) uiStrings.pairingInvitationFailed else uiStrings.pairingFailed
         }
 
-    private fun syncBlockingMessage(mode: SyncMode): String? =
-        when (mode) {
-            SyncMode.SelfHosted -> if (state.settings.syncConfiguration.selfHostedSession.loggedIn) {
-                null
-            } else {
-                uiStrings.signInBeforeSync
-            }
-            SyncMode.Off -> uiStrings.signInBeforeSync
-        }
+    private fun publishCurrentState() {
+        state = buildState(
+            settings = state.settings,
+            exportSummary = state.exportSummary,
+            feedbackMessage = state.feedbackMessage,
+            feedbackSeverity = state.feedbackSeverity,
+            feedbackEventId = state.feedbackEventId,
+        )
+    }
 
-    private fun formatManualSyncPhase(phase: ManualSyncPhase): String =
-        when (phase) {
-            is ManualSyncPhase.UploadingChunks ->
-                if (phase.total <= 0) {
-                    uiStrings.syncUploadingCheckpoint
-                } else {
-                    formatUiString(
-                        uiStrings.syncUploadingCheckpointChunks,
-                        phase.completed.toString(),
-                        phase.total.toString(),
-                    )
-                }
-            ManualSyncPhase.UploadingManifest -> uiStrings.syncUploadingManifest
-            ManualSyncPhase.VerifyingRemote -> uiStrings.syncVerifyingRemote
-            ManualSyncPhase.CommittingPointer -> uiStrings.syncCommittingEpoch
+    private suspend fun <T> runExclusiveSyncLifecycle(
+        unavailable: T,
+        block: suspend () -> T,
+    ): T {
+        if (!settingsMutationMutex.tryLock()) return unavailable
+        return try {
+            block()
+        } finally {
+            settingsMutationMutex.unlock()
         }
+    }
 
-    private suspend fun persist(
+    private suspend fun <T> withSettingsMutation(block: suspend () -> T): T {
+        settingsMutationMutex.lock()
+        return try {
+            block()
+        } finally {
+            settingsMutationMutex.unlock()
+        }
+    }
+
+    /** Caller must hold [settingsMutationMutex]. */
+    private suspend fun persistLocked(
         updated: ClientSettings,
         successMessage: String,
+        successSeverity: SettingsFeedbackSeverity = SettingsFeedbackSeverity.Success,
     ): Boolean =
         runCatching {
             withContext(backgroundDispatcher) { persistSettings(updated) }
@@ -872,20 +1145,17 @@ class SettingsUiController(
                     settings = persisted,
                     exportSummary = state.exportSummary,
                     feedbackMessage = successMessage,
-                    manualSyncProgress = if (persisted.syncConfiguration.mode == state.manualSyncProgress.mode) {
-                        state.manualSyncProgress
-                    } else {
-                        ManualSyncProgress.idle(persisted.syncConfiguration.mode, uiStrings.syncReady)
-                    },
+                    feedbackSeverity = successSeverity,
                 )
                 true
             },
             onFailure = { failure ->
+                failure.rethrowCancellation()
                 state = buildState(
                     settings = state.settings,
                     exportSummary = state.exportSummary,
                     feedbackMessage = formatUiString(uiStrings.settingsSaveFailed, failure.message ?: uiStrings.unknownError),
-                    manualSyncProgress = state.manualSyncProgress,
+                    feedbackSeverity = SettingsFeedbackSeverity.Error,
                 )
                 false
             },
@@ -895,15 +1165,15 @@ class SettingsUiController(
         settings: ClientSettings,
         exportSummary: SettingsExportSummary? = null,
         feedbackMessage: String? = null,
+        feedbackSeverity: SettingsFeedbackSeverity = SettingsFeedbackSeverity.Info,
         feedbackEventId: Long? = null,
-        manualSyncProgress: ManualSyncProgress = ManualSyncProgress.idle(
-            settings.syncConfiguration.mode,
-            uiStrings.syncReady,
-        ),
-    ): SettingsUiState =
-        SettingsUiState(
+    ): SettingsUiState {
+        val syncConfiguration = settings.syncConfiguration
+        val session = syncConfiguration.selfHostedSession
+        val visibleInvitation = currentWorkspacePairingInvitation
+            ?.takeIf { it.expiresAtEpochMillis > currentEpochMillis() }
+        return SettingsUiState(
             settings = settings,
-            sections = requiredSettingsSections(settings),
             defaultNotebookOptions = notebooksProvider().map { notebook ->
                 DefaultNotebookOption(
                     id = notebook.id,
@@ -915,31 +1185,95 @@ class SettingsUiController(
             importSummary = currentImportSummary,
             importRunning = importRunning,
             feedbackMessage = feedbackMessage,
+            feedbackSeverity = feedbackSeverity,
             feedbackEventId = when {
                 feedbackMessage == null -> 0L
                 feedbackEventId != null -> feedbackEventId
                 else -> ++nextFeedbackEventId
             },
-            manualSyncProgress = manualSyncProgress,
-            workspacePairingInvitation = currentWorkspacePairingInvitation
-                ?.takeIf { it.expiresAtEpochMillis > currentEpochMillis() },
+            sync = SyncUiState(
+                connection = when {
+                    secureSessionAccess == SecureSessionAccess.Unavailable && session.loggedIn -> SyncConnectionUi.Unavailable(
+                        configuredEndpoint = syncConfiguration.selfHostedEndpoint,
+                        accountEmail = session.userEmail,
+                        deviceLabel = session.deviceLabel,
+                    )
+                    secureSessionAccess != SecureSessionAccess.Missing &&
+                        session.loggedIn &&
+                        syncConfiguration.mode == SyncMode.SelfHosted -> SyncConnectionUi.Connected(
+                        endpoint = syncConfiguration.selfHostedEndpoint,
+                        accountEmail = session.userEmail,
+                        deviceLabel = session.deviceLabel,
+                    )
+                    else -> SyncConnectionUi.LocalOnly(syncConfiguration.selfHostedEndpoint)
+                },
+                operation = currentSyncOperation,
+                issue = currentSyncIssue,
+                invitation = visibleInvitation,
+            ),
         )
+    }
 }
+
+private enum class SecureSessionAccess {
+    Unknown,
+    Available,
+    Missing,
+    Unavailable,
+}
+
+private data class SyncCompletion(
+    val success: Boolean = false,
+    val refreshProductData: Boolean = false,
+)
+
+private data class WorkspaceJoinCompletion(
+    val joined: Boolean = false,
+    val refreshProductData: Boolean = false,
+)
 
 private val ManualSyncResult.hasVisibleSyncChanges: Boolean
     get() = pushedObjects > 0 || pulledObjects > 0 || conflicts > 0
 
+private fun Throwable.rethrowCancellation() {
+    if (this is CancellationException) throw this
+}
+
+private fun syncIssueFromLastError(lastError: String?): SyncIssueUi? {
+    val marker = lastError?.substringAfter(':', missingDelimiterValue = "")
+        ?.takeIf(String::isNotBlank)
+        ?: return null
+    val reason = if (lastError.startsWith("setup:")) {
+        SyncIssueReason.SetupFailed
+    } else {
+        when (marker) {
+            ManualSyncReason.AuthorityMismatch.name -> SyncIssueReason.AuthorityMismatch
+            ManualSyncReason.WorkspaceLocked.name -> SyncIssueReason.WorkspaceLocked
+            ManualSyncReason.RemoteHistoryConflict.name -> SyncIssueReason.RemoteHistoryConflict
+            ManualSyncReason.CheckpointInvalid.name -> SyncIssueReason.CheckpointInvalid
+            ManualSyncReason.RetryRequired.name -> SyncIssueReason.RetryRequired
+            ManualSyncReason.Blocked.name -> SyncIssueReason.Blocked
+            ManualSyncReason.Disabled.name,
+            ManualSyncReason.Unavailable.name,
+            -> SyncIssueReason.SyncUnavailable
+            ManualSyncReason.ProviderChanged.name -> SyncIssueReason.ConfigurationChanged
+            ManualSyncReason.AlreadyRunning.name -> return null
+            else -> SyncIssueReason.SyncFailed
+        }
+    }
+    return SyncIssueUi(reason)
+}
+
 data class SettingsUiState(
     val settings: ClientSettings,
-    val sections: List<SettingsSectionUi>,
     val defaultNotebookOptions: List<DefaultNotebookOption>,
-    val manualSyncProgress: ManualSyncProgress,
+    val sync: SyncUiState,
     val exportSummary: SettingsExportSummary? = null,
     val importSummary: SettingsImportSummary? = null,
     val importRunning: Boolean = false,
     val feedbackMessage: String? = null,
+    val feedbackSeverity: SettingsFeedbackSeverity = SettingsFeedbackSeverity.Info,
     val feedbackEventId: Long = 0L,
-    val workspacePairingInvitation: WorkspacePairingInvitationUi? = null,
 ) {
     val selectedDefaultNotebookTitle: String? =
         defaultNotebookOptions.firstOrNull { it.selected }?.title
@@ -957,12 +1291,6 @@ class WorkspacePairingInvitationUi(
     override fun toString(): String =
         "WorkspacePairingInvitationUi(expiresAtEpochMillis=$expiresAtEpochMillis, token=<redacted>)"
 }
-
-data class SettingsSectionUi(
-    val title: String,
-    val description: String,
-    val entryPoints: List<String>,
-)
 
 data class DefaultNotebookOption(
     val id: String,
@@ -1053,101 +1381,3 @@ fun resolveAppliedTheme(
         ClientTheme.Light -> AppliedTheme.Light
         ClientTheme.Dark -> AppliedTheme.Dark
     }
-
-fun settingsCapabilityLog(): String =
-    "settings-sections=sync-mode-account|self-hosted-device-management|device-pairing|" +
-        "editor-preferences|theme-default-notebook|sync-status-last-error|import-export-entry-points " +
-        "self-hosted=endpoint|login-register|device-session|manual-sync-progress|tokens-redacted " +
-        "workspace-pairing=one-use-invitation|qr-or-token|redacted-logs " +
-        "theme=system|light|dark default-notebook=add-target-unless-overridden " +
-        "import=day-one-json-zip|dag-only export=notes-notebooks|dag-only|excludes-media-bytes|" +
-        "asset-references-may-be-unresolved|excludes-raw-keys-tokens-passwords-recovery-material"
-
-private fun requiredSettingsSections(settings: ClientSettings): List<SettingsSectionUi> {
-    val selfHostedSession = settings.syncConfiguration.selfHostedSession
-    return listOf(
-        SettingsSectionUi(
-            title = "Sync mode/account",
-            description = "Enable or disable self-hosted sync without blocking local-first note editing.",
-            entryPoints = listOf(
-                "Current mode: ${settings.syncConfiguration.mode.name}",
-                "Account/session entry point",
-            ),
-        ),
-        SettingsSectionUi(
-            title = "Self-hosted device management",
-            description = "Configure self-hosted endpoint, account session, current device identity, and manual sync without plaintext note data.",
-            entryPoints = listOf(
-                "Endpoint: ${settings.syncConfiguration.selfHostedEndpoint ?: "not configured"}",
-                if (selfHostedSession.loggedIn && selfHostedSession.userEmail != null) {
-                    "Logged in as ${selfHostedSession.userEmail}"
-                } else {
-                    "Logged out"
-                },
-                "Active self-hosted device: ${selfHostedSession.deviceId ?: settings.activeDeviceId}",
-                "Device label: ${selfHostedSession.deviceLabel}",
-                "Register or log in and register this device",
-                "Device management entry",
-                "Manual sync now with progress and error state",
-                "Plaintext note data: not shown",
-            ),
-        ),
-        SettingsSectionUi(
-            title = "Device pairing",
-            description = "Pair through the configured self-hosted service without exposing workspace secrets to the remote.",
-            entryPoints = listOf(
-                "Create a one-use workspace pairing invitation",
-                "Join a workspace with a QR scan or high-entropy token before syncing",
-                "Pairing messages must not log raw tokens",
-            ),
-        ),
-        SettingsSectionUi(
-            title = "Editor preferences",
-            description = "Control Markdown preview and toolbar assistance defaults.",
-            entryPoints = listOf(
-                "Preview by default: ${settings.editorPreferences.previewByDefault}",
-                "Markdown toolbar visible: ${settings.editorPreferences.markdownToolbarVisible}",
-            ),
-        ),
-        SettingsSectionUi(
-            title = "Theme/default notebook",
-            description = "Theme applies across primary tabs; default notebook controls the persistent add-note target unless a notebook is selected.",
-            entryPoints = listOf(
-                "Theme: ${settings.theme.name}",
-                "Default notebook: ${settings.defaultNotebookId ?: "selected notebook context"}",
-            ),
-        ),
-        SettingsSectionUi(
-            title = "Sync status/last error",
-            description = "Show sync readiness, active mode, manual sync progress, and the most recent issue.",
-            entryPoints = listOf(
-                "Current mode: ${settings.syncConfiguration.mode.name}",
-                "Manual sync trigger available for self-hosted mode",
-                if (settings.syncConfiguration.lastError == null) {
-                    "Last error: none"
-                } else {
-                    "Last error: recorded without exposing diagnostics"
-                },
-            ),
-        ),
-        SettingsSectionUi(
-            title = "Import external journals",
-            description = "Import notes from supported journal apps while preserving source dates, time zones, and supported location metadata.",
-            entryPoints = listOf(
-                "Day One JSON zip import",
-                "Rich text converted to Markdown",
-                "Unsupported media remains as references",
-            ),
-        ),
-        SettingsSectionUi(
-            title = "Export local data",
-            description =
-                "Export local note Markdown and notebooks as Someday JSON. " +
-                    "Image bytes and secrets are excluded, so this is not a complete media backup.",
-            entryPoints = listOf(
-                "Export local data",
-                "Image bytes and secrets excluded by default",
-            ),
-        ),
-    )
-}

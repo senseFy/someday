@@ -46,7 +46,6 @@ fun rememberNotesUiStrings(): NotesUiStrings {
     val batchNotebookUnavailable = stringResource(Res.string.notes_fb_batch_notebook_unavailable)
     val invalidTimeZone = stringResource(Res.string.notes_fb_invalid_timezone)
     val saveBeforeHistory = stringResource(Res.string.notes_fb_save_before_history)
-    val conflictResolvedAction = stringResource(Res.string.notes_fb_conflict_resolved_action)
     val conflictResolvedBranch = stringResource(Res.string.notes_fb_conflict_resolved_branch)
     val cannotResolveConflict = stringResource(Res.string.notes_fb_cannot_resolve_conflict)
     val saveBeforeRestore = stringResource(Res.string.notes_fb_save_before_restore)
@@ -70,10 +69,6 @@ fun rememberNotesUiStrings(): NotesUiStrings {
     val capturedIso = stringResource(Res.string.notes_fb_captured_iso)
     val metaRequiresCoords = stringResource(Res.string.notes_fb_meta_requires_coords)
     val unknownError = stringResource(Res.string.common_unknown_error)
-    val conflictActionMerge = stringResource(Res.string.conflict_action_merge)
-    val conflictActionKeepCopy = stringResource(Res.string.conflict_action_keep_copy)
-    val conflictActionRestoreOriginal = stringResource(Res.string.conflict_action_restore_original)
-    val conflictActionDeleteCopy = stringResource(Res.string.conflict_action_delete_copy)
     return NotesUiStrings(
             conflictWaiting = conflictWaiting,
             noteNoLongerExists = noteNoLongerExists,
@@ -113,7 +108,6 @@ fun rememberNotesUiStrings(): NotesUiStrings {
             batchNotebookUnavailable = batchNotebookUnavailable,
             invalidTimeZone = invalidTimeZone,
             saveBeforeHistory = saveBeforeHistory,
-            conflictResolvedAction = conflictResolvedAction,
             conflictResolvedBranch = conflictResolvedBranch,
             cannotResolveConflict = cannotResolveConflict,
             saveBeforeRestore = saveBeforeRestore,
@@ -137,10 +131,6 @@ fun rememberNotesUiStrings(): NotesUiStrings {
             capturedIso = capturedIso,
             metaRequiresCoords = metaRequiresCoords,
             unknownError = unknownError,
-            conflictActionMerge = conflictActionMerge,
-            conflictActionKeepCopy = conflictActionKeepCopy,
-            conflictActionRestoreOriginal = conflictActionRestoreOriginal,
-            conflictActionDeleteCopy = conflictActionDeleteCopy,
     )
 }
 
@@ -170,9 +160,7 @@ fun rememberSettingsUiStrings(): SettingsUiStrings {
     val prefsConflictUnavailable = stringResource(Res.string.settings_fb_prefs_conflict_unavailable)
     val prefsConflictResolved = stringResource(Res.string.settings_fb_prefs_conflict_resolved)
     val cannotResolvePrefs = stringResource(Res.string.settings_fb_cannot_resolve_prefs)
-    val syncModeUpdated = stringResource(Res.string.settings_fb_sync_mode_updated)
     val selfHostedHttps = stringResource(Res.string.settings_fb_selfhosted_https)
-    val selfHostedSaved = stringResource(Res.string.settings_fb_selfhosted_saved)
     val selfHostedReady = stringResource(Res.string.settings_fb_selfhosted_ready)
     val selfHostedBoundSessionRenewed = stringResource(Res.string.settings_fb_selfhosted_bound_session_renewed)
     val selfHostedAccountChangeBlocked = stringResource(Res.string.settings_fb_selfhosted_account_change_blocked)
@@ -186,14 +174,12 @@ fun rememberSettingsUiStrings(): SettingsUiStrings {
     val selfHostedPasswordTooShort = stringResource(Res.string.val_selfhosted_password_length)
     val selfHostedDeviceNameRequired = stringResource(Res.string.val_selfhosted_device_name_required)
     val selfHostedPlatformRequired = stringResource(Res.string.val_selfhosted_platform_required)
-    val sessionRemoveFailed = stringResource(Res.string.settings_fb_session_remove_failed)
-    val sessionCleared = stringResource(Res.string.settings_fb_session_cleared)
     val syncStarted = stringResource(Res.string.settings_fb_sync_started)
-    val syncReady = stringResource(Res.string.sync_ready)
     val syncCompleted = stringResource(Res.string.settings_fb_sync_completed)
     val syncInitialized = stringResource(Res.string.settings_fb_sync_initialized)
     val syncDisabled = stringResource(Res.string.settings_fb_sync_disabled)
-    val syncUnavailable = stringResource(Res.string.stub_sync_unavailable)
+    val syncUnavailable = stringResource(Res.string.settings_fb_sync_unavailable)
+    val secureSessionUnavailable = stringResource(Res.string.sync_secure_session_unavailable)
     val syncAlreadyRunning = stringResource(Res.string.settings_fb_sync_already_running)
     val syncConfigurationChanged = stringResource(Res.string.settings_fb_sync_configuration_changed)
     val syncAuthorityMismatch = stringResource(Res.string.settings_fb_sync_authority_mismatch)
@@ -201,9 +187,8 @@ fun rememberSettingsUiStrings(): SettingsUiStrings {
     val syncRemoteHistoryConflict = stringResource(Res.string.settings_fb_sync_remote_history_conflict)
     val syncRetryRequired = stringResource(Res.string.settings_fb_sync_retry_required)
     val syncBlocked = stringResource(Res.string.settings_fb_sync_blocked)
+    val syncCheckpointInvalid = stringResource(Res.string.settings_fb_sync_checkpoint_invalid)
     val syncFailed = stringResource(Res.string.settings_fb_sync_failed)
-    val syncStatusCleared = stringResource(Res.string.settings_fb_sync_status_cleared)
-    val syncStatusUpdated = stringResource(Res.string.settings_fb_sync_status_updated)
     val exportPrepared = stringResource(Res.string.settings_fb_export_prepared)
     val exportSaved = stringResource(Res.string.settings_fb_export_saved)
     val exportFailed = stringResource(Res.string.settings_fb_export_failed)
@@ -224,12 +209,6 @@ fun rememberSettingsUiStrings(): SettingsUiStrings {
     val signInBeforeSync = stringResource(Res.string.settings_fb_sign_in_before_sync)
     val chooseDayOne = stringResource(Res.string.import_choose_day_one)
     val dayOneImportFailed = stringResource(Res.string.import_day_one_failed)
-    val syncInProgress = stringResource(Res.string.sync_in_progress)
-    val syncUploadingCheckpoint = stringResource(Res.string.sync_uploading_checkpoint)
-    val syncUploadingCheckpointChunks = stringResource(Res.string.sync_uploading_checkpoint_chunks)
-    val syncUploadingManifest = stringResource(Res.string.sync_uploading_manifest)
-    val syncVerifyingRemote = stringResource(Res.string.sync_verifying_remote)
-    val syncCommittingEpoch = stringResource(Res.string.sync_committing_epoch)
     val unknownError = stringResource(Res.string.common_unknown_error)
     val strings = SettingsUiStrings(
         themeUpdated = themeUpdated,
@@ -242,9 +221,7 @@ fun rememberSettingsUiStrings(): SettingsUiStrings {
         prefsConflictUnavailable = prefsConflictUnavailable,
         prefsConflictResolved = prefsConflictResolved,
         cannotResolvePrefs = cannotResolvePrefs,
-        syncModeUpdated = syncModeUpdated,
         selfHostedHttps = selfHostedHttps,
-        selfHostedSaved = selfHostedSaved,
         selfHostedReady = selfHostedReady,
         selfHostedBoundSessionRenewed = selfHostedBoundSessionRenewed,
         selfHostedAccountChangeBlocked = selfHostedAccountChangeBlocked,
@@ -258,14 +235,12 @@ fun rememberSettingsUiStrings(): SettingsUiStrings {
         selfHostedPasswordTooShort = selfHostedPasswordTooShort,
         selfHostedDeviceNameRequired = selfHostedDeviceNameRequired,
         selfHostedPlatformRequired = selfHostedPlatformRequired,
-        sessionRemoveFailed = sessionRemoveFailed,
-        sessionCleared = sessionCleared,
         syncStarted = syncStarted,
-        syncReady = syncReady,
         syncCompleted = syncCompleted,
         syncInitialized = syncInitialized,
         syncDisabled = syncDisabled,
         syncUnavailable = syncUnavailable,
+        secureSessionUnavailable = secureSessionUnavailable,
         syncAlreadyRunning = syncAlreadyRunning,
         syncConfigurationChanged = syncConfigurationChanged,
         syncAuthorityMismatch = syncAuthorityMismatch,
@@ -273,9 +248,8 @@ fun rememberSettingsUiStrings(): SettingsUiStrings {
         syncRemoteHistoryConflict = syncRemoteHistoryConflict,
         syncRetryRequired = syncRetryRequired,
         syncBlocked = syncBlocked,
+        syncCheckpointInvalid = syncCheckpointInvalid,
         syncFailed = syncFailed,
-        syncStatusCleared = syncStatusCleared,
-        syncStatusUpdated = syncStatusUpdated,
         exportPrepared = exportPrepared,
         exportSaved = exportSaved,
         exportFailed = exportFailed,
@@ -296,12 +270,6 @@ fun rememberSettingsUiStrings(): SettingsUiStrings {
         signInBeforeSync = signInBeforeSync,
         chooseDayOne = chooseDayOne,
         dayOneImportFailed = dayOneImportFailed,
-        syncInProgress = syncInProgress,
-        syncUploadingCheckpoint = syncUploadingCheckpoint,
-        syncUploadingCheckpointChunks = syncUploadingCheckpointChunks,
-        syncUploadingManifest = syncUploadingManifest,
-        syncVerifyingRemote = syncVerifyingRemote,
-        syncCommittingEpoch = syncCommittingEpoch,
         unknownError = unknownError,
     )
     return remember(strings) { strings }

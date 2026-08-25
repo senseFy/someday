@@ -21,7 +21,6 @@ import saien.someday.data.settings.ClientSettingsRepository
 import saien.someday.data.settings.SqlDelightClientSettingsRepository
 import saien.someday.domain.notes.NotesRepository
 import saien.someday.domain.settings.ClientSettings
-import saien.someday.domain.settings.ManualSyncProgressListener
 import saien.someday.domain.settings.ManualSyncRunner
 import saien.someday.domain.settings.SelfHostedSessionCredentialStore
 import saien.someday.domain.settings.SelfHostedSetupClient
@@ -51,7 +50,6 @@ class AndroidClientRepositories(
     val selfHostedSetupClient: SelfHostedSetupClient,
     val selfHostedSessionCredentialStore: SelfHostedSessionCredentialStore,
     val manualSyncRunner: ManualSyncRunner,
-    val bindManualSyncProgressListener: (ManualSyncProgressListener?) -> Unit = {},
     val workspacePairingInvitationCreator: WorkspacePairingInvitationCreator,
     val workspacePairingInvitationJoiner: WorkspacePairingInvitationJoiner,
     val workspacePairingInvitationCanceller: WorkspacePairingInvitationCanceller,
@@ -242,7 +240,6 @@ private fun assembleAndroidClientRepositories(
             systemV3Services.activeWorkspaceSessionGuard,
         ),
         manualSyncRunner = systemV3Services.manualSyncRunner,
-        bindManualSyncProgressListener = systemV3Services.bindManualSyncProgressListener,
         workspacePairingInvitationCreator = selfHostedPairingService,
         workspacePairingInvitationJoiner = selfHostedPairingService,
         workspacePairingInvitationCanceller = selfHostedPairingService,

@@ -86,12 +86,7 @@ tasks.register("iosShellSmoke") {
                 "memories=calendar-counts|month-navigation|selected-day|prior-year " +
                 "location=system-coordinates|manual-place|permission-denied-usable|no-map-sdk " +
                 "platform-smoke=workspace-setup|unlock|create-note|markdown-preview|denied-location|" +
-                "restart-persistence search=local-title-body-active-only " +
-                "settings-sections=sync-mode-account|self-hosted-device-management|device-pairing|" +
-                "editor-preferences|theme-default-notebook|sync-status-last-error|export-entry-points " +
-                "workspace-pairing=one-use-invitation|qr-or-token|redacted-logs " +
-                "export=notes-notebooks|dag-only|excludes-media-bytes|asset-references-may-be-unresolved|" +
-                "excludes-raw-keys-tokens-passwords-recovery-material",
+                "restart-persistence search=local-title-body-active-only",
         )
     }
 }

@@ -44,7 +44,6 @@ data class NotesUiStrings(
     val batchNotebookUnavailable: String = "The destination notebook is no longer available.",
     val invalidTimeZone: String = "Enter a valid IANA time zone.",
     val saveBeforeHistory: String = "Save the note before opening version history.",
-    val conflictResolvedAction: String = "Conflict resolved: %1\$s.",
     val conflictResolvedBranch: String = "Conflict resolved using the selected branch.",
     val cannotResolveConflict: String = "Cannot resolve conflict: %1\$s",
     val saveBeforeRestore: String = "Save the note before restoring a version.",
@@ -68,10 +67,6 @@ data class NotesUiStrings(
     val capturedIso: String = "Captured timestamp must be an ISO-8601 instant.",
     val metaRequiresCoords: String = "Accuracy, altitude, and captured timestamp require captured coordinates.",
     val unknownError: String = "unknown error",
-    val conflictActionMerge: String = "Merge into original",
-    val conflictActionKeepCopy: String = "Keep conflict copy",
-    val conflictActionRestoreOriginal: String = "Restore original from conflict",
-    val conflictActionDeleteCopy: String = "Delete conflict copy",
 )
 
 data class MemoriesUiStrings(

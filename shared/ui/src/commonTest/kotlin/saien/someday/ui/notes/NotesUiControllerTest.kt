@@ -1,15 +1,19 @@
 @file:OptIn(kotlin.time.ExperimentalTime::class)
 package saien.someday.ui.notes
 
+import kotlinx.coroutines.runBlocking
+import kotlinx.datetime.LocalDate
 import saien.someday.domain.media.MediaAssetId
+import saien.someday.domain.notes.ConflictBranchResolutionResult
+import saien.someday.domain.notes.ConflictDetails
 import saien.someday.domain.notes.NoteSyncBadge
 import saien.someday.domain.notes.NotesLocationInput
+import saien.someday.domain.notes.NotesRepository
 import saien.someday.domain.notes.noteCalendarDate
 import saien.someday.domain.settings.EditorPreferences
 import saien.someday.ui.media.MediaImportUiResult
 import saien.someday.ui.media.MediaUiFailureReason
-import kotlinx.coroutines.runBlocking
-import kotlinx.datetime.LocalDate
+import saien.someday.ui.shouldShowSyncBadge
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -405,7 +409,7 @@ class NotesUiControllerTest {
     }
 
     @Test
-    fun syncErrorPendingAndConflictBadgesAreVisibleInListAndEditor() = runBlocking {
+    fun syncBadgeStateKeepsPendingQuietAndShowsOnlyActionableIssues() = runBlocking {
         val repository = InMemoryNotesRepository()
         val controller = NotesUiController(repository)
         val diary = controller.createNotebook("Diary")
@@ -438,6 +442,10 @@ class NotesUiControllerTest {
             setOf("Pending sync", "Sync error", "Conflict"),
             controller.state.notes.map { it.syncBadge.label }.toSet(),
         )
+        assertFalse(shouldShowSyncBadge(NoteSyncBadge.Pending))
+        assertFalse(shouldShowSyncBadge(NoteSyncBadge.Synced))
+        assertTrue(shouldShowSyncBadge(NoteSyncBadge.Error("Network unavailable")))
+        assertTrue(shouldShowSyncBadge(NoteSyncBadge.Conflict("Manual resolution required")))
 
         controller.openExistingNote(conflict.id)
 
@@ -468,6 +476,93 @@ class NotesUiControllerTest {
         assertTrue(details.originalHistory.versions.any { it.markdownBody.contains("Local version") })
         assertTrue(details.conflictHistory.versions.any { it.markdownBody.contains("Remote version") })
         assertTrue(controller.state.feedbackMessage.orEmpty().contains("Conflict copy exposes both histories"))
+    }
+
+    @Test
+    fun choosingAConflictHeadResolvesToThatExactVersion() = runBlocking {
+        val repository = InMemoryNotesRepository()
+        val controller = NotesUiController(repository)
+        val diary = controller.createNotebook("Diary")
+        val conflictPair = repository.seedConflictPair(
+            notebookId = diary.id,
+            originalTitle = "Local original",
+            originalBody = "Local body",
+            conflictTitle = "Remote branch",
+            conflictBody = "Remote body",
+        )
+
+        assertTrue(controller.openExistingNote(conflictPair.conflictNoteId))
+        val details = assertNotNull(controller.state.conflictDetails)
+        val remoteHead = assertNotNull(
+            details.versionBranches.firstOrNull {
+                it.history.noteId == conflictPair.conflictNoteId
+            },
+        )
+
+        assertTrue(controller.resolveConflictBranch(remoteHead.versionId))
+
+        assertEquals(conflictPair.originalNoteId, controller.state.editor?.noteId)
+        assertEquals("Remote branch", controller.state.editor?.title)
+        assertEquals("Remote body", controller.state.editor?.markdownBody)
+        assertNull(controller.state.conflictDetails)
+        assertNull(repository.getNoteDetails(conflictPair.conflictNoteId))
+    }
+
+    @Test
+    fun choosingADeletionHeadClosesTheEditorAsASuccessfulResolution() = runBlocking {
+        val storage = InMemoryNotesRepository()
+        val diary = storage.createNotebook("Diary")
+        val conflictPair = storage.seedConflictPair(
+            notebookId = diary.id,
+            originalTitle = "Local original",
+            originalBody = "Local body",
+            conflictTitle = "Deleted remotely",
+            conflictBody = "Deletion marker",
+        )
+        val repository = DeletionConflictNotesRepository(
+            delegate = storage,
+            conflictNoteId = conflictPair.conflictNoteId,
+        )
+        val controller = NotesUiController(repository)
+
+        assertTrue(controller.openExistingNote(conflictPair.conflictNoteId))
+        val details = assertNotNull(controller.state.conflictDetails)
+        val deletionHead = details.versionBranches.single { it.deleted }
+
+        assertTrue(controller.resolveConflictBranch(deletionHead.versionId))
+        assertNull(controller.state.editor)
+        assertNull(controller.state.conflictDetails)
+        assertNull(repository.getNoteDetails(conflictPair.originalNoteId))
+        assertNull(repository.getNoteDetails(conflictPair.conflictNoteId))
+    }
+
+    @Test
+    fun conflictResolutionRejectsAHeadSetThatChangedAfterRendering() = runBlocking {
+        val repository = InMemoryNotesRepository()
+        val controller = NotesUiController(repository)
+        val diary = controller.createNotebook("Diary")
+        val conflictPair = repository.seedConflictPair(
+            notebookId = diary.id,
+            originalTitle = "Local original",
+            originalBody = "Local body",
+            conflictTitle = "Remote branch",
+            conflictBody = "Remote body",
+        )
+
+        assertTrue(controller.openExistingNote(conflictPair.conflictNoteId))
+        val renderedDetails = assertNotNull(controller.state.conflictDetails)
+        val remoteHead = assertNotNull(
+            renderedDetails.versionBranches.firstOrNull {
+                it.history.noteId == conflictPair.conflictNoteId
+            },
+        )
+        val originalVersion = assertNotNull(renderedDetails.originalHistory.versions.firstOrNull())
+        repository.restoreNoteVersion(conflictPair.originalNoteId, originalVersion.versionId)
+
+        assertFalse(controller.resolveConflictBranch(remoteHead.versionId))
+        assertNotNull(controller.state.conflictDetails)
+        assertNotNull(repository.getNoteDetails(conflictPair.conflictNoteId))
+        Unit
     }
 
     @Test
@@ -764,5 +859,54 @@ class NotesUiControllerTest {
         assertEquals(10, cleared.deletedNotebooks)
         assertEquals(1_000, cleared.deletedNotes)
         assertTrue(repository.listNotebooks().isEmpty())
+    }
+}
+
+private class DeletionConflictNotesRepository(
+    private val delegate: InMemoryNotesRepository,
+    private val conflictNoteId: String,
+) : NotesRepository by delegate {
+    private var active = true
+
+    override fun getConflictDetails(noteId: String): ConflictDetails? =
+        currentDetails()?.takeIf { details ->
+            noteId == details.originalNoteId || noteId == details.conflictNoteId
+        }
+
+    override fun getConflictDetailsForOriginal(originalNoteId: String): ConflictDetails? =
+        currentDetails()?.takeIf { it.originalNoteId == originalNoteId }
+
+    override fun resolveConflictBranch(
+        conflictNoteId: String,
+        versionId: String,
+        expectedHeadVersionIds: List<String>,
+    ): ConflictBranchResolutionResult {
+        val details = currentDetails() ?: return ConflictBranchResolutionResult.Rejected
+        val selected = details.versionBranches.firstOrNull { it.versionId == versionId }
+            ?: return ConflictBranchResolutionResult.Rejected
+        if (conflictNoteId != details.conflictNoteId ||
+            expectedHeadVersionIds.sorted() != details.expectedHeadVersionIds.sorted() ||
+            !selected.deleted
+        ) {
+            return ConflictBranchResolutionResult.Rejected
+        }
+        active = false
+        delegate.deleteNote(details.originalNoteId)
+        delegate.deleteNote(details.conflictNoteId)
+        return ConflictBranchResolutionResult.Deletion
+    }
+
+    private fun currentDetails(): ConflictDetails? {
+        if (!active) return null
+        val details = delegate.getConflictDetails(conflictNoteId) ?: return null
+        return details.copy(
+            versionBranches = details.versionBranches.map { branch ->
+                if (branch.history.noteId == conflictNoteId) {
+                    branch.copy(deleted = true)
+                } else {
+                    branch
+                }
+            },
+        )
     }
 }

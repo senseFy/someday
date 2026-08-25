@@ -8,8 +8,6 @@ import saien.someday.data.media.LocalMediaAssetStore
 import saien.someday.data.settings.ClientSettingsRepository
 import saien.someday.domain.notes.NotesRepository
 import saien.someday.domain.media.findSomedayAssetIds
-import saien.someday.domain.settings.ManualSyncPhase
-import saien.someday.domain.settings.ManualSyncProgressListener
 import saien.someday.domain.settings.ManualSyncReason
 import saien.someday.domain.settings.ManualSyncResult
 import saien.someday.domain.settings.ManualSyncRunner
@@ -27,7 +25,6 @@ import saien.someday.sync.causality.v2.SystemV2NotesRepository
 import saien.someday.sync.causality.v2.NoteContentV2
 import saien.someday.sync.causality.v2.SyncEpochLifecycleV2
 import saien.someday.sync.causality.v2.SyncEpochHealthV2
-import saien.someday.sync.causality.v2.WorkspaceCheckpointPublishProgressV2
 import saien.someday.sync.causality.v2.WorkspaceLocalDataTransferV2
 import saien.someday.sync.causality.v2.SystemV2ClientSettingsRepository
 import saien.someday.sync.causality.v2.normalizeWriterDeviceIdV2
@@ -59,12 +56,6 @@ data class SystemV3ClientServices(
     val workspacePairingInviterReady: () -> Boolean,
     val localDataExportProvider: (kotlin.time.Instant) -> LocalDataExportDocument,
     val localDataImportProvider: (LocalDataExportDocument) -> LocalDataImportSummary,
-    /**
-     * Bind/unbind a listener for first-epoch (and other checkpoint) publish
-     * progress while manual sync runs. Pass null to clear. Receives typed
-     * phases; the UI layer formats localized product copy.
-     */
-    val bindManualSyncProgressListener: (ManualSyncProgressListener?) -> Unit = {},
 )
 
 fun createSystemV3ClientServices(
@@ -148,16 +139,6 @@ fun createSystemV3ClientServices(
         )
     }
 
-    val publishProgressListener = object {
-        @kotlin.concurrent.Volatile
-        var value: ManualSyncProgressListener? = null
-    }
-    val onPublishProgress: (WorkspaceCheckpointPublishProgressV2) -> Unit =
-        { progress ->
-            runCatching {
-                publishProgressListener.value?.onProgress(progress.toManualSyncPhase())
-            }
-        }
     val selfHostedRuntime = SyncV2RuntimeService(
         mode = SyncMode.SelfHosted,
         localRepository = localRepository,
@@ -168,7 +149,6 @@ fun createSystemV3ClientServices(
         },
         transportFactory = SyncRemoteTransportFactoryV2 { createSelfHostedRemoteV2() },
         authorityMutationCoordinator = authorityMutationCoordinator,
-        onPublishProgress = onPublishProgress,
         beforeEntityPublication = { versions ->
             val mediaIds = versions.asSequence()
                 .mapNotNull { it.contentPayload as? NoteContentV2 }
@@ -279,9 +259,6 @@ fun createSystemV3ClientServices(
                 }
             }
         },
-        bindManualSyncProgressListener = { listener ->
-            publishProgressListener.value = listener
-        },
     )
 }
 
@@ -347,15 +324,3 @@ internal fun runSystemV3OrderedSync(
     }
     return entitySync()
 }
-
-private fun WorkspaceCheckpointPublishProgressV2.toManualSyncPhase(): ManualSyncPhase =
-    when (this) {
-        is WorkspaceCheckpointPublishProgressV2.UploadingChunks ->
-            ManualSyncPhase.UploadingChunks(completed = completed, total = total)
-        WorkspaceCheckpointPublishProgressV2.UploadingManifest ->
-            ManualSyncPhase.UploadingManifest
-        WorkspaceCheckpointPublishProgressV2.VerifyingRemote ->
-            ManualSyncPhase.VerifyingRemote
-        WorkspaceCheckpointPublishProgressV2.CommittingPointer ->
-            ManualSyncPhase.CommittingPointer
-    }

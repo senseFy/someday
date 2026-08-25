@@ -86,6 +86,7 @@ import androidx.compose.material3.rememberTimePickerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -192,7 +193,6 @@ import saien.someday.domain.navigation.PrimaryTab
 import saien.someday.domain.navigation.primaryNavigationTabs
 import saien.someday.domain.notes.ConflictDetails
 import saien.someday.domain.notes.ConflictHistory
-import saien.someday.domain.notes.ConflictResolutionAction
 import saien.someday.domain.notes.DeletedWorkspaceItem
 import saien.someday.domain.notes.DeletedWorkspaceItemType
 import saien.someday.domain.notes.MemoryMonth
@@ -210,13 +210,10 @@ import saien.someday.domain.settings.AppLanguage
 import saien.someday.domain.settings.ClientTheme
 import saien.someday.domain.settings.EditorPreferences
 import saien.someday.domain.settings.ManualSyncReason
-import saien.someday.domain.settings.ManualSyncProgressListener
 import saien.someday.domain.settings.ManualSyncRunner
 import saien.someday.domain.settings.SelfHostedSessionCredentialStore
 import saien.someday.domain.settings.SelfHostedSetupClient
-import saien.someday.domain.settings.SelfHostedSetupInput
 import saien.someday.domain.settings.SelfHostedSetupReason
-import saien.someday.domain.settings.SyncMode
 import saien.someday.domain.settings.WorkspaceJoinResult
 import saien.someday.domain.settings.WorkspacePairingInvitationCanceller
 import saien.someday.domain.settings.WorkspacePairingInvitationCreator
@@ -289,13 +286,21 @@ import saien.someday.ui.settings.AppliedTheme
 import saien.someday.ui.settings.DayOneImportRunner
 import saien.someday.ui.settings.OnThisDayNotificationStrings
 import saien.someday.ui.settings.SettingsExportSummary
+import saien.someday.ui.settings.SettingsFeedbackSeverity
 import saien.someday.ui.settings.SettingsImportSummary
 import saien.someday.ui.settings.SettingsUiController
 import saien.someday.ui.settings.SettingsUiState
+import saien.someday.ui.settings.SyncAccountFormMode
+import saien.someday.ui.settings.SyncConnectionUi
+import saien.someday.ui.settings.SyncIssueAction
+import saien.someday.ui.settings.SyncIssueReason
+import saien.someday.ui.settings.SyncUiOperation
+import saien.someday.ui.settings.accountFormMode
 import saien.someday.ui.settings.resolveAppliedTheme
 import kotlin.math.roundToInt
 import kotlin.time.Instant
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -332,7 +337,6 @@ fun SomedayApp(
     selfHostedSetupClient: SelfHostedSetupClient? = null,
     selfHostedSessionCredentialStore: SelfHostedSessionCredentialStore? = null,
     manualSyncRunner: ManualSyncRunner? = null,
-    bindManualSyncProgressListener: (ManualSyncProgressListener?) -> Unit = {},
     workspacePairingInvitationCreator: WorkspacePairingInvitationCreator? = null,
     workspacePairingInvitationJoiner: WorkspacePairingInvitationJoiner? = null,
     workspacePairingInvitationCanceller: WorkspacePairingInvitationCanceller? = null,
@@ -354,7 +358,7 @@ fun SomedayApp(
         val notesUiStrings = rememberNotesUiStrings()
         val memoriesUiStrings = rememberMemoriesUiStrings()
         val settingsUiStrings = rememberSettingsUiStrings()
-        val notesController = remember(effectiveNotesRepository, locationCaptureAdapter, notesUiStrings) {
+        val notesController = remember(effectiveNotesRepository, locationCaptureAdapter) {
             startupTrace?.invoke("SomedayApp.notesController.start")
             NotesUiController(
                 repository = effectiveNotesRepository,
@@ -367,7 +371,7 @@ fun SomedayApp(
                 startupTrace?.invoke("SomedayApp.notesController.end")
             }
         }
-        val memoriesController = remember(effectiveNotesRepository, memoriesUiStrings) {
+        val memoriesController = remember(effectiveNotesRepository) {
             startupTrace?.invoke("SomedayApp.memoriesController.start")
             MemoriesUiController(
                 repository = effectiveNotesRepository,
@@ -394,12 +398,16 @@ fun SomedayApp(
             invalidTime = stringResource(Res.string.on_this_day_feedback_invalid_time),
             timeUpdated = stringResource(Res.string.on_this_day_feedback_time_updated),
         )
+        val selfHostedDeviceName = when (platformName.lowercase()) {
+            "android" -> stringResource(Res.string.android_device_name)
+            "ios" -> stringResource(Res.string.ios_device_name)
+            "desktop" -> stringResource(Res.string.desktop_device_name)
+            else -> stringResource(Res.string.someday_device_name)
+        }
         val settingsController = remember(
             effectiveNotesRepository,
             appDispatchers.background,
             onThisDayNotificationScheduler,
-            onThisDayNotificationStrings,
-            settingsUiStrings,
             workspacePairingInvitationCreator,
             workspacePairingInvitationJoiner,
             workspacePairingInvitationCanceller,
@@ -426,13 +434,14 @@ fun SomedayApp(
                 },
                 selfHostedSessionCredentialStore = selfHostedSessionCredentialStore
                     ?: saien.someday.domain.settings.UnavailableSelfHostedSessionCredentialStore,
+                selfHostedDeviceName = selfHostedDeviceName,
+                selfHostedDevicePlatform = platformName,
                 manualSyncRunner = manualSyncRunner ?: ManualSyncRunner {
                     saien.someday.domain.settings.ManualSyncResult.failure(
                         mode = appSettings.syncConfiguration.mode,
                         reason = ManualSyncReason.Unavailable,
                     )
                 },
-                bindManualSyncProgressListener = bindManualSyncProgressListener,
                 workspacePairingInvitationCreator =
                     workspacePairingInvitationCreator ?: WorkspacePairingInvitationCreator {
                         WorkspacePairingInvitationResult.failure(WorkspacePairingReason.Unavailable)
@@ -453,26 +462,25 @@ fun SomedayApp(
                 startupTrace?.invoke("SomedayApp.settingsController.end")
             }
         }
+        SideEffect {
+            notesController.updateLocalizedStrings(notesUiStrings)
+            memoriesController.updateLocalizedStrings(memoriesUiStrings)
+            settingsController.updateLocalizedStrings(
+                settings = settingsUiStrings,
+                notifications = onThisDayNotificationStrings,
+                hostDeviceName = selfHostedDeviceName,
+            )
+        }
         val notesState = notesController.state
         val memoriesState = memoriesController.state
         val settingsState = settingsController.state
-        var scheduledSyncRunning by remember { mutableStateOf(false) }
         var pullSyncActive by remember { mutableStateOf(false) }
-        var syncTopRevealSignal by remember { mutableStateOf(0L) }
-        var syncWasRunning by remember { mutableStateOf(settingsState.manualSyncProgress.running) }
         val autoSyncScheduler = remember(settingsController, uiCoroutineScope) {
             AutoSyncScheduler(
                 scope = uiCoroutineScope,
                 syncReady = settingsController::canRunAutomaticSync,
-                syncRunning = { settingsController.state.manualSyncProgress.running },
-                runSync = {
-                    scheduledSyncRunning = true
-                    try {
-                        settingsController.runAutomaticSync()
-                    } finally {
-                        scheduledSyncRunning = false
-                    }
-                },
+                syncRunning = { settingsController.state.sync.syncing },
+                runSync = settingsController::runAutomaticSync,
             )
         }
         var topToast by remember { mutableStateOf<SomedayToast?>(null) }
@@ -506,16 +514,8 @@ fun SomedayApp(
 
         LaunchedEffect(foregroundSyncSignal) {
             if (foregroundSyncSignal > 0) {
-                autoSyncScheduler.request(AutoSyncTrigger.Foreground)
                 settingsController.refresh()
-            }
-        }
-
-        LaunchedEffect(settingsState.manualSyncProgress.running) {
-            val wasRunning = syncWasRunning
-            syncWasRunning = settingsState.manualSyncProgress.running
-            if (syncCompletionRevealsRemoteChanges(wasRunning, settingsState.manualSyncProgress)) {
-                syncTopRevealSignal += 1
+                autoSyncScheduler.request(AutoSyncTrigger.Foreground)
             }
         }
 
@@ -531,7 +531,11 @@ fun SomedayApp(
         LaunchedEffect(settingsState.feedbackEventId) {
             val message = settingsState.feedbackMessage?.trim()
             if (settingsState.feedbackEventId > 0L && !message.isNullOrBlank()) {
-                topToast = somedayToastFromFeedback(settingsState.feedbackEventId, message)
+                topToast = SomedayToast(
+                    id = settingsState.feedbackEventId,
+                    text = message,
+                    status = settingsState.feedbackSeverity.toToastStatus(),
+                )
             }
         }
 
@@ -752,7 +756,6 @@ fun SomedayApp(
                     developerOptions = developerOptions,
                     workspacePairingScanner = workspacePairingScanner,
                     pullRefresh = pullRefresh,
-                    syncTopRevealSignal = syncTopRevealSignal,
                     discardEditorOnExit = discardEditorOnExit,
                     onEditorExitDiscardConsumed = { discardEditorOnExit = false },
                     onSelectTab = ::selectPrimaryTab,
@@ -771,7 +774,6 @@ fun SomedayApp(
                     ) {
                         NotebookSheet(
                             state = notesState,
-                            syncInProgress = settingsState.manualSyncProgress.running,
                             onCreateNotebook = { title ->
                                 uiCoroutineScope.launch { notesController.createNotebook(title) }
                             },
@@ -798,7 +800,6 @@ fun SomedayApp(
                     ) {
                         RecentlyDeletedSheet(
                             state = notesState,
-                            syncInProgress = settingsState.manualSyncProgress.running,
                             onRestoreDeletedItem = { entityId ->
                                 uiCoroutineScope.launch {
                                     notesController.restoreDeletedWorkspaceItem(entityId)
@@ -849,7 +850,7 @@ fun SomedayApp(
                         modifier = Modifier.fillMaxWidth(),
                     )
                     SomedaySyncStatusPill(
-                        visible = scheduledSyncRunning && !pullSyncActive,
+                        visible = settingsState.sync.syncing && !pullSyncActive,
                     )
                 }
             }
@@ -1231,6 +1232,14 @@ private fun String.feedbackToastStatus(): SomedayToastStatus {
     }
 }
 
+private fun SettingsFeedbackSeverity.toToastStatus(): SomedayToastStatus =
+    when (this) {
+        SettingsFeedbackSeverity.Info -> SomedayToastStatus.Info
+        SettingsFeedbackSeverity.Success -> SomedayToastStatus.Success
+        SettingsFeedbackSeverity.Warning -> SomedayToastStatus.Warning
+        SettingsFeedbackSeverity.Error -> SomedayToastStatus.Error
+    }
+
 private data class DeveloperOptionsUi(
     val platformName: String,
     val buildTypeLabel: String,
@@ -1302,7 +1311,6 @@ private fun SomedayAdaptiveShell(
     developerOptions: DeveloperOptionsUi?,
     workspacePairingScanner: WorkspacePairingScanner,
     pullRefresh: SomedayPullRefreshUi?,
-    syncTopRevealSignal: Long,
     discardEditorOnExit: Boolean,
     onEditorExitDiscardConsumed: () -> Unit,
     onSelectTab: (PrimaryTab) -> Unit,
@@ -1332,7 +1340,6 @@ private fun SomedayAdaptiveShell(
             developerOptions = developerOptions,
             workspacePairingScanner = workspacePairingScanner,
             pullRefresh = pullRefresh,
-            syncTopRevealSignal = syncTopRevealSignal,
             discardEditorOnExit = discardEditorOnExit,
             onEditorExitDiscardConsumed = onEditorExitDiscardConsumed,
             onSelectTab = onSelectTab,
@@ -1362,7 +1369,6 @@ private fun SomedayAdaptiveShell(
             developerOptions = developerOptions,
             workspacePairingScanner = workspacePairingScanner,
             pullRefresh = pullRefresh,
-            syncTopRevealSignal = syncTopRevealSignal,
             discardEditorOnExit = discardEditorOnExit,
             onEditorExitDiscardConsumed = onEditorExitDiscardConsumed,
             onSelectTab = onSelectTab,
@@ -1395,7 +1401,6 @@ private fun SomedayCompactShell(
     developerOptions: DeveloperOptionsUi?,
     workspacePairingScanner: WorkspacePairingScanner,
     pullRefresh: SomedayPullRefreshUi?,
-    syncTopRevealSignal: Long,
     discardEditorOnExit: Boolean,
     onEditorExitDiscardConsumed: () -> Unit,
     onSelectTab: (PrimaryTab) -> Unit,
@@ -1453,7 +1458,6 @@ private fun SomedayCompactShell(
                 developerOptions = developerOptions,
                 workspacePairingScanner = workspacePairingScanner,
                 pullRefresh = pullRefresh,
-                syncTopRevealSignal = syncTopRevealSignal,
                 discardEditorOnExit = discardEditorOnExit,
                 onEditorExitDiscardConsumed = onEditorExitDiscardConsumed,
                 onCreateNote = onCreateNote,
@@ -1488,7 +1492,6 @@ private fun SomedayWideShell(
     developerOptions: DeveloperOptionsUi?,
     workspacePairingScanner: WorkspacePairingScanner,
     pullRefresh: SomedayPullRefreshUi?,
-    syncTopRevealSignal: Long,
     discardEditorOnExit: Boolean,
     onEditorExitDiscardConsumed: () -> Unit,
     onSelectTab: (PrimaryTab) -> Unit,
@@ -1521,7 +1524,6 @@ private fun SomedayWideShell(
                     selectedTab = selectedTab,
                     notesState = notesState,
                     showCreateNote = shouldShowCreateNoteAction(selectedTab, currentRouteKind, notesState),
-                    syncInProgress = settingsState.manualSyncProgress.running,
                     width = sidebarWidth,
                     onSelectTab = onSelectTab,
                     onCreateNote = onCreateNote,
@@ -1567,7 +1569,6 @@ private fun SomedayWideShell(
                     developerOptions = developerOptions,
                     workspacePairingScanner = workspacePairingScanner,
                     pullRefresh = pullRefresh,
-                    syncTopRevealSignal = syncTopRevealSignal,
                     discardEditorOnExit = discardEditorOnExit,
                     onEditorExitDiscardConsumed = onEditorExitDiscardConsumed,
                     onCreateNote = onCreateNote,
@@ -1650,7 +1651,6 @@ private fun SomedaySidebar(
     selectedTab: PrimaryTab,
     notesState: NotesUiState,
     showCreateNote: Boolean,
-    syncInProgress: Boolean,
     width: Dp,
     onSelectTab: (PrimaryTab) -> Unit,
     onCreateNote: () -> Unit,
@@ -1691,7 +1691,6 @@ private fun SomedaySidebar(
             HorizontalDivider()
             DesktopNotebookSection(
                 state = notesState,
-                syncInProgress = syncInProgress,
                 onShowNotebooks = onShowNotebooks,
                 onSelectNotebook = onSelectNotebook,
                 modifier = Modifier.weight(1f),
@@ -1740,7 +1739,6 @@ private fun PrimarySidebarItem(
 @Composable
 private fun DesktopNotebookSection(
     state: NotesUiState,
-    syncInProgress: Boolean,
     onShowNotebooks: () -> Unit,
     onSelectNotebook: (String) -> Unit,
     modifier: Modifier = Modifier,
@@ -1784,7 +1782,6 @@ private fun DesktopNotebookSection(
                         title = notebook.title,
                         selected = notebook.id == state.selectedNotebookId,
                         syncBadge = notebook.syncBadge,
-                        syncInProgress = syncInProgress,
                         onClick = { onSelectNotebook(notebook.id) },
                     )
                 }
@@ -1798,7 +1795,6 @@ private fun NotebookSidebarItem(
     title: String,
     selected: Boolean,
     syncBadge: NoteSyncBadge,
-    syncInProgress: Boolean,
     onClick: () -> Unit,
 ) {
     val containerColor = if (selected) {
@@ -1830,7 +1826,7 @@ private fun NotebookSidebarItem(
             style = MaterialTheme.typography.bodyMedium,
             modifier = Modifier.weight(1f),
         )
-        NoteSyncIndicator(syncBadge = syncBadge, syncInProgress = syncInProgress, showText = false)
+        NoteSyncIndicator(syncBadge = syncBadge, showText = false)
     }
 }
 
@@ -1849,7 +1845,6 @@ private fun SomedayNavigationHost(
     developerOptions: DeveloperOptionsUi?,
     workspacePairingScanner: WorkspacePairingScanner,
     pullRefresh: SomedayPullRefreshUi?,
-    syncTopRevealSignal: Long,
     discardEditorOnExit: Boolean,
     onEditorExitDiscardConsumed: () -> Unit,
     onCreateNote: () -> Unit,
@@ -1903,10 +1898,8 @@ private fun SomedayNavigationHost(
                         notesState = notesState,
                         memoriesState = memoriesState,
                         notesController = notesController,
-                        syncInProgress = settingsState.manualSyncProgress.running,
                         notesSearchActive = false,
                         pullRefresh = pullRefresh,
-                        syncTopRevealSignal = syncTopRevealSignal,
                         onOpenNote = onOpenNote,
                         onOpenSearch = onOpenSearch,
                         onCloseSearch = onCloseSearch,
@@ -1926,7 +1919,6 @@ private fun SomedayNavigationHost(
                         mediaUiPorts = mediaUiPorts,
                         notesSearchActive = false,
                         pullRefresh = pullRefresh,
-                        syncTopRevealSignal = syncTopRevealSignal,
                         onCreateNote = onCreateNote,
                         onOpenNote = onOpenNote,
                         onOpenConflictResolution = onOpenConflictResolution,
@@ -1949,10 +1941,8 @@ private fun SomedayNavigationHost(
                             notesState = notesState,
                             memoriesState = memoriesState,
                             notesController = notesController,
-                            syncInProgress = settingsState.manualSyncProgress.running,
                             notesSearchActive = true,
                             pullRefresh = pullRefresh,
-                            syncTopRevealSignal = syncTopRevealSignal,
                             onOpenNote = onOpenNote,
                             onOpenSearch = onOpenSearch,
                             onCloseSearch = onCloseSearch,
@@ -1972,7 +1962,6 @@ private fun SomedayNavigationHost(
                             mediaUiPorts = mediaUiPorts,
                             notesSearchActive = true,
                             pullRefresh = pullRefresh,
-                            syncTopRevealSignal = syncTopRevealSignal,
                             onCreateNote = onCreateNote,
                             onOpenNote = onOpenNote,
                             onOpenConflictResolution = onOpenConflictResolution,
@@ -2052,7 +2041,6 @@ private fun SomedayNavigationHost(
                             mediaUiPorts = mediaUiPorts,
                             notesSearchActive = false,
                             pullRefresh = pullRefresh,
-                            syncTopRevealSignal = syncTopRevealSignal,
                             onCreateNote = onCreateNote,
                             onOpenNote = onOpenNote,
                             onOpenConflictResolution = onOpenConflictResolution,
@@ -2097,7 +2085,6 @@ private fun SomedayNavigationHost(
                         selectedTab = PrimaryTab.Memories,
                         notesState = notesState,
                         memoriesState = memoriesState,
-                        syncInProgress = settingsState.manualSyncProgress.running,
                         pullRefresh = pullRefresh,
                         onGoToMonth = { month ->
                             routeCoroutineScope.launch { memoriesController.goToMonth(month) }
@@ -2119,7 +2106,6 @@ private fun SomedayNavigationHost(
                     ) {
                         memoriesContentItems(
                             state = memoriesState,
-                            syncInProgress = settingsState.manualSyncProgress.running,
                             onGoToMonth = { month ->
                                 routeCoroutineScope.launch { memoriesController.goToMonth(month) }
                             },
@@ -2141,6 +2127,7 @@ private fun SomedayNavigationHost(
                     onThisDayNotificationTimeFormatter = onThisDayNotificationTimeFormatter,
                     developerOptions = developerOptions,
                     workspacePairingScanner = workspacePairingScanner,
+                    actionScope = routeCoroutineScope,
                     onOpenPage = { page -> navController.navigate(SettingsDetailRoute(page.routeId)) },
                     onBack = { navController.popBackStack() },
                     modifier = settingsContentModifier(layoutSpec, paddingValues),
@@ -2163,6 +2150,7 @@ private fun SomedayNavigationHost(
                         onThisDayNotificationTimeFormatter = onThisDayNotificationTimeFormatter,
                         developerOptions = developerOptions,
                         workspacePairingScanner = workspacePairingScanner,
+                        actionScope = routeCoroutineScope,
                         onOpenPage = { nextPage -> navController.navigate(SettingsDetailRoute(nextPage.routeId)) },
                         onBack = { navController.popBackStack() },
                         modifier = settingsContentModifier(layoutSpec, paddingValues),
@@ -2207,7 +2195,6 @@ private fun NoteEditorRouteContent(
             toolbarPlacement = NoteEditorToolbarPlacement.KeyboardAccessory,
             contentHorizontalPadding = 24.dp,
             autoFocusBody = false,
-            syncInProgress = settingsState.manualSyncProgress.running,
             onOpenConflictResolution = onOpenConflictResolution,
             onSave = {
                 coroutineScope.launch {
@@ -2288,78 +2275,37 @@ private fun NoteConflictResolutionRouteContent(
                     .verticalScroll(rememberScrollState())
                     .padding(top = 10.dp, bottom = 28.dp),
             ) {
-                if (details.versionBranches.isEmpty()) {
+                Text(
+                    stringResource(Res.string.conflict_branch_help),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                details.versionBranches.forEachIndexed { index, branch ->
                     ConflictHistoryPanel(
-                        title = stringResource(Res.string.conflict_your_copy),
-                        history = details.originalHistory,
-                    )
-                    ConflictHistoryPanel(
-                        title = stringResource(Res.string.conflict_other_copy),
-                        history = details.conflictHistory,
-                    )
-                    ConflictActionsPanel(
-                        actions = details.availableActions,
-                        onResolve = { action ->
+                        title = stringResource(Res.string.conflict_branch_n, index + 1),
+                        history = branch.history,
+                        metadata = buildString {
+                            append(if (branch.deleted) stringResource(Res.string.common_deletion) else stringResource(Res.string.common_content))
+                            append(" · ")
+                            append(branch.updatedAt)
+                            branch.authorDeviceId?.let {
+                                append(" · ")
+                                append(it)
+                            }
+                        },
+                        actionLabel = if (branch.deleted) {
+                            stringResource(Res.string.conflict_keep_deletion)
+                        } else {
+                            stringResource(Res.string.conflict_use_this_branch)
+                        },
+                        onAction = {
                             coroutineScope.launch {
-                                if (notesController.resolveConflict(action)) {
+                                if (notesController.resolveConflictBranch(branch.versionId)) {
                                     navController.popBackStack()
                                 }
                             }
                         },
                     )
-                } else {
-                    Text(
-                        stringResource(Res.string.conflict_branch_help),
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        style = MaterialTheme.typography.bodyMedium,
-                    )
-                    details.versionBranches.forEachIndexed { index, branch ->
-                        ConflictHistoryPanel(
-                            title = stringResource(Res.string.conflict_branch_n, index + 1),
-                            history = branch.history,
-                            metadata = buildString {
-                                append(if (branch.deleted) stringResource(Res.string.common_deletion) else stringResource(Res.string.common_content))
-                                append(" · ")
-                                append(branch.updatedAt)
-                                branch.authorDeviceId?.let {
-                                    append(" · ")
-                                    append(it)
-                                }
-                            },
-                            actionLabel = if (branch.deleted) {
-                                stringResource(Res.string.conflict_keep_deletion)
-                            } else {
-                                stringResource(Res.string.conflict_use_this_branch)
-                            },
-                            onAction = {
-                                coroutineScope.launch {
-                                    if (notesController.resolveConflictBranch(branch.versionId)) {
-                                        navController.popBackStack()
-                                    }
-                                }
-                            },
-                        )
-                    }
-                    if (details.availableActions.isNotEmpty()) {
-                        ConflictActionsPanel(
-                            actions = details.availableActions,
-                            actionLabel = { action ->
-                                when (action) {
-                                    ConflictResolutionAction.MergeIntoOriginal -> stringResource(Res.string.conflict_combine_all)
-                                    ConflictResolutionAction.KeepConflictCopy -> stringResource(Res.string.conflict_action_keep_copy)
-                                    ConflictResolutionAction.RestoreOriginalFromConflict -> stringResource(Res.string.conflict_action_restore_original)
-                                    ConflictResolutionAction.DeleteConflictCopy -> stringResource(Res.string.conflict_action_delete_copy)
-                                }
-                            },
-                            onResolve = { action ->
-                                coroutineScope.launch {
-                                    if (notesController.resolveConflict(action)) {
-                                        navController.popBackStack()
-                                    }
-                                }
-                            },
-                        )
-                    }
                 }
             }
         }
@@ -2392,7 +2338,6 @@ private fun NotesAdaptiveWorkspace(
     mediaUiPorts: MediaUiPorts,
     notesSearchActive: Boolean,
     pullRefresh: SomedayPullRefreshUi?,
-    syncTopRevealSignal: Long,
     onCreateNote: () -> Unit,
     onOpenNote: (String) -> Boolean,
     onOpenConflictResolution: (ConflictDetails) -> Unit,
@@ -2403,17 +2348,14 @@ private fun NotesAdaptiveWorkspace(
 ) {
     val coroutineScope = rememberCoroutineScope()
     val listWidth = if (layoutSpec.contentLayout == SomedayContentLayout.ThreePane) 382.dp else 328.dp
-    val syncInProgress = settingsState.manualSyncProgress.running
     Row(modifier = modifier.fillMaxSize()) {
         NotesListPane(
             selectedTab = selectedTab,
             notesState = notesState,
             memoriesState = memoriesState,
             notesController = notesController,
-            syncInProgress = syncInProgress,
             notesSearchActive = notesSearchActive,
             pullRefresh = pullRefresh,
-            syncTopRevealSignal = syncTopRevealSignal,
             onOpenNote = onOpenNote,
             onOpenSearch = onOpenSearch,
             onCloseSearch = onCloseSearch,
@@ -2439,7 +2381,6 @@ private fun NotesAdaptiveWorkspace(
                 mediaUiPorts = mediaUiPorts,
                 editorPreferences = settingsState.settings.editorPreferences,
                 autoFocusBody = true,
-                syncInProgress = syncInProgress,
                 onOpenConflictResolution = onOpenConflictResolution,
                 onSave = {
                     coroutineScope.launch { notesController.saveEditor() }
@@ -2468,10 +2409,8 @@ private fun NotesListPane(
     notesState: NotesUiState,
     memoriesState: MemoriesUiState,
     notesController: NotesUiController,
-    syncInProgress: Boolean,
     notesSearchActive: Boolean,
     pullRefresh: SomedayPullRefreshUi?,
-    syncTopRevealSignal: Long,
     onOpenNote: (String) -> Boolean,
     onOpenSearch: () -> Unit,
     onCloseSearch: () -> Unit,
@@ -2538,7 +2477,6 @@ private fun NotesListPane(
             LazyColumnWithDragHandle(
                 modifier = Modifier.fillMaxSize(),
                 listStateKey = notesListStateKey(notesState, notesSearchActive),
-                topRevealSignal = syncTopRevealSignal.takeUnless { notesSearchActive },
                 contentPadding = PaddingValues(
                     start = SomedayDesignDefaults.PageHorizontalPadding,
                     top = 12.dp,
@@ -2550,7 +2488,6 @@ private fun NotesListPane(
                 if (notesSearchActive) {
                     notesSearchItems(
                         state = notesState,
-                        syncInProgress = syncInProgress,
                         onSearchQueryChange = { query ->
                             coroutineScope.launch { notesController.updateSearchQuery(query) }
                         },
@@ -2564,7 +2501,6 @@ private fun NotesListPane(
                 } else {
                     notesListItems(
                         state = notesState,
-                        syncInProgress = syncInProgress,
                         onShowNotebooks = onShowNotebooks,
                         onOpenNote = { noteId -> onOpenNote(noteId) },
                         showSelectionControls = true,
@@ -2706,7 +2642,12 @@ private fun SomedayStatusBar(
         PrimaryTab.Notes -> notesState.selectedNotebook?.let { stringResource(Res.string.status_notes_in_notebook, notesState.notes.size, it.title) }
             ?: stringResource(Res.string.status_no_notebook_selected)
         PrimaryTab.Memories -> stringResource(Res.string.tab_memories_title)
-        PrimaryTab.Settings -> stringResource(Res.string.status_sync_mode, settingsState.settings.syncConfiguration.mode.localizedLabel())
+        PrimaryTab.Settings -> when {
+            settingsState.sync.syncing -> stringResource(Res.string.sync_status_syncing)
+            settingsState.sync.issue != null -> stringResource(Res.string.sync_last_issue)
+            settingsState.sync.connection is SyncConnectionUi.Connected -> stringResource(Res.string.common_signed_in)
+            else -> stringResource(Res.string.common_not_configured)
+        }
     }
     Surface(
         color = MaterialTheme.colorScheme.surfaceVariant,
@@ -2886,10 +2827,8 @@ private fun NotesTabLazyContent(
     notesState: NotesUiState,
     memoriesState: MemoriesUiState,
     notesController: NotesUiController,
-    syncInProgress: Boolean,
     notesSearchActive: Boolean,
     pullRefresh: SomedayPullRefreshUi?,
-    syncTopRevealSignal: Long,
     onOpenNote: (String) -> Boolean,
     onOpenSearch: () -> Unit,
     onCloseSearch: () -> Unit,
@@ -2940,7 +2879,6 @@ private fun NotesTabLazyContent(
             LazyColumnWithDragHandle(
                 modifier = Modifier.fillMaxSize(),
                 listStateKey = notesListStateKey(notesState, notesSearchActive),
-                topRevealSignal = syncTopRevealSignal.takeUnless { notesSearchActive },
                 contentPadding = PaddingValues(
                     start = SomedayDesignDefaults.PageHorizontalPadding,
                     top = 12.dp,
@@ -2952,7 +2890,6 @@ private fun NotesTabLazyContent(
                 if (notesSearchActive) {
                     notesSearchItems(
                         state = notesState,
-                        syncInProgress = syncInProgress,
                         onSearchQueryChange = { query ->
                             coroutineScope.launch { notesController.updateSearchQuery(query) }
                         },
@@ -2966,7 +2903,6 @@ private fun NotesTabLazyContent(
                 } else {
                     notesListItems(
                         state = notesState,
-                        syncInProgress = syncInProgress,
                         onShowNotebooks = onShowNotebooks,
                         onOpenNote = { noteId -> onOpenNote(noteId) },
                         showSelectionControls = false,
@@ -3038,28 +2974,10 @@ private fun LazyColumnWithDragHandle(
     contentPadding: PaddingValues,
     modifier: Modifier = Modifier,
     listStateKey: Any? = Unit,
-    topRevealSignal: Long? = null,
     dragLabelForItemIndex: (Int) -> String? = { null },
     content: LazyListScope.() -> Unit,
 ) {
     val listState = rememberSaveable(listStateKey, saver = LazyListState.Saver) { LazyListState() }
-    var handledTopRevealSignal by remember { mutableStateOf(topRevealSignal) }
-    LaunchedEffect(topRevealSignal) {
-        val alreadyHandled = handledTopRevealSignal
-        handledTopRevealSignal = topRevealSignal
-        // Only react to signals raised while this list was already showing; a null
-        // transition means the list was disabled (e.g. search) when the sync finished.
-        if (topRevealSignal == null || alreadyHandled == null || topRevealSignal == alreadyHandled) {
-            return@LaunchedEffect
-        }
-        if (shouldScrollToRevealTop(
-                firstVisibleItemIndex = listState.firstVisibleItemIndex,
-                scrollInProgress = listState.isScrollInProgress,
-            )
-        ) {
-            listState.animateScrollToItem(0)
-        }
-    }
     Box(modifier = modifier) {
         LazyColumn(
             state = listState,
@@ -3266,7 +3184,6 @@ private fun MemoriesTabLazyContent(
     selectedTab: PrimaryTab,
     notesState: NotesUiState,
     memoriesState: MemoriesUiState,
-    syncInProgress: Boolean,
     pullRefresh: SomedayPullRefreshUi?,
     onGoToMonth: (MemoryMonth) -> Unit,
     onSelectDay: (Int) -> Unit,
@@ -3297,7 +3214,6 @@ private fun MemoriesTabLazyContent(
             ) {
                 memoriesContentItems(
                     state = memoriesState,
-                    syncInProgress = syncInProgress,
                     onGoToMonth = onGoToMonth,
                     onSelectDay = onSelectDay,
                     onOpenNote = onOpenNote,
@@ -3509,7 +3425,6 @@ private fun SectionHeader(
 
 private fun LazyListScope.notesListItems(
     state: NotesUiState,
-    syncInProgress: Boolean,
     onShowNotebooks: () -> Unit,
     onOpenNote: (String) -> Unit,
     showSelectionControls: Boolean,
@@ -3549,7 +3464,6 @@ private fun LazyListScope.notesListItems(
             NoteListItem(
                 note = note,
                 metadataText = formatNoteCreatedMetadata(note),
-                syncInProgress = syncInProgress,
                 onOpenNote = onOpenNote,
                 selected = note.id in state.selectedNoteIds,
                 showSelectionControl = showSelectionControls || state.noteSelectionActive,
@@ -3581,7 +3495,6 @@ private fun notesDragMonthLabelProvider(
 
 private fun LazyListScope.notesSearchItems(
     state: NotesUiState,
-    syncInProgress: Boolean,
     onSearchQueryChange: (String) -> Unit,
     onClearSearch: () -> Unit,
     onOpenNote: (String) -> Unit,
@@ -3641,7 +3554,6 @@ private fun LazyListScope.notesSearchItems(
             NoteListItem(
                 note = note,
                 metadataText = formatNoteCreatedThenUpdatedMetadata(note),
-                syncInProgress = syncInProgress,
                 onOpenNote = onOpenNote,
                 selected = note.id in state.selectedNoteIds,
                 showSelectionControl = showSelectionControls || state.noteSelectionActive,
@@ -3657,7 +3569,6 @@ private fun LazyListScope.notesSearchItems(
 private fun NoteListItem(
     note: NoteSummary,
     metadataText: String,
-    syncInProgress: Boolean,
     onOpenNote: (String) -> Unit,
     selected: Boolean = false,
     showSelectionControl: Boolean = false,
@@ -3715,7 +3626,6 @@ private fun NoteListItem(
             }
             NoteSyncIndicator(
                 syncBadge = note.syncBadge,
-                syncInProgress = syncInProgress,
                 showText = false,
             )
         }
@@ -4040,7 +3950,6 @@ private fun formatNoteUpdatedAt(updatedAt: Instant): String {
 
 private fun LazyListScope.memoriesContentItems(
     state: MemoriesUiState,
-    syncInProgress: Boolean,
     onGoToMonth: (MemoryMonth) -> Unit,
     onSelectDay: (Int) -> Unit,
     onOpenNote: (String) -> Boolean,
@@ -4149,7 +4058,6 @@ private fun LazyListScope.memoriesContentItems(
     noteSummaryListItems(
         notes = state.selectedDayNotes,
         emptyMessage = Res.string.memories_no_notes_on_date,
-        syncInProgress = syncInProgress,
         onOpenNote = onOpenNote,
         keyPrefix = "selected-day",
         metadataText = { formatNoteUpdatedMetadata(it) },
@@ -4167,7 +4075,6 @@ private fun LazyListScope.memoriesContentItems(
     noteSummaryListItems(
         notes = state.priorYearNotes,
         emptyMessage = Res.string.memories_no_past_memories,
-        syncInProgress = syncInProgress,
         onOpenNote = onOpenNote,
         keyPrefix = "prior-year",
         metadataText = { formatNoteCreatedThenUpdatedMetadata(it) },
@@ -4223,6 +4130,7 @@ private fun SettingsContent(
     onThisDayNotificationTimeFormatter: OnThisDayNotificationTimeFormatter,
     developerOptions: DeveloperOptionsUi? = null,
     workspacePairingScanner: WorkspacePairingScanner,
+    actionScope: CoroutineScope,
     onOpenPage: (SettingsPage) -> Unit,
     onBack: () -> Unit,
     modifier: Modifier = Modifier,
@@ -4258,7 +4166,7 @@ private fun SettingsContent(
                     onThisDayNotificationTimeFormatter = onThisDayNotificationTimeFormatter,
                     developerOptions = developerOptions,
                     workspacePairingScanner = workspacePairingScanner,
-                    onOpenPage = onOpenPage,
+                    actionScope = actionScope,
                 )
             }
         }
@@ -4362,7 +4270,12 @@ private fun SettingsMainContent(
         SettingsNavigationRow(
             icon = Lucide.Cloud,
             title = stringResource(Res.string.common_sync),
-            subtitle = state.settings.syncConfiguration.mode.localizedLabel(),
+            subtitle = when {
+                state.sync.syncing -> stringResource(Res.string.sync_status_syncing)
+                state.sync.issue != null -> stringResource(Res.string.sync_last_issue)
+                state.sync.connection is SyncConnectionUi.Connected -> stringResource(Res.string.common_signed_in)
+                else -> stringResource(Res.string.common_not_configured)
+            },
             onClick = { onOpenPage(SettingsPage.Sync) },
         )
         SettingsDivider()
@@ -4480,7 +4393,7 @@ private fun SettingsDetailContent(
     onThisDayNotificationTimeFormatter: OnThisDayNotificationTimeFormatter,
     developerOptions: DeveloperOptionsUi?,
     workspacePairingScanner: WorkspacePairingScanner,
-    onOpenPage: (SettingsPage) -> Unit,
+    actionScope: CoroutineScope,
 ) {
     WorkspacePreferencesStatusSection(state, controller)
     when (page) {
@@ -4495,9 +4408,8 @@ private fun SettingsDetailContent(
             state = state,
             controller = controller,
             workspacePairingScanner = workspacePairingScanner,
-            onOpenPage = onOpenPage,
+            actionScope = actionScope,
         )
-        SettingsPage.SelfHosted -> SelfHostedSettingsContent(state = state, controller = controller)
         SettingsPage.Import -> ImportSettingsContent(state = state, controller = controller)
         SettingsPage.Export -> ExportSettingsContent(state = state, controller = controller)
         SettingsPage.Developer -> developerOptions?.let { DeveloperSettingsContent(options = it) }
@@ -4511,7 +4423,6 @@ private fun settingsPageTitle(page: SettingsPage): String =
         SettingsPage.Editor -> stringResource(Res.string.settings_editor)
         SettingsPage.Notifications -> stringResource(Res.string.on_this_day_settings_navigation_title)
         SettingsPage.Sync -> stringResource(Res.string.common_sync)
-        SettingsPage.SelfHosted -> stringResource(Res.string.settings_self_hosted)
         SettingsPage.Import -> stringResource(Res.string.common_import)
         SettingsPage.Export -> stringResource(Res.string.common_export)
         SettingsPage.Developer -> stringResource(Res.string.settings_developer_options)
@@ -4819,122 +4730,226 @@ private fun SyncSettingsContent(
     state: SettingsUiState,
     controller: SettingsUiController,
     workspacePairingScanner: WorkspacePairingScanner,
-    onOpenPage: (SettingsPage) -> Unit,
+    actionScope: CoroutineScope,
 ) {
-    val coroutineScope = rememberCoroutineScope()
-    var syncModeDialogVisible by remember { mutableStateOf(false) }
-    var manualSyncRunning by remember { mutableStateOf(false) }
-    val syncConfiguration = state.settings.syncConfiguration
-    val syncMode = syncConfiguration.mode
+    val connection = state.sync.connection
+    val connected = connection as? SyncConnectionUi.Connected
+    val unavailable = connection as? SyncConnectionUi.Unavailable
+    val signedIn = connected != null
+    val savedAccount = connected != null || unavailable != null
+    val configuredEndpoint = when (connection) {
+        is SyncConnectionUi.Connected -> connection.endpoint
+        is SyncConnectionUi.LocalOnly -> connection.configuredEndpoint
+        is SyncConnectionUi.Unavailable -> connection.configuredEndpoint
+    }
+    val accountEmail = connected?.accountEmail ?: unavailable?.accountEmail
+    val deviceLabel = connected?.deviceLabel ?: unavailable?.deviceLabel
+    val accountFormMode = state.sync.accountFormMode()
+    var connectionFormVisible by remember {
+        mutableStateOf(accountFormMode.initiallyVisible)
+    }
+    var selfHostedEndpoint by remember(configuredEndpoint) {
+        mutableStateOf(configuredEndpoint ?: "http://127.0.0.1:3180")
+    }
+    var selfHostedEmail by remember(accountEmail) {
+        mutableStateOf(accountEmail.orEmpty())
+    }
+    var selfHostedPassword by remember { mutableStateOf("") }
 
-    SettingsSection(
-        title = stringResource(Res.string.common_sync),
-    ) {
-        SettingsRow(
-            icon = Lucide.Cloud,
-            title = stringResource(Res.string.settings_mode),
-            subtitle = syncMode.name,
-            onClick = { syncModeDialogVisible = true },
-        ) {
-            SettingsChevron()
+    LaunchedEffect(accountFormMode) {
+        when {
+            accountFormMode.initiallyVisible -> connectionFormVisible = true
+            !accountFormMode.allowManualReauthentication -> {
+                connectionFormVisible = false
+                selfHostedPassword = ""
+            }
         }
-        when (syncMode) {
-            SyncMode.SelfHosted -> {
-                HorizontalDivider()
-                SettingsRow(
-                    icon = Lucide.Server,
-                    title = stringResource(Res.string.sync_self_hosted_server),
-                    subtitle = if (syncConfiguration.selfHostedSession.loggedIn) {
-                        stringResource(Res.string.common_signed_in)
-                    } else {
-                        stringResource(Res.string.common_not_configured)
-                    },
-                    onClick = { onOpenPage(SettingsPage.SelfHosted) },
-                ) {
-                    SettingsChevron()
+    }
+
+    fun connect(createAccount: Boolean) {
+        if (state.sync.busy) return
+        actionScope.launch {
+            val succeeded = controller.setupSelfHosted(
+                endpoint = selfHostedEndpoint,
+                email = selfHostedEmail,
+                password = selfHostedPassword,
+                createAccount = createAccount,
+            )
+            if (succeeded) {
+                selfHostedPassword = ""
+                connectionFormVisible = false
+            }
+        }
+    }
+
+    SettingsSection(title = stringResource(Res.string.common_status)) {
+        SettingsRow(
+            icon = if (signedIn) Lucide.Cloud else Lucide.Server,
+            title = when {
+                state.sync.syncing -> stringResource(Res.string.sync_status_syncing)
+                unavailable != null || state.sync.issue?.action == SyncIssueAction.ReloadSession ->
+                    stringResource(Res.string.sync_status_unavailable)
+                signedIn -> stringResource(Res.string.common_signed_in)
+                else -> stringResource(Res.string.common_not_configured)
+            },
+            subtitle = accountEmail ?: configuredEndpoint,
+        )
+        if (savedAccount) {
+            HorizontalDivider()
+            StatusLine(
+                stringResource(Res.string.common_server),
+                configuredEndpoint.orEmpty(),
+            )
+            StatusLine(stringResource(Res.string.common_device), deviceLabel.orEmpty())
+        }
+        state.sync.issue?.let { issue ->
+            StatusLine(
+                stringResource(Res.string.sync_last_issue),
+                issue.reason.localizedMessage(),
+            )
+        }
+        val issueAction = state.sync.issue?.action
+        if (savedAccount || issueAction == SyncIssueAction.ReloadSession) {
+            HorizontalDivider()
+            if (
+                (connected != null && state.sync.issue == null) ||
+                issueAction == SyncIssueAction.RetrySync ||
+                issueAction == SyncIssueAction.ReloadSession
+            ) {
+                val retrying = issueAction != null
+                val actionBusy = if (issueAction == SyncIssueAction.ReloadSession) {
+                    state.sync.operation == SyncUiOperation.ReloadingSession
+                } else {
+                    state.sync.operation == SyncUiOperation.Syncing
                 }
-                HorizontalDivider()
-                val progress = state.manualSyncProgress
                 SettingsActionRow(
                     icon = Lucide.Cloud,
-                    title = stringResource(Res.string.sync_now),
-                    subtitle = progress.message.takeIf { progress.running }
-                        ?: if (syncConfiguration.selfHostedSession.loggedIn) null else stringResource(Res.string.sync_sign_in_to_enable),
-                    actionText = stringResource(Res.string.common_sync),
-                    busy = manualSyncRunning || progress.running,
-                    enabled = !manualSyncRunning && !progress.running && syncConfiguration.selfHostedSession.loggedIn,
+                    title = if (retrying) stringResource(Res.string.sync_retry) else stringResource(Res.string.sync_now),
+                    subtitle = if (state.sync.syncing) stringResource(Res.string.sync_in_progress) else null,
+                    actionText = if (retrying) stringResource(Res.string.sync_retry) else stringResource(Res.string.common_sync),
+                    busy = actionBusy,
+                    enabled = !state.sync.busy,
                     onClick = {
-                        if (!manualSyncRunning) {
-                            manualSyncRunning = true
-                            coroutineScope.launch {
-                                controller.runManualSync()
-                                manualSyncRunning = false
-                            }
+                        actionScope.launch {
+                            if (retrying) controller.recoverSyncIssue() else controller.runUserSync()
                         }
                     },
                 )
-                if (progress.running || progress.pushedObjects > 0 || progress.pulledObjects > 0 || progress.conflicts > 0) {
-                    StatusLine(
-                        stringResource(Res.string.common_changes),
-                        stringResource(
-                            Res.string.sync_progress_summary,
-                            progress.pushedObjects,
-                            progress.pulledObjects,
-                            progress.conflicts,
-                        ),
+            }
+            if (accountFormMode.allowManualReauthentication) {
+                TextButton(
+                    onClick = {
+                        connectionFormVisible = !connectionFormVisible
+                        if (!connectionFormVisible) selfHostedPassword = ""
+                    },
+                    enabled = !state.sync.busy,
+                ) {
+                    Text(
+                        if (connectionFormVisible) {
+                            stringResource(Res.string.common_cancel)
+                        } else {
+                            stringResource(Res.string.sync_reauthenticate)
+                        },
                     )
                 }
             }
-            SyncMode.Off -> {
-                HorizontalDivider()
-                SettingsRow(
-                    icon = Lucide.Server,
-                    title = stringResource(Res.string.sync_self_hosted_server),
-                    subtitle = if (syncConfiguration.selfHostedSession.loggedIn) {
-                        stringResource(Res.string.common_signed_in)
-                    } else {
-                        stringResource(Res.string.sync_set_up)
-                    },
-                    onClick = { onOpenPage(SettingsPage.SelfHosted) },
-                ) {
-                    SettingsChevron()
-                }
-            }
-        }
-        syncConfiguration.lastError?.let {
-            StatusLine(
-                stringResource(Res.string.sync_last_issue),
-                stringResource(Res.string.sync_last_issue_safe),
-            )
         }
     }
 
-    // Device pairing is how a second client receives the workspace master key.
-    if (syncMode == SyncMode.SelfHosted) {
+    if (connectionFormVisible) {
+        SettingsSection(title = stringResource(Res.string.common_account)) {
+            OutlinedTextField(
+                value = selfHostedEndpoint,
+                onValueChange = { selfHostedEndpoint = it },
+                label = { Text(stringResource(Res.string.common_server_url)) },
+                enabled = !state.sync.busy,
+                readOnly = accountFormMode.serverReadOnly,
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            OutlinedTextField(
+                value = selfHostedEmail,
+                onValueChange = { selfHostedEmail = it },
+                label = { Text(stringResource(Res.string.common_email)) },
+                enabled = !state.sync.busy,
+                readOnly = accountFormMode.emailReadOnly,
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            OutlinedTextField(
+                value = selfHostedPassword,
+                onValueChange = { selfHostedPassword = it },
+                label = { Text(stringResource(Res.string.common_password)) },
+                enabled = !state.sync.busy,
+                singleLine = true,
+                visualTransformation = PasswordVisualTransformation(),
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Button(
+                onClick = { connect(createAccount = false) },
+                enabled = !state.sync.busy,
+            ) {
+                ActionButtonLabel(
+                    icon = Lucide.Server,
+                    text = if (accountFormMode != SyncAccountFormMode.InitialSetup) {
+                        stringResource(Res.string.sync_reauthenticate)
+                    } else {
+                        stringResource(Res.string.selfhosted_sign_in)
+                    },
+                    busy = state.sync.operation == SyncUiOperation.Authenticating,
+                )
+            }
+            if (accountFormMode.allowCreateAccount) {
+                TextButton(
+                    onClick = { connect(createAccount = true) },
+                    enabled = !state.sync.busy,
+                ) {
+                    ActionButtonLabel(
+                        icon = Lucide.Plus,
+                        text = stringResource(Res.string.sync_create_account),
+                        busy = state.sync.operation == SyncUiOperation.CreatingAccount,
+                    )
+                }
+            }
+            if (
+                state.sync.operation == SyncUiOperation.Authenticating ||
+                state.sync.operation == SyncUiOperation.CreatingAccount
+            ) {
+                StatusLine(
+                    stringResource(Res.string.common_now),
+                    stringResource(Res.string.sync_connecting),
+                )
+            }
+        }
+    }
+
+    if (state.sync.pairingAvailable) {
         WorkspacePairingContent(
             state = state,
             controller = controller,
-            pairingReady = syncConfiguration.selfHostedSession.loggedIn,
-            readinessSubtitle = if (syncConfiguration.selfHostedSession.loggedIn) {
-                stringResource(Res.string.self_hosted_pairing_help)
-            } else {
-                stringResource(Res.string.sync_sign_in_to_enable)
-            },
+            readinessSubtitle = stringResource(Res.string.self_hosted_pairing_help),
             scanner = workspacePairingScanner,
-        )
-    }
-
-    if (syncModeDialogVisible) {
-        SyncModeSelectionDialog(
-            selectedMode = syncMode,
-            onSelect = { mode ->
-                coroutineScope.launch { controller.selectSyncMode(mode) }
-                syncModeDialogVisible = false
-            },
-            onDismiss = { syncModeDialogVisible = false },
+            actionScope = actionScope,
         )
     }
 }
+
+@Composable
+private fun SyncIssueReason.localizedMessage(): String =
+    when (this) {
+        SyncIssueReason.SignInRequired -> stringResource(Res.string.settings_fb_sign_in_before_sync)
+        SyncIssueReason.SecureSessionUnavailable -> stringResource(Res.string.sync_secure_session_unavailable)
+        SyncIssueReason.SetupFailed -> stringResource(Res.string.settings_fb_selfhosted_setup_failed)
+        SyncIssueReason.ConfigurationChanged -> stringResource(Res.string.settings_fb_sync_configuration_changed)
+        SyncIssueReason.SyncUnavailable -> stringResource(Res.string.settings_fb_sync_unavailable)
+        SyncIssueReason.AuthorityMismatch -> stringResource(Res.string.settings_fb_sync_authority_mismatch)
+        SyncIssueReason.WorkspaceLocked -> stringResource(Res.string.settings_fb_sync_workspace_locked)
+        SyncIssueReason.RemoteHistoryConflict -> stringResource(Res.string.settings_fb_sync_remote_history_conflict)
+        SyncIssueReason.CheckpointInvalid -> stringResource(Res.string.settings_fb_sync_checkpoint_invalid)
+        SyncIssueReason.RetryRequired -> stringResource(Res.string.settings_fb_sync_retry_required)
+        SyncIssueReason.Blocked -> stringResource(Res.string.settings_fb_sync_blocked)
+        SyncIssueReason.SyncFailed -> stringResource(Res.string.settings_fb_sync_failed)
+    }
 
 @Composable
 private fun ThemeSelectionDialog(
@@ -5029,35 +5044,6 @@ private fun DefaultNotebookSelectionDialog(
 }
 
 @Composable
-private fun SyncModeSelectionDialog(
-    selectedMode: SyncMode,
-    onSelect: (SyncMode) -> Unit,
-    onDismiss: () -> Unit,
-) {
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        confirmButton = {},
-        dismissButton = {
-            TextButton(onClick = onDismiss) {
-                Text(stringResource(Res.string.common_cancel))
-            }
-        },
-        title = { Text(stringResource(Res.string.settings_sync_mode)) },
-        text = {
-            Column {
-                SyncMode.entries.forEach { mode ->
-                    DialogOptionRow(
-                        title = mode.localizedLabel(),
-                        selected = mode == selectedMode,
-                        onClick = { onSelect(mode) },
-                    )
-                }
-            }
-        },
-    )
-}
-
-@Composable
 private fun DialogOptionRow(
     title: String,
     selected: Boolean,
@@ -5079,188 +5065,16 @@ private fun DialogOptionRow(
 }
 
 @Composable
-private fun SelfHostedSettingsContent(
-    state: SettingsUiState,
-    controller: SettingsUiController,
-) {
-    val coroutineScope = rememberCoroutineScope()
-    var activeAction by remember { mutableStateOf<SelfHostedUiAction?>(null) }
-    var forgetSessionDialogVisible by remember { mutableStateOf(false) }
-    var selfHostedEndpoint by remember(state.settings.syncConfiguration.selfHostedEndpoint) {
-        mutableStateOf(state.settings.syncConfiguration.selfHostedEndpoint ?: "http://127.0.0.1:3180")
-    }
-    var selfHostedEmail by remember { mutableStateOf("") }
-    var selfHostedPassword by remember { mutableStateOf("") }
-    var selfHostedDeviceName by remember(state.settings.syncConfiguration.selfHostedSession.deviceName) {
-        mutableStateOf(state.settings.syncConfiguration.selfHostedSession.deviceName.orEmpty())
-    }
-    var selfHostedPlatform by remember(state.settings.syncConfiguration.selfHostedSession.devicePlatform) {
-        mutableStateOf(state.settings.syncConfiguration.selfHostedSession.devicePlatform ?: "desktop")
-    }
-    val selfHostedSession = state.settings.syncConfiguration.selfHostedSession
-    fun runSelfHostedAction(
-        action: SelfHostedUiAction,
-        block: suspend () -> Boolean,
-    ) {
-        if (activeAction != null) return
-        activeAction = action
-        coroutineScope.launch {
-            val succeeded = block()
-            if (succeeded) {
-                selfHostedPassword = ""
-            }
-            activeAction = null
-        }
-    }
-
-    SettingsSection(title = stringResource(Res.string.common_status)) {
-        SettingsRow(
-            icon = Lucide.Server,
-            title = if (selfHostedSession.loggedIn) stringResource(Res.string.common_signed_in) else stringResource(Res.string.common_not_signed_in),
-            subtitle = selfHostedSession.userEmail,
-        )
-        if (selfHostedSession.loggedIn) {
-            HorizontalDivider()
-            StatusLine(stringResource(Res.string.common_device), selfHostedSession.deviceLabel)
-        }
-        activeAction?.let { action ->
-            StatusLine(stringResource(Res.string.common_now), action.progressText())
-        }
-    }
-
-    SettingsSection(
-        title = stringResource(Res.string.common_account),
-    ) {
-        OutlinedTextField(
-            value = selfHostedEndpoint,
-            onValueChange = { selfHostedEndpoint = it },
-            label = { Text(stringResource(Res.string.common_server_url)) },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth(),
-        )
-        OutlinedTextField(
-            value = selfHostedEmail,
-            onValueChange = { selfHostedEmail = it },
-            label = { Text(stringResource(Res.string.common_email)) },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth(),
-        )
-        OutlinedTextField(
-            value = selfHostedPassword,
-            onValueChange = { selfHostedPassword = it },
-            label = { Text(stringResource(Res.string.common_password)) },
-            singleLine = true,
-            visualTransformation = PasswordVisualTransformation(),
-            modifier = Modifier.fillMaxWidth(),
-        )
-        OutlinedTextField(
-            value = selfHostedDeviceName,
-            onValueChange = { selfHostedDeviceName = it },
-            label = { Text(stringResource(Res.string.selfhosted_device_name)) },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth(),
-        )
-        OutlinedTextField(
-            value = selfHostedPlatform,
-            onValueChange = { selfHostedPlatform = it },
-            label = { Text(stringResource(Res.string.selfhosted_device_type)) },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth(),
-        )
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Button(
-                onClick = {
-                    runSelfHostedAction(SelfHostedUiAction.CreateAccount) {
-                        controller.setupSelfHosted(
-                            SelfHostedSetupInput(
-                                endpoint = selfHostedEndpoint,
-                                email = selfHostedEmail,
-                                password = selfHostedPassword,
-                                deviceName = selfHostedDeviceName,
-                                platform = selfHostedPlatform,
-                                createAccount = true,
-                            ),
-                        )
-                    }
-                },
-                enabled = activeAction == null,
-            ) {
-                ActionButtonLabel(
-                    icon = Lucide.Server,
-                    text = stringResource(Res.string.common_create),
-                    busy = activeAction == SelfHostedUiAction.CreateAccount,
-                )
-            }
-            Button(
-                onClick = {
-                    runSelfHostedAction(SelfHostedUiAction.SignIn) {
-                        controller.setupSelfHosted(
-                            SelfHostedSetupInput(
-                                endpoint = selfHostedEndpoint,
-                                email = selfHostedEmail,
-                                password = selfHostedPassword,
-                                deviceName = selfHostedDeviceName,
-                                platform = selfHostedPlatform,
-                                createAccount = false,
-                            ),
-                        )
-                    }
-                },
-                enabled = activeAction == null,
-            ) {
-                ActionButtonLabel(
-                    icon = Lucide.Server,
-                    text = stringResource(Res.string.selfhosted_sign_in),
-                    busy = activeAction == SelfHostedUiAction.SignIn,
-                )
-            }
-        }
-        if (selfHostedSession.loggedIn) {
-            TextButton(onClick = { forgetSessionDialogVisible = true }) {
-                Text(stringResource(Res.string.selfhosted_forget_session))
-            }
-        }
-    }
-
-    if (forgetSessionDialogVisible) {
-        ConfirmActionDialog(
-            title = stringResource(Res.string.selfhosted_forget_session_title),
-            text = stringResource(Res.string.selfhosted_forget_session_message),
-            confirmText = stringResource(Res.string.common_forget),
-            onConfirm = {
-                coroutineScope.launch { controller.clearSelfHostedSession() }
-                forgetSessionDialogVisible = false
-            },
-            onDismiss = { forgetSessionDialogVisible = false },
-        )
-    }
-}
-
-private enum class SelfHostedUiAction {
-    CreateAccount,
-    SignIn,
-}
-
-@Composable
-private fun SelfHostedUiAction.progressText(): String =
-    when (this) {
-        SelfHostedUiAction.CreateAccount -> stringResource(Res.string.selfhosted_creating_account)
-        SelfHostedUiAction.SignIn -> stringResource(Res.string.selfhosted_signing_in)
-    }
-
-@Composable
 private fun WorkspacePairingContent(
     state: SettingsUiState,
     controller: SettingsUiController,
-    pairingReady: Boolean,
     readinessSubtitle: String,
     scanner: WorkspacePairingScanner,
+    actionScope: CoroutineScope,
 ) {
-    val coroutineScope = rememberCoroutineScope()
-    var activeAction by remember { mutableStateOf<WorkspacePairingUiAction?>(null) }
     var selectedMode by remember {
         mutableStateOf(
-            if (state.workspacePairingInvitation != null) {
+            if (state.sync.invitation != null) {
                 WorkspacePairingMode.ShowInvitation
             } else {
                 null
@@ -5268,9 +5082,9 @@ private fun WorkspacePairingContent(
         )
     }
     var joinPairingToken by remember { mutableStateOf("") }
-    val actionRunning = activeAction != null
+    val actionRunning = state.sync.busy
     val tokenEntered = joinPairingToken.isNotBlank()
-    val invitationExpiresAt = state.workspacePairingInvitation?.expiresAtEpochMillis
+    val invitationExpiresAt = state.sync.invitation?.expiresAtEpochMillis
     var invitationExpired by remember(invitationExpiresAt) {
         mutableStateOf(
             invitationExpiresAt?.let {
@@ -5290,7 +5104,7 @@ private fun WorkspacePairingContent(
             true
         } ?: false
     }
-    val displayedInvitation = state.workspacePairingInvitation
+    val displayedInvitation = state.sync.invitation
         ?.takeUnless { invitationExpired }
 
     LaunchedEffect(displayedInvitation?.expiresAtEpochMillis) {
@@ -5300,20 +5114,18 @@ private fun WorkspacePairingContent(
     }
 
     fun runWorkspacePairingAction(
-        action: WorkspacePairingUiAction,
+        clearJoinFormOnSuccess: Boolean = false,
         block: suspend () -> Boolean,
     ) {
-        if (activeAction != null) {
+        if (state.sync.busy) {
             return
         }
-        activeAction = action
-        coroutineScope.launch {
+        actionScope.launch {
             val succeeded = block()
-            if (succeeded && action == WorkspacePairingUiAction.Join) {
+            if (succeeded && clearJoinFormOnSuccess) {
                 joinPairingToken = ""
                 selectedMode = null
             }
-            activeAction = null
         }
     }
 
@@ -5330,12 +5142,12 @@ private fun WorkspacePairingContent(
         ) {
             CompactSettingsActionButton(
                 text = stringResource(Res.string.pairing_create_invitation),
-                busy = activeAction == WorkspacePairingUiAction.CreateInvitation,
-                enabled = !actionRunning && pairingReady,
+                busy = state.sync.operation == SyncUiOperation.CreatingInvitation,
+                enabled = !actionRunning,
                 onClick = {
                     selectedMode = WorkspacePairingMode.ShowInvitation
                     if (displayedInvitation == null) {
-                        runWorkspacePairingAction(WorkspacePairingUiAction.CreateInvitation) {
+                        runWorkspacePairingAction {
                             controller.createWorkspacePairingInvitation()
                         }
                     }
@@ -5343,59 +5155,46 @@ private fun WorkspacePairingContent(
             )
             CompactSettingsActionButton(
                 text = stringResource(Res.string.pairing_enter_token),
-                enabled = !actionRunning && pairingReady,
+                enabled = !actionRunning,
                 onClick = { selectedMode = WorkspacePairingMode.JoinWithToken },
             )
         }
-        if (selectedMode == WorkspacePairingMode.ShowInvitation) {
+        if (selectedMode == WorkspacePairingMode.ShowInvitation && displayedInvitation != null) {
             HorizontalDivider()
-            val invitation = displayedInvitation
-            if (invitation == null) {
-                SettingsActionRow(
-                    icon = Lucide.LockKeyhole,
-                    title = stringResource(Res.string.pairing_create_title),
-                    subtitle = stringResource(Res.string.pairing_create_subtitle),
-                    actionText = stringResource(Res.string.common_create),
-                    busy = activeAction == WorkspacePairingUiAction.CreateInvitation,
-                    enabled = !actionRunning && pairingReady,
+            Column(
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                modifier = Modifier.fillMaxWidth().padding(vertical = 10.dp),
+            ) {
+                WorkspacePairingQrCode(displayedInvitation.qrPayload)
+                Text(
+                    text = displayedInvitation.manualToken,
+                    fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.SemiBold,
+                    textAlign = TextAlign.Center,
+                    style = MaterialTheme.typography.headlineMedium,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Text(
+                    text = stringResource(Res.string.pairing_expires),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.Center,
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                TextButton(
                     onClick = {
-                        runWorkspacePairingAction(WorkspacePairingUiAction.CreateInvitation) {
-                            controller.createWorkspacePairingInvitation()
+                        runWorkspacePairingAction {
+                            controller.cancelWorkspacePairingInvitation()
                         }
                     },
-                )
-            } else {
-                Column(
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    modifier = Modifier.fillMaxWidth().padding(vertical = 10.dp),
+                    enabled = !actionRunning,
                 ) {
-                    WorkspacePairingQrCode(invitation.qrPayload)
-                    Text(
-                        text = invitation.manualToken,
-                        fontFamily = FontFamily.Monospace,
-                        fontWeight = FontWeight.SemiBold,
-                        textAlign = TextAlign.Center,
-                        style = MaterialTheme.typography.headlineMedium,
-                        modifier = Modifier.fillMaxWidth(),
+                    ActionButtonLabel(
+                        icon = Lucide.X,
+                        text = stringResource(Res.string.pairing_cancel_invitation),
+                        busy = state.sync.operation == SyncUiOperation.CancellingInvitation,
                     )
-                    Text(
-                        text = stringResource(Res.string.pairing_expires),
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        textAlign = TextAlign.Center,
-                        style = MaterialTheme.typography.bodySmall,
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                    TextButton(
-                        onClick = {
-                            runWorkspacePairingAction(WorkspacePairingUiAction.CancelInvitation) {
-                                controller.cancelWorkspacePairingInvitation()
-                            }
-                        },
-                        enabled = !actionRunning,
-                    ) {
-                        Text(stringResource(Res.string.pairing_cancel_invitation))
-                    }
                 }
             }
         }
@@ -5444,10 +5243,10 @@ private fun WorkspacePairingContent(
                     stringResource(Res.string.pairing_enter_token_prompt)
                 },
                 actionText = stringResource(Res.string.common_join),
-                busy = activeAction == WorkspacePairingUiAction.Join,
-                enabled = !actionRunning && pairingReady && tokenEntered,
+                busy = state.sync.operation == SyncUiOperation.JoiningInvitation,
+                enabled = !actionRunning && tokenEntered,
                 onClick = {
-                    runWorkspacePairingAction(WorkspacePairingUiAction.Join) {
+                    runWorkspacePairingAction(clearJoinFormOnSuccess = true) {
                         controller.joinWorkspaceWithToken(joinPairingToken)
                     }
                 },
@@ -5495,12 +5294,6 @@ private fun WorkspacePairingQrCode(payload: String) {
 private enum class WorkspacePairingMode {
     ShowInvitation,
     JoinWithToken,
-}
-
-private enum class WorkspacePairingUiAction {
-    CreateInvitation,
-    CancelInvitation,
-    Join,
 }
 
 @Composable
@@ -5833,7 +5626,6 @@ private fun StatusLine(
 private fun LazyListScope.noteSummaryListItems(
     notes: List<NoteSummary>,
     emptyMessage: org.jetbrains.compose.resources.StringResource,
-    syncInProgress: Boolean,
     onOpenNote: (String) -> Boolean,
     keyPrefix: String,
     metadataText: @Composable (NoteSummary) -> String,
@@ -5857,7 +5649,6 @@ private fun LazyListScope.noteSummaryListItems(
         NoteListItem(
             note = note,
             metadataText = metadataText(note),
-            syncInProgress = syncInProgress,
             onOpenNote = { noteId -> onOpenNote(noteId) },
         )
     }
@@ -5872,7 +5663,6 @@ private fun NoteEditorContent(
     toolbarPlacement: NoteEditorToolbarPlacement = NoteEditorToolbarPlacement.Inline,
     contentHorizontalPadding: Dp = 0.dp,
     autoFocusBody: Boolean,
-    syncInProgress: Boolean,
     onOpenConflictResolution: (ConflictDetails) -> Unit,
     onSave: () -> Unit,
     onClose: () -> Unit,
@@ -6068,7 +5858,9 @@ private fun NoteEditorContent(
                     inputActionsEnabled = markdownFieldValue.composition == null,
                     imageActionEnabled = !mediaImportInProgress,
                     onToolbarAction = onMarkdownToolbarAction,
-                    modifier = Modifier.align(Alignment.BottomCenter),
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .imePadding(),
                 )
             }
         }
@@ -6123,7 +5915,6 @@ private fun NoteEditorContent(
             editor = editor,
             dateText = noteEditorDateLabel(editor),
             placeDraft = placeDraft,
-            syncInProgress = syncInProgress,
             onPlaceDraftChange = { placeDraft = it },
             onSelectNotebook = { notebookId -> controller.updateDraft(notebookId = notebookId) },
             onCaptureCurrentLocation = controller::captureCurrentLocation,
@@ -6453,7 +6244,6 @@ private fun NoteDetailsDialog(
     editor: NoteEditorState,
     dateText: String,
     placeDraft: String,
-    syncInProgress: Boolean,
     onPlaceDraftChange: (String) -> Unit,
     onSelectNotebook: (String) -> Unit,
     onCaptureCurrentLocation: () -> Boolean,
@@ -6494,44 +6284,45 @@ private fun NoteDetailsDialog(
                     label = stringResource(Res.string.common_location),
                     value = placeDraft.ifBlank { noteEditorLocationLabel(editor).ifBlank { stringResource(Res.string.note_no_location) } },
                 )
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Icon(
-                        Lucide.Cloud,
-                        contentDescription = null,
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.size(18.dp),
-                    )
-                    Text(
-                        stringResource(Res.string.common_status),
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        style = MaterialTheme.typography.bodySmall,
-                        modifier = Modifier.width(74.dp),
-                    )
-                    if (editor.noteId == null) {
-                        Text(
-                            stringResource(Res.string.common_draft),
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            style = MaterialTheme.typography.bodyMedium,
-                            modifier = Modifier.weight(1f),
+                if (editor.noteId == null || shouldShowSyncBadge(editor.syncBadge)) {
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Icon(
+                            Lucide.Cloud,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(18.dp),
                         )
-                    } else {
-                        Column(modifier = Modifier.weight(1f)) {
-                            NoteSyncIndicator(
-                                syncBadge = editor.syncBadge,
-                                syncInProgress = syncInProgress,
-                                showText = true,
+                        Text(
+                            stringResource(Res.string.common_status),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier.width(74.dp),
+                        )
+                        if (editor.noteId == null) {
+                            Text(
+                                stringResource(Res.string.common_draft),
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                style = MaterialTheme.typography.bodyMedium,
+                                modifier = Modifier.weight(1f),
                             )
-                            syncBadgeDetailsText(editor.syncBadge, syncInProgress)?.let { details ->
-                                Text(
-                                    details,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    modifier = Modifier.padding(top = 4.dp),
+                        } else {
+                            Column(modifier = Modifier.weight(1f)) {
+                                NoteSyncIndicator(
+                                    syncBadge = editor.syncBadge,
+                                    showText = true,
                                 )
+                                syncBadgeDetailsText(editor.syncBadge)?.let { details ->
+                                    Text(
+                                        details,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        modifier = Modifier.padding(top = 4.dp),
+                                    )
+                                }
                             }
                         }
                     }
@@ -6816,41 +6607,6 @@ private fun ConflictHistoryPanel(
                     .padding(top = 14.dp),
             ) {
                 Text(actionLabel)
-            }
-        }
-    }
-}
-
-@Composable
-private fun ConflictActionsPanel(
-    actions: List<ConflictResolutionAction>,
-    actionLabel: @Composable (ConflictResolutionAction) -> String = { action ->
-        when (action) {
-            ConflictResolutionAction.MergeIntoOriginal -> stringResource(Res.string.conflict_action_merge)
-            ConflictResolutionAction.KeepConflictCopy -> stringResource(Res.string.conflict_action_keep_copy)
-            ConflictResolutionAction.RestoreOriginalFromConflict -> stringResource(Res.string.conflict_action_restore_original)
-            ConflictResolutionAction.DeleteConflictCopy -> stringResource(Res.string.conflict_action_delete_copy)
-        }
-    },
-    onResolve: (ConflictResolutionAction) -> Unit,
-) {
-    SomedayPanel(modifier = Modifier.fillMaxWidth()) {
-        Text(
-            text = stringResource(Res.string.conflict_choose_resolution),
-            fontWeight = FontWeight.SemiBold,
-            style = MaterialTheme.typography.titleMedium,
-        )
-        Column(
-            verticalArrangement = Arrangement.spacedBy(8.dp),
-            modifier = Modifier.padding(top = 12.dp),
-        ) {
-            actions.forEach { action ->
-                Button(
-                    onClick = { onResolve(action) },
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Text(actionLabel(action))
-                }
             }
         }
     }
@@ -7246,7 +7002,6 @@ private fun MarkdownInlineText(inlines: List<MarkdownPreviewInline>) {
 @Composable
 private fun NotebookSheet(
     state: NotesUiState,
-    syncInProgress: Boolean,
     onCreateNotebook: (String) -> Unit,
     onRenameNotebook: (String, String) -> Unit,
     onDeleteNotebook: (String) -> Unit,
@@ -7333,7 +7088,6 @@ private fun NotebookSheet(
                     title = notebook.title,
                     selected = selected,
                     syncBadge = notebook.syncBadge,
-                    syncInProgress = syncInProgress,
                     onSelect = { onSelectNotebook(notebook.id) },
                     onRename = {
                         renamingNotebookId = notebook.id
@@ -7415,7 +7169,6 @@ private fun NotebookSheet(
 @Composable
 private fun RecentlyDeletedSheet(
     state: NotesUiState,
-    syncInProgress: Boolean,
     onRestoreDeletedItem: (String) -> Unit,
 ) {
     val deletedNotes = state.deletedWorkspaceItems.filter { it.type == DeletedWorkspaceItemType.Note }
@@ -7452,14 +7205,12 @@ private fun RecentlyDeletedSheet(
                     key = "notes",
                     title = Res.string.deleted_notes_section,
                     items = deletedNotes,
-                    syncInProgress = syncInProgress,
                     onRestoreDeletedItem = onRestoreDeletedItem,
                 )
                 deletedWorkspaceSection(
                     key = "notebooks",
                     title = Res.string.deleted_notebooks_section,
                     items = deletedNotebooks,
-                    syncInProgress = syncInProgress,
                     onRestoreDeletedItem = onRestoreDeletedItem,
                 )
             }
@@ -7471,7 +7222,6 @@ private fun LazyListScope.deletedWorkspaceSection(
     key: String,
     title: StringResource,
     items: List<DeletedWorkspaceItem>,
-    syncInProgress: Boolean,
     onRestoreDeletedItem: (String) -> Unit,
 ) {
     if (items.isEmpty()) return
@@ -7505,7 +7255,7 @@ private fun LazyListScope.deletedWorkspaceSection(
                 )
             }
             TextButton(
-                enabled = item.canRestore && !syncInProgress,
+                enabled = item.canRestore,
                 onClick = { onRestoreDeletedItem(item.entityId) },
             ) {
                 Text(
@@ -7526,7 +7276,6 @@ private fun NotebookSheetRow(
     title: String,
     selected: Boolean,
     syncBadge: NoteSyncBadge,
-    syncInProgress: Boolean,
     onSelect: () -> Unit,
     onRename: () -> Unit,
     onDelete: () -> Unit,
@@ -7563,7 +7312,7 @@ private fun NotebookSheetRow(
                 style = MaterialTheme.typography.titleMedium,
                 modifier = Modifier.weight(1f),
             )
-            NoteSyncIndicator(syncBadge = syncBadge, syncInProgress = syncInProgress, showText = false)
+            NoteSyncIndicator(syncBadge = syncBadge, showText = false)
         }
         Box {
             IconButton(
@@ -7604,27 +7353,21 @@ private fun NotebookSheetRow(
 @Composable
 private fun NoteSyncIndicator(
     syncBadge: NoteSyncBadge,
-    syncInProgress: Boolean = false,
     showText: Boolean = true,
 ) {
-    if (syncBadge == NoteSyncBadge.Synced) {
+    if (!shouldShowSyncBadge(syncBadge)) {
         return
     }
-    val syncing = syncBadge == NoteSyncBadge.Pending && syncInProgress
     val icon = syncBadgeIcon(syncBadge)
-    val label = syncBadgeShortLabel(syncBadge, syncInProgress)
+    val label = syncBadgeShortLabel(syncBadge)
     val containerColor = when {
-        syncing -> MaterialTheme.colorScheme.primaryContainer
         syncBadge is NoteSyncBadge.Error -> MaterialTheme.colorScheme.errorContainer
         syncBadge is NoteSyncBadge.Conflict -> MaterialTheme.colorScheme.tertiaryContainer
-        syncBadge == NoteSyncBadge.Pending -> MaterialTheme.colorScheme.secondaryContainer
         else -> MaterialTheme.colorScheme.surfaceVariant
     }
     val contentColor = when {
-        syncing -> MaterialTheme.colorScheme.onPrimaryContainer
         syncBadge is NoteSyncBadge.Error -> MaterialTheme.colorScheme.onErrorContainer
         syncBadge is NoteSyncBadge.Conflict -> MaterialTheme.colorScheme.onTertiaryContainer
-        syncBadge == NoteSyncBadge.Pending -> MaterialTheme.colorScheme.onSecondaryContainer
         else -> MaterialTheme.colorScheme.onSurfaceVariant
     }
     Surface(
@@ -7644,6 +7387,9 @@ private fun NoteSyncIndicator(
         }
     }
 }
+
+internal fun shouldShowSyncBadge(syncBadge: NoteSyncBadge): Boolean =
+    syncBadge is NoteSyncBadge.Error || syncBadge is NoteSyncBadge.Conflict
 
 private fun syncBadgeIcon(syncBadge: NoteSyncBadge): ImageVector =
     when (syncBadge) {

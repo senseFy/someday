@@ -44,7 +44,6 @@ internal enum class SettingsPage {
     Editor,
     Notifications,
     Sync,
-    SelfHosted,
     Import,
     Export,
     Developer,
@@ -56,7 +55,6 @@ internal val SettingsPage.routeId: String
         SettingsPage.Editor -> "editor"
         SettingsPage.Notifications -> "notifications"
         SettingsPage.Sync -> "sync"
-        SettingsPage.SelfHosted -> "self_hosted"
         SettingsPage.Import -> "import"
         SettingsPage.Export -> "export"
         SettingsPage.Developer -> "developer"
@@ -68,7 +66,6 @@ internal fun settingsPageFromRouteId(routeId: String): SettingsPage? =
         SettingsPage.Editor.routeId -> SettingsPage.Editor
         SettingsPage.Notifications.routeId -> SettingsPage.Notifications
         SettingsPage.Sync.routeId -> SettingsPage.Sync
-        SettingsPage.SelfHosted.routeId -> SettingsPage.SelfHosted
         SettingsPage.Import.routeId -> SettingsPage.Import
         SettingsPage.Export.routeId -> SettingsPage.Export
         SettingsPage.Developer.routeId -> SettingsPage.Developer

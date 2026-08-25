@@ -17,6 +17,7 @@ import saien.someday.domain.notes.NotebookOrderEdit
 import saien.someday.domain.notes.NoteSyncBadge
 import saien.someday.domain.notes.NotesLocationInput
 import saien.someday.domain.notes.DeletedWorkspaceItemType
+import saien.someday.domain.notes.ConflictBranchResolutionResult
 import saien.someday.domain.settings.ClientSettings
 import saien.someday.domain.settings.ClientTheme
 import saien.someday.domain.settings.EditorPreferences
@@ -34,6 +35,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertFails
 import kotlin.test.assertFailsWith
+import kotlin.test.assertIs
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -420,15 +422,55 @@ class SystemV2ProductRepositoriesTest {
         val selectedId = conflict.expectedHeadVersionIds.single { id ->
             (fixture.context().store.loadVersion(id)?.contentPayload as? NoteContentV2)?.title == "Remote title"
         }
-        val resolved = assertNotNull(
+        val resolved = assertIs<ConflictBranchResolutionResult.Content>(
             fixture.notes.resolveConflictBranch(conflict.conflictNoteId, selectedId, conflict.expectedHeadVersionIds),
-        )
+        ).note
         assertEquals("Remote title", resolved.title)
         assertEquals(secondNotebook.id, resolved.notebookId)
         assertEquals("Current place", resolved.location?.placeText)
         assertNull(fixture.notes.getConflictDetails(original.id))
         val resolution = fixture.context().store.loadHeads(noteKeyForTest(original.id)).single()
         assertTrue(conflict.expectedHeadVersionIds.all { fixture.isAncestor(it, resolution.versionId) })
+    }
+
+    @Test
+    fun selectingADeletionHeadReturnsAnExplicitSuccessfulDeletion() = withFixture { fixture ->
+        val notebook = fixture.notes.createNotebook("Diary")
+        val note = fixture.notes.createNote(NoteInput(notebook.id, "Local", "Body"))
+        val base = fixture.context().store.loadVersion(
+            checkNotNull(note.causalToken).expectedBaseVersionId,
+        )!!
+        val remoteDeletion = fixture.context().factory.createDeletion(
+            parent = base,
+            deletedAt = T2,
+            deviceActorId = "device:$WRITER_B",
+            authoredAt = T2,
+        )
+        fixture.applyRemote(remoteDeletion, "remote-deletion")
+        fixture.notes.updateNote(
+            note.id,
+            NoteInput(
+                notebookId = note.notebookId,
+                title = "Local edit",
+                markdownBody = note.markdownBody,
+                createdAt = note.createdAt,
+                location = note.location,
+                timeZoneId = note.timeZoneId,
+                causalToken = note.causalToken,
+            ),
+        )
+        val conflict = assertNotNull(fixture.notes.getConflictDetails(note.id))
+        val deletionHead = conflict.versionBranches.single { it.deleted }
+
+        val result = fixture.notes.resolveConflictBranch(
+            conflict.conflictNoteId,
+            deletionHead.versionId,
+            conflict.expectedHeadVersionIds,
+        )
+
+        assertEquals(ConflictBranchResolutionResult.Deletion, result)
+        assertNull(fixture.notes.getNoteDetails(note.id))
+        assertNull(fixture.notes.getConflictDetails(note.id))
     }
 
     @Test

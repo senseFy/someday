@@ -177,9 +177,9 @@ data class SelfHostedSessionCredentials(
         "endpoint=$endpoint user=$userEmail device=$deviceId accessToken=redacted refreshToken=redacted"
 }
 
-fun SelfHostedSessionCredentials.encodeForSecureStorage(): String =
-    listOf(
-        SelfHostedSessionCredentialsStorageVersion,
+fun SelfHostedSessionCredentials.encodeForSecureStorage(): String {
+    val payload = listOf(
+        SelfHostedSessionCredentialsPayloadVersion,
         endpoint,
         userId,
         userEmail,
@@ -191,18 +191,31 @@ fun SelfHostedSessionCredentials.encodeForSecureStorage(): String =
     ).joinToString(separator = "\n") { value ->
         Base64.encode(value.encodeToByteArray())
     }
+    return "$SelfHostedSessionCredentialsEnvelopeVersion:${Base64.encode(payload.encodeToByteArray())}"
+}
 
 fun decodeSelfHostedSessionCredentials(value: String): SelfHostedSessionCredentials? {
+    val payload = if (value.startsWith("$SelfHostedSessionCredentialsEnvelopeVersion:")) {
+        val encodedPayload = value.substringAfter(':')
+        runCatching {
+            Base64.decode(encodedPayload).decodeToString(throwOnInvalidSequence = true)
+        }.getOrNull()
+            ?: return null
+    } else {
+        // Development builds before the single-line envelope stored this payload directly.
+        value
+    }
     val decoded = buildList {
-        value.lineSequence()
-            .filter { it.isNotBlank() }
+        payload.split('\n')
             .forEach { line ->
-                val decodedLine = runCatching { Base64.decode(line).decodeToString() }.getOrNull()
+                val decodedLine = runCatching {
+                    Base64.decode(line).decodeToString(throwOnInvalidSequence = true)
+                }.getOrNull()
                     ?: return null
                 add(decodedLine)
             }
     }
-    if (decoded.size != 9 || decoded[0] != SelfHostedSessionCredentialsStorageVersion) {
+    if (decoded.size != 9 || decoded[0] != SelfHostedSessionCredentialsPayloadVersion) {
         return null
     }
     return runCatching {
@@ -219,7 +232,8 @@ fun decodeSelfHostedSessionCredentials(value: String): SelfHostedSessionCredenti
     }.getOrNull()
 }
 
-private const val SelfHostedSessionCredentialsStorageVersion = "self-hosted-session-v2"
+private const val SelfHostedSessionCredentialsEnvelopeVersion = "self-hosted-session-v3"
+private const val SelfHostedSessionCredentialsPayloadVersion = "self-hosted-session-v2"
 
 interface SelfHostedSessionCredentialStore {
     fun load(): SelfHostedSessionCredentials?
@@ -536,25 +550,6 @@ fun interface ManualSyncRunner {
     fun run(): ManualSyncResult
 }
 
-/**
- * Typed mid-run progress for manual sync (e.g. first-epoch checkpoint upload).
- * Product copy is formatted by the UI layer; this surface carries no secrets.
- */
-sealed interface ManualSyncPhase {
-    data class UploadingChunks(val completed: Int, val total: Int) : ManualSyncPhase
-    data object UploadingManifest : ManualSyncPhase
-    data object VerifyingRemote : ManualSyncPhase
-    data object CommittingPointer : ManualSyncPhase
-}
-
-/**
- * Optional mid-run progress for manual sync.
- * Implementations must be safe to call from background threads; UI layers hop to Main.
- */
-fun interface ManualSyncProgressListener {
-    fun onProgress(phase: ManualSyncPhase)
-}
-
 class WorkspaceJoinPackage(
     val metadataJson: String,
     val recoveryCode: String,
@@ -712,50 +707,6 @@ fun interface WorkspacePairingInvitationJoiner {
 
 fun interface WorkspacePairingInvitationCanceller {
     fun cancelInvitation(invitation: WorkspacePairingInvitation): WorkspaceJoinResult
-}
-
-data class ManualSyncProgress(
-    val running: Boolean,
-    val mode: SyncMode,
-    val message: String,
-    val pushedObjects: Int = 0,
-    val pulledObjects: Int = 0,
-    val conflicts: Int = 0,
-) {
-    companion object {
-        fun idle(
-            mode: SyncMode,
-            displayMessage: String,
-        ): ManualSyncProgress =
-            ManualSyncProgress(
-                running = false,
-                mode = mode,
-                message = displayMessage,
-            )
-
-        fun inProgress(
-            mode: SyncMode,
-            displayMessage: String,
-        ): ManualSyncProgress =
-            ManualSyncProgress(
-                running = true,
-                mode = mode,
-                message = displayMessage,
-            )
-
-        fun fromResult(
-            result: ManualSyncResult,
-            displayMessage: String,
-        ): ManualSyncProgress =
-            ManualSyncProgress(
-                running = false,
-                mode = result.mode,
-                message = displayMessage,
-                pushedObjects = result.pushedObjects,
-                pulledObjects = result.pulledObjects,
-                conflicts = result.conflicts,
-            )
-    }
 }
 
 fun normalizeSelfHostedEndpoint(value: String): String {

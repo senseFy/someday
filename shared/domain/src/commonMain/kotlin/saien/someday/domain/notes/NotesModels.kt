@@ -191,15 +191,6 @@ data class NoteVersionSummary(
     val createdAt: Instant,
 )
 
-enum class ConflictResolutionAction(
-    val label: String,
-) {
-    MergeIntoOriginal("Merge into original"),
-    KeepConflictCopy("Keep conflict copy"),
-    RestoreOriginalFromConflict("Restore original from conflict"),
-    DeleteConflictCopy("Delete conflict copy"),
-}
-
 fun noteCalendarDate(
     createdAt: Instant,
     timeZoneId: String?,
@@ -232,10 +223,18 @@ data class ConflictDetails(
     val conflictHistory: ConflictHistory,
     val sourceDeviceId: String?,
     val sourceUpdatedAt: Instant?,
-    val availableActions: List<ConflictResolutionAction> = ConflictResolutionAction.entries,
     val versionBranches: List<VersionConflictBranch> = emptyList(),
     val expectedHeadVersionIds: List<String> = emptyList(),
 )
+
+sealed interface ConflictBranchResolutionResult {
+    data class Content(
+        val note: NoteDetails,
+    ) : ConflictBranchResolutionResult
+
+    data object Deletion : ConflictBranchResolutionResult
+    data object Rejected : ConflictBranchResolutionResult
+}
 
 sealed interface NoteSyncBadge {
     val label: String
@@ -336,25 +335,12 @@ interface NotesRepository {
 
     fun getConflictDetailsForOriginal(originalNoteId: String): ConflictDetails? = null
 
-    fun resolveConflict(
-        conflictNoteId: String,
-        action: ConflictResolutionAction,
-    ): NoteDetails? = null
-
-    /**
-     * Resolves a version-DAG conflict by preserving the exact payload of the
-     * selected immutable head while joining every currently active head.
-     */
-    fun resolveConflictBranch(
-        conflictNoteId: String,
-        versionId: String,
-    ): NoteDetails? = null
-
+    /** Resolves a conflict from the exact head set displayed to the user. */
     fun resolveConflictBranch(
         conflictNoteId: String,
         versionId: String,
         expectedHeadVersionIds: List<String>,
-    ): NoteDetails? = resolveConflictBranch(conflictNoteId, versionId)
+    ): ConflictBranchResolutionResult = ConflictBranchResolutionResult.Rejected
 
     fun deleteNote(noteId: String)
 

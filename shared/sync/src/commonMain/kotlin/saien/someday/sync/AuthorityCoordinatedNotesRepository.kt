@@ -2,7 +2,6 @@ package saien.someday.sync
 
 import kotlinx.datetime.LocalDate
 import saien.someday.domain.notes.CausalEditToken
-import saien.someday.domain.notes.ConflictResolutionAction
 import saien.someday.domain.notes.MemoryMonth
 import saien.someday.domain.notes.NoteBatchDeletion
 import saien.someday.domain.notes.NoteBatchUndelete
@@ -78,16 +77,6 @@ internal class AuthorityCoordinatedNotesRepository(
 
     override fun getConflictDetails(noteId: String) = access { getConflictDetails(noteId) }
     override fun getConflictDetailsForOriginal(originalNoteId: String) = access { getConflictDetailsForOriginal(originalNoteId) }
-    override fun resolveConflict(
-        conflictNoteId: String,
-        action: ConflictResolutionAction,
-    ) = access { resolveConflict(conflictNoteId, action) }
-
-    override fun resolveConflictBranch(
-        conflictNoteId: String,
-        versionId: String,
-    ) = access { resolveConflictBranch(conflictNoteId, versionId) }
-
     override fun resolveConflictBranch(
         conflictNoteId: String,
         versionId: String,

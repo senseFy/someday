@@ -1,11 +1,15 @@
 package saien.someday.ui.settings
 
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.runBlocking
+import kotlinx.datetime.LocalDate
 import saien.someday.domain.notifications.OnThisDayNotificationScheduler
 import saien.someday.domain.settings.AppLanguage
 import saien.someday.domain.settings.ClientSettings
 import saien.someday.domain.settings.ClientTheme
-import saien.someday.domain.settings.ManualSyncPhase
-import saien.someday.domain.settings.ManualSyncProgressListener
 import saien.someday.domain.settings.ManualSyncReason
 import saien.someday.domain.settings.ManualSyncResult
 import saien.someday.domain.settings.OnThisDayNotificationPreferences
@@ -14,105 +18,167 @@ import saien.someday.domain.settings.SelfHostedSessionCredentials
 import saien.someday.domain.settings.SelfHostedSessionSummary
 import saien.someday.domain.settings.SelfHostedSetupClient
 import saien.someday.domain.settings.SelfHostedSetupInput
-import saien.someday.domain.settings.SelfHostedSetupResult
 import saien.someday.domain.settings.SelfHostedSetupReason
+import saien.someday.domain.settings.SelfHostedSetupResult
 import saien.someday.domain.settings.SelfHostedSetupStatus
 import saien.someday.domain.settings.SyncConfiguration
 import saien.someday.domain.settings.SyncMode
 import saien.someday.domain.settings.WorkspaceJoinResult
 import saien.someday.domain.settings.WorkspacePairingInvitation
+import saien.someday.domain.settings.WorkspacePairingInvitationCanceller
 import saien.someday.domain.settings.WorkspacePairingInvitationCreator
 import saien.someday.domain.settings.WorkspacePairingInvitationJoiner
 import saien.someday.domain.settings.WorkspacePairingInvitationResult
 import saien.someday.domain.settings.WorkspacePairingReason
 import saien.someday.ui.i18n.SettingsUiStrings
 import saien.someday.ui.notes.InMemoryNotesRepository
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.runBlocking
-import kotlinx.datetime.LocalDate
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class SettingsUiControllerTest {
     @Test
-    fun settingsSectionsExposeSelfHostedPairingAndLocalDataTools() = runBlocking {
-        val repository = InMemoryNotesRepository()
-        repository.createNotebook("Diary")
-        val controller = SettingsUiController(
-            initialSettings = ClientSettings(
-                syncConfiguration = SyncConfiguration(
-                    mode = SyncMode.Off,
-                    lastError = "Last sync failed without secrets.",
-                ),
+    fun accountFormModesSeparateSetupBoundAndMissingCredentialFlows() {
+        val initialSetup = SyncUiState(SyncConnectionUi.LocalOnly()).accountFormMode()
+        val boundSession = SyncUiState(
+            SyncConnectionUi.Connected(
+                endpoint = "https://sync.example.test",
+                accountEmail = "alice@example.test",
+                deviceLabel = "Desktop device",
             ),
-            notebooksProvider = repository::listNotebooks,
-        )
+        ).accountFormMode()
+        val unavailableSession = SyncUiState(
+            connection = SyncConnectionUi.Unavailable(
+                configuredEndpoint = "https://sync.example.test",
+                accountEmail = "alice@example.test",
+                deviceLabel = "Desktop device",
+            ),
+            issue = SyncIssueUi(SyncIssueReason.SecureSessionUnavailable),
+        ).accountFormMode()
+        val missingCredentials = SyncUiState(
+            connection = SyncConnectionUi.LocalOnly("https://sync.example.test"),
+            issue = SyncIssueUi(SyncIssueReason.SignInRequired),
+        ).accountFormMode()
+        val failedCredentialRecovery = SyncUiState(
+            connection = SyncConnectionUi.LocalOnly("https://sync.example.test"),
+            issue = SyncIssueUi(SyncIssueReason.SetupFailed),
+        ).accountFormMode()
+        val restartedCredentialRecovery = SyncUiState(
+            connection = SyncConnectionUi.LocalOnly("https://sync.example.test"),
+        ).accountFormMode()
+        val failedFirstSetup = SyncUiState(
+            connection = SyncConnectionUi.LocalOnly(),
+            issue = SyncIssueUi(SyncIssueReason.SetupFailed),
+        ).accountFormMode()
+        val authorityRecovery = SyncUiState(
+            connection = SyncConnectionUi.Connected(
+                endpoint = "https://sync.example.test",
+                accountEmail = "alice@example.test",
+                deviceLabel = "Desktop device",
+            ),
+            issue = SyncIssueUi(SyncIssueReason.AuthorityMismatch),
+        ).accountFormMode()
 
-        val hierarchyText = controller.state.sections
-            .flatMap { section -> listOf(section.title, section.description) + section.entryPoints }
-            .joinToString(separator = "\n")
+        assertEquals(SyncAccountFormMode.InitialSetup, initialSetup)
+        assertTrue(initialSetup.allowCreateAccount)
+        assertEquals(SyncAccountFormMode.BoundSession, boundSession)
+        assertTrue(boundSession.serverReadOnly)
+        assertTrue(boundSession.emailReadOnly)
+        assertTrue(boundSession.allowManualReauthentication)
+        assertEquals(SyncAccountFormMode.SessionUnavailable, unavailableSession)
+        assertFalse(unavailableSession.initiallyVisible)
+        assertFalse(unavailableSession.allowCreateAccount)
+        assertFalse(unavailableSession.allowManualReauthentication)
+        assertEquals(SyncAccountFormMode.MissingCredentials, missingCredentials)
+        assertTrue(missingCredentials.serverReadOnly)
+        assertFalse(missingCredentials.emailReadOnly)
+        assertFalse(missingCredentials.allowCreateAccount)
+        assertEquals(SyncAccountFormMode.MissingCredentials, failedCredentialRecovery)
+        assertEquals(SyncAccountFormMode.MissingCredentials, restartedCredentialRecovery)
+        assertEquals(SyncAccountFormMode.InitialSetup, failedFirstSetup)
+        assertEquals(SyncAccountFormMode.AuthorityRecovery, authorityRecovery)
+        assertTrue(authorityRecovery.serverReadOnly)
+        assertFalse(authorityRecovery.emailReadOnly)
+        assertFalse(authorityRecovery.allowCreateAccount)
+        assertTrue(authorityRecovery.allowManualReauthentication)
 
-        assertTrue(hierarchyText.contains("Sync mode/account"))
-        assertTrue(hierarchyText.contains("Self-hosted device management"))
-        assertTrue(hierarchyText.contains("Device pairing"))
-        assertFalse(hierarchyText.contains("Encryption/recovery"))
-        assertTrue(hierarchyText.contains("Editor preferences"))
-        assertTrue(hierarchyText.contains("Theme/default notebook"))
-        assertTrue(hierarchyText.contains("Sync status/last error"))
-        assertTrue(hierarchyText.contains("Export local data"))
-        assertTrue(hierarchyText.contains("Create a one-use workspace pairing invitation"))
-        assertTrue(hierarchyText.contains("QR scan or high-entropy token"))
-        assertTrue(hierarchyText.contains("must not log raw tokens"))
+        val unavailableProjection = SyncUiState(
+            connection = SyncConnectionUi.LocalOnly("https://sync.example.test"),
+            issue = SyncIssueUi(SyncIssueReason.SecureSessionUnavailable),
+        ).accountFormMode()
+        assertEquals(SyncAccountFormMode.SessionUnavailable, unavailableProjection)
+        assertFalse(unavailableProjection.initiallyVisible)
+        assertFalse(unavailableProjection.allowCreateAccount)
     }
 
     @Test
-    fun onThisDayNotificationsRequirePermissionBeforePersistingEnabledState() = runBlocking {
+    fun nonRetryableSyncIssuesDoNotPublishAnInvalidAction() {
+        assertNull(SyncIssueUi(SyncIssueReason.RemoteHistoryConflict).action)
+        assertNull(SyncIssueUi(SyncIssueReason.CheckpointInvalid).action)
+        assertNull(SyncIssueUi(SyncIssueReason.SyncUnavailable).action)
+        assertEquals(
+            SyncIssueAction.Reauthenticate,
+            SyncIssueUi(SyncIssueReason.ConfigurationChanged).action,
+        )
+    }
+
+    @Test
+    fun pairingIsOnlyPresentedForHealthyOrRetryableConnections() {
+        fun state(issue: SyncIssueUi?) = SyncUiState(
+            connection = SyncConnectionUi.Connected(
+                endpoint = "https://sync.example.test",
+                accountEmail = "alice@example.test",
+                deviceLabel = "Desktop device",
+            ),
+            issue = issue,
+        )
+
+        assertTrue(state(issue = null).pairingAvailable)
+        assertTrue(state(SyncIssueUi(SyncIssueReason.SyncFailed)).pairingAvailable)
+        assertFalse(state(SyncIssueUi(SyncIssueReason.RemoteHistoryConflict)).pairingAvailable)
+        assertFalse(state(SyncIssueUi(SyncIssueReason.CheckpointInvalid)).pairingAvailable)
+        assertFalse(state(SyncIssueUi(SyncIssueReason.AuthorityMismatch)).pairingAvailable)
+    }
+
+    @Test
+    fun notificationsRequirePermissionBeforePersisting() = runBlocking {
         var persisted = ClientSettings()
         val scheduler = FakeOnThisDayNotificationScheduler(permissionGranted = false)
         val controller = SettingsUiController(
             initialSettings = persisted,
-            persistSettings = { updated ->
-                persisted = updated
-                updated
-            },
+            persistSettings = { updated -> updated.also { persisted = it } },
             onThisDayNotificationScheduler = scheduler,
+            backgroundDispatcher = Dispatchers.Unconfined,
         )
 
-        assertTrue(controller.onThisDayNotificationsSupported)
         assertFalse(controller.toggleOnThisDayNotifications(enabled = true))
         assertFalse(persisted.onThisDayNotifications.enabled)
         assertEquals(0, scheduler.syncCalls)
-        assertTrue(controller.state.feedbackMessage != null)
     }
 
     @Test
-    fun onThisDayNotificationsPersistAndSyncScheduleWhenEnabled() = runBlocking {
+    fun notificationsPersistAndKeepThePlatformScheduleCurrent() = runBlocking {
         var persisted = ClientSettings()
         val scheduler = FakeOnThisDayNotificationScheduler(permissionGranted = true)
         val controller = SettingsUiController(
             initialSettings = persisted,
-            persistSettings = { updated ->
-                persisted = updated
-                updated
-            },
+            persistSettings = { updated -> updated.also { persisted = it } },
             onThisDayNotificationScheduler = scheduler,
+            backgroundDispatcher = Dispatchers.Unconfined,
         )
 
         assertTrue(controller.toggleOnThisDayNotifications(enabled = true))
-        assertTrue(persisted.onThisDayNotifications.enabled)
         assertEquals(1, scheduler.syncCalls)
-        assertEquals(10, scheduler.lastSynced?.hour)
-        assertEquals(0, scheduler.lastSynced?.minute)
-
         assertTrue(controller.setOnThisDayNotificationTime(hour = 8, minute = 30))
-        assertEquals(8, persisted.onThisDayNotifications.hour)
-        assertEquals(30, persisted.onThisDayNotifications.minute)
         assertEquals(2, scheduler.syncCalls)
-        assertEquals(8, scheduler.lastSynced?.hour)
-        assertEquals(30, scheduler.lastSynced?.minute)
+        assertEquals(OnThisDayNotificationPreferences(enabled = true, hour = 8, minute = 30), scheduler.lastSynced)
+
+        controller.rescheduleOnThisDayNotifications()
+        assertEquals(3, scheduler.syncCalls)
 
         assertTrue(controller.toggleOnThisDayNotifications(enabled = false))
         assertFalse(persisted.onThisDayNotifications.enabled)
@@ -120,35 +186,11 @@ class SettingsUiControllerTest {
     }
 
     @Test
-    fun onThisDayNotificationsCanBeRescheduledAfterNotesChange() = runBlocking {
-        val scheduler = FakeOnThisDayNotificationScheduler(permissionGranted = true)
-        val controller = SettingsUiController(
-            initialSettings = ClientSettings(
-                onThisDayNotifications = OnThisDayNotificationPreferences(
-                    enabled = true,
-                    hour = 8,
-                    minute = 30,
-                ),
-            ),
-            onThisDayNotificationScheduler = scheduler,
-        )
-
-        controller.rescheduleOnThisDayNotifications()
-
-        assertEquals(1, scheduler.syncCalls)
-        assertEquals(8, scheduler.lastSynced?.hour)
-        assertEquals(30, scheduler.lastSynced?.minute)
-    }
-
-    @Test
-    fun unavailableOnThisDaySchedulerDoesNotPersistToggle() = runBlocking {
+    fun unavailableNotificationSchedulerDoesNotPersistTheToggle() = runBlocking {
         var persisted = ClientSettings()
         val controller = SettingsUiController(
             initialSettings = persisted,
-            persistSettings = { updated ->
-                persisted = updated
-                updated
-            },
+            persistSettings = { updated -> updated.also { persisted = it } },
         )
 
         assertFalse(controller.onThisDayNotificationsSupported)
@@ -157,100 +199,59 @@ class SettingsUiControllerTest {
     }
 
     @Test
-    fun themeAndDefaultNotebookPreferenceChangesPersist() = runBlocking {
+    fun preferencesPersistAndRepeatedFeedbackGetsDistinctEventIds() = runBlocking {
         val repository = InMemoryNotesRepository()
         val work = repository.createNotebook("Work")
         var persisted = ClientSettings()
         val controller = SettingsUiController(
             initialSettings = persisted,
             notebooksProvider = repository::listNotebooks,
-            persistSettings = { updated ->
-                persisted = updated
-                updated
-            },
+            persistSettings = { updated -> updated.also { persisted = it } },
         )
 
         assertEquals(AppliedTheme.Light, resolveAppliedTheme(ClientTheme.System, systemDark = false))
         assertTrue(controller.selectTheme(ClientTheme.Dark))
-        assertEquals(ClientTheme.Dark, persisted.theme)
-        assertEquals(AppliedTheme.Dark, resolveAppliedTheme(persisted.theme, systemDark = false))
-
+        val firstEventId = controller.state.feedbackEventId
+        assertTrue(controller.selectTheme(ClientTheme.Dark))
+        assertTrue(controller.state.feedbackEventId > firstEventId)
+        assertTrue(controller.selectLanguage(AppLanguage.Chinese))
         assertTrue(controller.selectDefaultNotebook(work.id))
+
+        assertEquals(ClientTheme.Dark, persisted.theme)
+        assertEquals(AppLanguage.Chinese, persisted.appLanguage)
         assertEquals(work.id, persisted.defaultNotebookId)
     }
 
     @Test
-    fun lastSelectedNotebookPreferencePersistsWithoutUserFacingFeedback() = runBlocking {
+    fun lastSelectedNotebookPersistsWithoutUserFacingFeedback() = runBlocking {
         val repository = InMemoryNotesRepository()
-        val diary = repository.createNotebook("Diary")
         val work = repository.createNotebook("Work")
-        var persisted = ClientSettings(defaultNotebookId = diary.id)
+        var persisted = ClientSettings()
         val controller = SettingsUiController(
             initialSettings = persisted,
             notebooksProvider = repository::listNotebooks,
-            persistSettings = { updated ->
-                persisted = updated
-                updated
-            },
+            persistSettings = { updated -> updated.also { persisted = it } },
         )
 
         assertTrue(controller.recordLastSelectedNotebook(work.id))
 
         assertEquals(work.id, persisted.lastSelectedNotebookId)
-        assertEquals(work.id, controller.state.settings.lastSelectedNotebookId)
-        assertEquals(null, controller.state.feedbackMessage)
+        assertNull(controller.state.feedbackMessage)
         assertEquals(0L, controller.state.feedbackEventId)
         assertFalse(controller.recordLastSelectedNotebook("missing-notebook"))
-        assertEquals(work.id, persisted.lastSelectedNotebookId)
     }
 
     @Test
-    fun repeatedSettingsFeedbackEmitsDistinctEventsForToastConsumers() = runBlocking {
-        val controller = SettingsUiController()
-
-        assertTrue(controller.selectTheme(ClientTheme.Dark))
-        val firstFeedbackEventId = controller.state.feedbackEventId
-        assertTrue(firstFeedbackEventId > 0L)
-
-        assertTrue(controller.selectTheme(ClientTheme.Dark))
-        val secondFeedbackEventId = controller.state.feedbackEventId
-        assertTrue(secondFeedbackEventId > firstFeedbackEventId)
-        assertEquals("Theme updated.", controller.state.feedbackMessage)
-    }
-
-    @Test
-    fun selectLanguagePersistsDeviceLocalPreferenceAndFeedback() = runBlocking {
-        var persisted = ClientSettings()
-        val controller = SettingsUiController(
-            initialSettings = persisted,
-            persistSettings = { updated ->
-                persisted = updated
-                updated
-            },
-        )
-
-        assertEquals(AppLanguage.System, controller.state.settings.appLanguage)
-        assertTrue(controller.selectLanguage(AppLanguage.Chinese))
-        assertEquals(AppLanguage.Chinese, persisted.appLanguage)
-        assertEquals(AppLanguage.Chinese, controller.state.settings.appLanguage)
-        assertEquals("Language updated.", controller.state.feedbackMessage)
-
-        assertTrue(controller.selectLanguage(AppLanguage.System))
-        assertEquals(AppLanguage.System, persisted.appLanguage)
-    }
-
-    @Test
-    fun localExportEntryPointReportsIncludedDataAndSecretExclusions() = runBlocking {
+    fun exportSummaryStatesThatMediaBytesAndSecretsAreExcluded() = runBlocking {
         val repository = InMemoryNotesRepository()
         val diary = repository.createNotebook("Diary")
         repository.seedNote(
             notebookId = diary.id,
             title = "Exported note",
-            markdownBody = "Plain local note body is part of the user-requested export.",
+            markdownBody = "Plain local note body.",
             createdDate = LocalDate(2026, 5, 22),
         )
         val controller = SettingsUiController(
-            initialSettings = ClientSettings(),
             notebooksProvider = repository::listNotebooks,
             exportProvider = {
                 SettingsExportSummary(
@@ -265,29 +266,23 @@ class SettingsUiControllerTest {
         assertTrue(controller.runLocalExport())
 
         val summary = assertNotNull(controller.state.exportSummary)
-        assertEquals("Someday JSON export", summary.formatName)
         assertEquals(1, summary.notebookCount)
         assertEquals(1, summary.noteCount)
         assertTrue(summary.excludedSensitiveFields.contains("raw workspace keys"))
         assertTrue(summary.excludedSensitiveFields.contains("refresh tokens"))
-        assertTrue(summary.excludedSensitiveFields.contains("recovery material"))
         assertFalse(summary.includesMediaBytes)
         assertTrue(summary.assetReferencesMayBeUnresolved)
-        assertTrue(controller.state.feedbackMessage.orEmpty().contains("Export prepared"))
     }
 
     @Test
-    fun dayOneImportEntryPointReportsAsynchronousImportSummary() = runBlocking {
+    fun asynchronousImportPublishesOneProductSummary() = runBlocking {
         var callback: ((SettingsImportSummary) -> Unit)? = null
         val controller = SettingsUiController(
-            dayOneImportRunner = DayOneImportRunner { onResult ->
-                callback = onResult
-            },
+            dayOneImportRunner = DayOneImportRunner { onResult -> callback = onResult },
         )
 
         assertTrue(controller.startDayOneImport())
         assertTrue(controller.state.importRunning)
-        assertTrue(controller.state.feedbackMessage.orEmpty().contains("Choose a Day One"))
 
         callback?.invoke(
             SettingsImportSummary(
@@ -295,9 +290,7 @@ class SettingsUiControllerTest {
                 success = true,
                 message = "Imported 2 Day One notes.",
                 journalsImported = 1,
-                notebooksCreated = 1,
                 notesCreated = 2,
-                richTextConverted = 2,
                 mediaReferenced = 1,
             ),
         )
@@ -305,53 +298,676 @@ class SettingsUiControllerTest {
         val summary = assertNotNull(controller.state.importSummary)
         assertFalse(controller.state.importRunning)
         assertEquals(2, summary.notesImported)
-        assertEquals(1, summary.journalsImported)
         assertEquals(1, summary.mediaReferenced)
         assertFalse(summary.includesMediaBytes)
-        assertTrue(summary.assetReferencesMayBeUnresolved)
-        assertEquals("Imported 2 Day One notes.", controller.state.feedbackMessage)
     }
 
     @Test
-    fun workspacePairingInvitationCreatesAndJoinsWithoutExposingSecretInObjects() = runBlocking {
-        val manualToken = "000G40R 40M30E2 09185GR 38E1WRJ"
-        val qrPayload = "SOMEDAY:PAIR:1:000G40R40M30E209185GR38E1WRJ"
-        var capturedToken: String? = null
+    fun secureCredentialsDriveTheConnectionProjection() = runBlocking {
+        val store = FakeSelfHostedSessionCredentialStore(credentials = testCredentials())
         val controller = SettingsUiController(
-            workspacePairingInvitationCreator = WorkspacePairingInvitationCreator {
-                WorkspacePairingInvitationResult.success(
-                    reason = WorkspacePairingReason.InvitationCreated,
-                    invitation = WorkspacePairingInvitation.create(
-                        manualToken = manualToken,
-                        qrPayload = qrPayload,
-                        expiresAtEpochMillis = 4_000_000_000_000L,
+            initialSettings = connectedSettings(endpoint = "https://stale.example.test"),
+            selfHostedSessionCredentialStore = store,
+            backgroundDispatcher = Dispatchers.Unconfined,
+        )
+
+        controller.refresh()
+
+        val connected = controller.state.sync.connection as SyncConnectionUi.Connected
+        assertEquals("https://sync.example.test", connected.endpoint)
+        assertEquals("alice@example.test", connected.accountEmail)
+        assertEquals("Test device / desktop", connected.deviceLabel)
+
+        store.credentials = null
+        controller.refresh()
+
+        val localOnly = controller.state.sync.connection as SyncConnectionUi.LocalOnly
+        assertEquals("https://sync.example.test", localOnly.configuredEndpoint)
+        assertEquals(SyncIssueAction.Reauthenticate, controller.state.sync.issue?.action)
+    }
+
+    @Test
+    fun secureStoreFailureBlocksSyncAndPairingUntilReloadSucceeds() = runBlocking {
+        val store = FakeSelfHostedSessionCredentialStore(
+            credentials = testCredentials(),
+            failOnLoad = true,
+        )
+        val controller = SettingsUiController(
+            initialSettings = connectedSettings(),
+            selfHostedSessionCredentialStore = store,
+            backgroundDispatcher = Dispatchers.Unconfined,
+        )
+
+        controller.refresh()
+
+        assertTrue(controller.state.sync.connection is SyncConnectionUi.Unavailable)
+        assertEquals(SyncIssueAction.ReloadSession, controller.state.sync.issue?.action)
+        assertFalse(controller.canRunAutomaticSync())
+        assertFalse(controller.runUserSync())
+        assertFalse(controller.createWorkspacePairingInvitation())
+
+        store.failOnLoad = false
+        assertTrue(controller.recoverSyncIssue())
+        assertTrue(controller.state.sync.connection is SyncConnectionUi.Connected)
+        assertTrue(controller.canRunAutomaticSync())
+    }
+
+    @Test
+    fun recoveredCredentialsNormalizeAndPersistTheSelfHostedConnection() = runBlocking {
+        var persisted = ClientSettings(
+            syncConfiguration = SyncConfiguration(
+                mode = SyncMode.Off,
+                selfHostedEndpoint = "https://stale.example.test",
+            ),
+        )
+        val controller = SettingsUiController(
+            initialSettings = persisted,
+            persistSettings = { updated -> updated.also { persisted = it } },
+            selfHostedSessionCredentialStore = FakeSelfHostedSessionCredentialStore(testCredentials()),
+            backgroundDispatcher = Dispatchers.Unconfined,
+        )
+
+        controller.refresh()
+
+        assertEquals(SyncMode.SelfHosted, persisted.syncConfiguration.mode)
+        assertEquals("https://sync.example.test", persisted.syncConfiguration.selfHostedEndpoint)
+        assertEquals("device-123", persisted.activeDeviceId)
+        assertTrue(controller.state.sync.connection is SyncConnectionUi.Connected)
+    }
+
+    @Test
+    fun credentialReconciliationCanRecoverAfterSettingsPersistenceReturns() = runBlocking {
+        var failPersistence = true
+        var persisted = ClientSettings()
+        val controller = SettingsUiController(
+            initialSettings = persisted,
+            persistSettings = { updated ->
+                check(!failPersistence) { "settings store unavailable" }
+                updated.also { persisted = it }
+            },
+            selfHostedSessionCredentialStore = FakeSelfHostedSessionCredentialStore(testCredentials()),
+            backgroundDispatcher = Dispatchers.Unconfined,
+        )
+
+        controller.refresh()
+
+        assertTrue(controller.state.sync.connection is SyncConnectionUi.LocalOnly)
+        assertEquals(SyncIssueAction.ReloadSession, controller.state.sync.issue?.action)
+
+        failPersistence = false
+        assertTrue(controller.recoverSyncIssue())
+        assertEquals(SyncMode.SelfHosted, persisted.syncConfiguration.mode)
+        assertTrue(controller.state.sync.connection is SyncConnectionUi.Connected)
+    }
+
+    @Test
+    fun setupNormalizesAccountInputAndUsesHostDeviceIdentity() = runBlocking {
+        var capturedInput: SelfHostedSetupInput? = null
+        var persisted = ClientSettings(activeDeviceId = "device-abcdef12")
+        lateinit var controller: SettingsUiController
+        controller = SettingsUiController(
+            initialSettings = persisted,
+            persistSettings = { updated -> updated.also { persisted = it } },
+            selfHostedDeviceName = "Mac",
+            selfHostedDevicePlatform = "desktop",
+            selfHostedSetupClient = SelfHostedSetupClient { input ->
+                assertEquals(SyncUiOperation.CreatingAccount, controller.state.sync.operation)
+                capturedInput = input
+                SelfHostedSetupResult.success(
+                    status = SelfHostedSetupStatus(ready = true, reason = SelfHostedSetupReason.Ready),
+                    session = SelfHostedSessionSummary(
+                        loggedIn = true,
+                        userEmail = input.email,
+                        deviceId = "device-123",
+                        deviceName = input.deviceName,
+                        devicePlatform = input.platform,
                     ),
                 )
             },
-            workspacePairingInvitationJoiner = WorkspacePairingInvitationJoiner { token ->
-                capturedToken = token
-                WorkspaceJoinResult.success(WorkspacePairingReason.Joined)
-            },
+            backgroundDispatcher = Dispatchers.Unconfined,
+        )
+        controller.updateLocalizedStrings(
+            settings = SettingsUiStrings(),
+            notifications = OnThisDayNotificationStrings(),
+            hostDeviceName = "桌面设备",
         )
 
-        assertTrue(controller.createWorkspacePairingInvitation())
-        val invitation = assertNotNull(controller.state.workspacePairingInvitation)
-        assertEquals(manualToken, invitation.manualToken)
-        assertEquals(qrPayload, invitation.qrPayload)
-        assertFalse(invitation.toString().contains(manualToken))
+        assertTrue(
+            controller.setupSelfHosted(
+                endpoint = " http://127.0.0.1:3180/ ",
+                email = " Alice@Example.test ",
+                password = "correct-password",
+                createAccount = true,
+            ),
+        )
 
-        assertFalse(controller.joinWorkspaceWithToken("  "))
-        assertTrue(controller.state.feedbackMessage.orEmpty().contains("pairing token"))
-
-        assertTrue(controller.joinWorkspaceWithToken(manualToken))
-        assertEquals(manualToken, capturedToken)
-        assertEquals(null, controller.state.workspacePairingInvitation)
+        val input = assertNotNull(capturedInput)
+        assertEquals("http://127.0.0.1:3180", input.endpoint)
+        assertEquals("alice@example.test", input.email)
+        assertEquals("桌面设备 · cdef12", input.deviceName)
+        assertEquals("desktop", input.platform)
+        assertTrue(input.createAccount)
+        assertEquals("device-123", persisted.activeDeviceId)
+        assertTrue(controller.state.sync.connection is SyncConnectionUi.Connected)
+        assertNull(controller.state.sync.operation)
     }
 
     @Test
-    fun expiredWorkspacePairingInvitationIsNotPublishedByUiState() = runBlocking {
+    fun setupValidationAndFailureExposeOnlySafeLocalizedCopy() = runBlocking {
+        val rawDiagnostic = "raw-diagnostic-must-not-reach-ui"
+        var setupCalls = 0
+        lateinit var controller: SettingsUiController
+        controller = SettingsUiController(
+            selfHostedSetupClient = SelfHostedSetupClient {
+                assertEquals(SyncUiOperation.Authenticating, controller.state.sync.operation)
+                setupCalls += 1
+                SelfHostedSetupResult.failure(
+                    reason = SelfHostedSetupReason.Failed,
+                    diagnosticMessage = rawDiagnostic,
+                )
+            },
+            uiStrings = SettingsUiStrings(selfHostedSetupFailed = "localized-setup-failure"),
+            backgroundDispatcher = Dispatchers.Unconfined,
+        )
+
+        assertFalse(
+            controller.setupSelfHosted(
+                endpoint = "",
+                email = "alice@example.test",
+                password = "super-secret",
+                createAccount = false,
+            ),
+        )
+        assertEquals(0, setupCalls)
+        assertTrue(controller.state.feedbackMessage.orEmpty().contains("endpoint"))
+        assertFalse(controller.state.feedbackMessage.orEmpty().contains("super-secret"))
+
+        assertFalse(
+            controller.setupSelfHosted(
+                endpoint = "https://sync.example.test",
+                email = "alice@example.test",
+                password = "super-secret",
+                createAccount = false,
+            ),
+        )
+        assertEquals(1, setupCalls)
+        assertEquals(SyncIssueReason.SetupFailed, controller.state.sync.issue?.reason)
+        assertEquals("localized-setup-failure", controller.state.feedbackMessage)
+        assertEquals(SyncIssueAction.Reauthenticate, controller.state.sync.issue?.action)
+        assertFalse(controller.state.feedbackMessage.orEmpty().contains(rawDiagnostic))
+    }
+
+    @Test
+    fun failedMissingCredentialRecoveryKeepsTheBoundEndpointAndRecoveryForm() = runBlocking {
+        var persisted = connectedSettings()
+        val controller = SettingsUiController(
+            initialSettings = persisted,
+            persistSettings = { updated -> updated.also { persisted = it } },
+            selfHostedSessionCredentialStore = FakeSelfHostedSessionCredentialStore(),
+            selfHostedSetupClient = SelfHostedSetupClient {
+                SelfHostedSetupResult.failure(SelfHostedSetupReason.Failed)
+            },
+            backgroundDispatcher = Dispatchers.Unconfined,
+        )
+
+        controller.refresh()
+        assertEquals(SyncAccountFormMode.MissingCredentials, controller.state.sync.accountFormMode())
+
+        assertFalse(
+            controller.setupSelfHosted(
+                endpoint = "https://sync.example.test",
+                email = "alice@example.test",
+                password = "incorrect-password",
+                createAccount = false,
+            ),
+        )
+
+        assertEquals("https://sync.example.test", persisted.syncConfiguration.selfHostedEndpoint)
+        assertEquals(SyncIssueReason.SetupFailed, controller.state.sync.issue?.reason)
+        assertEquals(SyncAccountFormMode.MissingCredentials, controller.state.sync.accountFormMode())
+        assertFalse(controller.state.sync.accountFormMode().allowCreateAccount)
+    }
+
+    @Test
+    fun missingCredentialsRemainAReauthenticationFlowAfterRestart() = runBlocking {
+        val restartedSettings = ClientSettings(
+            syncConfiguration = SyncConfiguration(
+                mode = SyncMode.SelfHosted,
+                selfHostedEndpoint = "https://sync.example.test",
+            ),
+        )
+        val controller = SettingsUiController(
+            initialSettings = restartedSettings,
+            selfHostedSessionCredentialStore = FakeSelfHostedSessionCredentialStore(),
+            backgroundDispatcher = Dispatchers.Unconfined,
+        )
+
+        controller.refresh()
+
+        assertEquals(SyncIssueReason.SignInRequired, controller.state.sync.issue?.reason)
+        assertEquals(SyncAccountFormMode.MissingCredentials, controller.state.sync.accountFormMode())
+        assertFalse(controller.state.sync.accountFormMode().allowCreateAccount)
+    }
+
+    @Test
+    fun failedReplacementPreservesTheBoundEndpointDeviceAndSession() = runBlocking {
+        val originalConfiguration = connectedSettings().syncConfiguration
+        var persisted = connectedSettings()
+        val controller = SettingsUiController(
+            initialSettings = persisted,
+            persistSettings = { updated -> updated.also { persisted = it } },
+            selfHostedSetupClient = SelfHostedSetupClient {
+                SelfHostedSetupResult.failure(
+                    reason = SelfHostedSetupReason.AccountChangeBlocked,
+                    diagnosticMessage = "raw-bound-replacement-diagnostic",
+                )
+            },
+            backgroundDispatcher = Dispatchers.Unconfined,
+        )
+
+        assertFalse(
+            controller.setupSelfHosted(
+                endpoint = "https://other.example.test",
+                email = "other@example.test",
+                password = "another-password",
+                createAccount = false,
+            ),
+        )
+
+        assertEquals("device-123", persisted.activeDeviceId)
+        assertEquals(originalConfiguration.selfHostedEndpoint, persisted.syncConfiguration.selfHostedEndpoint)
+        assertEquals(originalConfiguration.selfHostedSession, persisted.syncConfiguration.selfHostedSession)
+        assertNull(persisted.syncConfiguration.lastError)
+        assertNull(controller.state.sync.issue)
+        assertFalse(controller.state.feedbackMessage.orEmpty().contains("raw-bound-replacement"))
+    }
+
+    @Test
+    fun userSyncUsesOneOperationAndRefreshesEvenWithZeroTransportDeltas() = runBlocking {
+        var persisted = connectedSettings(lastError = "sync:Failed")
+        var refreshCalls = 0
+        lateinit var controller: SettingsUiController
+        controller = SettingsUiController(
+            initialSettings = persisted,
+            persistSettings = { updated -> updated.also { persisted = it } },
+            manualSyncRunner = {
+                assertEquals(SyncUiOperation.Syncing, controller.state.sync.operation)
+                ManualSyncResult.success(SyncMode.SelfHosted, 0, 0, 0)
+            },
+            onDataRestored = { refreshCalls += 1 },
+            backgroundDispatcher = Dispatchers.Unconfined,
+        )
+
+        assertTrue(controller.runUserSync())
+
+        assertEquals(1, refreshCalls)
+        assertNull(controller.state.sync.operation)
+        assertNull(controller.state.sync.issue)
+        assertNull(persisted.syncConfiguration.lastError)
+        assertEquals("Sync complete.", controller.state.feedbackMessage)
+    }
+
+    @Test
+    fun failedSyncRefreshesMaterializedChangesAndNeverLeaksDiagnostics() = runBlocking {
+        val rawDiagnostic = "raw-sync-diagnostic-must-not-reach-ui"
+        var refreshCalls = 0
+        val controller = SettingsUiController(
+            initialSettings = connectedSettings(),
+            manualSyncRunner = {
+                ManualSyncResult.failure(
+                    mode = SyncMode.SelfHosted,
+                    reason = ManualSyncReason.AuthorityMismatch,
+                    pulledObjects = 1,
+                    conflicts = 1,
+                    diagnosticMessage = rawDiagnostic,
+                )
+            },
+            onDataRestored = { refreshCalls += 1 },
+            uiStrings = SettingsUiStrings(syncAuthorityMismatch = "localized-authority-failure"),
+            backgroundDispatcher = Dispatchers.Unconfined,
+        )
+
+        assertFalse(controller.runUserSync())
+
+        assertEquals(1, refreshCalls)
+        assertEquals(SyncIssueReason.AuthorityMismatch, controller.state.sync.issue?.reason)
+        assertEquals("localized-authority-failure", controller.state.feedbackMessage)
+        assertEquals(SyncIssueAction.Reauthenticate, controller.state.sync.issue?.action)
+        assertFalse(controller.state.feedbackMessage.orEmpty().contains(rawDiagnostic))
+    }
+
+    @Test
+    fun alreadyRunningIsTransientAndPreservesTheExistingRecoveryIssue() = runBlocking {
+        var persistenceCalls = 0
+        val controller = SettingsUiController(
+            initialSettings = connectedSettings(lastError = "sync:WorkspaceLocked"),
+            persistSettings = { updated ->
+                persistenceCalls += 1
+                updated
+            },
+            manualSyncRunner = {
+                ManualSyncResult.failure(SyncMode.SelfHosted, ManualSyncReason.AlreadyRunning)
+            },
+            backgroundDispatcher = Dispatchers.Unconfined,
+        )
+
+        assertFalse(controller.runUserSync())
+
+        assertEquals(0, persistenceCalls)
+        assertEquals(SyncIssueReason.WorkspaceLocked, controller.state.sync.issue?.reason)
+        assertEquals("sync:WorkspaceLocked", controller.state.settings.syncConfiguration.lastError)
+        assertEquals("A sync is already in progress.", controller.state.feedbackMessage)
+        assertEquals(SettingsFeedbackSeverity.Info, controller.state.feedbackSeverity)
+        assertNull(controller.state.sync.operation)
+    }
+
+    @Test
+    fun runtimeAvailabilityReasonsExposeOnlyValidRecoveryActions() = runBlocking {
+        val configurationChanged = SettingsUiController(
+            initialSettings = connectedSettings(),
+            manualSyncRunner = {
+                ManualSyncResult.failure(SyncMode.SelfHosted, ManualSyncReason.ProviderChanged)
+            },
+            backgroundDispatcher = Dispatchers.Unconfined,
+        )
+        val unavailable = SettingsUiController(
+            initialSettings = connectedSettings(),
+            manualSyncRunner = {
+                ManualSyncResult.failure(SyncMode.SelfHosted, ManualSyncReason.Unavailable)
+            },
+            backgroundDispatcher = Dispatchers.Unconfined,
+        )
+
+        assertFalse(configurationChanged.runUserSync())
+        assertEquals(SyncIssueReason.ConfigurationChanged, configurationChanged.state.sync.issue?.reason)
+        assertEquals(SyncIssueAction.Reauthenticate, configurationChanged.state.sync.issue?.action)
+
+        assertFalse(unavailable.runUserSync())
+        assertEquals(SyncIssueReason.SyncUnavailable, unavailable.state.sync.issue?.reason)
+        assertNull(unavailable.state.sync.issue?.action)
+    }
+
+    @Test
+    fun automaticSyncUsesTheSameRunnerAndStaysQuietOnSuccess() = runBlocking {
+        var syncCalls = 0
+        var refreshCalls = 0
+        val controller = SettingsUiController(
+            initialSettings = connectedSettings(),
+            manualSyncRunner = {
+                syncCalls += 1
+                ManualSyncResult.success(SyncMode.SelfHosted, 1, 2, 0)
+            },
+            onDataRestored = { refreshCalls += 1 },
+            backgroundDispatcher = Dispatchers.Unconfined,
+        )
+
+        assertTrue(controller.canRunAutomaticSync())
+        assertTrue(controller.runAutomaticSync())
+
+        assertEquals(1, syncCalls)
+        assertEquals(1, refreshCalls)
+        assertNull(controller.state.feedbackMessage)
+        assertEquals(0L, controller.state.feedbackEventId)
+        assertNull(controller.state.sync.operation)
+    }
+
+    @Test
+    fun automaticSyncSkipsADeviceWithoutAConnection() = runBlocking {
+        var syncCalls = 0
+        val controller = SettingsUiController(
+            manualSyncRunner = {
+                syncCalls += 1
+                ManualSyncResult.success(SyncMode.Off, 0, 0, 0)
+            },
+        )
+
+        assertFalse(controller.canRunAutomaticSync())
+        assertFalse(controller.runAutomaticSync())
+        assertFalse(controller.runUserSync())
+        assertEquals(0, syncCalls)
+    }
+
+    @Test
+    fun automaticSyncWaitsForReauthenticationAfterAnAuthorityFailure() = runBlocking {
+        var syncCalls = 0
+        val controller = SettingsUiController(
+            initialSettings = connectedSettings(lastError = "sync:AuthorityMismatch"),
+            manualSyncRunner = {
+                syncCalls += 1
+                ManualSyncResult.success(SyncMode.SelfHosted, 0, 0, 0)
+            },
+        )
+
+        assertFalse(controller.canRunAutomaticSync())
+        assertFalse(controller.runAutomaticSync())
+        assertFalse(controller.runUserSync())
+        assertEquals(0, syncCalls)
+    }
+
+    @Test
+    fun retryableWorkspaceLockCanRunTheSharedSyncPath() = runBlocking {
+        var syncCalls = 0
+        val controller = SettingsUiController(
+            initialSettings = connectedSettings(lastError = "sync:WorkspaceLocked"),
+            manualSyncRunner = {
+                syncCalls += 1
+                ManualSyncResult.success(SyncMode.SelfHosted, 0, 0, 0)
+            },
+            backgroundDispatcher = Dispatchers.Unconfined,
+        )
+
+        assertEquals(SyncIssueAction.RetrySync, controller.state.sync.issue?.action)
+        assertTrue(controller.runUserSync())
+        assertEquals(1, syncCalls)
+        assertNull(controller.state.sync.issue)
+    }
+
+    @Test
+    fun concurrentSyncTriggersShareTheControllerGuard() = runBlocking {
+        val enteredRunner = CompletableDeferred<Unit>()
+        val releaseRunner = CompletableDeferred<Unit>()
+        val controller = SettingsUiController(
+            initialSettings = connectedSettings(),
+            manualSyncRunner = {
+                enteredRunner.complete(Unit)
+                runBlocking { releaseRunner.await() }
+                ManualSyncResult.success(SyncMode.SelfHosted, 0, 0, 0)
+            },
+        )
+
+        val firstSync = async(Dispatchers.Default) { controller.runUserSync() }
+        enteredRunner.await()
+
+        assertEquals(SyncUiOperation.Syncing, controller.state.sync.operation)
+        assertFalse(controller.runUserSync())
+        releaseRunner.complete(Unit)
+        assertTrue(firstSync.await())
+        assertNull(controller.state.sync.operation)
+    }
+
+    @Test
+    fun settingsWritesWaitForSyncPersistenceAndPreserveBothChanges() = runBlocking {
+        val repository = InMemoryNotesRepository()
+        val work = repository.createNotebook("Work")
+        val enteredPersistence = CompletableDeferred<Unit>()
+        val releasePersistence = CompletableDeferred<Unit>()
+        var persisted = connectedSettings(lastError = "sync:Failed")
+        val controller = SettingsUiController(
+            initialSettings = persisted,
+            notebooksProvider = repository::listNotebooks,
+            persistSettings = { updated ->
+                if (updated.syncConfiguration.lastError == null &&
+                    updated.lastSelectedNotebookId == null
+                ) {
+                    enteredPersistence.complete(Unit)
+                    runBlocking { releasePersistence.await() }
+                }
+                updated.also { persisted = it }
+            },
+            manualSyncRunner = {
+                ManualSyncResult.success(SyncMode.SelfHosted, 0, 0, 0)
+            },
+        )
+
+        val sync = async(Dispatchers.Default) { controller.runUserSync() }
+        enteredPersistence.await()
+        val notebookSelection = async(Dispatchers.Default) {
+            controller.recordLastSelectedNotebook(work.id)
+        }
+
+        assertEquals(SyncUiOperation.Syncing, controller.state.sync.operation)
+        assertFalse(notebookSelection.isCompleted)
+        assertFalse(controller.canRunAutomaticSync())
+        releasePersistence.complete(Unit)
+
+        assertTrue(sync.await())
+        assertTrue(notebookSelection.await())
+        assertNull(persisted.syncConfiguration.lastError)
+        assertEquals(work.id, persisted.lastSelectedNotebookId)
+        assertEquals(persisted, controller.state.settings)
+    }
+
+    @Test
+    fun syncPersistenceFailureStaysVisibleAndRetryable() = runBlocking {
+        val controller = SettingsUiController(
+            initialSettings = connectedSettings(),
+            persistSettings = { error("settings store unavailable") },
+            manualSyncRunner = {
+                ManualSyncResult.success(SyncMode.SelfHosted, 0, 0, 0)
+            },
+            backgroundDispatcher = Dispatchers.Unconfined,
+        )
+
+        assertFalse(controller.runUserSync())
+        assertEquals(SyncIssueReason.SyncFailed, controller.state.sync.issue?.reason)
+        assertEquals(SyncIssueAction.RetrySync, controller.state.sync.issue?.action)
+        assertEquals(SettingsFeedbackSeverity.Error, controller.state.feedbackSeverity)
+        assertNull(controller.state.sync.operation)
+    }
+
+    @Test
+    fun cancellationClearsTheOperationAndPropagates() = runBlocking {
+        val controller = SettingsUiController(
+            initialSettings = connectedSettings(),
+            manualSyncRunner = {
+                throw CancellationException("navigation scope cancelled")
+            },
+            backgroundDispatcher = Dispatchers.Unconfined,
+        )
+
+        assertFailsWith<CancellationException> { controller.runUserSync() }
+        assertNull(controller.state.sync.operation)
+        assertTrue(controller.selectTheme(ClientTheme.Dark))
+        assertEquals(ClientTheme.Dark, controller.state.settings.theme)
+    }
+
+    @Test
+    fun localizedFeedbackCanChangeWithoutRecreatingAnActiveController() = runBlocking {
+        val enteredRunner = CompletableDeferred<Unit>()
+        val releaseRunner = CompletableDeferred<Unit>()
+        val controller = SettingsUiController(
+            initialSettings = connectedSettings(),
+            manualSyncRunner = {
+                enteredRunner.complete(Unit)
+                runBlocking { releaseRunner.await() }
+                ManualSyncResult.failure(SyncMode.SelfHosted, ManualSyncReason.Failed)
+            },
+        )
+
+        val sync = async(Dispatchers.Default) { controller.runUserSync() }
+        enteredRunner.await()
+        controller.updateLocalizedStrings(
+            settings = SettingsUiStrings(syncFailed = "同步失败"),
+            notifications = OnThisDayNotificationStrings(),
+        )
+        releaseRunner.complete(Unit)
+
+        assertFalse(sync.await())
+        assertEquals("同步失败", controller.state.feedbackMessage)
+        assertEquals(SettingsFeedbackSeverity.Error, controller.state.feedbackSeverity)
+    }
+
+    @Test
+    fun pairingIsUnavailableUntilTheDeviceIsConnected() = runBlocking {
+        var createCalls = 0
+        var joinCalls = 0
+        val controller = SettingsUiController(
+            workspacePairingInvitationCreator = WorkspacePairingInvitationCreator {
+                createCalls += 1
+                WorkspacePairingInvitationResult.failure(WorkspacePairingReason.Failed)
+            },
+            workspacePairingInvitationJoiner = WorkspacePairingInvitationJoiner {
+                joinCalls += 1
+                WorkspaceJoinResult.failure(WorkspacePairingReason.Failed)
+            },
+        )
+
+        assertFalse(controller.createWorkspacePairingInvitation())
+        assertFalse(controller.joinWorkspaceWithToken("valid-looking-token"))
+        assertEquals(0, createCalls)
+        assertEquals(0, joinCalls)
+    }
+
+    @Test
+    fun pairingInvitationLifecycleKeepsTokensRedacted() = runBlocking {
+        val manualToken = "000G40R 40M30E2 09185GR 38E1WRJ"
+        val qrPayload = "SOMEDAY:PAIR:1:000G40R40M30E209185GR38E1WRJ"
+        val invitation = WorkspacePairingInvitation.create(
+            manualToken = manualToken,
+            qrPayload = qrPayload,
+            expiresAtEpochMillis = 4_000_000_000_000L,
+        )
+        var cancelledInvitation: WorkspacePairingInvitation? = null
+        lateinit var controller: SettingsUiController
+        controller = SettingsUiController(
+            initialSettings = connectedSettings(),
+            workspacePairingInvitationCreator = WorkspacePairingInvitationCreator {
+                assertEquals(SyncUiOperation.CreatingInvitation, controller.state.sync.operation)
+                WorkspacePairingInvitationResult.success(WorkspacePairingReason.InvitationCreated, invitation)
+            },
+            workspacePairingInvitationCanceller = WorkspacePairingInvitationCanceller { value ->
+                cancelledInvitation = value
+                WorkspaceJoinResult.success(WorkspacePairingReason.InvitationCancelled)
+            },
+            backgroundDispatcher = Dispatchers.Unconfined,
+        )
+
+        assertTrue(controller.createWorkspacePairingInvitation())
+        val visible = assertNotNull(controller.state.sync.invitation)
+        assertEquals(manualToken, visible.manualToken)
+        assertEquals(qrPayload, visible.qrPayload)
+        assertFalse(visible.toString().contains(manualToken))
+
+        assertTrue(controller.cancelWorkspacePairingInvitation())
+        assertNotNull(cancelledInvitation)
+        assertNull(controller.state.sync.invitation)
+    }
+
+    @Test
+    fun pairingFailureNeverLeaksCoreDiagnostics() = runBlocking {
+        val rawDiagnostic = "raw-pairing-diagnostic-must-not-reach-ui"
+        val controller = SettingsUiController(
+            initialSettings = connectedSettings(),
+            workspacePairingInvitationCreator = WorkspacePairingInvitationCreator {
+                WorkspacePairingInvitationResult.failure(
+                    reason = WorkspacePairingReason.Failed,
+                    diagnosticMessage = rawDiagnostic,
+                )
+            },
+            uiStrings = SettingsUiStrings(pairingInvitationFailed = "localized-pairing-failure"),
+            backgroundDispatcher = Dispatchers.Unconfined,
+        )
+
+        assertFalse(controller.createWorkspacePairingInvitation())
+        assertEquals("localized-pairing-failure", controller.state.feedbackMessage)
+        assertFalse(controller.state.feedbackMessage.orEmpty().contains(rawDiagnostic))
+    }
+
+    @Test
+    fun expiredPairingInvitationIsRemovedFromUiState() = runBlocking {
         var now = 1_000L
         val controller = SettingsUiController(
+            initialSettings = connectedSettings(),
             currentEpochMillis = { now },
             workspacePairingInvitationCreator = WorkspacePairingInvitationCreator {
                 WorkspacePairingInvitationResult.success(
@@ -366,501 +982,116 @@ class SettingsUiControllerTest {
         )
 
         assertTrue(controller.createWorkspacePairingInvitation())
-        assertNotNull(controller.state.workspacePairingInvitation)
+        assertNotNull(controller.state.sync.invitation)
 
         now = 2_000L
         controller.discardWorkspacePairingInvitationAtExpiry(2_000L)
 
-        assertEquals(null, controller.state.workspacePairingInvitation)
-        now = 1_500L
-        controller.refresh()
-        assertEquals(null, controller.state.workspacePairingInvitation)
+        assertNull(controller.state.sync.invitation)
     }
 
     @Test
-    fun typedCoreDiagnosticsAreMappedToLocalizedCopyAndNeverShown() = runBlocking {
-        val rawDiagnostic = "raw-diagnostic-must-not-reach-ui"
+    fun joiningAWorkspaceRejectsBlankInputAndRunsTheFirstSyncOnSuccess() = runBlocking {
+        val token = "000G40R 40M30E2 09185GR 38E1WRJ"
+        var capturedToken: String? = null
+        var syncCalls = 0
         val controller = SettingsUiController(
-            initialSettings = ClientSettings(
-                syncConfiguration = loggedInSelfHostedConfiguration(),
-            ),
-            selfHostedSetupClient = SelfHostedSetupClient {
-                SelfHostedSetupResult.failure(
-                    reason = SelfHostedSetupReason.Failed,
-                    diagnosticMessage = rawDiagnostic,
-                )
+            initialSettings = connectedSettings(lastError = "sync:Failed"),
+            workspacePairingInvitationJoiner = WorkspacePairingInvitationJoiner { value ->
+                capturedToken = value
+                WorkspaceJoinResult.success(WorkspacePairingReason.Joined)
             },
             manualSyncRunner = {
-                ManualSyncResult.failure(
-                    mode = SyncMode.SelfHosted,
-                    reason = ManualSyncReason.AuthorityMismatch,
-                    diagnosticMessage = rawDiagnostic,
-                )
+                syncCalls += 1
+                ManualSyncResult.success(SyncMode.SelfHosted, 0, 0, 0)
             },
-            workspacePairingInvitationCreator = WorkspacePairingInvitationCreator {
-                WorkspacePairingInvitationResult.failure(
-                    reason = WorkspacePairingReason.Failed,
-                    diagnosticMessage = rawDiagnostic,
-                )
-            },
-            uiStrings = SettingsUiStrings(
-                selfHostedSetupFailed = "localized-setup-failure",
-                syncAuthorityMismatch = "localized-sync-authority-failure",
-                pairingInvitationFailed = "localized-pairing-failure",
-            ),
             backgroundDispatcher = Dispatchers.Unconfined,
-            uiDispatcher = Dispatchers.Unconfined,
         )
 
-        assertFalse(
-            controller.setupSelfHosted(
-                SelfHostedSetupInput(
-                    endpoint = "https://sync.example.test",
-                    email = "alice@example.test",
-                    password = "redacted-password",
-                    deviceName = "Test device",
-                    platform = "test",
-                    createAccount = false,
-                ),
-            ),
-        )
-        assertEquals("localized-setup-failure", controller.state.feedbackMessage)
-        assertFalse(controller.state.feedbackMessage.orEmpty().contains(rawDiagnostic))
+        assertFalse(controller.joinWorkspaceWithToken("  "))
+        assertNull(capturedToken)
 
-        assertFalse(controller.runManualSync())
-        assertEquals("localized-sync-authority-failure", controller.state.feedbackMessage)
-        assertEquals("localized-sync-authority-failure", controller.state.manualSyncProgress.message)
-        assertFalse(controller.state.manualSyncProgress.message.contains(rawDiagnostic))
-
-        assertFalse(controller.createWorkspacePairingInvitation())
-        assertEquals("localized-pairing-failure", controller.state.feedbackMessage)
-        assertFalse(controller.state.feedbackMessage.orEmpty().contains(rawDiagnostic))
+        assertTrue(controller.joinWorkspaceWithToken(token))
+        assertEquals(token, capturedToken)
+        assertEquals(1, syncCalls)
+        assertNull(controller.state.sync.issue)
+        assertNull(controller.state.sync.operation)
     }
 
     @Test
-    fun manualSyncProgressUsesLocalizedCopyAndUnbindsListener() = runBlocking {
-        var progressListener: ManualSyncProgressListener? = null
-        var initialMessage = ""
-        var chunkMessage = ""
-        lateinit var controller: SettingsUiController
-        controller = SettingsUiController(
-            initialSettings = ClientSettings(
-                syncConfiguration = loggedInSelfHostedConfiguration(),
-            ),
-            manualSyncRunner = {
-                initialMessage = controller.state.manualSyncProgress.message
-                checkNotNull(progressListener).onProgress(
-                    ManualSyncPhase.UploadingChunks(completed = 2, total = 5),
-                )
-                chunkMessage = controller.state.manualSyncProgress.message
-                ManualSyncResult.success(
-                    mode = SyncMode.SelfHosted,
-                    pushedObjects = 0,
-                    pulledObjects = 0,
-                    conflicts = 0,
-                    diagnosticMessage = "raw completion diagnostic",
-                )
-            },
-            bindManualSyncProgressListener = { progressListener = it },
-            uiStrings = SettingsUiStrings(
-                syncReady = "同步已就绪。",
-                syncInProgress = "正在同步更改。",
-                syncUploadingCheckpointChunks = "正在上传快照（%1\$s/%2\$s）。",
-            ),
-            backgroundDispatcher = Dispatchers.Default,
-            uiDispatcher = Dispatchers.Unconfined,
-        )
-        controller.refresh()
-
-        assertEquals("同步已就绪。", controller.state.manualSyncProgress.message)
-        assertTrue(controller.runManualSync())
-
-        assertEquals("正在同步更改。", initialMessage)
-        assertEquals("正在上传快照（2/5）。", chunkMessage)
-        assertEquals(null, progressListener)
-    }
-
-    @Test
-    fun selfHostedModeRunsManualSyncAndRefreshesPulledData() = runBlocking {
-        var persisted = ClientSettings(
-            syncConfiguration = loggedInSelfHostedConfiguration(),
-        )
-        var syncCalled = false
-        var restored = false
+    fun successfulJoinSurvivesAFailedFirstSyncAndRefreshesVisibleChanges() = runBlocking {
+        var refreshCalls = 0
         val controller = SettingsUiController(
-            initialSettings = persisted,
-            persistSettings = { updated ->
-                persisted = updated
-                updated
+            initialSettings = connectedSettings(lastError = "sync:Failed"),
+            workspacePairingInvitationJoiner = WorkspacePairingInvitationJoiner {
+                WorkspaceJoinResult.success(WorkspacePairingReason.Joined)
             },
-            manualSyncRunner = {
-                syncCalled = true
-                ManualSyncResult.success(
-                    mode = SyncMode.SelfHosted,
-                    pushedObjects = 3,
-                    pulledObjects = 2,
-                    conflicts = 0,
-                    diagnosticMessage = "raw self-hosted completion diagnostic",
-                )
-            },
-            onDataRestored = { restored = true },
-        )
-        controller.refresh()
-
-        assertTrue(controller.runManualSync())
-
-        assertTrue(syncCalled)
-        assertTrue(restored)
-        assertFalse(controller.state.manualSyncProgress.running)
-        assertEquals(3, controller.state.manualSyncProgress.pushedObjects)
-        assertEquals(2, controller.state.manualSyncProgress.pulledObjects)
-        assertEquals(null, persisted.syncConfiguration.lastError)
-        assertFalse(controller.state.feedbackMessage.orEmpty().contains("session-token"))
-    }
-
-    @Test
-    fun manualSyncRefreshesLocalStateForFailedResultWithConflicts() = runBlocking {
-        var refreshed = false
-        val controller = SettingsUiController(
-            initialSettings = ClientSettings(
-                syncConfiguration = loggedInSelfHostedConfiguration(),
-            ),
             manualSyncRunner = {
                 ManualSyncResult.failure(
                     mode = SyncMode.SelfHosted,
-                    reason = ManualSyncReason.Blocked,
-                    pushedObjects = 0,
+                    reason = ManualSyncReason.RetryRequired,
                     pulledObjects = 1,
-                    conflicts = 1,
-                    diagnosticMessage = "raw conflict diagnostic",
                 )
             },
-            onDataRestored = { refreshed = true },
-        )
-        controller.refresh()
-
-        assertFalse(controller.runManualSync())
-
-        assertTrue(refreshed)
-        assertEquals(1, controller.state.manualSyncProgress.conflicts)
-    }
-
-    @Test
-    fun successfulManualSyncWithZeroTransportDeltasStillRefreshesLocalState() = runBlocking {
-        var refreshed = false
-        val controller = SettingsUiController(
-            initialSettings = ClientSettings(
-                syncConfiguration = loggedInSelfHostedConfiguration(),
-            ),
-            manualSyncRunner = {
-                ManualSyncResult.success(
-                    mode = SyncMode.SelfHosted,
-                    pushedObjects = 0,
-                    pulledObjects = 0,
-                    conflicts = 0,
-                    diagnosticMessage = "raw bootstrap completion diagnostic",
-                )
-            },
-            onDataRestored = { refreshed = true },
-        )
-        controller.refresh()
-
-        assertTrue(controller.runManualSync())
-        assertTrue(
-            refreshed,
-            "Successful first-time V2 activation must refresh Notes even when transport deltas are zero.",
-        )
-    }
-
-    @Test
-    fun automaticSyncRefreshesLocalStateAfterPushWithoutConfigurationToasts() = runBlocking {
-        var persisted = ClientSettings(
-            syncConfiguration = loggedInSelfHostedConfiguration(),
-        )
-        var syncCalls = 0
-        var refreshed = false
-        val controller = SettingsUiController(
-            initialSettings = persisted,
-            persistSettings = { updated ->
-                persisted = updated
-                updated
-            },
-            manualSyncRunner = {
-                syncCalls += 1
-                ManualSyncResult.success(
-                    mode = SyncMode.SelfHosted,
-                    pushedObjects = 1,
-                    pulledObjects = 0,
-                    conflicts = 0,
-                    diagnosticMessage = "raw automatic sync diagnostic",
-                )
-            },
-            onDataRestored = { refreshed = true },
-        )
-        controller.refresh()
-        val initialFeedbackEventId = controller.state.feedbackEventId
-
-        assertTrue(controller.canRunAutomaticSync())
-        assertTrue(controller.runAutomaticSync())
-
-        assertEquals(1, syncCalls)
-        assertTrue(refreshed)
-        assertFalse(controller.state.manualSyncProgress.running)
-        assertEquals(1, controller.state.manualSyncProgress.pushedObjects)
-        assertEquals(initialFeedbackEventId, controller.state.feedbackEventId)
-        assertEquals(null, persisted.syncConfiguration.lastError)
-    }
-
-    @Test
-    fun automaticSyncSkipsWhenSyncModeIsNotConfigured() = runBlocking {
-        var syncCalls = 0
-        val controller = SettingsUiController(
-            initialSettings = ClientSettings(
-                syncConfiguration = SyncConfiguration(mode = SyncMode.Off),
-            ),
-            manualSyncRunner = {
-                syncCalls += 1
-                ManualSyncResult.success(
-                    mode = SyncMode.Off,
-                    pushedObjects = 0,
-                    pulledObjects = 0,
-                    conflicts = 0,
-                    diagnosticMessage = "unexpected sync diagnostic",
-                )
-            },
+            onDataRestored = { refreshCalls += 1 },
+            backgroundDispatcher = Dispatchers.Unconfined,
         )
 
-        assertFalse(controller.canRunAutomaticSync())
-        assertFalse(controller.runAutomaticSync())
-        assertEquals(0, syncCalls)
-        assertEquals(0L, controller.state.feedbackEventId)
-    }
-
-    @Test
-    fun selfHostedSetupShowsSessionDeviceStateAndManualSyncProgress() = runBlocking {
-        var persisted = ClientSettings()
-        var nextManualSyncResult = ManualSyncResult.success(
-            mode = SyncMode.SelfHosted,
-            pushedObjects = 2,
-            pulledObjects = 1,
-            conflicts = 0,
-            diagnosticMessage = "raw self-hosted success diagnostic",
-        )
-        val controller = SettingsUiController(
-            initialSettings = persisted,
-            persistSettings = { updated ->
-                persisted = updated
-                updated
-            },
-            selfHostedSetupClient = SelfHostedSetupClient { input ->
-                if (input.password == "bad-password") {
-                    SelfHostedSetupResult.failure(
-                        reason = SelfHostedSetupReason.Failed,
-                        diagnosticMessage = "Self-hosted login failed: invalid credentials; password redacted.",
-                    )
-                } else {
-                    SelfHostedSetupResult.success(
-                        status = SelfHostedSetupStatus(
-                            ready = true,
-                            reason = SelfHostedSetupReason.Ready,
-                            diagnosticMessage = "Self-hosted account and device registered; password redacted.",
-                        ),
-                        session = SelfHostedSessionSummary(
-                            loggedIn = true,
-                            userEmail = input.email,
-                            deviceId = "device-123",
-                            deviceName = input.deviceName,
-                            devicePlatform = input.platform,
-                        ),
-                    )
-                }
-            },
-            manualSyncRunner = {
-                nextManualSyncResult
-            },
-        )
-
-        assertFalse(
-            controller.setupSelfHosted(
-                SelfHostedSetupInput(
-                    endpoint = "",
-                    email = "alice@example.com",
-                    password = "super-secret",
-                    deviceName = "MacBook",
-                    platform = "desktop",
-                    createAccount = true,
-                ),
-            ),
-        )
-        assertTrue(controller.state.feedbackMessage.orEmpty().contains("endpoint is required"))
-        assertFalse(controller.state.feedbackMessage.orEmpty().contains("super-secret"))
-
-        assertFalse(
-            controller.setupSelfHosted(
-                SelfHostedSetupInput(
-                    endpoint = "http://127.0.0.1:3180",
-                    email = "alice@example.com",
-                    password = "bad-password",
-                    deviceName = "MacBook",
-                    platform = "desktop",
-                    createAccount = false,
-                ),
-            ),
-        )
-        assertEquals("Self-hosted setup failed safely.", controller.state.feedbackMessage)
-        assertFalse(controller.state.feedbackMessage.orEmpty().contains("invalid credentials"))
-        assertFalse(controller.state.feedbackMessage.orEmpty().contains("bad-password"))
-
-        assertTrue(
-            controller.setupSelfHosted(
-                SelfHostedSetupInput(
-                    endpoint = " http://127.0.0.1:3180/ ",
-                    email = " Alice@Example.com ",
-                    password = "correct-password",
-                    deviceName = "MacBook",
-                    platform = "desktop",
-                    createAccount = true,
-                ),
-            ),
-        )
-
-        assertEquals(SyncMode.SelfHosted, persisted.syncConfiguration.mode)
-        assertEquals("http://127.0.0.1:3180", persisted.syncConfiguration.selfHostedEndpoint)
-        assertEquals("alice@example.com", persisted.syncConfiguration.selfHostedSession.userEmail)
-        assertEquals("device-123", persisted.syncConfiguration.selfHostedSession.deviceId)
-        assertEquals("device-123", persisted.activeDeviceId)
-
-        val hierarchyText = controller.state.sections
-            .flatMap { section -> listOf(section.title, section.description) + section.entryPoints }
-            .joinToString(separator = "\n")
-        assertTrue(hierarchyText.contains("Logged in as alice@example.com"))
-        assertTrue(hierarchyText.contains("Endpoint: http://127.0.0.1:3180"))
-        assertTrue(hierarchyText.contains("Active self-hosted device: device-123"))
-        assertFalse(hierarchyText.contains("correct-password"))
-
-        assertTrue(controller.beginManualSync())
-        assertTrue(controller.state.manualSyncProgress.running)
-        assertTrue(controller.state.manualSyncProgress.message.contains("Syncing"))
-        assertFalse(controller.beginManualSync())
-        assertTrue(controller.state.manualSyncProgress.running)
-
-        assertTrue(controller.completeManualSync(nextManualSyncResult))
-        assertFalse(controller.state.manualSyncProgress.running)
-        assertTrue(controller.state.manualSyncProgress.message.contains("Sync complete"))
-        assertFalse(controller.state.manualSyncProgress.message.contains("raw self-hosted"))
-        assertEquals(2, controller.state.manualSyncProgress.pushedObjects)
-        assertEquals(1, controller.state.manualSyncProgress.pulledObjects)
-        assertEquals(null, persisted.syncConfiguration.lastError)
-
-        nextManualSyncResult = ManualSyncResult.failure(
-            mode = SyncMode.SelfHosted,
-            reason = ManualSyncReason.Failed,
-            diagnosticMessage = "Self-hosted sync failed safely: HTTP 503; retryable.",
-        )
-        assertFalse(controller.runManualSync())
-        assertFalse(controller.state.manualSyncProgress.running)
-        assertTrue(controller.state.manualSyncProgress.message.contains("failed"))
-        assertEquals("sync:Failed", persisted.syncConfiguration.lastError)
-    }
-
-    @Test
-    fun failedSelfHostedReplacementPreservesTheBoundEndpointDeviceAndSession() = runBlocking {
-        val originalConfiguration = loggedInSelfHostedConfiguration()
-        var persisted = ClientSettings(
-            activeDeviceId = "device-123",
-            syncConfiguration = originalConfiguration,
-        )
-        val controller = SettingsUiController(
-            initialSettings = persisted,
-            persistSettings = { updated ->
-                persisted = updated
-                updated
-            },
-            selfHostedSetupClient = SelfHostedSetupClient {
-                SelfHostedSetupResult.failure(
-                    reason = SelfHostedSetupReason.AccountChangeBlocked,
-                    diagnosticMessage = "raw-bound-replacement-diagnostic",
-                )
-            },
-        )
-
-        assertFalse(
-            controller.setupSelfHosted(
-                SelfHostedSetupInput(
-                    endpoint = "https://other.example.com",
-                    email = "other@example.com",
-                    password = "another-password",
-                    deviceName = "Replacement device",
-                    platform = "desktop",
-                    createAccount = false,
-                ),
-            ),
-        )
-
-        assertEquals("device-123", persisted.activeDeviceId)
-        assertEquals(originalConfiguration.selfHostedEndpoint, persisted.syncConfiguration.selfHostedEndpoint)
-        assertEquals(originalConfiguration.selfHostedSession, persisted.syncConfiguration.selfHostedSession)
-        assertEquals("setup:AccountChangeBlocked", persisted.syncConfiguration.lastError)
-        assertEquals(
-            "This workspace is already bound to an account; sign in to that account instead.",
-            controller.state.feedbackMessage,
-        )
-        assertFalse(controller.state.feedbackMessage.orEmpty().contains("raw-bound-replacement"))
-    }
-
-    @Test
-    fun selfHostedSessionClearDoesNotPersistLoggedOutStateWhenSecureStoreFails() = runBlocking {
-        var persisted = ClientSettings(
-            syncConfiguration = SyncConfiguration(
-                mode = SyncMode.SelfHosted,
-                selfHostedEndpoint = "http://127.0.0.1:3180",
-                selfHostedSession = SelfHostedSessionSummary(
-                    loggedIn = true,
-                    userEmail = "alice@example.com",
-                    deviceId = "device-123",
-                    deviceName = "MacBook",
-                    devicePlatform = "desktop",
-                ),
-            ),
-        )
-        val controller = SettingsUiController(
-            initialSettings = persisted,
-            persistSettings = { updated ->
-                persisted = updated
-                updated
-            },
-            selfHostedSessionCredentialStore = FakeSelfHostedSessionCredentialStore(failOnClear = true),
-        )
-
-        assertFalse(controller.clearSelfHostedSession())
-
-        assertTrue(persisted.syncConfiguration.selfHostedSession.loggedIn)
-        assertTrue(controller.state.feedbackMessage.orEmpty().contains("could not be removed"))
+        assertTrue(controller.joinWorkspaceWithToken("valid-looking-token"))
+        assertEquals(SyncIssueReason.RetryRequired, controller.state.sync.issue?.reason)
+        assertEquals(SyncIssueAction.RetrySync, controller.state.sync.issue?.action)
+        assertNull(controller.state.sync.operation)
+        assertEquals(1, refreshCalls)
     }
 }
 
-private fun loggedInSelfHostedConfiguration(): SyncConfiguration =
-    SyncConfiguration(
-        mode = SyncMode.SelfHosted,
-        selfHostedEndpoint = "https://sync.example.com",
-        selfHostedSession = SelfHostedSessionSummary(
-            loggedIn = true,
-            userEmail = "alice@example.com",
-            deviceId = "device-123",
-            deviceName = "Test device",
-            devicePlatform = "desktop",
+private fun connectedSettings(
+    endpoint: String = "https://sync.example.test",
+    lastError: String? = null,
+): ClientSettings =
+    ClientSettings(
+        activeDeviceId = "device-123",
+        syncConfiguration = SyncConfiguration(
+            mode = SyncMode.SelfHosted,
+            selfHostedEndpoint = endpoint,
+            lastError = lastError,
+            selfHostedSession = SelfHostedSessionSummary(
+                loggedIn = true,
+                userEmail = "alice@example.test",
+                deviceId = "device-123",
+                deviceName = "Test device",
+                devicePlatform = "desktop",
+            ),
         ),
     )
 
-private class FakeSelfHostedSessionCredentialStore(
-    private val failOnClear: Boolean = false,
-) : SelfHostedSessionCredentialStore {
-    override fun load(): SelfHostedSessionCredentials? = null
+private fun testCredentials(): SelfHostedSessionCredentials =
+    SelfHostedSessionCredentials(
+        endpoint = "https://sync.example.test",
+        userId = "user-123",
+        userEmail = "alice@example.test",
+        deviceId = "device-123",
+        deviceName = "Test device",
+        devicePlatform = "desktop",
+        accessToken = "access-token",
+        refreshToken = "refresh-token",
+    )
 
-    override fun save(credentials: SelfHostedSessionCredentials) = Unit
+private class FakeSelfHostedSessionCredentialStore(
+    var credentials: SelfHostedSessionCredentials? = null,
+    var failOnLoad: Boolean = false,
+) : SelfHostedSessionCredentialStore {
+    override fun load(): SelfHostedSessionCredentials? {
+        check(!failOnLoad) { "secure store locked" }
+        return credentials
+    }
+
+    override fun save(credentials: SelfHostedSessionCredentials) {
+        this.credentials = credentials
+    }
 
     override fun clear() {
-        check(!failOnClear) { "secure store locked" }
+        credentials = null
     }
 }
 

@@ -8,8 +8,8 @@ import saien.someday.domain.notes.CausalEditToken
 import saien.someday.domain.notes.DeletedWorkspaceItem
 import saien.someday.domain.notes.DeletedWorkspaceItemType
 import saien.someday.domain.notes.ConflictDetails
+import saien.someday.domain.notes.ConflictBranchResolutionResult
 import saien.someday.domain.notes.ConflictHistory
-import saien.someday.domain.notes.ConflictResolutionAction
 import saien.someday.domain.notes.MemoryDayCount
 import saien.someday.domain.notes.MemoryMonth
 import saien.someday.domain.notes.NoteDetails
@@ -458,21 +458,11 @@ class SystemV2NotesRepository(
     override fun getConflictDetailsForOriginal(originalNoteId: String): ConflictDetails? =
         getConflictDetails(originalNoteId)
 
-    override fun resolveConflict(
-        conflictNoteId: String,
-        action: ConflictResolutionAction,
-    ): NoteDetails? = error(
-        "Whole-product V2 has no original/conflict-copy roles. Select an exact immutable branch or submit an explicit full resolution.",
-    )
-
-    override fun resolveConflictBranch(conflictNoteId: String, versionId: String): NoteDetails? =
-        error("A V2 conflict resolution requires the exact expected head set displayed by the conflict view.")
-
     override fun resolveConflictBranch(
         conflictNoteId: String,
         versionId: String,
         expectedHeadVersionIds: List<String>,
-    ): NoteDetails? {
+    ): ConflictBranchResolutionResult {
         val context = contexts.requireWritable()
         val conflict = context.store.loadActiveConflicts().singleOrNull {
             it.descriptor.entityType == WorkspaceEntityTypeV2.NOTE &&
@@ -488,7 +478,16 @@ class SystemV2NotesRepository(
             authoredAt = now,
         )
         commit(context, chain.map { it to context.factory.newMutationId() }, now)
-        return getNoteDetails(conflict.descriptor.entityId)
+        val resolvedNote = getNoteDetails(conflict.descriptor.entityId)
+        return when (selected.kind) {
+            WorkspaceEntityVersionKindV2.CONTENT -> ConflictBranchResolutionResult.Content(
+                checkNotNull(resolvedNote) { "Resolved note content is unavailable." },
+            )
+            WorkspaceEntityVersionKindV2.DELETION -> {
+                check(resolvedNote == null) { "Resolved note deletion was not projected." }
+                ConflictBranchResolutionResult.Deletion
+            }
+        }
     }
 
     override fun listMemoryDayCounts(month: MemoryMonth): List<MemoryDayCount> =
@@ -952,7 +951,6 @@ private fun WorkspaceConflictStateV2.toNoteConflictDetails(context: ActiveWorksp
         conflictHistory = second.history,
         sourceDeviceId = second.authorDeviceId,
         sourceUpdatedAt = branches.drop(1).maxOfOrNull { it.updatedAt },
-        availableActions = emptyList(),
         versionBranches = branches,
         expectedHeadVersionIds = descriptor.headVersionIds,
     )

@@ -244,6 +244,9 @@ class MainActivity : ComponentActivity() {
             }
             val systemDark = resources.configuration.isSystemDarkTheme()
             val darkTheme = currentTheme.isDarkTheme(systemDark)
+            val locationCaptureAdapter = remember {
+                AndroidLocationCaptureAdapter(this@MainActivity)
+            }
             SideEffect {
                 window.applySomedaySystemBars(darkTheme)
             }
@@ -252,7 +255,7 @@ class MainActivity : ComponentActivity() {
                 developerOptionsEnabled = BuildConfig.DEBUG,
                 initialSettings = loaded.initialSettings,
                 notesRepository = loaded.repositories.notesRepository,
-                locationCaptureAdapter = AndroidLocationCaptureAdapter(this),
+                locationCaptureAdapter = locationCaptureAdapter,
                 onThisDayNotificationScheduler = onThisDayNotificationScheduler,
                 onThisDayNotificationTimeFormatter = onThisDayNotificationTimeFormatter,
                 pendingOpenMemories = pendingOpenMemories,
@@ -305,7 +308,6 @@ class MainActivity : ComponentActivity() {
                 selfHostedSetupClient = loaded.repositories.selfHostedSetupClient,
                 selfHostedSessionCredentialStore = loaded.repositories.selfHostedSessionCredentialStore,
                 manualSyncRunner = loaded.repositories.manualSyncRunner,
-                bindManualSyncProgressListener = loaded.repositories.bindManualSyncProgressListener,
                 workspacePairingInvitationCreator = loaded.repositories.workspacePairingInvitationCreator,
                 workspacePairingInvitationJoiner = loaded.repositories.workspacePairingInvitationJoiner,
                 workspacePairingInvitationCanceller = loaded.repositories.workspacePairingInvitationCanceller,
