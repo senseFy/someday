@@ -55,7 +55,7 @@ class GradleTopologyTest {
             ),
             "Desktop" to versionDeclarations(
                 projectRoot.resolve("app/desktop/build.gradle.kts"),
-                Regex("""packageVersion\s*=\s*"([^"]+)"""),
+                Regex("""desktopVersionName\s*=\s*"([^"]+)"""),
             ),
         )
         val malformedDeclarations = declarations.filterValues { versions -> versions.size != 1 }

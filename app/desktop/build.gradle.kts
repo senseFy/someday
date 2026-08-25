@@ -21,6 +21,8 @@ val somedayJvmHome: Provider<String> = somedayJvmLauncher.map {
 }
 
 val generatedDesktopBuildConfigDir = layout.buildDirectory.dir("generated/sources/desktopBuildConfig/jvmMain/kotlin")
+val desktopVersionName = "1.0.16"
+val desktopVersionCode = "17"
 val desktopDeveloperOptionsEnabled = providers
     .gradleProperty("someday.desktop.developerOptions")
     .orElse("true")
@@ -48,6 +50,8 @@ val generateDesktopBuildConfig by tasks.registering {
     inputs.property("developerOptionsEnabled", desktopDeveloperOptionsEnabled)
     inputs.property("systemV2ReleaseEnabled", desktopSystemV2ReleaseEnabled)
     inputs.property("systemV2DevelopmentEnabled", desktopSystemV2DevelopmentEnabled)
+    inputs.property("versionName", desktopVersionName)
+    inputs.property("versionCode", desktopVersionCode)
     outputs.dir(generatedDesktopBuildConfigDir)
 
     doLast {
@@ -66,6 +70,8 @@ val generateDesktopBuildConfig by tasks.registering {
             package saien.someday.app.desktop
 
             internal object DesktopBuildConfig {
+                const val VERSION_NAME: String = "$desktopVersionName"
+                const val VERSION_CODE: String = "$desktopVersionCode"
                 const val DEVELOPER_OPTIONS_ENABLED: Boolean = $enabled
                 const val SOMEDAY_SYSTEM_V2_RELEASE_ENABLED: Boolean = $v2ReleaseEnabled
                 const val SOMEDAY_SYSTEM_V2_DEVELOPMENT_ENABLED: Boolean = $v2DevelopmentEnabled
@@ -113,7 +119,7 @@ compose.desktop {
         nativeDistributions {
             targetFormats(TargetFormat.Dmg, TargetFormat.Msi, TargetFormat.Deb)
             packageName = "Someday"
-            packageVersion = "1.0.16"
+            packageVersion = desktopVersionName
             modules("java.sql")
 
             macOS {

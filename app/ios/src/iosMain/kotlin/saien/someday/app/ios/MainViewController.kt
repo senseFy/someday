@@ -28,6 +28,7 @@ import kotlinx.cinterop.addressOf
 import kotlinx.cinterop.convert
 import kotlinx.cinterop.usePinned
 import kotlin.time.Clock
+import platform.Foundation.NSBundle
 import platform.Foundation.NSData
 import platform.Foundation.NSNotificationCenter
 import platform.Foundation.NSURL
@@ -128,6 +129,8 @@ fun MainViewController(): UIViewController {
         }
         SomedayApp(
             platformName = IosShellEntrypoint.platformName,
+            appVersionName = iosAppVersionName(),
+            appVersionCode = iosAppVersionCode(),
             developerOptionsEnabled = IosBuildConfig.DEVELOPER_OPTIONS_ENABLED,
             systemV2ActivationEnabled = IosBuildConfig.SOMEDAY_SYSTEM_V2_RELEASE_ENABLED ||
                 IosBuildConfig.SOMEDAY_SYSTEM_V2_DEVELOPMENT_ENABLED,
@@ -286,6 +289,12 @@ private fun NSURL.readBytes(): ByteArray {
         }
     }
 }
+
+private fun iosAppVersionName(): String =
+    NSBundle.mainBundle.objectForInfoDictionaryKey("CFBundleShortVersionString") as? String ?: ""
+
+private fun iosAppVersionCode(): String =
+    NSBundle.mainBundle.objectForInfoDictionaryKey("CFBundleVersion") as? String ?: ""
 
 @OptIn(ExperimentalForeignApi::class)
 private fun NSData.toByteArray(): ByteArray {
