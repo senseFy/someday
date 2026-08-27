@@ -17,7 +17,9 @@ compose = "1.11.1"
 icons-lucide-cmp = "2.2.1"
 junit4 = "4.13.2"
 argon2 = "2.12"
+aws-sdk = "2.54.3"
 flyway = "11.17.1"
+hikari = "7.1.0"
 java-jwt = "4.5.0"
 koin = "4.1.1"
 kotlin = "2.3.21"
@@ -29,6 +31,7 @@ navigation-compose = "2.9.2"
 libsodium = "0.9.5"
 okio = "3.16.4"
 qrcode-kotlin = "4.5.0"
+slf4j = "2.0.17"
 zxing = "3.5.4"
 postgresql = "42.7.8"
 sqldelight = "2.1.0"
@@ -36,6 +39,8 @@ sqlite-jdbc = "3.49.1.0"
 
 [libraries]
 argon2-jvm = { module = "de.mkammerer:argon2-jvm", version.ref = "argon2" }
+aws-sdk-s3 = { module = "software.amazon.awssdk:s3", version.ref = "aws-sdk" }
+aws-sdk-url-connection-client = { module = "software.amazon.awssdk:url-connection-client", version.ref = "aws-sdk" }
 androidx-activity-compose = { module = "androidx.activity:activity-compose", version.ref = "androidx-activity-compose" }
 androidx-core = { module = "androidx.core:core-ktx", version.ref = "androidx-core" }
 androidx-camera-core = { module = "androidx.camera:camera-core", version.ref = "androidx-camera" }
@@ -48,6 +53,7 @@ androidx-test-runner = { module = "androidx.test:runner", version.ref = "android
 backdrop = { module = "io.github.kyant0:backdrop", version.ref = "backdrop" }
 flyway-core = { module = "org.flywaydb:flyway-core", version.ref = "flyway" }
 flyway-database-postgresql = { module = "org.flywaydb:flyway-database-postgresql", version.ref = "flyway" }
+hikari-cp = { module = "com.zaxxer:HikariCP", version.ref = "hikari" }
 java-jwt = { module = "com.auth0:java-jwt", version.ref = "java-jwt" }
 junit4 = { module = "junit:junit", version.ref = "junit4" }
 icons-lucide-cmp = { module = "com.composables:icons-lucide-cmp", version.ref = "icons-lucide-cmp" }
@@ -69,6 +75,8 @@ ktor-server-test-host = { module = "io.ktor:ktor-server-test-host", version.ref 
 libsodium-bindings = { module = "com.ionspin.kotlin:multiplatform-crypto-libsodium-bindings", version.ref = "libsodium" }
 okio = { module = "com.squareup.okio:okio", version.ref = "okio" }
 qrcode-kotlin = { module = "io.github.g0dkar:qrcode-kotlin", version.ref = "qrcode-kotlin" }
+slf4j-api = { module = "org.slf4j:slf4j-api", version.ref = "slf4j" }
+slf4j-simple = { module = "org.slf4j:slf4j-simple", version.ref = "slf4j" }
 zxing-core = { module = "com.google.zxing:core", version.ref = "zxing" }
 postgresql = { module = "org.postgresql:postgresql", version.ref = "postgresql" }
 sqldelight-runtime = { module = "app.cash.sqldelight:runtime", version.ref = "sqldelight" }

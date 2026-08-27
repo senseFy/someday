@@ -180,6 +180,7 @@ class KtorSelfHostedSyncTransport(
             bearerToken = accessToken,
             encodedBody = json.encodeToString(request),
             responseSerializer = SelfHostedV2ImmutablePutResponse.serializer(),
+            acceptedStatuses = setOf(409),
         )
 
     override fun v2PutCheckpointManifest(
@@ -193,6 +194,7 @@ class KtorSelfHostedSyncTransport(
             bearerToken = accessToken,
             encodedBody = json.encodeToString(request),
             responseSerializer = SelfHostedV2ImmutablePutResponse.serializer(),
+            acceptedStatuses = setOf(409),
         )
 
     override fun v2FetchCheckpoint(

@@ -13,9 +13,6 @@ internal class ControllableMediaBlobStore : MediaBlobStore {
     private val values = ConcurrentHashMap<MediaBlobKey, ByteArray>()
     private var failNextWrite = false
 
-    var removeUntrackedCalls: Int = 0
-        private set
-
     @Synchronized
     override fun putImmutable(
         key: MediaBlobKey,
@@ -47,14 +44,6 @@ internal class ControllableMediaBlobStore : MediaBlobStore {
         require(bytes.size <= maxBytes)
         val copy = bytes.copyOf()
         MediaBlobValue(MediaBlobMetadata(copy.size.toLong(), sha256(copy)), copy)
-    }
-
-    override fun delete(key: MediaBlobKey): Boolean = values.remove(key) != null
-
-    @Synchronized
-    override fun removeUntracked(key: MediaBlobKey): Boolean {
-        removeUntrackedCalls += 1
-        return values.remove(key) != null
     }
 
     fun drop(key: MediaBlobKey) {

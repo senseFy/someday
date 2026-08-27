@@ -80,7 +80,10 @@ records so ciphertext and claim identity exist only in valid states.
 by `(user_id, workspace_id, media_id)`, with a foreign key to the workspace
 registry. Ciphertext bytes remain in the configured media blob store; account
 quota is summed across workspaces. Operators must back up PostgreSQL and that
-store as one recovery unit.
+store as one recovery unit. The standalone topology uses a filesystem store;
+the external topology uses an S3-compatible store. Backend choice
+does not alter Flyway schema or create provider-specific database migrations;
+see `server-storage-architecture.md`.
 
 When changing server tables, columns, indexes, or constraints:
 

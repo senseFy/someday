@@ -11,6 +11,29 @@ enum class ServerDeploymentMode {
     PRODUCTION,
 }
 
+const val DEFAULT_DATABASE_MAX_POOL_SIZE: Int = 10
+const val MAX_DATABASE_MAX_POOL_SIZE: Int = 32
+
+sealed interface ServerMediaStorage {
+    data class FileSystem(val directory: Path) : ServerMediaStorage
+
+    data class S3(
+        val bucket: String,
+        val region: String,
+        val endpoint: URI?,
+        val pathStyle: Boolean,
+    ) : ServerMediaStorage {
+        init {
+            require(bucket.isNotBlank() && bucket.none { it.isWhitespace() || it.isISOControl() || it == '/' }) {
+                "SOMEDAY_MEDIA_S3_BUCKET must be a non-blank bucket name without whitespace or slashes."
+            }
+            require(region.isNotBlank() && region.none { it.isWhitespace() }) {
+                "SOMEDAY_MEDIA_S3_REGION must be a non-blank region without whitespace."
+            }
+        }
+    }
+}
+
 data class ServerConfig(
     val deploymentMode: ServerDeploymentMode,
     val bindHost: String,
@@ -19,7 +42,8 @@ data class ServerConfig(
     val databaseUrl: String,
     val databaseUser: String,
     val databasePassword: String,
-    val mediaBlobDirectory: String,
+    val databaseMaxPoolSize: Int,
+    val mediaStorage: ServerMediaStorage,
     val mediaQuotaBytes: Long,
     val jwtIssuer: String,
     val jwtAudience: String,
@@ -46,7 +70,9 @@ data class ServerConfig(
         require(databaseUrl.isNotBlank()) { "SOMEDAY_DB_URL must not be blank." }
         require(databaseUser.isNotBlank()) { "SOMEDAY_DB_USER must not be blank." }
         require(databasePassword.isNotBlank()) { "SOMEDAY_DB_PASSWORD must not be blank." }
-        require(mediaBlobDirectory.isNotBlank()) { "SOMEDAY_MEDIA_BLOB_DIR must not be blank." }
+        require(databaseMaxPoolSize in 1..MAX_DATABASE_MAX_POOL_SIZE) {
+            "SOMEDAY_DB_MAX_POOL_SIZE must be between 1 and $MAX_DATABASE_MAX_POOL_SIZE."
+        }
         require(mediaQuotaBytes > 0L) { "SOMEDAY_MEDIA_QUOTA_BYTES must be positive." }
         require(jwtIssuer.isNotBlank()) { "SOMEDAY_JWT_ISSUER must not be blank." }
         require(jwtAudience.isNotBlank()) { "SOMEDAY_JWT_AUDIENCE must not be blank." }
@@ -77,8 +103,8 @@ data class ServerConfig(
             require(jwtSecret != LOCAL_DEVELOPMENT_JWT_SECRET) {
                 "The local development JWT secret cannot be used in production mode."
             }
-            require(Path.of(mediaBlobDirectory).isAbsolute) {
-                "SOMEDAY_MEDIA_BLOB_DIR must be an absolute path in production mode."
+            require(mediaStorage !is ServerMediaStorage.FileSystem || mediaStorage.directory.isAbsolute) {
+                "SOMEDAY_MEDIA_BLOB_DIR must be an absolute path for filesystem storage in production mode."
             }
         }
     }
@@ -126,11 +152,11 @@ data class ServerConfig(
                     production = production,
                     localDefault = "someday",
                 ),
-                mediaBlobDirectory = environment.productionValue(
-                    name = "SOMEDAY_MEDIA_BLOB_DIR",
-                    production = production,
-                    localDefault = "build/local-media-blobs",
+                databaseMaxPoolSize = environment.intValue(
+                    "SOMEDAY_DB_MAX_POOL_SIZE",
+                    DEFAULT_DATABASE_MAX_POOL_SIZE,
                 ),
+                mediaStorage = environment.mediaStorage(production),
                 mediaQuotaBytes = environment.longValue(
                     "SOMEDAY_MEDIA_QUOTA_BYTES",
                     DEFAULT_MEDIA_QUOTA_BYTES,
@@ -187,6 +213,54 @@ private fun Map<String, String>.productionValue(
     } else {
         localDefault
     }
+
+private fun Map<String, String>.mediaStorage(production: Boolean): ServerMediaStorage {
+    val backend = nonBlank("SOMEDAY_MEDIA_BACKEND")
+        ?: if (containsKey("SOMEDAY_MEDIA_BACKEND")) {
+            error("SOMEDAY_MEDIA_BACKEND must not be blank.")
+        } else if (production) {
+            error("SOMEDAY_MEDIA_BACKEND is required in production mode.")
+        } else {
+            "filesystem"
+        }
+    return when (backend.lowercase()) {
+        "filesystem" -> ServerMediaStorage.FileSystem(
+            Path.of(
+                productionValue(
+                    name = "SOMEDAY_MEDIA_BLOB_DIR",
+                    production = production,
+                    localDefault = "build/local-media-blobs",
+                ),
+            ),
+        )
+        "s3" -> ServerMediaStorage.S3(
+            bucket = requiredValue("SOMEDAY_MEDIA_S3_BUCKET"),
+            region = requiredValue("SOMEDAY_MEDIA_S3_REGION"),
+            endpoint = nonBlank("SOMEDAY_MEDIA_S3_ENDPOINT")?.let(::validatedS3Endpoint),
+            pathStyle = booleanValue("SOMEDAY_MEDIA_S3_PATH_STYLE", default = false),
+        )
+        else -> error("SOMEDAY_MEDIA_BACKEND must be filesystem or s3.")
+    }
+}
+
+private fun Map<String, String>.requiredValue(name: String): String =
+    nonBlank(name) ?: error("$name is required for the selected media backend.")
+
+private fun validatedS3Endpoint(value: String): URI {
+    val uri = runCatching { URI(value) }.getOrElse {
+        throw IllegalArgumentException("SOMEDAY_MEDIA_S3_ENDPOINT must be a valid URL.", it)
+    }
+    require(uri.scheme.equals("http", ignoreCase = true) || uri.scheme.equals("https", ignoreCase = true)) {
+        "SOMEDAY_MEDIA_S3_ENDPOINT must use HTTP or HTTPS."
+    }
+    require(
+        !uri.host.isNullOrBlank() && uri.userInfo == null && uri.query == null && uri.fragment == null &&
+            (uri.path.isNullOrEmpty() || uri.path == "/"),
+    ) {
+        "SOMEDAY_MEDIA_S3_ENDPOINT must be an origin without credentials, path, query, or fragment."
+    }
+    return uri
+}
 
 private fun Map<String, String>.booleanValue(name: String, default: Boolean): Boolean =
     nonBlank(name)?.toBooleanStrictOrNull()

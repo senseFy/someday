@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   check:
-    name: Linux, PostgreSQL, and real journeys
+    name: Linux, PostgreSQL, S3, and real journeys
     runs-on: ubuntu-24.04
     timeout-minutes: 60
 

@@ -27,7 +27,11 @@ You may run, study, share, and modify it under the terms of that license. If you
   SDKs remain outside it.
 - **Portable export/restore does not include image bytes.** Preserve the
   app-private media store locally, or back up both PostgreSQL and the configured
-  server blob directory when operating a self-hosted service.
+  server media store when operating a self-hosted service. The accepted
+  production topology delegates persistence to external PostgreSQL and private
+  S3-compatible object storage; standalone PostgreSQL plus a filesystem volume
+  remains supported. Both backends use the same production server image; see
+  the deployment examples under `deploy/`.
 
 ## Contributing and security
 
@@ -36,6 +40,7 @@ You may run, study, share, and modify it under the terms of that license. If you
 - Engineering constraints (schema, UI threading, System V3): [agent.md](agent.md)
 - Vulnerability reports: [SECURITY.md](SECURITY.md) (please do not file public issues for security bugs)
 - Self-hosted production contract: [docs/self-hosting.md](docs/self-hosting.md)
+- Server storage architecture: [docs/server-storage-architecture.md](docs/server-storage-architecture.md)
 
 ## Repository layout
 
@@ -44,7 +49,7 @@ You may run, study, share, and modify it under the terms of that license. If you
 - `shared:sync` — System V3 encrypted entity/media sync, self-hosted clients, and conflict resolution.
 - `shared:ui` — shared Compose UI controllers and app shell.
 - `app:android`, `app:ios`, `app:desktop` — platform entry points and platform adapters.
-- `server` — Ktor API/admin service backed by PostgreSQL.
+- `server` — Ktor API/admin service backed by PostgreSQL and a configured media store.
 - `integration-tests` — real self-hosted end-to-end validation.
 
 ## Requirements
@@ -52,7 +57,8 @@ You may run, study, share, and modify it under the terms of that license. If you
 - JDK 21 (Temurin/JBR/OpenJDK) for the Gradle wrapper, Kotlin/Compose toolchain,
   Desktop run/package, and server. The monorepo `jvmTarget` and Java toolchains
   are 21-wide; older JDKs cannot load dependencies such as backdrop 2.x.
-- Docker and Docker Compose for the PostgreSQL integration service.
+- Docker and Docker Compose for local PostgreSQL, the S3/PostgreSQL reliability
+  gate, and containerized self-hosting.
 - Android SDK/emulator for Android smoke or instrumented tests.
 - Xcode/iOS Simulator on macOS for iOS simulator tests.
 
@@ -151,8 +157,9 @@ Android `versionName`, iOS `MARKETING_VERSION`, and the macOS/Windows/Linux Desk
 
 The `CI` workflow runs the hermetic Gradle `check` contract and both System V3
 release gates for every pull request and every push to `main`. The Ubuntu gate
-starts a pinned disposable PostgreSQL container and Ktor server and runs the
-real self-hosted journeys; it never contacts developer localhost services. The
+starts pinned disposable PostgreSQL and S3-compatible services, runs the real
+backend contracts, starts a production-mode Ktor server, and executes the real
+self-hosted journeys; it never contacts developer localhost services. The
 macOS gate runs shared behavior and app-shell tests on an iOS simulator. The
 separate `Android` workflow builds a debug APK when a tag is pushed or when the
 workflow is run manually.
@@ -337,6 +344,7 @@ Targeted smoke and integration checks:
 make client-smoke
 make shared-smoke
 make server-test
+make server-container-smoke
 make integration-test
 make sync-v3-gate
 # On Apple Silicon macOS with Xcode:
@@ -344,8 +352,11 @@ make sync-v3-apple-gate
 ```
 
 `make integration-test` contains only hermetic repository topology checks.
-`make sync-v3-gate` provisions isolated PostgreSQL and Ktor endpoints for the
-System V3 contract, then runs the no-skip real self-hosted journeys.
+`make server-container-smoke` verifies the production image, standalone
+Compose boundary, and operator subcommands without duplicating sync journeys.
+`make sync-v3-gate` provisions isolated PostgreSQL, S3-compatible storage, and
+Ktor endpoints for the System V3 contract, then runs the no-skip real
+self-hosted journeys.
 `make sync-v3-apple-gate` runs shared behavior and app-shell evidence on the
 iOS simulator; it does not claim a platform-native HTTP transport journey.
 `make real-remote-test` and
@@ -370,6 +381,9 @@ make ios-simulator-test
 - Self-hosted sync covers append-only versions, tombstones, conflict handling,
   recovery-key workflows, and immutable lazy image materialization.
 - Portable export/restore omits app-private image bytes. An operator recovery
-  of published images requires a consistent PostgreSQL and media-blob backup.
+  of published images requires PostgreSQL and the configured media store as one
+  recovery unit. External PostgreSQL plus S3-compatible object storage is the
+  accepted production recommendation; standalone filesystem storage remains a
+  supported topology.
 - Location capture records coordinates and place text without requiring a map SDK.
 - The first release targets Android, iOS, macOS, Windows, and Linux, with JVM Desktop as the primary desktop runtime.

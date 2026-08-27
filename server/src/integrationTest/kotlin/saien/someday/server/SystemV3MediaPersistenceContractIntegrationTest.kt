@@ -59,7 +59,7 @@ class SystemV3MediaPersistenceContractIntegrationTest {
     }
 
     @Test
-    fun exactPutRepairsMissingAndCorruptBlobWhenMetadataAlreadyExists() {
+    fun exactPutRepairsAMissingBlobButNeverOverwritesDivergentBytes() {
         val missingBytes = ByteArray(64) { index -> index.toByte() }
         val missingKey = key(MEDIA_MISSING)
         assertIs<SystemV3MediaPutResult.Stored>(put(MEDIA_MISSING, missingBytes))
@@ -76,14 +76,15 @@ class SystemV3MediaPersistenceContractIntegrationTest {
         blobStore.replaceWithCorruption(corruptKey, ByteArray(corruptBytes.size) { 99 })
         assertEquals(SystemV3MediaReadResult.Corrupt, repository.headObject(identity.userId, WORKSPACE_ID, MEDIA_CORRUPT))
 
-        val corruptRepair = assertIs<SystemV3MediaPutResult.Stored>(put(MEDIA_CORRUPT, corruptBytes))
-        assertTrue(corruptRepair.idempotentReplay)
-        assertReadEquals(MEDIA_CORRUPT, corruptBytes)
+        val corruptRepair = assertIs<SystemV3MediaPutResult.Rejected>(put(MEDIA_CORRUPT, corruptBytes))
+        assertEquals("immutable_media_mismatch", corruptRepair.error)
+        assertEquals(SystemV3MediaReadResult.Corrupt, repository.headObject(identity.userId, WORKSPACE_ID, MEDIA_CORRUPT))
+        assertContentEquals(ByteArray(corruptBytes.size) { 99 }, blobStore.bytes(corruptKey))
         assertEquals(2L, database.countRows("someday_media_v3_objects", identity.userId, WORKSPACE_ID))
     }
 
     @Test
-    fun blobPublishedBeforeDatabaseFailureIsRemovedBeforeTheAuthoritativeRetry() {
+    fun blobPublishedBeforeDatabaseFailureIsReusedByTheAuthoritativeRetry() {
         val expected = ByteArray(67) { 7 }
         val mediaKey = key(MEDIA_ORPHAN)
 
@@ -100,12 +101,9 @@ class SystemV3MediaPersistenceContractIntegrationTest {
         assertContentEquals(expected, blobStore.bytes(mediaKey))
         assertEquals(0L, database.countRows("someday_media_v3_objects", identity.userId, WORKSPACE_ID))
         assertEquals(0L, database.mediaBytes(identity.userId))
-        val cleanupCallsBeforeRetry = blobStore.removeUntrackedCalls
-
         val stored = assertIs<SystemV3MediaPutResult.Stored>(put(MEDIA_ORPHAN, expected))
 
-        assertTrue(!stored.idempotentReplay)
-        assertEquals(cleanupCallsBeforeRetry + 1, blobStore.removeUntrackedCalls)
+        assertEquals(false, stored.idempotentReplay)
         assertContentEquals(expected, blobStore.bytes(mediaKey))
         assertReadEquals(MEDIA_ORPHAN, expected)
         assertEquals(1L, database.countRows("someday_media_v3_objects", identity.userId, WORKSPACE_ID))

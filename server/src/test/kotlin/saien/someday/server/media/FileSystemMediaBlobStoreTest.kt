@@ -9,7 +9,6 @@ import java.util.concurrent.TimeUnit
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
-import kotlin.test.assertFalse
 import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
 import kotlin.test.assertNull
@@ -86,7 +85,7 @@ class FileSystemMediaBlobStoreTest {
     }
 
     @Test
-    fun deleteAndAbsentMetadataReconciliationAreExactAndIdempotent() {
+    fun existingOrphanRemainsImmutableAndCanBeReusedOnlyByExactReplay() {
         val store = FileSystemMediaBlobStore(temporaryFolder.newFolder("media").toPath())
         val userId = UUID.randomUUID()
         val mediaId = "1".repeat(64)
@@ -98,9 +97,10 @@ class FileSystemMediaBlobStoreTest {
         store.putImmutable(orphanKey, orphanBytes, sha256(orphanBytes))
         store.putImmutable(neighborKey, neighborBytes, sha256(neighborBytes))
 
-        assertTrue(store.removeUntracked(orphanKey))
-        assertFalse(store.removeUntracked(orphanKey))
-        assertNull(store.head(orphanKey))
+        assertEquals(
+            MediaBlobPutResult.Stored(idempotentReplay = true),
+            store.putImmutable(orphanKey, orphanBytes, sha256(orphanBytes)),
+        )
         assertEquals(
             MediaBlobMetadata(neighborBytes.size.toLong(), sha256(neighborBytes)),
             store.head(neighborKey),
@@ -108,13 +108,11 @@ class FileSystemMediaBlobStoreTest {
 
         val replacement = ByteArray(41) { 5 }
         assertEquals(
-            MediaBlobPutResult.Stored(idempotentReplay = false),
+            MediaBlobPutResult.ImmutableMismatch,
             store.putImmutable(orphanKey, replacement, sha256(replacement)),
         )
-        assertTrue(store.delete(neighborKey))
-        assertFalse(store.delete(neighborKey))
-        assertNull(store.head(neighborKey))
-        assertContentEquals(replacement, store.read(orphanKey, replacement.size)?.bytes)
+        assertContentEquals(orphanBytes, store.read(orphanKey, orphanBytes.size)?.bytes)
+        assertContentEquals(neighborBytes, store.read(neighborKey, neighborBytes.size)?.bytes)
     }
 
     @Test

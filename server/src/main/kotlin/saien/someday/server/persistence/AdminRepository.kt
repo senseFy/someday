@@ -2,7 +2,6 @@ package saien.someday.server.persistence
 
 import saien.someday.server.ServerConfig
 import java.sql.Connection
-import java.sql.DriverManager
 import java.sql.ResultSet
 import java.time.Instant
 import java.time.OffsetDateTime
@@ -106,8 +105,9 @@ data class AdminHealthSnapshot(
 )
 
 class AdminRepository(
-    private val config: ServerConfig,
+    config: ServerConfig,
     private val startedAt: Instant,
+    private val connections: DatabaseConnectionProvider = directDatabaseConnectionProvider(config),
 ) {
     fun dashboard(): AdminDashboardSnapshot =
         connection().use { connection ->
@@ -538,15 +538,21 @@ class AdminRepository(
             }
         }
 
-    private fun connection(): Connection =
-        DriverManager.getConnection(config.databaseUrl, config.databaseUser, config.databasePassword).also { connection ->
+    private fun connection(): Connection {
+        val connection = connections.connection()
+        try {
             connection.prepareStatement("SELECT set_config('someday.user_id', '*', false)").use { statement ->
                 statement.execute()
             }
             connection.prepareStatement("SELECT set_config('someday.workspace_id', '*', false)").use { statement ->
                 statement.execute()
             }
+            return connection
+        } catch (failure: Throwable) {
+            runCatching { connection.close() }
+            throw failure
         }
+    }
 
     private fun ResultSet.toAdminUserSummary(): AdminUserSummary =
         AdminUserSummary(

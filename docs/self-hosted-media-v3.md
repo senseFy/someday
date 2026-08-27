@@ -1,6 +1,7 @@
 # Self-Hosted Media V3
 
-Status: wire and storage contract for bounded image synchronization.
+Status: implemented bounded-image wire, append-only storage, and
+filesystem/S3-compatible server backends.
 
 ## Contract
 
@@ -62,23 +63,51 @@ different value already stored at that identity. Exact replay returns success.
 
 HEAD and GET return ciphertext length and digest headers. GET returns only
 bytes whose blob metadata matches PostgreSQL. A missing or divergent blob is
-reported unavailable; the same authenticated client can reconstruct it with
-an exact PUT replay.
+reported unavailable. The same authenticated client can reconstruct a missing
+blob with an exact PUT replay. A divergent existing blob is never overwritten;
+it requires operator recovery from a valid media-store copy.
 
 There is no list, patch, chunk, manifest, draft, finalize, or delete endpoint.
 
 ## Storage and quota
 
 PostgreSQL stores bounded metadata and the configured blob store holds the
-ciphertext. A filesystem implementation uses an account/workspace-sharded key:
+ciphertext. The accepted server storage target defines exactly two blob
+backends: filesystem for the standalone topology and S3-compatible object
+storage for the recommended external topology.
+
+A filesystem implementation may shard that logical identity internally. The
+current layout is:
 
 ```text
-<root>/<user-id>/<workspace-id>/<media-id-prefix>/<media-id>.bin
+<root>/<user-id>/<workspace-id>/<media-id[0:2]>/<media-id[2:4]>/<media-id>/object.bin
 ```
 
+This physical layout is not part of the wire contract.
+
+The S3 adapter uses the same identity beneath a fixed `media/v1/`
+prefix. It requires private PUT/HEAD/GET, strong read-after-write behavior, and
+conditional create equivalent to `If-None-Match: *`. The server does not use
+public object URLs, expose storage credentials, rely on ETag as SHA-256, invoke
+bucket listing, or require multipart upload. AWS deployments grant
+prefix-scoped `ListBucket` only so missing HEAD/GET responses remain
+distinguishable from permission denial. After conditional create reports an
+existing object, a bounded GET and SHA-256 of its actual bytes are required
+before it can be accepted as an exact replay; object metadata alone is not
+authoritative.
+
+Blob publication precedes the PostgreSQL metadata commit. A transaction
+failure may leave an invisible immutable orphan; an exact retry reuses that
+object, while different bytes at the same identity are always rejected. The
+first release neither deletes these orphans nor gives the application a
+runtime object-deletion requirement. This avoids a distributed transaction or
+compensation state machine.
+
 Quota is checked atomically per account across all workspaces. It counts
-stored ciphertext bytes only; there are no draft reservations. Published
-objects are not garbage-collected in the initial release.
+PostgreSQL-indexed published ciphertext bytes only; there are no draft
+reservations. A safe orphan consumes backend capacity without counting against
+published account quota. Published objects are not garbage-collected in the
+initial release.
 
 ## Client publication proof
 
@@ -102,5 +131,10 @@ Only static JPEG, PNG, and WebP are accepted. SVG, animation, video, general
 attachments, and automatic URL fetching are unsupported.
 
 Portable JSON export/restore does not contain media bytes in this release.
-Self-hosted operators must back up PostgreSQL and the blob directory as one
-logical unit.
+Self-hosted operators must protect PostgreSQL and the configured blob store as
+one logical recovery unit. Standalone uses coordinated database and off-host
+directory backups. The recommended external topology uses PostgreSQL recovery
+points plus bucket versioning/retention. A valid recovery set must contain an
+exact key, length, and actual-byte SHA-256 match for every PostgreSQL media
+record; extra unreferenced objects are harmless. See
+`server-storage-architecture.md`.

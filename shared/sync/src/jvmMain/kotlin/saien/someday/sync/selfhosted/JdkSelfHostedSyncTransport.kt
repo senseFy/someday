@@ -152,6 +152,7 @@ class JdkSelfHostedSyncTransport(
         accessToken,
         json.encodeToString(request),
         SelfHostedV2ImmutablePutResponse.serializer(),
+        acceptedStatuses = setOf(409),
     )
 
     override fun v2PutCheckpointManifest(
@@ -164,6 +165,7 @@ class JdkSelfHostedSyncTransport(
         accessToken,
         json.encodeToString(request),
         SelfHostedV2ImmutablePutResponse.serializer(),
+        acceptedStatuses = setOf(409),
     )
 
     override fun v2FetchCheckpoint(

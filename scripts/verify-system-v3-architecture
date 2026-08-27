@@ -26,6 +26,8 @@ SERVER_ENTITY_REPOSITORY="$SERVER_MAIN/kotlin/saien/someday/server/persistence/S
 SERVER_MEDIA_REPOSITORY="$SERVER_MAIN/kotlin/saien/someday/server/persistence/SystemV3MediaRepository.kt"
 ENTITY_MIGRATION="$SERVER_MAIN/resources/db/migration/V4__sync_v2_epochs_immutable_objects.sql"
 MEDIA_MIGRATION="$SERVER_MAIN/resources/db/migration/V8__system_v3_media_metadata.sql"
+MEDIA_BLOB_STORE="$SERVER_MAIN/kotlin/saien/someday/server/media/MediaBlobStore.kt"
+S3_MEDIA_BLOB_STORE="$SERVER_MAIN/kotlin/saien/someday/server/media/S3MediaBlobStore.kt"
 
 [[ -f "$SERVICE_FILE" ]] || fail "the product-facing System V3 client composition is missing"
 [[ ! -e "$SYNC_MAIN/saien/someday/sync/SyncV2ClientServices.kt" ]] ||
@@ -183,6 +185,14 @@ if rg -n -i 'media(chunk|manifest|draft|reservation|finalize)|resumable' "${medi
     fail "chunked or draft media lifecycle leaked into the bounded image protocol"
 fi
 pass ARCH-BOUNDED-IMAGES
+
+if rg -n 'fun (delete|removeUntracked)\b|ListObjects|DeleteObject' \
+    "$MEDIA_BLOB_STORE" "$S3_MEDIA_BLOB_STORE" >/dev/null; then
+    fail "runtime media storage regained list/delete or cleanup operations"
+fi
+rg -Fq '.ifNoneMatch("*")' "$S3_MEDIA_BLOB_STORE" ||
+    fail "S3 media publication is not conditional immutable create"
+pass ARCH-APPEND-ONLY-MEDIA
 
 rg -q 'beforeEntityPublication = \{ versions ->' "$SERVICE_FILE" ||
     fail "the product composition does not install the media publication gate"

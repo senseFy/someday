@@ -387,6 +387,58 @@ class SqlDelightWorkspaceEntityStoreV2Test {
     }
 
     @Test
+    fun equivalentRemoteDeterministicMergeAcknowledgesTheLocalOutboxCopy() = withFixture { fixture ->
+        val root = fixture.factory.createGenesis(
+            WorkspaceEntityTypeV2.NOTEBOOK,
+            NOTEBOOK_ID,
+            NotebookContentV2("Base", 0, at(1)),
+            ACTOR,
+            at(1),
+        )
+        val rename = fixture.factory.createContentChild(
+            root,
+            NotebookContentV2("Renamed", 0, at(1)),
+            ACTOR,
+            at(2),
+        )
+        val reorder = fixture.factory.createContentChild(
+            root,
+            NotebookContentV2("Base", 5, at(1)),
+            ACTOR,
+            at(3),
+        )
+        fixture.applyRemote(root, "1")
+        fixture.applyRemote(rename, "2", expected = "1")
+        fixture.applyRemote(reorder, "3", expected = "2")
+
+        val localPending = fixture.store.loadPending(PROFILE).single()
+        val joined = fixture.store.loadVersion(localPending.objectId)!!
+        val remoteCopy = RemoteWorkspaceMutationV2(
+            mutationId = localPending.mutationId,
+            objectId = localPending.objectId,
+            objectDigest = localPending.objectDigest,
+            writerDeviceId = OTHER_WRITER,
+            version = joined,
+        )
+        assertIs<WorkspaceRemoteUnitApplyResultV2.Applied>(
+            fixture.store.applyRemoteCursorUnit(
+                RemoteWorkspaceCursorUnitV2(
+                    PROFILE,
+                    WorkspaceRemoteCursorAdvanceV2(STREAM, "3", "4", "unit-4", "digest-4"),
+                    listOf(remoteCopy),
+                    at(24),
+                ),
+            ),
+        )
+
+        assertTrue(fixture.store.loadPending(PROFILE).isEmpty())
+        assertEquals(
+            OTHER_WRITER,
+            fixture.store.findApplied(PROFILE, localPending.mutationId)?.firstWriterDeviceId,
+        )
+    }
+
+    @Test
     fun everyTypedProjectionIncludingLocationWarningAndConflictCanBeRebuiltFromDag() = withFixture { fixture ->
         val notebook = fixture.factory.createGenesis(
             WorkspaceEntityTypeV2.NOTEBOOK,
@@ -419,15 +471,16 @@ class SqlDelightWorkspaceEntityStoreV2Test {
         fixture.commit(notebook)
         fixture.commit(note)
         fixture.commit(preferences)
+        val preferenceContent = preferences.contentPayload as WorkspacePreferencesV2
         val preferenceLight = fixture.factory.createContentChild(
             preferences,
-            (preferences.contentPayload as WorkspacePreferencesV2).copy(theme = WorkspaceThemeV2.LIGHT),
+            preferenceContent.copy(theme = WorkspaceThemeV2.LIGHT),
             ACTOR,
             at(5),
         )
         val preferenceDark = fixture.factory.createContentChild(
             preferences,
-            (preferences.contentPayload as WorkspacePreferencesV2).copy(theme = WorkspaceThemeV2.DARK),
+            preferenceContent.copy(theme = WorkspaceThemeV2.DARK),
             "device:00000000-0000-4000-8000-000000000002",
             at(6),
         )

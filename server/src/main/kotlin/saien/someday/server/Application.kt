@@ -9,6 +9,7 @@ import saien.someday.server.routes.systemV3Routes
 import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.Application
+import io.ktor.server.application.ApplicationStopped
 import io.ktor.server.application.call
 import io.ktor.server.application.install
 import io.ktor.server.engine.embeddedServer
@@ -21,16 +22,26 @@ import io.ktor.server.routing.get
 import io.ktor.server.routing.routing
 import io.ktor.serialization.kotlinx.json.json
 import kotlinx.serialization.json.Json
+import org.slf4j.LoggerFactory
+
+private val SERVER_LOGGER = LoggerFactory.getLogger("saien.someday.server")
 
 fun main() {
     val config = ServerConfig.fromEnvironment()
     val context = ServerContext.create(config)
-    embeddedServer(Netty, port = config.port, host = config.bindHost) {
-        somedayServerModule(context)
-    }.start(wait = true)
+    try {
+        embeddedServer(Netty, port = config.port, host = config.bindHost) {
+            somedayServerModule(context)
+        }.start(wait = true)
+    } finally {
+        context.close()
+    }
 }
 
 fun Application.somedayServerModule(context: ServerContext = ServerContext.create()) {
+    monitor.subscribe(ApplicationStopped) {
+        context.close()
+    }
     install(ContentNegotiation) {
         json(
             Json {
@@ -42,7 +53,8 @@ fun Application.somedayServerModule(context: ServerContext = ServerContext.creat
         )
     }
     install(StatusPages) {
-        exception<Exception> { call, _ ->
+        exception<Exception> { call, failure ->
+            SERVER_LOGGER.error("Unhandled server request failure", failure)
             call.respond(HttpStatusCode.InternalServerError, ErrorResponse("internal_error"))
         }
     }

@@ -19,6 +19,14 @@ accounts and devices, applies bounded immutable-object and compare-and-set
 rules, and stores opaque ciphertext. It never receives workspace keys, note
 content, image metadata, or image bytes in plaintext.
 
+The accepted server persistence target defines two topologies. Standalone uses
+PostgreSQL and a filesystem media volume; the recommended production topology
+uses external PostgreSQL and private S3-compatible object storage so the
+application container holds no durable user data. These are deployment choices
+behind the same server API, never client-selectable sync providers. Both are
+implemented by the same server image. The normative storage decision is in
+`server-storage-architecture.md`.
+
 The public API is rooted at:
 
 ```text
@@ -147,8 +155,16 @@ Key derivation, nonce derivation, and AAD are domain-separated and bind both
 scope, opaque IDs, ciphertext length, and ciphertext digest.
 
 PUT is immutable and idempotent: exact replay succeeds; another value at the
-same key conflicts. A missing or damaged blob may be reconstructed only by an
-exact replay matching its database identity.
+same key conflicts. A missing blob may be reconstructed only by an exact replay
+matching its database identity. A divergent existing blob remains corrupt and
+requires operator restoration; the application never overwrites it.
+
+Media storage uses conditional immutable creation. Blob durability precedes
+the PostgreSQL metadata commit; a database failure may leave an invisible
+orphan that an exact replay reuses. The first release does not require runtime
+blob deletion, provider failover, or a distributed compensation state machine.
+A storage collision is an exact replay only after the server has bounded-read
+and hashed the actual existing bytes; provider metadata alone is insufficient.
 
 ## 6. Cross-plane publication
 
@@ -197,8 +213,14 @@ references may therefore be unresolved. A complete portable media archive is
 a separate future feature, not an implicit extension of JSON export.
 
 An operator backup of a self-hosted deployment is different: PostgreSQL and
-the configured media blob directory form one logical storage unit and must be
-captured and restored consistently. Either half alone is incomplete.
+the configured media blob store form one logical recovery unit. Either half
+alone is incomplete. A standalone deployment requires coordinated PostgreSQL
+and off-host filesystem backups. The recommended external topology requires
+PostgreSQL recovery points and bucket versioning/retention; the restored bucket
+may contain harmless orphans. Every restored PostgreSQL media record must
+resolve to an object with the exact expected key, length, and actual-byte
+digest; operators either quiesce writes for capture or run the operator
+integrity validator afterward. The stable JWT secret is backed up separately.
 
 The initial server does not garbage-collect published media. Local previews
 are disposable caches; original bytes are retained unless a separately proven
@@ -209,6 +231,8 @@ remote copy exists.
 The architecture leaves narrow seams, not generic plugin systems:
 
 - more local workspaces can be exposed using the existing `workspaceId` scope;
+- target server media storage is limited to filesystem and S3-compatible
+  adapters; it does not expose vendor-specific providers to clients;
 - a larger-file protocol may later add resumable objects under a new media
   contract without changing the bounded-image contract;
 - complete media export and authenticated reachability-based deletion require

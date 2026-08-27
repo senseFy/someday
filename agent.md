@@ -72,9 +72,27 @@
 
 ## Self-hosted Server
 
-- `local` and `production` deployment modes have different explicit security
-  contracts. Production startup must remain fail-closed on missing database
-  credentials, a strong JWT secret, or an HTTPS public origin.
+- `docs/server-storage-architecture.md` is the canonical server persistence and
+  deployment-topology decision.
+- `local` and `production` runtime security modes, selected by
+  `SOMEDAY_DEPLOYMENT_MODE`, have different explicit contracts. Production
+  startup must remain fail-closed on missing database credentials, a strong JWT
+  secret, or an HTTPS public origin.
+- Runtime security mode is independent of storage topology. Support standalone
+  PostgreSQL plus filesystem media and the recommended external PostgreSQL plus
+  S3-compatible media topology without adding a provider plugin system. The
+  external application container must own no durable user data.
+- Production media configuration has exactly one explicit `filesystem|s3`
+  backend choice; local development may default to filesystem. Do not add
+  silent fallback, vendor-specific client behavior, PostgreSQL BLOB media,
+  public object URLs, or S3-mounted filesystem emulation.
+- Blob publication precedes PostgreSQL metadata. Preserve immutable exact
+  replay, retain safe untracked blobs after a database failure, and give the
+  first-release application runtime no list/delete operations, no
+  `DeleteObject` permission, and no compensation state machine. An AWS runtime
+  policy may grant `ListBucket` only for `media/v1/*` so missing HEAD/GET is
+  distinguishable from permission denial. Exact-replay adoption must hash the
+  actual existing bytes rather than trusting object metadata.
 - Production registration defaults off, admin cookies are `Secure`, browser
   admin mutations require the configured same-origin `Origin`, and proxy
   forwarding headers are ignored unless the operator opts in.
@@ -85,5 +103,6 @@
 - `compose.yaml` is loopback-only local infrastructure. Do not turn its known
   credentials or exposed dependency ports into a production recipe.
 - Portable export/restore omits image bytes. Operator backup and recovery of
-  published media must treat PostgreSQL and the configured media blob directory
-  as one storage unit.
+  published media must treat PostgreSQL and the configured media blob store as
+  one recovery unit. Standalone needs coordinated off-host directory backups;
+  external needs PostgreSQL recovery points plus bucket versioning/retention.

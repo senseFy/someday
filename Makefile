@@ -279,7 +279,7 @@ desktop-test: ## Run desktop JVM tests
 	$(GRADLE) :app:desktop:jvmTest --stacktrace
 
 ##@ Validation
-.PHONY: lint compile check client-smoke shared-smoke server-test integration-test real-remote-test sync-v3-gate sync-v3-apple-gate release-readiness validate android-lint
+.PHONY: lint compile check client-smoke shared-smoke server-test server-container-smoke integration-test real-remote-test sync-v3-gate sync-v3-apple-gate release-readiness validate android-lint
 lint: ## Run source hygiene and Android lint
 	$(GRADLE) sourceHygieneCheck :app:android:lintDebug
 
@@ -301,13 +301,16 @@ shared-smoke: ## Run shared behavior tests across JVM/Android/iOS targets
 server-test: ## Run server unit and integration tests
 	$(GRADLE) :server:test :server:integrationTest --max-workers=$(SMOKE_WORKERS)
 
+server-container-smoke: ## Build and verify the production server image and Compose packaging
+	./scripts/server-container-smoke
+
 integration-test: ## Run hermetic repository topology tests
 	$(GRADLE) :integration-tests:test --max-workers=$(SMOKE_WORKERS)
 
 real-remote-test: ## Run live self-hosted tests; explicit SOMEDAY_* service environment is required
 	$(GRADLE) :integration-tests:realRemoteTest --max-workers=$(SMOKE_WORKERS)
 
-sync-v3-gate: ## Run the Linux/PostgreSQL System V3 release gate
+sync-v3-gate: ## Run the Linux/PostgreSQL/S3 System V3 release gate
 	./scripts/sync-v3-reliability-gate
 
 sync-v3-apple-gate: ## Run System V3 shared behavior and app shell tests on an iOS simulator

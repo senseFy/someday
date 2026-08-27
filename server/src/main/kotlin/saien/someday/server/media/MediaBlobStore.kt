@@ -50,19 +50,6 @@ interface MediaBlobStore {
     fun head(key: MediaBlobKey): MediaBlobMetadata?
 
     fun read(key: MediaBlobKey, maxBytes: Int): MediaBlobValue?
-
-    /**
-     * Deletes exactly one opaque blob key. The operation is idempotent and must
-     * never broaden the deletion to a media, account, or store directory.
-     */
-    fun delete(key: MediaBlobKey): Boolean
-
-    /**
-     * Removes an untracked blob left by a crash between durable publication and
-     * the PostgreSQL metadata commit. The caller must already hold the account
-     * quota lock and have established that authoritative metadata is absent.
-     */
-    fun removeUntracked(key: MediaBlobKey): Boolean = delete(key)
 }
 
 /**
@@ -120,13 +107,6 @@ class FileSystemMediaBlobStore(root: Path) : MediaBlobStore {
         require(size in 1..maxBytes.toLong()) { "Stored media blob exceeds its protocol bound." }
         val bytes = Files.readAllBytes(path)
         return MediaBlobValue(MediaBlobMetadata(bytes.size.toLong(), sha256(bytes)), bytes)
-    }
-
-    override fun delete(key: MediaBlobKey): Boolean {
-        val target = pathFor(key)
-        val deleted = Files.deleteIfExists(target)
-        if (deleted) forceDirectory(checkNotNull(target.parent))
-        return deleted
     }
 
     private fun existingResult(

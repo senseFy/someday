@@ -2,6 +2,7 @@
 
 package saien.someday.server
 
+import saien.someday.server.api.ErrorResponse
 import saien.someday.server.api.SyncV2CheckpointChunkRef
 import saien.someday.server.api.SyncV2CheckpointChunkRequest
 import saien.someday.server.api.SyncV2CheckpointCleanupResponse
@@ -204,6 +205,7 @@ class SyncV2ApiIntegrationTest {
                 differentChunkCiphertext,
             ),
         )
+        assertEquals(HttpStatusCode.Conflict, chunkReplay.status, chunkReplay.body)
         val chunkResult = json.decodeFromString<SyncV2ImmutablePutResponse>(chunkReplay.body)
         assertFalse(chunkResult.stored)
         assertEquals("immutable_object_mismatch", chunkResult.error)
@@ -259,6 +261,7 @@ class SyncV2ApiIntegrationTest {
                 differentManifestCiphertext,
             ),
         )
+        assertEquals(HttpStatusCode.Conflict, manifestReplay.status, manifestReplay.body)
         val manifestResult = json.decodeFromString<SyncV2ImmutablePutResponse>(manifestReplay.body)
         assertFalse(manifestResult.stored)
         assertEquals("immutable_object_mismatch", manifestResult.error)
@@ -423,7 +426,7 @@ class SyncV2ApiIntegrationTest {
         assertEquals(HttpStatusCode.BadRequest, cas.status, cas.body)
         assertEquals(
             "invalid_epoch_pointer",
-            json.decodeFromString<SyncV2EpochCompareAndSetResponse>(cas.body).error,
+            json.decodeFromString<ErrorResponse>(cas.body).error,
         )
     }
 

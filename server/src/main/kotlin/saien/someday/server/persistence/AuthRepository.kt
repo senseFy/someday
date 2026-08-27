@@ -2,7 +2,6 @@ package saien.someday.server.persistence
 
 import saien.someday.server.ServerConfig
 import java.sql.Connection
-import java.sql.DriverManager
 import java.sql.PreparedStatement
 import java.sql.ResultSet
 import java.sql.SQLException
@@ -91,7 +90,8 @@ sealed interface PairingInviteMutationResult {
 }
 
 class AuthRepository(
-    private val config: ServerConfig,
+    config: ServerConfig,
+    private val connections: DatabaseConnectionProvider = directDatabaseConnectionProvider(config),
 ) {
     fun createUser(email: String, passwordHash: String): UserRecord? =
         createUser(email, passwordHash, isAdmin = false)
@@ -808,7 +808,7 @@ class AuthRepository(
         }
 
     private fun connection(): Connection =
-        DriverManager.getConnection(config.databaseUrl, config.databaseUser, config.databasePassword)
+        connections.connection()
 
     private fun ResultSet.toUserRecord(): UserRecord =
         UserRecord(

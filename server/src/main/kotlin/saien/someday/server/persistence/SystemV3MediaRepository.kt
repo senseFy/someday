@@ -5,7 +5,6 @@ import saien.someday.server.media.MediaBlobKey
 import saien.someday.server.media.MediaBlobPutResult
 import saien.someday.server.media.MediaBlobStore
 import java.sql.Connection
-import java.sql.DriverManager
 import java.util.UUID
 
 const val MAX_MEDIA_OBJECT_CIPHERTEXT_BYTES: Int = 4 * 1024 * 1024 + 4 * 1024 + 4 + 40
@@ -33,6 +32,7 @@ sealed interface SystemV3MediaReadResult<out T> {
 class SystemV3MediaRepository(
     private val config: ServerConfig,
     private val blobStore: MediaBlobStore,
+    private val connections: DatabaseConnectionProvider = directDatabaseConnectionProvider(config),
 ) {
     fun putObject(
         userId: UUID,
@@ -51,12 +51,9 @@ class SystemV3MediaRepository(
         }
         val key = MediaBlobKey(userId, workspaceId, mediaId)
         if (existing == null) {
-            blobStore.removeUntracked(key)
             if (!canIncreaseAccountQuota(connection, userId, workspaceId, bytes.size.toLong())) {
                 return@transaction SystemV3MediaPutResult.Rejected("media_quota_exceeded")
             }
-        } else {
-            restoreBlobForExactReplay(key, existing)
         }
         when (blobStore.putImmutable(key, bytes, ciphertextSha256)) {
             MediaBlobPutResult.ImmutableMismatch ->
@@ -88,12 +85,13 @@ class SystemV3MediaRepository(
         userId: UUID,
         workspaceId: String,
         mediaId: String,
-    ): SystemV3MediaReadResult<SystemV3MediaObjectRecord> = scopedConnection(userId, workspaceId).use { connection ->
-        val record = loadObject(connection, userId, workspaceId, mediaId)
-            ?: return@use SystemV3MediaReadResult.Missing
+    ): SystemV3MediaReadResult<SystemV3MediaObjectRecord> {
+        val record = scopedConnection(userId, workspaceId).use { connection ->
+            loadObject(connection, userId, workspaceId, mediaId)
+        } ?: return SystemV3MediaReadResult.Missing
         val blob = blobStore.head(MediaBlobKey(userId, workspaceId, mediaId))
-            ?: return@use SystemV3MediaReadResult.Corrupt
-        if (blob.bytes != record.ciphertextBytes.toLong() || blob.sha256 != record.ciphertextSha256) {
+            ?: return SystemV3MediaReadResult.Corrupt
+        return if (blob.bytes != record.ciphertextBytes.toLong() || blob.sha256 != record.ciphertextSha256) {
             SystemV3MediaReadResult.Corrupt
         } else {
             SystemV3MediaReadResult.Found(record)
@@ -183,13 +181,6 @@ class SystemV3MediaRepository(
         }
     }
 
-    private fun restoreBlobForExactReplay(key: MediaBlobKey, expected: SystemV3MediaObjectRecord) {
-        val blob = blobStore.head(key)
-        if (blob == null || blob.bytes != expected.ciphertextBytes.toLong() ||
-            blob.sha256 != expected.ciphertextSha256
-        ) blobStore.delete(key)
-    }
-
     private fun <T> transaction(
         userId: UUID,
         workspaceId: String,
@@ -206,7 +197,7 @@ class SystemV3MediaRepository(
     }
 
     private fun connection(): Connection =
-        DriverManager.getConnection(config.databaseUrl, config.databaseUser, config.databasePassword)
+        connections.connection()
 
     private fun scopedConnection(userId: UUID, workspaceId: String): Connection =
         connection().also { connection ->

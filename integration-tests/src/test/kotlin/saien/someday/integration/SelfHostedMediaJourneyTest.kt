@@ -27,6 +27,13 @@ class SelfHostedMediaJourneyTest {
             leader.connect(createAccount = true)
             follower.connect(createAccount = false)
 
+            // Publish the frozen first-epoch checkpoint and the notebook before
+            // observing the note boundary. That checkpoint contains only the
+            // exact versions prepared during setup and therefore must not be
+            // forced to drain an unrelated, later media import.
+            val notebook = leader.services.notesRepository.createNotebook("Image journal")
+            leader.assertSuccessfulSync()
+
             val imported = leader.services.localMediaAssetStore.importAsset(
                 source = Buffer().write(PNG_1X1),
                 request = MediaAssetImportRequest(
@@ -35,7 +42,6 @@ class SelfHostedMediaJourneyTest {
                 ),
             )
             val assetId = imported.asset.metadata.id
-            val notebook = leader.services.notesRepository.createNotebook("Image journal")
             val note = leader.services.notesRepository.createNote(
                 NoteInput(
                     notebookId = notebook.id,

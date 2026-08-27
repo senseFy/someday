@@ -386,6 +386,22 @@ class ServerRlsIsolationIntegrationTest {
     private fun cleanupAccounts(firstUserId: UUID, secondUserId: UUID) {
         administratorConnection().use { connection ->
             selectWildcardScope(connection)
+            // Changes and mutations deliberately RESTRICT deletion of their
+            // immutable object. Media and entity objects in turn retain the
+            // first-writer device, so remove those rows before the account's
+            // cascading device cleanup.
+            listOf(
+                "someday_sync_v2_changes",
+                "someday_sync_v2_mutations",
+                "someday_sync_v2_objects",
+                "someday_media_v3_objects",
+            ).forEach { table ->
+                connection.prepareStatement("DELETE FROM $table WHERE user_id IN (?, ?)").use { statement ->
+                    statement.setObject(1, firstUserId)
+                    statement.setObject(2, secondUserId)
+                    statement.executeUpdate()
+                }
+            }
             connection.prepareStatement("DELETE FROM someday_users WHERE id IN (?, ?)").use { statement ->
                 statement.setObject(1, firstUserId)
                 statement.setObject(2, secondUserId)

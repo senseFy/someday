@@ -13,6 +13,7 @@ internal fun productionTestServerConfig(
             "SOMEDAY_DB_URL" to databaseUrl,
             "SOMEDAY_DB_USER" to databaseUser,
             "SOMEDAY_DB_PASSWORD" to databasePassword,
+            "SOMEDAY_MEDIA_BACKEND" to "filesystem",
             "SOMEDAY_MEDIA_BLOB_DIR" to "${System.getProperty("java.io.tmpdir")}/someday-server-integration-media",
             "SOMEDAY_JWT_SECRET" to "integration-test-only-jwt-secret-with-at-least-thirty-two-bytes",
         ),

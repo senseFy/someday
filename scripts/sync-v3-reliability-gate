@@ -5,6 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 GRADLEW="${GRADLEW:-$ROOT_DIR/gradlew}"
 POSTGRES_IMAGE="postgres@sha256:16bc17c64a573ef34162af9298258d1aec548232985b33ed7b1eac33ba35c229"
+MINIO_IMAGE="minio/minio@sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e"
+MINIO_MC_IMAGE="minio/mc@sha256:aead63c77f9db9107f1696fb08ecb0faeda23729cde94b0f663edf4fe09728e3"
 GATE_PROPERTY="-Psomeday.systemV3ReliabilityGate=true"
 
 mkdir -p "$ROOT_DIR/build"
@@ -21,10 +23,17 @@ PHASES="$RUN_DIR/phases.tsv"
 REPORT="$RUN_DIR/report.json"
 RUN_SUFFIX="$(date +%s)-$$"
 POSTGRES_NAME="someday-v3-gate-postgres-$RUN_SUFFIX"
+MINIO_NAME="someday-v3-gate-minio-$RUN_SUFFIX"
+NETWORK_NAME="someday-v3-gate-$RUN_SUFFIX"
 POSTGRES_ADMIN_USER="someday_admin"
 POSTGRES_ADMIN_PASSWORD="gate-admin-only-password"
 POSTGRES_APP_USER="someday_app"
 POSTGRES_APP_PASSWORD="gate-app-only-password"
+MINIO_ROOT_USER="someday_minio_admin"
+MINIO_ROOT_PASSWORD="gate-minio-admin-only-password"
+MINIO_APP_USER="someday_s3_app"
+MINIO_APP_PASSWORD="gate-s3-app-only-password"
+MINIO_BUCKET="someday-media"
 SERVER_PID=""
 SERVER_JWT_SECRET=""
 GATE_STARTED_AT="$(date +%s)"
@@ -66,7 +75,8 @@ cleanup() {
         wait "$SERVER_PID" >/dev/null 2>&1 || true
     fi
     if command -v docker >/dev/null 2>&1; then
-        docker rm -f "$POSTGRES_NAME" >/dev/null 2>&1 || true
+        docker rm -f "$POSTGRES_NAME" "$MINIO_NAME" >/dev/null 2>&1 || true
+        docker network rm "$NETWORK_NAME" >/dev/null 2>&1 || true
     fi
     [[ ! -f "$REPORT" ]] || cp "$REPORT" "$FINAL_DIR/report.json"
     [[ ! -f "$SERVER_LOG" ]] || tail -n 300 "$SERVER_LOG" >"$FINAL_DIR/server-tail.log" || true
@@ -118,7 +128,13 @@ start_installed_server() {
     SOMEDAY_DB_URL="$DB_URL" \
     SOMEDAY_DB_USER="$POSTGRES_APP_USER" \
     SOMEDAY_DB_PASSWORD="$POSTGRES_APP_PASSWORD" \
-    SOMEDAY_MEDIA_BLOB_DIR="$MEDIA_BLOB_DIR" \
+    SOMEDAY_MEDIA_BACKEND=s3 \
+    SOMEDAY_MEDIA_S3_BUCKET="$MINIO_BUCKET" \
+    SOMEDAY_MEDIA_S3_REGION=us-east-1 \
+    SOMEDAY_MEDIA_S3_ENDPOINT="$MINIO_ENDPOINT" \
+    SOMEDAY_MEDIA_S3_PATH_STYLE=true \
+    AWS_ACCESS_KEY_ID="$MINIO_APP_USER" \
+    AWS_SECRET_ACCESS_KEY="$MINIO_APP_PASSWORD" \
     SOMEDAY_JWT_SECRET="$SERVER_JWT_SECRET" \
     SOMEDAY_REGISTRATION_ENABLED=true \
         "$executable" >"$SERVER_LOG" 2>&1 &
@@ -153,6 +169,7 @@ targets = {
     "desktop": root / "app/desktop/build/test-results/jvmTest",
     "server-test": root / "server/build/test-results/test",
     "server-integration": root / "server/build/test-results/integrationTest",
+    "server-s3-integration": root / "server/build/test-results/s3IntegrationTest",
     "real-e2e": root / "integration-tests/build/test-results/realRemoteTest",
 }
 minimum_tests = {
@@ -229,6 +246,8 @@ report = {
     "flakyRetries": 0,
     "containerImages": {
         "postgres": "postgres@sha256:16bc17c64a573ef34162af9298258d1aec548232985b33ed7b1eac33ba35c229",
+        "minio": "minio/minio@sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e",
+        "minioClient": "minio/mc@sha256:aead63c77f9db9107f1696fb08ecb0faeda23729cde94b0f663edf4fe09728e3",
     },
     "phases": phases,
     "architectureEvidence": architecture_evidence,
@@ -244,7 +263,7 @@ for command in curl docker git java python3 rg; do
 done
 require_java_21
 [[ -x "$GRADLEW" ]] || die "Gradle wrapper is not executable: $GRADLEW"
-docker info >/dev/null 2>&1 || die "Docker daemon is required for isolated PostgreSQL evidence"
+docker info >/dev/null 2>&1 || die "Docker daemon is required for isolated PostgreSQL/S3 evidence"
 SERVER_JWT_SECRET="$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')"
 [[ ${#SERVER_JWT_SECRET} -ge 32 ]] || die "failed to create a production-strength JWT secret"
 
@@ -258,8 +277,18 @@ if ! docker image inspect "$POSTGRES_IMAGE" >/dev/null 2>&1; then
     info "pulling pinned PostgreSQL image"
     docker pull "$POSTGRES_IMAGE" >/dev/null
 fi
+if ! docker image inspect "$MINIO_IMAGE" >/dev/null 2>&1; then
+    info "pulling pinned MinIO image"
+    docker pull "$MINIO_IMAGE" >/dev/null
+fi
+if ! docker image inspect "$MINIO_MC_IMAGE" >/dev/null 2>&1; then
+    info "pulling pinned MinIO client image"
+    docker pull "$MINIO_MC_IMAGE" >/dev/null
+fi
+docker network create "$NETWORK_NAME" >/dev/null
 docker run -d --rm \
     --name "$POSTGRES_NAME" \
+    --network "$NETWORK_NAME" \
     --tmpfs /var/lib/postgresql/data:rw,noexec,nosuid,size=512m \
     -e POSTGRES_DB=someday \
     -e POSTGRES_USER="$POSTGRES_ADMIN_USER" \
@@ -270,6 +299,31 @@ POSTGRES_PORT="$(container_port "$POSTGRES_NAME" 5432)"
 [[ "$POSTGRES_PORT" =~ ^[0-9]+$ ]] || die "could not resolve PostgreSQL port"
 DB_URL="jdbc:postgresql://127.0.0.1:$POSTGRES_PORT/someday"
 wait_for "PostgreSQL" docker exec "$POSTGRES_NAME" pg_isready -U "$POSTGRES_ADMIN_USER" -d someday
+
+docker run -d --rm \
+    --name "$MINIO_NAME" \
+    --network "$NETWORK_NAME" \
+    --tmpfs /data:rw,noexec,nosuid,size=512m \
+    -e MINIO_ROOT_USER="$MINIO_ROOT_USER" \
+    -e MINIO_ROOT_PASSWORD="$MINIO_ROOT_PASSWORD" \
+    -p 127.0.0.1::9000 \
+    "$MINIO_IMAGE" server /data --console-address :9001 >/dev/null
+MINIO_PORT="$(container_port "$MINIO_NAME" 9000)"
+[[ "$MINIO_PORT" =~ ^[0-9]+$ ]] || die "could not resolve MinIO port"
+MINIO_ENDPOINT="http://127.0.0.1:$MINIO_PORT"
+wait_for "MinIO" curl -fsS "$MINIO_ENDPOINT/minio/health/live"
+
+docker run --rm \
+    --network "$NETWORK_NAME" \
+    --entrypoint /bin/sh \
+    --volume "$ROOT_DIR/scripts/fixtures/minio-media-policy.json:/policy.json:ro" \
+    "$MINIO_MC_IMAGE" \
+    -c "mc alias set gate http://$MINIO_NAME:9000 '$MINIO_ROOT_USER' '$MINIO_ROOT_PASSWORD' >/dev/null && \
+        mc mb --ignore-existing gate/$MINIO_BUCKET >/dev/null && \
+        mc version enable gate/$MINIO_BUCKET >/dev/null && \
+        mc admin user add gate '$MINIO_APP_USER' '$MINIO_APP_PASSWORD' >/dev/null && \
+        mc admin policy create gate someday-media-app /policy.json >/dev/null && \
+        mc admin policy attach gate someday-media-app --user '$MINIO_APP_USER' >/dev/null"
 
 docker exec "$POSTGRES_NAME" psql \
     --username "$POSTGRES_ADMIN_USER" \
@@ -329,10 +383,23 @@ phase "self-hosted-postgresql-integration" env \
     SOMEDAY_DB_ADMIN_URL="$DB_URL" \
     SOMEDAY_DB_ADMIN_USER="$POSTGRES_ADMIN_USER" \
     SOMEDAY_DB_ADMIN_PASSWORD="$POSTGRES_ADMIN_PASSWORD" \
+    SOMEDAY_MEDIA_BACKEND=filesystem \
     SOMEDAY_MEDIA_BLOB_DIR="$MEDIA_INTEGRATION_BLOB_DIR" \
     "$GRADLEW" \
         :server:integrationTest \
         :server:installDist \
+        "$GATE_PROPERTY" \
+        --dependency-verification=strict \
+        --stacktrace
+
+phase "self-hosted-s3-integration" env \
+    SOMEDAY_S3_TEST_ENDPOINT="$MINIO_ENDPOINT" \
+    SOMEDAY_S3_TEST_BUCKET="$MINIO_BUCKET" \
+    SOMEDAY_S3_TEST_REGION=us-east-1 \
+    AWS_ACCESS_KEY_ID="$MINIO_APP_USER" \
+    AWS_SECRET_ACCESS_KEY="$MINIO_APP_PASSWORD" \
+    "$GRADLEW" \
+        :server:s3IntegrationTest \
         "$GATE_PROPERTY" \
         --dependency-verification=strict \
         --stacktrace
@@ -349,6 +416,8 @@ phase "real-self-hosted-journeys" env \
         "$GATE_PROPERTY" \
         --dependency-verification=strict \
         --stacktrace
+
+phase "server-container-packaging" bash "$ROOT_DIR/scripts/server-container-smoke"
 
 phase "diff-hygiene" git diff --check
 

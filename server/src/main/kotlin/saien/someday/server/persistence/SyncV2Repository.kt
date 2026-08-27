@@ -3,7 +3,6 @@ package saien.someday.server.persistence
 import saien.someday.server.ServerConfig
 import java.security.MessageDigest
 import java.sql.Connection
-import java.sql.DriverManager
 import java.sql.ResultSet
 import java.time.OffsetDateTime
 import java.time.ZoneOffset
@@ -132,7 +131,10 @@ sealed interface SyncV2CheckpointCleanupRepositoryResult {
     data class Retained(val error: String) : SyncV2CheckpointCleanupRepositoryResult
 }
 
-class SyncV2Repository(private val config: ServerConfig) {
+class SyncV2Repository(
+    config: ServerConfig,
+    private val connections: DatabaseConnectionProvider = directDatabaseConnectionProvider(config),
+) {
     fun loadEpoch(userId: UUID, workspaceId: String): SyncV2EpochRecord? =
         scopedConnection(userId, workspaceId).use { connection ->
         loadActiveEpoch(connection, userId, workspaceId, false)
@@ -907,7 +909,7 @@ class SyncV2Repository(private val config: ServerConfig) {
     }
 
     private fun connection(): Connection =
-        DriverManager.getConnection(config.databaseUrl, config.databaseUser, config.databasePassword)
+        connections.connection()
 
     private fun scopedConnection(userId: UUID, workspaceId: String): Connection {
         val connection = connection()

@@ -67,7 +67,10 @@ class SystemV3MediaApiIntegrationTest {
         val path = mediaPath(WORKSPACE_A, MEDIA_ID)
         val created = putObject(device.accessToken, path, bytes, digest)
         assertEquals(HttpStatusCode.Created, created.status, created.bodyAsText())
-        assertEquals(false, created.body<SystemV3MediaPutResponse>().idempotentReplay)
+        assertEquals(
+            false,
+            json.decodeFromString<SystemV3MediaPutResponse>(created.bodyAsText()).idempotentReplay,
+        )
         assertEquals(HttpStatusCode.OK, putObject(device.accessToken, path, bytes, digest).status)
 
         val head = client.head(path) { bearerAuth(device.accessToken) }
@@ -154,7 +157,10 @@ class SystemV3MediaApiIntegrationTest {
             putObject(device.accessToken, winner.path, winner.bytes, sha256(winner.bytes)).status,
         )
         val rejected = responses.single { it.status == HttpStatusCode.Conflict }
-        assertEquals("media_quota_exceeded", rejected.body<SystemV3MediaPutResponse>().error)
+        assertEquals(
+            "media_quota_exceeded",
+            json.decodeFromString<SystemV3MediaPutResponse>(rejected.bodyAsText()).error,
+        )
     }
 
     private fun localConfig(mediaQuotaBytes: Long? = null): ServerConfig = ServerConfig.fromEnvironment(
@@ -190,7 +196,7 @@ class SystemV3MediaApiIntegrationTest {
             setBody(
                 json.encodeToString(
                     DeviceRegistrationRequest(
-                        "device-${java.util.UUID.randomUUID()}",
+                        java.util.UUID.randomUUID().toString(),
                         "Media device",
                         "desktop",
                     ),

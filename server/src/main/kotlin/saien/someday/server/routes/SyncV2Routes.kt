@@ -84,7 +84,7 @@ private fun Route.syncV2EntityDagRouteBody(
                     JSON.encodeToString(request.objectValue),
                 ),
             )
-            call.respond(result.toResponse())
+            call.respondImmutablePut(result)
         }
 
         post("/checkpoint/manifest") {
@@ -106,7 +106,7 @@ private fun Route.syncV2EntityDagRouteBody(
                     JSON.encodeToString(request.objectValue),
                 ),
             )
-            call.respond(result.toResponse())
+            call.respondImmutablePut(result)
         }
 
         post("/checkpoint/fetch") {
@@ -421,6 +421,13 @@ private fun SyncV2EpochRecord?.toResponse(): SyncV2EpochResponse = when (this) {
 private fun SyncV2ImmutablePutRepositoryResult.toResponse() = when (this) {
     is SyncV2ImmutablePutRepositoryResult.Stored -> SyncV2ImmutablePutResponse(true, idempotentReplay)
     is SyncV2ImmutablePutRepositoryResult.Rejected -> SyncV2ImmutablePutResponse(false, error = error)
+}
+
+private suspend fun ApplicationCall.respondImmutablePut(result: SyncV2ImmutablePutRepositoryResult) {
+    when (result) {
+        is SyncV2ImmutablePutRepositoryResult.Stored -> respond(result.toResponse())
+        is SyncV2ImmutablePutRepositoryResult.Rejected -> respond(HttpStatusCode.Conflict, result.toResponse())
+    }
 }
 
 private fun SyncV2PointerPublishRepositoryResult.toResponse() = when (this) {

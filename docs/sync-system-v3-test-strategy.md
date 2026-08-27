@@ -1,6 +1,6 @@
 # System V3 Test Strategy
 
-Status: first-release verification contract.
+Status: implemented first-release verification contract.
 
 The synchronization suite proves protocol invariants and recovery behavior. It
 does not optimize for a line-coverage percentage, duplicate the same cases at
@@ -37,24 +37,28 @@ arrange durable state -> inject one failure -> close/reopen -> retry -> assert i
 
 ### Server contract
 
-Location: `server/src/test` and `server/src/integrationTest`.
+Location: `server/src/test`, `server/src/integrationTest`, and
+`server/src/s3IntegrationTest`.
 
 This layer owns HTTP validation, authentication, device revocation,
 account/workspace scope, PostgreSQL transactions and RLS, immutable object
-semantics, cursor allocation, account quota, and database/blob reconciliation.
-Integration tests always use real PostgreSQL. HTTP, RLS, and journey tests use
-the real filesystem blob store; repository publication tests may replace only
-that blob boundary with a controllable implementation to force a precise
-write, corruption, or orphan condition. That narrow fault seam does not
-substitute for the real filesystem path.
+semantics, cursor allocation, account quota, and the database/blob publication
+boundary. Integration tests use real PostgreSQL, the filesystem contract uses a
+real temporary directory, and the S3 contract runs against a pinned compatible
+service. Repository publication tests may replace only the blob boundary with
+a controllable implementation to force a precise write, corruption, or orphan
+condition. That narrow fault seam does not substitute for either real backend.
 
 ### Real self-hosted journeys
 
 Location: `integration-tests/src/test` under the `realRemoteTest` task.
 
 This layer starts from public production composition and crosses a real HTTP
-socket, installed server, PostgreSQL, blob directory, and independent client
-databases. It contains only a small set of product journeys:
+socket, installed server, PostgreSQL, the configured blob service, and
+independent client databases. The complete journey runs with PostgreSQL and a
+pinned S3-compatible service; standalone filesystem deployment receives a
+packaging/storage smoke test rather than a duplicate product journey. The layer
+contains only a small set of product journeys:
 
 1. bootstrap and non-conflicting two-device convergence;
 2. durable same-field conflict on both devices;
@@ -102,20 +106,31 @@ durable identity across reopen and retry.
 
 Server tests cover atomic multi-object push rejection, concurrent genesis CAS,
 concurrent cursor allocation, pull pagination and cursor rollback, and exact
-replay. Media tests cover blob-write failure, orphan blob cleanup, missing or
-corrupt blob reconstruction by exact PUT, same-key concurrency, and an
-account-wide quota race across workspaces.
+replay. Required target media tests cover blob-write failure, durable orphan
+reuse after a database failure, missing-object reconstruction by exact PUT,
+immutable mismatch rejection, same-key concurrency, and an account-wide quota
+race across workspaces.
+
+The shared backend contract proves immutable
+PUT/HEAD/GET, exact replay, canonical length/SHA-256 validation, same-key
+concurrency, and the maximum supported object. S3-specific adapter tests prove
+conditional create, read-after-write, bounded error/timeout mapping, and no
+filesystem fallback. They also cover an object whose metadata claims the
+expected digest while its actual payload differs. One pinned S3-compatible
+implementation is the release gate; Someday does not duplicate the suite for
+individual storage vendors.
 
 ## 4. Evidence rules
 
-The release contract has two host-native gates. `scripts/sync-v3-reliability-gate`
-runs on Ubuntu and owns JVM/Android, PostgreSQL, installed-server, and real
-self-hosted journey evidence. `scripts/sync-v3-apple-gate` runs on an Apple
-Silicon macOS host and owns shared behavior plus app-shell execution evidence
-on the iOS simulator. It does not claim a platform-native HTTP transport
-journey, which is outside the first-release P0 set. Together the gates must:
+The baseline release contract has two host-native gates.
+`scripts/sync-v3-reliability-gate` runs on Ubuntu and owns JVM/Android,
+PostgreSQL, installed-server, and real self-hosted journey evidence.
+`scripts/sync-v3-apple-gate` runs on an Apple Silicon macOS host and owns shared
+behavior plus app-shell execution evidence on the iOS simulator. It does not
+claim a platform-native HTTP transport journey, which is outside the
+first-release P0 set. The Ubuntu gate provisions pinned PostgreSQL and
+S3-compatible services. Together the gates:
 
-- provision an isolated pinned PostgreSQL image and blob directory;
 - create a dedicated application role with `NOSUPERUSER` and `NOBYPASSRLS`,
   and use it for migrations, server integration tests, the production-mode
   installed server, and real journeys;
@@ -124,6 +139,26 @@ journey, which is outside the first-release P0 set. Together the gates must:
 - start the installed server and run every real self-hosted journey;
 - accept only JUnit XML created during the current invocation;
 - fail on a failure, error, skipped test, stale result, or missing layer.
+
+The Ubuntu gate also:
+
+- provision a pinned S3-compatible service;
+- run the same backend contract against that service and a real filesystem
+  directory;
+- deny `DeleteObject`; on AWS, permit `ListBucket` only for the `media/v1/*`
+  prefix so missing-object HEAD/GET remains distinguishable from permission
+  denial, while proving the application never invokes listing;
+- prove orphan reuse, no divergent-object deletion, missing-object exact
+  replay, and same-key concurrency at the PostgreSQL/blob boundary;
+- run the complete installed-server product journey with PostgreSQL and S3;
+- prove the operator integrity validator accepts an object-store superset and
+  rejects a recovery set with a missing or byte-divergent referenced object.
+
+`scripts/server-container-smoke` owns the separate packaging boundary: it
+builds the production image, starts the standalone Compose topology with a
+read-only root and non-root identity, exercises both operator subcommands, and
+validates the external Compose configuration. It does not duplicate the sync
+journey.
 
 The PostgreSQL administrator identity is limited to container provisioning and
 the restricted-role RLS fixture's role management, seed, and cleanup work. It

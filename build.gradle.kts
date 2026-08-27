@@ -46,6 +46,7 @@ val systemV3ReliabilityTestTaskNames = setOf(
     "iosSimulatorArm64Test",
     "test",
     "integrationTest",
+    "s3IntegrationTest",
     "realRemoteTest",
 )
 

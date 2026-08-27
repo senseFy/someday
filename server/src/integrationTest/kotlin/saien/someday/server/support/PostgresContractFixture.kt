@@ -6,6 +6,7 @@ import java.sql.DriverManager
 import java.time.Duration
 import java.util.UUID
 import saien.someday.server.ServerConfig
+import saien.someday.server.ServerMediaStorage
 import saien.someday.server.persistence.DatabaseMigrator
 import saien.someday.server.productionTestServerConfig
 
@@ -29,7 +30,7 @@ internal class PostgresContractFixture(
         databaseUser,
         databasePassword,
     ).copy(
-        mediaBlobDirectory = mediaRoot.toAbsolutePath().toString(),
+        mediaStorage = ServerMediaStorage.FileSystem(mediaRoot.toAbsolutePath()),
         mediaQuotaBytes = mediaQuotaBytes,
     )
 
