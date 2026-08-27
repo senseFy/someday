@@ -34,16 +34,13 @@ S3_MEDIA_BLOB_STORE="$SERVER_MAIN/kotlin/saien/someday/server/media/S3MediaBlobS
     fail "the product-facing client composition still exposes a V2 facade"
 pass ARCH-PRODUCT-V3
 
-# The retired provider label is assembled so this verifier does not preserve
-# the removed product surface itself. The V3 design document may state that it
-# is unsupported; no implementation, test, script, or filename may remain.
 removed_provider='web''dav'
-provider_targets=(shared app server integration-tests scripts .github README.md CONTRIBUTING.md SECURITY.md Makefile agent.md)
+provider_targets=(shared app server integration-tests scripts .github docs README.md CONTRIBUTING.md SECURITY.md Makefile agent.md)
 if rg -n -i --glob '!**/build/**' --glob '!**/.gradle/**' \
     "$removed_provider" "${provider_targets[@]}" >/dev/null; then
     rg -n -i --glob '!**/build/**' --glob '!**/.gradle/**' \
         "$removed_provider" "${provider_targets[@]}" >&2
-    fail "removed remote provider remains outside the architecture decision record"
+    fail "unsupported remote provider remains"
 fi
 while IFS= read -r path; do
     printf '%s\n' "$path" >&2
@@ -226,7 +223,7 @@ rg -Fq 'requestedDeviceId.variant() != 2' \
     fail "server device registration does not require the RFC 4122 variant"
 pass ARCH-PAIRING-IDENTITY
 
-if rg -ni 'trustAll|X509TrustManager|HostnameVerifier|disableHostname|insecureSkip|ALLOW_ALL' \
+if rg -ni 'trustAll|NonValidating|X509TrustManager|NoopHostnameVerifier|disableHostname|insecureSkip|ALLOW_ALL' \
     shared/sync/src app server/src/main >/dev/null; then
     fail "production transport contains a certificate or hostname bypass"
 fi

@@ -128,8 +128,9 @@ PostgreSQL, installed-server, and real self-hosted journey evidence.
 `scripts/sync-v3-apple-gate` runs on an Apple Silicon macOS host and owns shared
 behavior plus app-shell execution evidence on the iOS simulator. It does not
 claim a platform-native HTTP transport journey, which is outside the
-first-release P0 set. The Ubuntu gate provisions pinned PostgreSQL and
-S3-compatible services. Together the gates:
+first-release P0 set. The Ubuntu gate provisions pinned PostgreSQL 17 and
+HTTPS MinIO. Its generated test CA is injected only into gate processes.
+Together the gates:
 
 - create a dedicated application role with `NOSUPERUSER` and `NOBYPASSRLS`,
   and use it for migrations, server integration tests, the production-mode
@@ -145,14 +146,23 @@ The Ubuntu gate also:
 - provision a pinned S3-compatible service;
 - run the same backend contract against that service and a real filesystem
   directory;
-- deny `DeleteObject`; on AWS, permit `ListBucket` only for the `media/v1/*`
-  prefix so missing-object HEAD/GET remains distinguishable from permission
-  denial, while proving the application never invokes listing;
+- prove missing-object HEAD/GET is distinguishable from permission denial and
+  that the application never invokes listing or deletion;
 - prove orphan reuse, no divergent-object deletion, missing-object exact
   replay, and same-key concurrency at the PostgreSQL/blob boundary;
 - run the complete installed-server product journey with PostgreSQL and S3;
 - prove the operator integrity validator accepts an object-store superset and
-  rejects a recovery set with a missing or byte-divergent referenced object.
+  rejects a recovery set with a missing or byte-divergent referenced object;
+- capture non-empty PostgreSQL and media as one recovery unit, restore both
+  into isolation, and compare ownership, Flyway history, rows, and media
+  digests, with missing media required to return status `2`; and
+- keep a content-empty paired client alive across that restore, read one note
+  and image through a write-blocked ingress, and prove both write planes are
+  rejected.
+
+`scripts/managed-storage-profile-gate planetscale|r2` applies the focused
+recovery journey to dedicated managed resources. A named profile is verified
+only when a current `result.json` records a complete passing live run.
 
 `scripts/server-container-smoke` owns the separate packaging boundary: it
 builds the production image, starts the standalone Compose topology with a

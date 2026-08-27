@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+usage() {
+    printf '%s\n' \
+        'usage: scripts/managed-storage-profile-gate planetscale|r2' \
+        '' \
+        'PlanetScale PostgreSQL (drops and recreates public in both named databases):' \
+        '  SOMEDAY_PLANETSCALE_SOURCE_JDBC_URL' \
+        '  SOMEDAY_PLANETSCALE_RESTORE_JDBC_URL' \
+        '  SOMEDAY_PLANETSCALE_SOURCE_PSQL_URL (username, no password)' \
+        '  SOMEDAY_PLANETSCALE_RESTORE_APP_PSQL_URL (username, no password)' \
+        '  SOMEDAY_PLANETSCALE_SOURCE_ADMIN_PSQL_URL (username, no password)' \
+        '  SOMEDAY_PLANETSCALE_RESTORE_ADMIN_PSQL_URL (username, no password)' \
+        '  SOMEDAY_PLANETSCALE_SOURCE_APP_USER / _PASSWORD' \
+        '  SOMEDAY_PLANETSCALE_RESTORE_APP_USER / _PASSWORD' \
+        '  SOMEDAY_PLANETSCALE_SOURCE_ADMIN_JDBC_URL / _USER / _PASSWORD' \
+        '  SOMEDAY_PLANETSCALE_RESTORE_ADMIN_PASSWORD' \
+        '  SOMEDAY_MANAGED_GATE_ALLOW_RESET=YES' \
+        '  SOMEDAY_PLANETSCALE_RESET_TARGETS=<branch-id>@<host>:5432/<db>,<branch-id>@<host>:5432/<db>' \
+        '' \
+        'Cloudflare R2 (requires two empty dedicated buckets; writes indefinite-lock objects):' \
+        '  CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID' \
+        '  SOMEDAY_R2_SOURCE_ENDPOINT / _BUCKET / _ACCESS_KEY_ID / _SECRET_ACCESS_KEY' \
+        '  SOMEDAY_R2_RESTORE_ENDPOINT / _BUCKET / _ACCESS_KEY_ID / _SECRET_ACCESS_KEY' \
+        '  SOMEDAY_R2_OFF_PROVIDER_DIR=<empty-absolute-directory>' \
+        '  SOMEDAY_MANAGED_GATE_ALLOW_RESET=YES' \
+        '  SOMEDAY_R2_RESET_TARGETS=<account/source>,<account/restore>' \
+        '' \
+        'See docs/managed-storage-profile-gates.md for the exact safety and evidence contract.'
+}
+
+[[ "$#" -eq 1 ]] || {
+    usage >&2
+    exit 64
+}
+
+case "$1" in
+    planetscale)
+        exec bash "$SCRIPT_DIR/lib/managed-storage-planetscale.sh"
+        ;;
+    r2)
+        exec bash "$SCRIPT_DIR/lib/managed-storage-r2.sh"
+        ;;
+    -h | --help)
+        usage
+        ;;
+    *)
+        usage >&2
+        exit 64
+        ;;
+esac

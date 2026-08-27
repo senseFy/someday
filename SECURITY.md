@@ -59,6 +59,6 @@ reasonable window for assessment and fix before any public disclosure.
   [`docs/workspace-pairing-protocol.md`](docs/workspace-pairing-protocol.md).
 - Portable export/restore does not contain app-private image bytes. Operators
   must protect and consistently back up both PostgreSQL and the configured media
-  blob directory; disclosing either can expose sensitive metadata or ciphertext.
+  store; disclosing either can expose sensitive metadata or ciphertext.
 - Social engineering of individual users and physical device access are
   generally out of scope unless Someday mishandles them.

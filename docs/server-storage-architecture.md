@@ -37,7 +37,7 @@ The durable state is divided deliberately:
 | Owner | Durable contents |
 | --- | --- |
 | PostgreSQL | Accounts, devices, sessions, workspace registry, pairing state, encrypted entity DAG, cursors, and media object metadata |
-| Media blob store | Immutable client-encrypted image objects only |
+| Media blob store | Immutable client-encrypted image objects and a fixed non-secret startup probe |
 | Operator secret store | Stable JWT secret and storage/database credentials |
 | Clients | Local-first workspace state and materialized images; not a complete server backup |
 
@@ -66,6 +66,7 @@ SOMEDAY_DB_URL
 SOMEDAY_DB_USER
 SOMEDAY_DB_PASSWORD
 SOMEDAY_DB_MAX_POOL_SIZE=10
+SOMEDAY_DB_TLS_MODE=private|verify-full
 SOMEDAY_MEDIA_BACKEND=filesystem|s3
 ```
 
@@ -73,10 +74,11 @@ The process uses one shared bounded database pool. The maximum accepts 1–32
 connections; operators should keep it within the external database's total
 connection budget.
 
-External PostgreSQL must expose a direct connection or a session-affine
-pooler. Transaction-mode pooling is unsupported because RLS scope uses
-session settings. Connections that cross an untrusted network must verify TLS;
-loopback and operator-controlled isolated networks are the explicit exception.
+PostgreSQL 17 must expose a direct connection. Transaction-mode pooling is
+unsupported because RLS scope uses session settings. Production requires
+`verify-full` for external databases and `private` only for loopback or an
+operator-controlled private network. `verify-full` uses Java's standard trust
+store unless the JDBC URL supplies an `sslrootcert` PEM path for a private CA.
 
 Local development may default to `filesystem`. Production must require an
 explicit `SOMEDAY_MEDIA_BACKEND` so an omitted setting never falls back to the
@@ -102,12 +104,11 @@ SOMEDAY_MEDIA_S3_ENDPOINT=<optional endpoint URL>
 SOMEDAY_MEDIA_S3_PATH_STYLE=false
 ```
 
-Use TLS whenever the object-store connection crosses an untrusted network.
-Loopback or isolated test infrastructure may use HTTP without weakening the
-public client HTTPS requirement.
+Production endpoint overrides require HTTPS. Loopback integration fixtures are
+the only HTTP exception.
 
-Credentials come from the standard AWS credential-provider chain. The current
-distribution supports conventional `AWS_ACCESS_KEY_ID`,
+Credentials come from the S3 SDK credential-provider chain. The current
+distribution supports `AWS_ACCESS_KEY_ID`,
 `AWS_SECRET_ACCESS_KEY`, and optional `AWS_SESSION_TOKEN` environment
 variables, shared configuration, and container or instance credentials.
 Web-identity role assumption is not bundled. Someday-specific copies of these
@@ -129,6 +130,12 @@ deterministic, server-private object key:
 media/v1/<user-id>/<workspace-id>/<media-id>.bin
 ```
 
+The bounded startup probe uses:
+
+```text
+media/v1/.someday-system/startup-probe-v1.bin
+```
+
 An S3-compatible service is supported only if it provides:
 
 - private single-object PUT, HEAD, and GET;
@@ -137,12 +144,10 @@ An S3-compatible service is supported only if it provides:
 - stable user metadata for the canonical ciphertext SHA-256;
 - no bucket lifecycle rule that can remove live Someday objects.
 
-AWS S3 returns `403`, rather than a distinguishable missing-object `404`, for
-HEAD/GET when the caller lacks `ListBucket`. The runtime policy therefore also
-grants `ListBucket` only when `s3:prefix` matches `media/v1/*`. The application
-does not expose or invoke a bucket-list operation; this narrowly scoped
-permission exists only to preserve fail-closed missing-versus-denied behavior.
-`DeleteObject` remains denied.
+Missing HEAD/GET must be distinguishable from permission denial. When a
+provider requires an additional bucket-level permission for that response,
+grant only the smallest permission scoped to `media/v1/*`. The runtime itself
+does not list or delete objects.
 
 Someday does not interpret ETag as a content digest. It compares the canonical
 ciphertext length and SHA-256 metadata on HEAD and re-hashes bytes read by GET.
@@ -150,8 +155,8 @@ HEAD metadata is only a fast integrity signal: after a conditional-create
 collision, the server must perform a bounded GET and hash the actual object
 before accepting it as an exact replay or adopting an orphan. Missing,
 different, or internally inconsistent metadata never permits overwrite. The
-existing 4 MiB plaintext bound makes every first-release upload a single
-request; multipart upload is unnecessary.
+existing 4 MiB encoded-original bound makes every first-release upload a
+single request; multipart upload is unnecessary.
 
 The bucket is never public. Clients continue to use authenticated Someday
 media routes, and the server remains responsible for account/workspace scope,
@@ -216,13 +221,14 @@ writable layer is never a backup strategy.
 Clients are not treated as disaster-recovery replicas. Media is materialized
 lazily and is not guaranteed to exist on every client, while the current
 portable export intentionally omits image bytes and server authority state.
+The executable checklist is in `server-backup-and-recovery.md`.
 
 ## 7. Deliberate exclusions
 
 The first release does not add:
 
 - PostgreSQL `BYTEA` media storage;
-- WebDAV, provider-specific storage adapters, or a generic plugin registry;
+- provider-specific storage adapters or a generic plugin registry;
 - S3-mounted FUSE filesystems as a substitute for the S3 backend;
 - presigned client upload/download, CDN URLs, or public buckets;
 - multipart upload, video, or general attachments;

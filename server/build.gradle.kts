@@ -1,4 +1,5 @@
 import org.gradle.api.tasks.testing.logging.TestLogEvent
+import org.gradle.jvm.application.tasks.CreateStartScripts
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
@@ -30,6 +31,59 @@ kotlin {
 
 application {
     mainClass.set("saien.someday.server.ApplicationKt")
+}
+
+val launcherClasspath = files(tasks.named("jar"), configurations.runtimeClasspath)
+
+fun registerLauncher(
+    taskName: String,
+    launcherName: String,
+    entryPoint: String,
+) = tasks.register<CreateStartScripts>(taskName) {
+    applicationName = launcherName
+    mainClass.set(entryPoint)
+    classpath = launcherClasspath
+    outputDir = layout.buildDirectory.dir("launchers/$launcherName").get().asFile
+}
+
+val bootstrapAdminStartScripts = registerLauncher(
+    taskName = "bootstrapAdminStartScripts",
+    launcherName = "bootstrap-admin",
+    entryPoint = "saien.someday.server.AdminBootstrapKt",
+)
+val verifyMediaIntegrityStartScripts = registerLauncher(
+    taskName = "verifyMediaIntegrityStartScripts",
+    launcherName = "verify-media-integrity",
+    entryPoint = "saien.someday.server.MediaIntegrityVerifierKt",
+)
+
+fun launcherFiles(
+    launcherName: String,
+    task: TaskProvider<CreateStartScripts>,
+) = objects.fileCollection()
+    .from(
+        layout.buildDirectory.file("launchers/$launcherName/$launcherName"),
+        layout.buildDirectory.file("launchers/$launcherName/$launcherName.bat"),
+    )
+    .builtBy(task)
+
+distributions {
+    named("main") {
+        contents {
+            from(launcherFiles("bootstrap-admin", bootstrapAdminStartScripts)) {
+                into("bin")
+                filePermissions {
+                    unix("rwxr-xr-x")
+                }
+            }
+            from(launcherFiles("verify-media-integrity", verifyMediaIntegrityStartScripts)) {
+                into("bin")
+                filePermissions {
+                    unix("rwxr-xr-x")
+                }
+            }
+        }
+    }
 }
 
 dependencies {

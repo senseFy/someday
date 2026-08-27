@@ -30,4 +30,22 @@ class DatabaseConnectionsTest {
         assertEquals(1, hikari.maximumPoolSize)
         assertEquals(1, hikari.minimumIdle)
     }
+
+    @Test
+    fun hikariUsesTheCertificateAndHostnameVerifyingJdbcUrl() {
+        val config = ServerConfig.fromEnvironment(
+            mapOf(
+                "SOMEDAY_DB_URL" to "jdbc:postgresql://database.example.com/someday",
+                "SOMEDAY_DB_TLS_MODE" to "verify-full",
+            ),
+        )
+
+        val hikari = hikariConfig(config)
+
+        assertEquals(
+            "jdbc:postgresql://database.example.com/someday" +
+                "?sslmode=verify-full&sslfactory=org.postgresql.ssl.DefaultJavaSSLFactory",
+            hikari.jdbcUrl,
+        )
+    }
 }

@@ -36,6 +36,7 @@ class ServerRlsIsolationIntegrationTest {
     private val administratorDatabaseUser = System.getenv("SOMEDAY_DB_ADMIN_USER") ?: databaseUser
     private val administratorDatabasePassword = System.getenv("SOMEDAY_DB_ADMIN_PASSWORD") ?: databasePassword
     private val applicationConfig = productionTestServerConfig(databaseUrl, databaseUser, databasePassword)
+    private val administratorDatabaseConnectionUrl = productionTestDatabaseConnectionUrl(administratorDatabaseUrl)
 
     @Test
     fun restrictedRoleInitializesWorkspaceAndRlsIsolatesEntityAndMediaByAccountAndWorkspace() {
@@ -422,16 +423,16 @@ class ServerRlsIsolationIntegrationTest {
 
     private fun administratorConnection(): Connection =
         DriverManager.getConnection(
-            administratorDatabaseUrl,
+            administratorDatabaseConnectionUrl,
             administratorDatabaseUser,
             administratorDatabasePassword,
         )
 
     private fun applicationConnection(): Connection =
-        DriverManager.getConnection(databaseUrl, databaseUser, databasePassword)
+        DriverManager.getConnection(applicationConfig.databaseConnectionUrl, databaseUser, databasePassword)
 
     private fun restrictedConnection(roleName: String, rolePassword: String): Connection =
-        DriverManager.getConnection(databaseUrl, roleName, rolePassword)
+        DriverManager.getConnection(applicationConfig.databaseConnectionUrl, roleName, rolePassword)
 
     private fun quoteIdentifier(value: String): String = "\"${value.replace("\"", "\"\"")}\""
 

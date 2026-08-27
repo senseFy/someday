@@ -5,6 +5,7 @@ import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
 import java.nio.file.FileAlreadyExistsException
 import java.nio.file.Files
+import java.nio.file.LinkOption
 import java.nio.file.Path
 import java.nio.file.StandardOpenOption
 import java.security.MessageDigest
@@ -66,7 +67,33 @@ class FileSystemMediaBlobStore(root: Path) : MediaBlobStore {
     ): MediaBlobPutResult {
         require(bytes.isNotEmpty())
         require(expectedSha256 == sha256(bytes))
-        val target = pathFor(key)
+        return putPathImmutable(pathFor(key), bytes, expectedSha256)
+    }
+
+    override fun head(key: MediaBlobKey): MediaBlobMetadata? = headPath(pathFor(key))
+
+    override fun read(key: MediaBlobKey, maxBytes: Int): MediaBlobValue? =
+        readPath(pathFor(key), maxBytes)
+
+    internal fun putStartupProbe(bytes: ByteArray, expectedSha256: String): MediaBlobPutResult {
+        require(bytes.isNotEmpty())
+        require(expectedSha256 == sha256(bytes))
+        return putPathImmutable(startupProbePath(), bytes, expectedSha256)
+    }
+
+    internal fun headStartupProbe(): MediaBlobMetadata? = headPath(startupProbePath())
+
+    internal fun readStartupProbe(maxBytes: Int): MediaBlobValue? = readPath(startupProbePath(), maxBytes)
+
+    internal fun isStartupProbeMissingByMetadata(): Boolean = isPathAbsent(missingStartupProbePath())
+
+    internal fun isStartupProbeMissingByRead(): Boolean = isPathAbsent(missingStartupProbePath())
+
+    private fun putPathImmutable(
+        target: Path,
+        bytes: ByteArray,
+        expectedSha256: String,
+    ): MediaBlobPutResult {
         existingResult(target, bytes.size.toLong(), expectedSha256)?.let { return it }
 
         val parent = checkNotNull(target.parent)
@@ -92,16 +119,14 @@ class FileSystemMediaBlobStore(root: Path) : MediaBlobStore {
         }
     }
 
-    override fun head(key: MediaBlobKey): MediaBlobMetadata? {
-        val path = pathFor(key)
+    private fun headPath(path: Path): MediaBlobMetadata? {
         if (!Files.isRegularFile(path)) return null
         val size = Files.size(path)
         return MediaBlobMetadata(size, Files.newInputStream(path).use(::sha256))
     }
 
-    override fun read(key: MediaBlobKey, maxBytes: Int): MediaBlobValue? {
+    private fun readPath(path: Path, maxBytes: Int): MediaBlobValue? {
         require(maxBytes > 0)
-        val path = pathFor(key)
         if (!Files.isRegularFile(path)) return null
         val size = Files.size(path)
         require(size in 1..maxBytes.toLong()) { "Stored media blob exceeds its protocol bound." }
@@ -134,6 +159,18 @@ class FileSystemMediaBlobStore(root: Path) : MediaBlobStore {
             require(path.startsWith(root)) { "Media blob path escaped its configured root." }
         }
     }
+
+    private fun startupProbePath(): Path = systemPath("startup-probe-v1.bin")
+
+    private fun missingStartupProbePath(): Path = systemPath("startup-probe-missing-v1.bin")
+
+    private fun isPathAbsent(path: Path): Boolean = Files.notExists(path, LinkOption.NOFOLLOW_LINKS)
+
+    private fun systemPath(fileName: String): Path = root
+        .resolve(".someday-system")
+        .resolve(fileName)
+        .normalize()
+        .also { path -> require(path.startsWith(root)) }
 
     private fun forceDirectory(directory: Path) {
         runCatching {

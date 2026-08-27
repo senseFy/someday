@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+TAG="${1:-}"
+IMAGE="${2:-}"
+DIGEST="${3:-}"
+
+die() {
+    printf 'server release contract error: %s\n' "$*" >&2
+    exit 1
+}
+
+[[ "$TAG" =~ ^server-v([0-9]+\.[0-9]+\.[0-9]+)$ ]] ||
+    die "tag must match server-vX.Y.Z: ${TAG:-<empty>}"
+version="${BASH_REMATCH[1]}"
+expected_image="ghcr.io/sensefy/someday-server:$version"
+[[ "$IMAGE" == "$expected_image" ]] ||
+    die "image must be $expected_image: ${IMAGE:-<empty>}"
+if [[ -n "$DIGEST" ]]; then
+    [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] ||
+        die "invalid OCI digest: $DIGEST"
+fi
+
+grep -Eq '^# syntax=docker/dockerfile:[^@[:space:]]+@sha256:[0-9a-f]{64}$' \
+    "$ROOT_DIR/Dockerfile" ||
+    die "Dockerfile frontend must be pinned by digest"
+
+for topology in standalone external; do
+    compose_file="$ROOT_DIR/deploy/$topology/compose.yaml"
+    source_file="$ROOT_DIR/deploy/$topology/compose.source.yaml"
+    env_file="$ROOT_DIR/deploy/$topology/.env.example"
+
+    [[ -f "$compose_file" ]] || die "missing $compose_file"
+    [[ -f "$source_file" ]] || die "missing $source_file"
+    [[ -f "$env_file" ]] || die "missing $env_file"
+    grep -Fq 'image: ${SOMEDAY_IMAGE:?' "$compose_file" ||
+        die "$topology release Compose must require SOMEDAY_IMAGE"
+    grep -Fq '${SOMEDAY_HTTP_BIND_ADDRESS:-127.0.0.1}' "$compose_file" ||
+        die "$topology release Compose must bind HTTP to loopback by default"
+    if grep -Eq '^[[:space:]]+build:' "$compose_file"; then
+        die "$topology release Compose must not build from source"
+    fi
+    grep -Eq '^[[:space:]]+build:' "$source_file" ||
+        die "$topology source override must define a build"
+    grep -Fq 'image: ${SOMEDAY_SOURCE_IMAGE:-someday-server:source}' "$source_file" ||
+        die "$topology source override must use a separate local image"
+    grep -Fq 'target: runtime' "$source_file" ||
+        die "$topology source override must build the runtime image"
+    grep -Fq \
+        'SOMEDAY_IMAGE=ghcr.io/sensefy/someday-server:X.Y.Z@sha256:<release-digest>' \
+        "$env_file" ||
+        die "$topology environment example must pin the release digest"
+done
+
+grep -Fq 'postgres:17-alpine@sha256:' \
+    "$ROOT_DIR/deploy/standalone/compose.yaml" ||
+    die "standalone Compose must pin PostgreSQL 17"
+if grep -Eq 'postgres:16|someday-server:(latest|main)' \
+    "$ROOT_DIR/deploy/standalone/compose.yaml" \
+    "$ROOT_DIR/deploy/external/compose.yaml"; then
+    die "release Compose contains an unsupported or floating image"
+fi
+
+grep -Fq -- "- 'v*.*.*'" "$ROOT_DIR/.github/workflows/android.yml" ||
+    die "Android releases must use client vX.Y.Z tags"
+if grep -Fq -- "- '**'" "$ROOT_DIR/.github/workflows/android.yml"; then
+    die "Android workflow still accepts server release tags"
+fi
+server_workflow="$ROOT_DIR/.github/workflows/server-release.yml"
+grep -Fq -- "- 'server-v*.*.*'" "$server_workflow" ||
+    die "server workflow must use independent server-vX.Y.Z tags"
+grep -Fq 'cancel-in-progress: false' "$server_workflow" ||
+    die "same-tag server release runs must not cancel each other"
+grep -Fq 'IMAGE_REPOSITORY: ghcr.io/sensefy/someday-server' "$server_workflow" ||
+    die "server workflow uses an unexpected image repository"
+
+printf 'server release contract passed: %s (%s%s)\n' \
+    "$TAG" "$IMAGE" "${DIGEST:+@$DIGEST}"

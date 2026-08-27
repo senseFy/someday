@@ -7,9 +7,12 @@ RUN_SUFFIX="$(date +%s)-$$"
 PROJECT_NAME="someday-container-smoke-$RUN_SUFFIX"
 IMAGE_NAME="someday-server:container-smoke-$RUN_SUFFIX"
 STANDALONE_FILE="$ROOT_DIR/deploy/standalone/compose.yaml"
+STANDALONE_SOURCE_FILE="$ROOT_DIR/deploy/standalone/compose.source.yaml"
 EXTERNAL_FILE="$ROOT_DIR/deploy/external/compose.yaml"
+EXTERNAL_SOURCE_FILE="$ROOT_DIR/deploy/external/compose.source.yaml"
 
 export SOMEDAY_IMAGE="$IMAGE_NAME"
+export SOMEDAY_SOURCE_IMAGE="$IMAGE_NAME"
 export SOMEDAY_HTTP_PORT=0
 export SOMEDAY_PUBLIC_BASE_URL=https://container-smoke.invalid
 export SOMEDAY_DB_NAME=someday
@@ -59,16 +62,27 @@ cleanup() {
     docker image rm "$IMAGE_NAME" >/dev/null 2>&1 || true
     exit "$status"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 require_command curl
 require_command docker
 docker info >/dev/null 2>&1 || die "Docker daemon is unavailable"
-docker compose version >/dev/null 2>&1 || die "Docker Compose is unavailable"
+compose_version="$(docker compose version --short 2>/dev/null)" ||
+    die "Docker Compose is unavailable"
+compose_version="${compose_version#v}"
+IFS=. read -r compose_major compose_minor _ <<<"$compose_version"
+[[ "$compose_major" =~ ^[0-9]+$ && "$compose_minor" =~ ^[0-9]+$ ]] ||
+    die "could not parse Docker Compose version: $compose_version"
+((compose_major > 2 || (compose_major == 2 && compose_minor >= 20))) ||
+    die "Docker Compose 2.20 or newer is required; found $compose_version"
 
 info "validating both Compose topologies"
 "${STANDALONE_COMPOSE[@]}" config --quiet
+"${STANDALONE_COMPOSE[@]}" --file "$STANDALONE_SOURCE_FILE" config --quiet
 external_config="$("${EXTERNAL_COMPOSE[@]}" config --format json)"
+"${EXTERNAL_COMPOSE[@]}" --file "$EXTERNAL_SOURCE_FILE" config --quiet
 external_compact="${external_config//[[:space:]]/}"
 [[ "$external_compact" == *'"read_only":true'* ]] ||
     die "external server must use a read-only root filesystem"
@@ -76,6 +90,8 @@ external_compact="${external_config//[[:space:]]/}"
     die "external server must select the S3 media backend"
 [[ "$external_compact" == *'"SOMEDAY_DB_MAX_POOL_SIZE":"4"'* ]] ||
     die "external server did not receive the configured database pool size"
+[[ "$external_compact" == *'"SOMEDAY_DB_TLS_MODE":"verify-full"'* ]] ||
+    die "external server did not enable verified database TLS"
 [[ "$external_compact" == *'"SOMEDAY_MEDIA_QUOTA_BYTES":"10485760"'* ]] ||
     die "external server did not receive the configured media quota"
 [[ "$external_compact" != *'"volumes":'* ]] ||
@@ -83,8 +99,12 @@ external_compact="${external_config//[[:space:]]/}"
 [[ "$external_compact" != *'SOMEDAY_POSTGRES_ADMIN_PASSWORD'* ]] ||
     die "external server received the standalone PostgreSQL administrator secret"
 
-info "building $IMAGE_NAME"
-docker build --progress=plain --tag "$IMAGE_NAME" "$ROOT_DIR"
+info "building $IMAGE_NAME through the source override"
+"${STANDALONE_COMPOSE[@]}" \
+    --file "$STANDALONE_SOURCE_FILE" \
+    --progress plain \
+    build \
+    server
 
 info "starting the standalone production image"
 "${STANDALONE_COMPOSE[@]}" up --detach --no-build --wait

@@ -9,6 +9,8 @@ import io.ktor.http.HttpStatusCode
 import io.ktor.http.contentType
 import io.ktor.server.testing.ApplicationTestBuilder
 import java.sql.DriverManager
+import kotlin.test.assertEquals
+import kotlin.test.assertTrue
 import kotlinx.serialization.encodeToString
 import saien.someday.server.api.AuthRequest
 import saien.someday.server.api.AuthTokensResponse
@@ -21,9 +23,8 @@ import saien.someday.server.api.SyncV2EpochCompareAndSetRequest
 import saien.someday.server.api.SyncV2EpochCompareAndSetResponse
 import saien.someday.server.api.SyncV2EpochMetadata
 import saien.someday.server.api.SyncV2ImmutablePutResponse
+import saien.someday.server.productionTestDatabaseConnectionUrl
 import saien.someday.sync.causality.v2.PreparedWorkspaceEpochCheckpointV2
-import kotlin.test.assertEquals
-import kotlin.test.assertTrue
 
 internal suspend fun ApplicationTestBuilder.publishEpoch(
     accessToken: String,
@@ -169,7 +170,11 @@ internal fun clearServerTables() {
     val databaseUser = System.getenv("SOMEDAY_DB_USER") ?: "someday"
     val databasePassword = System.getenv("SOMEDAY_DB_PASSWORD") ?: "someday"
     runCatching {
-        DriverManager.getConnection(databaseUrl, databaseUser, databasePassword).use { connection ->
+        DriverManager.getConnection(
+            productionTestDatabaseConnectionUrl(databaseUrl),
+            databaseUser,
+            databasePassword,
+        ).use { connection ->
             connection.createStatement().use { statement ->
                 statement.execute(
                     """

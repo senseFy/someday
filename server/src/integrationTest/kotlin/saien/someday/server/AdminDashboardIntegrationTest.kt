@@ -61,6 +61,7 @@ class AdminDashboardIntegrationTest {
     private val dbUrl = System.getenv("SOMEDAY_DB_URL") ?: "jdbc:postgresql://127.0.0.1:54329/someday"
     private val dbUser = System.getenv("SOMEDAY_DB_USER") ?: "someday"
     private val dbPassword = System.getenv("SOMEDAY_DB_PASSWORD") ?: "someday"
+    private val dbConnectionUrl = productionTestDatabaseConnectionUrl(dbUrl)
 
     @Before
     fun setUp() {
@@ -520,7 +521,7 @@ class AdminDashboardIntegrationTest {
 
     private fun clearServerTables() {
         runCatching {
-            DriverManager.getConnection(dbUrl, dbUser, dbPassword).use { connection ->
+            DriverManager.getConnection(dbConnectionUrl, dbUser, dbPassword).use { connection ->
                 connection.createStatement().use { statement ->
                     statement.execute(
                         """
@@ -545,7 +546,7 @@ class AdminDashboardIntegrationTest {
     }
 
     private fun promoteToAdmin(email: String) {
-        DriverManager.getConnection(dbUrl, dbUser, dbPassword).use { connection ->
+        DriverManager.getConnection(dbConnectionUrl, dbUser, dbPassword).use { connection ->
             connection.prepareStatement("UPDATE someday_users SET is_admin = TRUE WHERE email = ?").use { statement ->
                 statement.setString(1, email)
                 assertEquals(1, statement.executeUpdate())
@@ -554,7 +555,7 @@ class AdminDashboardIntegrationTest {
     }
 
     private fun disabledAt(userId: UUID): String? =
-        DriverManager.getConnection(dbUrl, dbUser, dbPassword).use { connection ->
+        DriverManager.getConnection(dbConnectionUrl, dbUser, dbPassword).use { connection ->
             connection.prepareStatement("SELECT disabled_at::TEXT FROM someday_users WHERE id = ?").use { statement ->
                 statement.setObject(1, userId)
                 statement.executeQuery().use { result ->
@@ -565,7 +566,7 @@ class AdminDashboardIntegrationTest {
         }
 
     private fun syncV2ObjectCount(): Int =
-        DriverManager.getConnection(dbUrl, dbUser, dbPassword).use { connection ->
+        DriverManager.getConnection(dbConnectionUrl, dbUser, dbPassword).use { connection ->
             connection.prepareStatement(
                 "SELECT set_config('someday.user_id', '*', false), " +
                     "set_config('someday.workspace_id', '*', false)",
@@ -579,7 +580,7 @@ class AdminDashboardIntegrationTest {
         }
 
     private fun activePasswordHashes(): List<String> =
-        DriverManager.getConnection(dbUrl, dbUser, dbPassword).use { connection ->
+        DriverManager.getConnection(dbConnectionUrl, dbUser, dbPassword).use { connection ->
             connection.createStatement().use { statement ->
                 statement.executeQuery("SELECT password_hash FROM someday_users ORDER BY email").use { result ->
                     buildList {
@@ -590,7 +591,7 @@ class AdminDashboardIntegrationTest {
         }
 
     private fun activeRefreshTokenHashes(): List<String> =
-        DriverManager.getConnection(dbUrl, dbUser, dbPassword).use { connection ->
+        DriverManager.getConnection(dbConnectionUrl, dbUser, dbPassword).use { connection ->
             connection.createStatement().use { statement ->
                 statement.executeQuery("SELECT token_hash FROM someday_refresh_tokens ORDER BY created_at").use { result ->
                     buildList {

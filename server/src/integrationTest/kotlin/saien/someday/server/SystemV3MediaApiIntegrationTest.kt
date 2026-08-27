@@ -44,6 +44,7 @@ class SystemV3MediaApiIntegrationTest {
     private val dbUrl = System.getenv("SOMEDAY_DB_URL") ?: "jdbc:postgresql://127.0.0.1:54329/someday"
     private val dbUser = System.getenv("SOMEDAY_DB_USER") ?: "someday"
     private val dbPassword = System.getenv("SOMEDAY_DB_PASSWORD") ?: "someday"
+    private val dbConnectionUrl = productionTestDatabaseConnectionUrl(dbUrl)
 
     @BeforeTest fun setUp() = clearServerTables()
     @AfterTest fun tearDown() = clearServerTables()
@@ -168,6 +169,7 @@ class SystemV3MediaApiIntegrationTest {
             put("SOMEDAY_DB_URL", dbUrl)
             put("SOMEDAY_DB_USER", dbUser)
             put("SOMEDAY_DB_PASSWORD", dbPassword)
+            put("SOMEDAY_DB_TLS_MODE", System.getenv("SOMEDAY_DB_TLS_MODE") ?: "private")
             put(
                 "SOMEDAY_MEDIA_BLOB_DIR",
                 temporaryFolder.newFolder("media-${System.nanoTime()}").absolutePath,
@@ -221,7 +223,7 @@ class SystemV3MediaApiIntegrationTest {
 
     private fun clearServerTables() {
         runCatching {
-            DriverManager.getConnection(dbUrl, dbUser, dbPassword).use { connection ->
+            DriverManager.getConnection(dbConnectionUrl, dbUser, dbPassword).use { connection ->
                 connection.createStatement().use { statement ->
                     statement.execute(
                         """

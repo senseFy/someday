@@ -70,13 +70,42 @@ class S3MediaBlobStore private constructor(
         key: MediaBlobKey,
         bytes: ByteArray,
         expectedSha256: String,
+    ): MediaBlobPutResult = putObjectKeyImmutable(objectKey(key), bytes, expectedSha256)
+
+    override fun head(key: MediaBlobKey): MediaBlobMetadata? = headObjectKey(objectKey(key))
+
+    override fun read(key: MediaBlobKey, maxBytes: Int): MediaBlobValue? =
+        readObjectKey(objectKey(key), maxBytes)
+
+    internal fun putStartupProbe(bytes: ByteArray, expectedSha256: String): MediaBlobPutResult =
+        putObjectKeyImmutable(STARTUP_PROBE_OBJECT_KEY, bytes, expectedSha256)
+
+    internal fun headStartupProbe(): MediaBlobMetadata? = headObjectKey(STARTUP_PROBE_OBJECT_KEY)
+
+    internal fun readStartupProbe(maxBytes: Int): MediaBlobValue? =
+        readObjectKey(STARTUP_PROBE_OBJECT_KEY, maxBytes)
+
+    internal fun isStartupProbeMissingByMetadata(): Boolean =
+        isObjectAbsentByHead(MISSING_STARTUP_PROBE_OBJECT_KEY)
+
+    internal fun isStartupProbeMissingByRead(): Boolean =
+        isObjectAbsentByBoundedGet(MISSING_STARTUP_PROBE_OBJECT_KEY)
+
+    override fun close() {
+        client.close()
+    }
+
+    private fun putObjectKeyImmutable(
+        objectKey: String,
+        bytes: ByteArray,
+        expectedSha256: String,
     ): MediaBlobPutResult {
         require(bytes.size in 1..config.maxObjectBytes) { "Media blob exceeds its protocol bound." }
         require(expectedSha256 == sha256(bytes)) { "Media blob digest does not match its bytes." }
 
         val request = PutObjectRequest.builder()
             .bucket(config.bucket)
-            .key(objectKey(key))
+            .key(objectKey)
             .contentLength(bytes.size.toLong())
             .contentType(BINARY_CONTENT_TYPE)
             .metadata(mapOf(SHA256_METADATA_KEY to expectedSha256))
@@ -86,10 +115,15 @@ class S3MediaBlobStore private constructor(
             client.putObject(request, RequestBody.fromBytes(bytes))
             return MediaBlobPutResult.Stored(idempotentReplay = false)
         } catch (exception: S3Exception) {
-            if (exception.statusCode() != PRECONDITION_FAILED) throw exception
+            // R2 Bucket Lock can reject an existing key before If-None-Match is
+            // evaluated. Accept only its exact error code in addition to S3's 412;
+            // the bounded GET below still verifies the retained metadata and bytes.
+            val immutableCollision = exception.statusCode() == PRECONDITION_FAILED ||
+                exception.awsErrorDetails()?.errorCode() == R2_OBJECT_LOCKED_ERROR_CODE
+            if (!immutableCollision) throw exception
         }
 
-        val existing = getBounded(key, config.maxObjectBytes)
+        val existing = getBounded(objectKey, config.maxObjectBytes)
             ?: error("S3 reported an immutable-key collision but the object was not readable.")
         return if (
             existing.bytes.size == bytes.size &&
@@ -102,18 +136,17 @@ class S3MediaBlobStore private constructor(
         }
     }
 
-    override fun head(key: MediaBlobKey): MediaBlobMetadata? {
+    private fun headObjectKey(objectKey: String): MediaBlobMetadata? {
         val response = try {
             client.headObject(
                 HeadObjectRequest.builder()
                     .bucket(config.bucket)
-                    .key(objectKey(key))
+                    .key(objectKey)
                     .build(),
             )
         } catch (exception: S3Exception) {
-            // S3 deliberately returns 403 for a missing object when the caller cannot
-            // list its prefix. The deployment policy therefore grants ListBucket only
-            // for media/v1/*; never reinterpret 403 as absence here.
+            // A compatible provider must make absence distinguishable as 404.
+            // Never reinterpret an authorization failure as a missing object.
             if (exception.statusCode() == NOT_FOUND) return null
             throw exception
         }
@@ -125,9 +158,38 @@ class S3MediaBlobStore private constructor(
         return MediaBlobMetadata(bytes, digest)
     }
 
-    override fun read(key: MediaBlobKey, maxBytes: Int): MediaBlobValue? {
+    private fun isObjectAbsentByHead(objectKey: String): Boolean = try {
+        client.headObject(
+            HeadObjectRequest.builder()
+                .bucket(config.bucket)
+                .key(objectKey)
+                .build(),
+        )
+        false
+    } catch (exception: S3Exception) {
+        if (exception.statusCode() == NOT_FOUND) true else throw exception
+    }
+
+    private fun isObjectAbsentByBoundedGet(objectKey: String): Boolean {
+        val response = try {
+            client.getObject(
+                GetObjectRequest.builder()
+                    .bucket(config.bucket)
+                    .key(objectKey)
+                    .range(MISSING_PROBE_READ_RANGE)
+                    .build(),
+            )
+        } catch (exception: S3Exception) {
+            if (exception.statusCode() == NOT_FOUND) return true
+            throw exception
+        }
+        response.use { }
+        return false
+    }
+
+    private fun readObjectKey(objectKey: String, maxBytes: Int): MediaBlobValue? {
         require(maxBytes > 0)
-        val stored = getBounded(key, min(maxBytes, config.maxObjectBytes)) ?: return null
+        val stored = getBounded(objectKey, min(maxBytes, config.maxObjectBytes)) ?: return null
         if (stored.storedSha256 != stored.actualSha256) return null
         return MediaBlobValue(
             metadata = MediaBlobMetadata(stored.bytes.size.toLong(), stored.actualSha256),
@@ -135,21 +197,16 @@ class S3MediaBlobStore private constructor(
         )
     }
 
-    override fun close() {
-        client.close()
-    }
-
-    private fun getBounded(key: MediaBlobKey, maxBytes: Int): StoredObject? {
+    private fun getBounded(objectKey: String, maxBytes: Int): StoredObject? {
         val response = try {
             client.getObject(
                 GetObjectRequest.builder()
                     .bucket(config.bucket)
-                    .key(objectKey(key))
+                    .key(objectKey)
                     .build(),
             )
         } catch (exception: S3Exception) {
-            // Keep authorization failures distinct from a proven missing object. See
-            // the matching prefix-scoped ListBucket requirement in the runtime policy.
+            // Keep authorization failures distinct from a proven missing object.
             if (exception.statusCode() == NOT_FOUND) return null
             throw exception
         }
@@ -185,8 +242,13 @@ class S3MediaBlobStore private constructor(
     private companion object {
         const val BINARY_CONTENT_TYPE = "application/octet-stream"
         const val SHA256_METADATA_KEY = "someday-ciphertext-sha256"
+        const val STARTUP_PROBE_OBJECT_KEY = "media/v1/.someday-system/startup-probe-v1.bin"
+        const val MISSING_STARTUP_PROBE_OBJECT_KEY =
+            "media/v1/.someday-system/startup-probe-missing-v1.bin"
+        const val MISSING_PROBE_READ_RANGE = "bytes=0-0"
         const val NOT_FOUND = 404
         const val PRECONDITION_FAILED = 412
+        const val R2_OBJECT_LOCKED_ERROR_CODE = "ObjectLockedByBucketPolicy"
         val CANONICAL_SHA256 = Regex("^sha256:[0-9a-f]{64}$")
 
         fun buildClient(

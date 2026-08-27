@@ -5,6 +5,7 @@ import saien.someday.server.auth.FixedWindowRateLimiter
 import saien.someday.server.auth.PasswordHasher
 import saien.someday.server.auth.TokenService
 import saien.someday.server.media.MediaBlobStore
+import saien.someday.server.media.verifyMediaBlobStoreStartup
 import saien.someday.server.persistence.AdminRepository
 import saien.someday.server.persistence.AuthRepository
 import saien.someday.server.persistence.DatabaseConnectionPool
@@ -46,6 +47,7 @@ class ServerContext(
             var databaseConnectionPool: DatabaseConnectionPool? = null
             try {
                 DatabaseMigrator.migrate(config)
+                if (mediaBlobStore == null) verifyMediaBlobStoreStartup(resolvedMediaBlobStore)
                 val activeDatabaseConnectionPool = DatabaseConnectionPool.create(config)
                 databaseConnectionPool = activeDatabaseConnectionPool
                 val startedAt = Instant.now()

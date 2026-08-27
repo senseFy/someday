@@ -1,0 +1,78 @@
+services:
+  server:
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-bootstrap:
+        condition: service_completed_successfully
+    environment:
+      JAVA_TOOL_OPTIONS: >-
+        -Djavax.net.ssl.trustStore=/run/someday-smoke/truststore.p12
+        -Djavax.net.ssl.trustStorePassword=someday-smoke-trust
+        -Djavax.net.ssl.trustStoreType=PKCS12
+    volumes:
+      - ./smoke-certs/truststore.p12:/run/someday-smoke/truststore.p12:ro
+
+  postgres:
+    image: postgres:17-alpine@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73
+    user: root
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        install -o postgres -g postgres -m 0600 /cert-source/postgres.key /var/lib/postgresql/server.key
+        install -o postgres -g postgres -m 0644 /cert-source/postgres.crt /var/lib/postgresql/server.crt
+        install -o postgres -g postgres -m 0644 /cert-source/ca.crt /var/lib/postgresql/ca.crt
+        exec docker-entrypoint.sh postgres \
+          -c ssl=on \
+          -c ssl_cert_file=/var/lib/postgresql/server.crt \
+          -c ssl_key_file=/var/lib/postgresql/server.key \
+          -c ssl_ca_file=/var/lib/postgresql/ca.crt
+    environment:
+      POSTGRES_DB: someday
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: external-smoke-admin-password
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+      SOMEDAY_DB_USER: someday
+      SOMEDAY_DB_PASSWORD: external-smoke-app-password
+    volumes:
+      - ../standalone/initdb/10-create-app-role.sh:/docker-entrypoint-initdb.d/10-create-app-role.sh:ro
+      - ./smoke-certs:/cert-source:ro
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready --host=127.0.0.1 --username=postgres --dbname=someday
+      interval: 2s
+      timeout: 3s
+      retries: 60
+
+  minio:
+    image: minio/minio@sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: someday-minio-smoke
+      MINIO_ROOT_PASSWORD: external-smoke-minio-password
+    volumes:
+      - ./smoke-certs/minio.crt:/root/.minio/certs/public.crt:ro
+      - ./smoke-certs/minio.key:/root/.minio/certs/private.key:ro
+    tmpfs:
+      - /data
+
+  minio-bootstrap:
+    image: minio/mc@sha256:aead63c77f9db9107f1696fb08ecb0faeda23729cde94b0f663edf4fe09728e3
+    depends_on:
+      - minio
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        until mc alias set --insecure smoke \
+          https://minio:9000 \
+          someday-minio-smoke \
+          external-smoke-minio-password >/dev/null 2>&1; do
+          sleep 1
+        done
+        mc --insecure mb --ignore-existing smoke/someday-media >/dev/null
+        mc --insecure version enable smoke/someday-media >/dev/null

@@ -32,6 +32,7 @@ class AuthDevicesSecurityIntegrationTest {
     private val dbUrl = System.getenv("SOMEDAY_DB_URL") ?: "jdbc:postgresql://127.0.0.1:54329/someday"
     private val dbUser = System.getenv("SOMEDAY_DB_USER") ?: "someday"
     private val dbPassword = System.getenv("SOMEDAY_DB_PASSWORD") ?: "someday"
+    private val dbConnectionUrl = productionTestDatabaseConnectionUrl(dbUrl)
 
     @Before
     fun setUp() {
@@ -423,7 +424,7 @@ class AuthDevicesSecurityIntegrationTest {
 
     private fun clearServerTables() {
         runCatching {
-            DriverManager.getConnection(dbUrl, dbUser, dbPassword).use { connection ->
+            DriverManager.getConnection(dbConnectionUrl, dbUser, dbPassword).use { connection ->
                 connection.createStatement().use { statement ->
                     statement.execute(
                         """
@@ -441,7 +442,7 @@ class AuthDevicesSecurityIntegrationTest {
     }
 
     private fun passwordHashFor(email: String): String? =
-        DriverManager.getConnection(dbUrl, dbUser, dbPassword).use { connection ->
+        DriverManager.getConnection(dbConnectionUrl, dbUser, dbPassword).use { connection ->
             connection.prepareStatement("SELECT password_hash FROM someday_users WHERE email = ?").use { statement ->
                 statement.setString(1, email)
                 statement.executeQuery().use { result ->
@@ -451,7 +452,7 @@ class AuthDevicesSecurityIntegrationTest {
         }
 
     private fun userCountFor(email: String): Int =
-        DriverManager.getConnection(dbUrl, dbUser, dbPassword).use { connection ->
+        DriverManager.getConnection(dbConnectionUrl, dbUser, dbPassword).use { connection ->
             connection.prepareStatement("SELECT COUNT(*) FROM someday_users WHERE email = ?").use { statement ->
                 statement.setString(1, email)
                 statement.executeQuery().use { result ->
@@ -462,7 +463,7 @@ class AuthDevicesSecurityIntegrationTest {
         }
 
     private fun activeRefreshTokenHashes(): List<String> =
-        DriverManager.getConnection(dbUrl, dbUser, dbPassword).use { connection ->
+        DriverManager.getConnection(dbConnectionUrl, dbUser, dbPassword).use { connection ->
             connection.createStatement().use { statement ->
                 statement.executeQuery(
                     """

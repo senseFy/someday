@@ -1,0 +1,7 @@
+services:
+  server:
+    image: ${SOMEDAY_SOURCE_IMAGE:-someday-server:source}
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: runtime

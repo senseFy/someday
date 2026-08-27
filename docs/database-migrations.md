@@ -59,6 +59,11 @@ SQLDelight migrations should be deterministic version-to-version transitions. Do
 
 Server schema is owned by Flyway files under `server/src/main/resources/db/migration`.
 
+The first server release supports PostgreSQL 17. Both the normal server and
+`bootstrap-admin` validate the same immutable migration set, reject an unknown
+future migration, and check the exact Someday RLS table/policy catalog before
+serving or mutating data.
+
 This pre-release branch rewrites unpublished sync migration history around the
 System V3 server schema. Existing development server databases carrying the
 earlier history must be recreated before running this branch. After the first
@@ -91,6 +96,11 @@ When changing server tables, columns, indexes, or constraints:
 2. Do not edit already-applied migrations in a deployed environment; add a new migration instead.
 3. Keep migrations deterministic. Avoid `IF EXISTS` and `IF NOT EXISTS` in versioned DDL.
 4. Run `./gradlew :server:test` and the relevant integration checks.
+
+Keep tenant-row DML and any RLS wildcard it requires inside the same
+transactional migration. A non-transactional migration must not modify tenant
+rows. Verify its result with the non-empty previous-release upgrade gate; a
+partial SQL parser is not an acceptance test.
 
 Flyway is the only server schema evolution path. Application startup and request handling should not patch database shape.
 

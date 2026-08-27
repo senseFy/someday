@@ -5,10 +5,17 @@ import java.nio.file.Path
 import java.security.SecureRandom
 import java.time.Duration
 import java.util.Base64
+import java.util.Properties
+import org.postgresql.Driver
 
 enum class ServerDeploymentMode {
     LOCAL,
     PRODUCTION,
+}
+
+enum class DatabaseTlsMode {
+    PRIVATE,
+    VERIFY_FULL,
 }
 
 const val DEFAULT_DATABASE_MAX_POOL_SIZE: Int = 10
@@ -42,6 +49,7 @@ data class ServerConfig(
     val databaseUrl: String,
     val databaseUser: String,
     val databasePassword: String,
+    val databaseTlsMode: DatabaseTlsMode,
     val databaseMaxPoolSize: Int,
     val mediaStorage: ServerMediaStorage,
     val mediaQuotaBytes: Long,
@@ -64,12 +72,17 @@ data class ServerConfig(
     val publicOrigin: String
         get() = normalizedOrigin(publicBaseUrl)
 
+    /** JDBC URL after applying the declared database network security mode. */
+    val databaseConnectionUrl: String
+        get() = databaseUrl.withDatabaseTlsMode(databaseTlsMode)
+
     init {
         require(bindHost.isNotBlank()) { "SOMEDAY_HOST must not be blank." }
         require(port in 1..65535) { "SOMEDAY_PORT must be between 1 and 65535." }
         require(databaseUrl.isNotBlank()) { "SOMEDAY_DB_URL must not be blank." }
         require(databaseUser.isNotBlank()) { "SOMEDAY_DB_USER must not be blank." }
         require(databasePassword.isNotBlank()) { "SOMEDAY_DB_PASSWORD must not be blank." }
+        databaseConnectionUrl
         require(databaseMaxPoolSize in 1..MAX_DATABASE_MAX_POOL_SIZE) {
             "SOMEDAY_DB_MAX_POOL_SIZE must be between 1 and $MAX_DATABASE_MAX_POOL_SIZE."
         }
@@ -105,6 +118,13 @@ data class ServerConfig(
             }
             require(mediaStorage !is ServerMediaStorage.FileSystem || mediaStorage.directory.isAbsolute) {
                 "SOMEDAY_MEDIA_BLOB_DIR must be an absolute path for filesystem storage in production mode."
+            }
+            require(
+                mediaStorage !is ServerMediaStorage.S3 ||
+                    mediaStorage.endpoint == null ||
+                    mediaStorage.endpoint.scheme.equals("https", ignoreCase = true),
+            ) {
+                "SOMEDAY_MEDIA_S3_ENDPOINT must use HTTPS in production mode."
             }
         }
     }
@@ -152,6 +172,7 @@ data class ServerConfig(
                     production = production,
                     localDefault = "someday",
                 ),
+                databaseTlsMode = environment.databaseTlsMode(production),
                 databaseMaxPoolSize = environment.intValue(
                     "SOMEDAY_DB_MAX_POOL_SIZE",
                     DEFAULT_DATABASE_MAX_POOL_SIZE,
@@ -199,6 +220,24 @@ data class ServerConfig(
         }
     }
 }
+
+private fun Map<String, String>.databaseTlsMode(production: Boolean): DatabaseTlsMode =
+    nonBlank("SOMEDAY_DB_TLS_MODE")
+        ?.lowercase()
+        ?.let { value ->
+            when (value) {
+                "private" -> DatabaseTlsMode.PRIVATE
+                "verify-full" -> DatabaseTlsMode.VERIFY_FULL
+                else -> error("SOMEDAY_DB_TLS_MODE must be private or verify-full.")
+            }
+        }
+        ?: if (containsKey("SOMEDAY_DB_TLS_MODE")) {
+            error("SOMEDAY_DB_TLS_MODE must not be blank.")
+        } else if (production) {
+            error("SOMEDAY_DB_TLS_MODE is required in production mode.")
+        } else {
+            DatabaseTlsMode.PRIVATE
+        }
 
 private fun Map<String, String>.nonBlank(name: String): String? =
     get(name)?.trim()?.takeIf { it.isNotEmpty() }
@@ -261,6 +300,38 @@ private fun validatedS3Endpoint(value: String): URI {
     }
     return uri
 }
+
+private fun String.withDatabaseTlsMode(mode: DatabaseTlsMode): String {
+    val properties = Driver.parseURL(this, Properties())
+        ?: error("SOMEDAY_DB_URL must be a valid PostgreSQL JDBC URL.")
+    if (mode != DatabaseTlsMode.VERIFY_FULL) return this
+
+    require(properties.getProperty("ssl") == null) {
+        "SOMEDAY_DB_URL must not combine ssl with SOMEDAY_DB_TLS_MODE=verify-full; use sslmode=verify-full."
+    }
+    require(properties.getProperty("sslfactory") == null && properties.getProperty("sslhostnameverifier") == null) {
+        "SOMEDAY_DB_URL must not override PostgreSQL certificate or hostname verification."
+    }
+    properties.getProperty("sslmode")?.let { sslMode ->
+        require(sslMode.equals("verify-full", ignoreCase = true)) {
+            "SOMEDAY_DB_URL sslmode conflicts with SOMEDAY_DB_TLS_MODE=verify-full."
+        }
+    }
+    val rootCertificate = properties.getProperty("sslrootcert")
+    require(rootCertificate == null || rootCertificate.isNotBlank()) {
+        "SOMEDAY_DB_URL sslrootcert must not be blank."
+    }
+
+    val enforcedParameters = buildList {
+        if (properties.getProperty("sslmode") == null) add("sslmode=verify-full")
+        if (rootCertificate == null) add("sslfactory=$DEFAULT_JAVA_SSL_FACTORY")
+    }
+    if (enforcedParameters.isEmpty()) return this
+    val separator = if ('?' in this) '&' else '?'
+    return "$this$separator${enforcedParameters.joinToString("&")}"
+}
+
+private const val DEFAULT_JAVA_SSL_FACTORY = "org.postgresql.ssl.DefaultJavaSSLFactory"
 
 private fun Map<String, String>.booleanValue(name: String, default: Boolean): Boolean =
     nonBlank(name)?.toBooleanStrictOrNull()

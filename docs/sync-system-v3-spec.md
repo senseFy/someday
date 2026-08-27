@@ -9,9 +9,6 @@ account and workspace scope:
 - an encrypted entity DAG for notes, notebooks, and synchronized preferences;
 - one immutable encrypted media object for each supported image.
 
-WebDAV, provider switching, provider migration, and remote fallbacks are not
-part of the product.
-
 ## 1. Architecture boundary
 
 The client owns all semantic state and cryptography. The server authenticates
@@ -221,6 +218,7 @@ may contain harmless orphans. Every restored PostgreSQL media record must
 resolve to an object with the exact expected key, length, and actual-byte
 digest; operators either quiesce writes for capture or run the operator
 integrity validator afterward. The stable JWT secret is backed up separately.
+The operational procedure is defined in `server-backup-and-recovery.md`.
 
 The initial server does not garbage-collect published media. Local previews
 are disposable caches; original bytes are retained unless a separately proven

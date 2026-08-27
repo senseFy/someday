@@ -2,11 +2,7 @@ name: someday-standalone
 
 services:
   server:
-    image: ${SOMEDAY_IMAGE:-someday-server:local}
-    build:
-      context: ../..
-      dockerfile: Dockerfile
-      target: runtime
+    image: ${SOMEDAY_IMAGE:?Set SOMEDAY_IMAGE to an exact server release}
     restart: unless-stopped
     init: true
     depends_on:
@@ -22,6 +18,7 @@ services:
       SOMEDAY_DB_USER: ${SOMEDAY_DB_USER:-someday}
       SOMEDAY_DB_PASSWORD: ${SOMEDAY_DB_PASSWORD:?Set SOMEDAY_DB_PASSWORD in .env}
       SOMEDAY_DB_MAX_POOL_SIZE: ${SOMEDAY_DB_MAX_POOL_SIZE:-10}
+      SOMEDAY_DB_TLS_MODE: private
       SOMEDAY_JWT_SECRET: ${SOMEDAY_JWT_SECRET:?Set SOMEDAY_JWT_SECRET in .env}
       SOMEDAY_MEDIA_BACKEND: filesystem
       SOMEDAY_MEDIA_BLOB_DIR: /var/lib/someday/media
@@ -29,7 +26,7 @@ services:
       SOMEDAY_REGISTRATION_ENABLED: ${SOMEDAY_REGISTRATION_ENABLED:-false}
       SOMEDAY_TRUST_PROXY_HEADERS: ${SOMEDAY_TRUST_PROXY_HEADERS:-false}
     ports:
-      - 127.0.0.1:${SOMEDAY_HTTP_PORT:-3180}:3180
+      - ${SOMEDAY_HTTP_BIND_ADDRESS:-127.0.0.1}:${SOMEDAY_HTTP_PORT:-3180}:3180
     volumes:
       - media-data:/var/lib/someday/media
     read_only: true
@@ -48,7 +45,7 @@ services:
         max-file: "3"
 
   postgres:
-    image: postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
+    image: postgres:17-alpine@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73
     restart: unless-stopped
     environment:
       POSTGRES_DB: ${SOMEDAY_DB_NAME:-someday}

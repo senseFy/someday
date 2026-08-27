@@ -21,9 +21,11 @@ class DatabaseConnectionPool private constructor(
         try {
             // RLS scopes are PostgreSQL session settings and are not reset by JDBC's
             // standard connection-state cleanup. Clear them on every pool checkout.
-            connection.createStatement().use { statement ->
-                statement.execute("RESET someday.user_id")
-                statement.execute("RESET someday.workspace_id")
+            connection.prepareStatement(
+                "SELECT set_config('someday.user_id', '', false), " +
+                    "set_config('someday.workspace_id', '', false)",
+            ).use { statement ->
+                statement.executeQuery().close()
             }
             return connection
         } catch (failure: Throwable) {
@@ -51,12 +53,12 @@ class DatabaseConnectionPool private constructor(
 /** Backwards-compatible unpooled provider for focused repository construction in tests. */
 internal fun directDatabaseConnectionProvider(config: ServerConfig): DatabaseConnectionProvider =
     DatabaseConnectionProvider {
-        DriverManager.getConnection(config.databaseUrl, config.databaseUser, config.databasePassword)
+        DriverManager.getConnection(config.databaseConnectionUrl, config.databaseUser, config.databasePassword)
     }
 
 internal fun hikariConfig(config: ServerConfig): HikariConfig =
     HikariConfig().apply {
-        jdbcUrl = config.databaseUrl
+        jdbcUrl = config.databaseConnectionUrl
         username = config.databaseUser
         password = config.databasePassword
         poolName = "someday-postgres"

@@ -1,6 +1,6 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 
-FROM eclipse-temurin:21-jdk-jammy@sha256:ce5767b7222312d42395f5bab033cd91f09e44032a2f21bdfd7b5b912dbe1e77 AS build
+FROM --platform=$BUILDPLATFORM eclipse-temurin:21-jdk-jammy@sha256:ce5767b7222312d42395f5bab033cd91f09e44032a2f21bdfd7b5b912dbe1e77 AS build
 
 WORKDIR /workspace
 
@@ -49,19 +49,9 @@ COPY --chmod=0555 docker/entrypoint.sh /opt/someday/bin/docker-entrypoint
 COPY --chmod=0555 docker/healthcheck.sh /opt/someday/bin/docker-healthcheck
 COPY LICENSE /usr/share/licenses/someday/LICENSE
 
-RUN cp /opt/someday/bin/server /opt/someday/bin/bootstrap-admin \
-    && sed -i \
-        's/saien\.someday\.server\.ApplicationKt/saien.someday.server.AdminBootstrapKt/' \
-        /opt/someday/bin/bootstrap-admin \
-    && chmod 0555 /opt/someday/bin/bootstrap-admin \
-    && cp /opt/someday/bin/server /opt/someday/bin/verify-media-integrity \
-    && sed -i \
-        's/saien\.someday\.server\.ApplicationKt/saien.someday.server.MediaIntegrityVerifierKt/' \
-        /opt/someday/bin/verify-media-integrity \
-    && chmod 0555 /opt/someday/bin/verify-media-integrity
-
 ENV HOME=/home/someday \
     JAVA_OPTS="-XX:MaxRAMPercentage=75.0 -Djava.io.tmpdir=/tmp" \
+    SOMEDAY_DEPLOYMENT_MODE=production \
     SOMEDAY_HOST=0.0.0.0 \
     SOMEDAY_PORT=3180
 

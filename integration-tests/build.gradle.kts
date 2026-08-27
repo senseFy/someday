@@ -44,5 +44,17 @@ tasks.register<Test>("realRemoteTest") {
     testClassesDirs = testSourceSet.output.classesDirs
     classpath = testSourceSet.runtimeClasspath
     include("**/*JourneyTest.class")
+    exclude("**/ServerRecoveryJourneyTest.class")
     shouldRunAfter(tasks.test)
+}
+
+tasks.register<Test>("serverRecoveryTest") {
+    description = "Runs the paired-client journey across an orchestrated isolated server restore."
+    group = "verification"
+    val testSourceSet = sourceSets.test.get()
+    testClassesDirs = testSourceSet.output.classesDirs
+    classpath = testSourceSet.runtimeClasspath
+    include("**/ServerRecoveryJourneyTest.class")
+    outputs.upToDateWhen { false }
+    shouldRunAfter(tasks.named("realRemoteTest"))
 }

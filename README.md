@@ -356,7 +356,8 @@ make sync-v3-apple-gate
 Compose boundary, and operator subcommands without duplicating sync journeys.
 `make sync-v3-gate` provisions isolated PostgreSQL, S3-compatible storage, and
 Ktor endpoints for the System V3 contract, then runs the no-skip real
-self-hosted journeys.
+self-hosted journeys, an isolated PostgreSQL-plus-media restore, and the
+production container smoke.
 `make sync-v3-apple-gate` runs shared behavior and app-shell evidence on the
 iOS simulator; it does not claim a platform-native HTTP transport journey.
 `make real-remote-test` and

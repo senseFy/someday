@@ -172,7 +172,7 @@ internal class PostgresContractFixture(
     }
 
     private fun connection(): Connection =
-        DriverManager.getConnection(databaseUrl, databaseUser, databasePassword)
+        DriverManager.getConnection(config.databaseConnectionUrl, databaseUser, databasePassword)
 
     private fun selectWildcardScope(connection: Connection) {
         setConfig(connection, "someday.user_id", "*")

@@ -61,6 +61,41 @@ class S3MediaBlobStoreTest {
     }
 
     @Test
+    fun verifiesR2BucketLockConflictAgainstTheRetainedObject() = withServer { server ->
+        server.existingPutStatus = 409
+        server.existingPutErrorCode = "ObjectLockedByBucketPolicy"
+        createStore(server).use { store ->
+            val first = ByteArray(97) { it.toByte() }
+            val second = ByteArray(first.size) { 42 }
+
+            assertEquals(MediaBlobPutResult.Stored(false), store.putImmutable(KEY, first, sha256(first)))
+            assertEquals(MediaBlobPutResult.Stored(true), store.putImmutable(KEY, first, sha256(first)))
+            assertEquals(MediaBlobPutResult.ImmutableMismatch, store.putImmutable(KEY, second, sha256(second)))
+
+            assertEquals(listOf("PUT", "PUT", "GET", "PUT", "GET"), server.calls.map(CapturedCall::method))
+            assertContentEquals(first, server.objectAt(EXPECTED_PATH)?.bytes)
+        }
+    }
+
+    @Test
+    fun propagatesUnrelatedConflictInsteadOfTreatingItAsAnImmutableCollision() = withServer { server ->
+        createStore(server).use { store ->
+            val bytes = ByteArray(97) { it.toByte() }
+            store.putImmutable(KEY, bytes, sha256(bytes))
+            server.existingPutStatus = 409
+            server.existingPutErrorCode = "BucketConflict"
+
+            val failure = assertFailsWith<S3Exception> {
+                store.putImmutable(KEY, bytes, sha256(bytes))
+            }
+
+            assertEquals(409, failure.statusCode())
+            assertEquals("BucketConflict", failure.awsErrorDetails()?.errorCode())
+            assertEquals(listOf("PUT", "PUT"), server.calls.map(CapturedCall::method))
+        }
+    }
+
+    @Test
     fun neverTrustsMetadataOrEtagWhenAnExistingObjectsBytesDiverge() = withServer { server ->
         createStore(server).use { store ->
             val expected = ByteArray(64) { 1 }
@@ -148,6 +183,75 @@ class S3MediaBlobStoreTest {
     }
 
     @Test
+    fun startupProbeUsesOneRetainedSystemKeyAndVerifiesImmutableReplay() = withServer { server ->
+        createStore(server).use { store ->
+            verifyMediaBlobStoreStartup(store)
+            verifyMediaBlobStoreStartup(store)
+
+            assertTrue(server.calls.isNotEmpty())
+            assertEquals(
+                setOf(STARTUP_PROBE_PATH, MISSING_STARTUP_PROBE_PATH),
+                server.calls.map(CapturedCall::path).toSet(),
+            )
+            assertTrue(server.objectAt(STARTUP_PROBE_PATH) != null)
+            assertNull(server.objectAt(MISSING_STARTUP_PROBE_PATH))
+            assertTrue(server.calls.any { it.method == "HEAD" })
+            assertTrue(server.calls.any { it.method == "GET" })
+            val missingGets = server.calls.filter {
+                it.method == "GET" && it.path == MISSING_STARTUP_PROBE_PATH
+            }
+            assertTrue(
+                missingGets.isNotEmpty() && missingGets.all { it.headers["range"] == "bytes=0-0" },
+            )
+            assertTrue(server.calls.count { it.method == "PUT" } >= 6)
+        }
+    }
+
+    @Test
+    fun startupProbeFailsWhenMissingHeadAccessCannotProveAbsence() = withServer { server ->
+        createStore(server).use { store ->
+            verifyMediaBlobStoreStartup(store)
+            assertTrue(server.objectAt(STARTUP_PROBE_PATH) != null)
+
+            server.denyMissingHead = true
+            val failure = assertFailsWith<S3Exception> { verifyMediaBlobStoreStartup(store) }
+
+            assertEquals(403, failure.statusCode())
+            assertTrue(server.objectAt(STARTUP_PROBE_PATH) != null)
+        }
+    }
+
+    @Test
+    fun startupProbeFailsWhenMissingGetAccessCannotProveAbsence() = withServer { server ->
+        createStore(server).use { store ->
+            verifyMediaBlobStoreStartup(store)
+
+            server.denyMissingGet = true
+            val failure = assertFailsWith<S3Exception> { verifyMediaBlobStoreStartup(store) }
+
+            assertEquals(403, failure.statusCode())
+            assertTrue(
+                server.calls.any { call ->
+                    call.method == "GET" && call.path == MISSING_STARTUP_PROBE_PATH
+                },
+            )
+        }
+    }
+
+    @Test
+    fun startupProbeRejectsAnOccupiedMissingKeyWithMalformedMetadata() = withServer { server ->
+        createStore(server).use { store ->
+            verifyMediaBlobStoreStartup(store)
+            server.seedObject(
+                MISSING_STARTUP_PROBE_PATH,
+                FakeStoredObject("occupied".encodeToByteArray(), "malformed-digest"),
+            )
+
+            assertFailsWith<IllegalStateException> { verifyMediaBlobStoreStartup(store) }
+        }
+    }
+
+    @Test
     fun validatesFailClosedClientConfiguration() {
         val base = S3MediaBlobStoreConfig(
             bucket = BUCKET,
@@ -196,6 +300,9 @@ class S3MediaBlobStoreTest {
             mediaId = "0123456789abcdef".repeat(4),
         )
         val EXPECTED_PATH = "/$BUCKET/media/v1/${KEY.userId}/$WORKSPACE/${KEY.mediaId}.bin"
+        val STARTUP_PROBE_PATH = "/$BUCKET/media/v1/.someday-system/startup-probe-v1.bin"
+        val MISSING_STARTUP_PROBE_PATH =
+            "/$BUCKET/media/v1/.someday-system/startup-probe-missing-v1.bin"
     }
 }
 
@@ -229,9 +336,25 @@ private class FakeS3Server : AutoCloseable {
     var putDelay: Duration = Duration.ZERO
 
     @Volatile
+    var existingPutStatus: Int = 412
+
+    @Volatile
+    var existingPutErrorCode: String = "PreconditionFailed"
+
+    @Volatile
     var denyObjectReads: Boolean = false
 
+    @Volatile
+    var denyMissingHead: Boolean = false
+
+    @Volatile
+    var denyMissingGet: Boolean = false
+
     fun objectAt(path: String): FakeStoredObject? = objects[path]
+
+    fun seedObject(path: String, stored: FakeStoredObject) {
+        check(objects.putIfAbsent(path, stored) == null)
+    }
 
     fun replaceObjectBytes(path: String, bytes: ByteArray) {
         objects.compute(path) { _, previous ->
@@ -291,7 +414,11 @@ private class FakeS3Server : AutoCloseable {
         )
         val existing = objects.putIfAbsent(call.path, candidate)
         if (existing != null) {
-            errorResponse(exchange, 412, "PreconditionFailed")
+            errorResponse(
+                exchange,
+                existingPutStatus,
+                existingPutErrorCode,
+            )
             return
         }
         exchange.responseHeaders.add("ETag", "\"not-a-content-digest\"")
@@ -307,7 +434,7 @@ private class FakeS3Server : AutoCloseable {
         }
         val stored = objects[path]
         if (stored == null) {
-            exchange.sendResponseHeaders(404, -1)
+            exchange.sendResponseHeaders(if (denyMissingHead) 403 else 404, -1)
             exchange.close()
             return
         }
@@ -327,7 +454,11 @@ private class FakeS3Server : AutoCloseable {
         }
         val stored = objects[path]
         if (stored == null) {
-            errorResponse(exchange, 404, "NoSuchKey")
+            if (denyMissingGet) {
+                errorResponse(exchange, 403, "AccessDenied")
+            } else {
+                errorResponse(exchange, 404, "NoSuchKey")
+            }
             return
         }
         stored.sha256Metadata?.let {

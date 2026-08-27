@@ -89,12 +89,11 @@ The S3 adapter uses the same identity beneath a fixed `media/v1/`
 prefix. It requires private PUT/HEAD/GET, strong read-after-write behavior, and
 conditional create equivalent to `If-None-Match: *`. The server does not use
 public object URLs, expose storage credentials, rely on ETag as SHA-256, invoke
-bucket listing, or require multipart upload. AWS deployments grant
-prefix-scoped `ListBucket` only so missing HEAD/GET responses remain
-distinguishable from permission denial. After conditional create reports an
-existing object, a bounded GET and SHA-256 of its actual bytes are required
-before it can be accepted as an exact replay; object metadata alone is not
-authoritative.
+bucket listing, or require multipart upload. The provider must keep missing
+HEAD/GET responses distinguishable from permission denial. After conditional
+create reports an existing object, a bounded GET and SHA-256 of its actual
+bytes are required before it can be accepted as an exact replay; object
+metadata alone is not authoritative.
 
 Blob publication precedes the PostgreSQL metadata commit. A transaction
 failure may leave an invisible immutable orphan; an exact retry reuses that
@@ -137,4 +136,4 @@ directory backups. The recommended external topology uses PostgreSQL recovery
 points plus bucket versioning/retention. A valid recovery set must contain an
 exact key, length, and actual-byte SHA-256 match for every PostgreSQL media
 record; extra unreferenced objects are harmless. See
-`server-storage-architecture.md`.
+`server-backup-and-recovery.md`.

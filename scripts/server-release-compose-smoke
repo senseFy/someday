@@ -1,0 +1,341 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+EXTERNAL_SMOKE_FILE="$ROOT_DIR/scripts/fixtures/server-release-external-compose.yaml"
+
+IMAGE=""
+PLATFORM="linux/amd64"
+TOPOLOGY="all"
+PULL_IMAGE=true
+PUBLISHED_HOST="${SOMEDAY_DOCKER_PUBLISHED_HOST:-127.0.0.1}"
+PUBLISHED_BIND_ADDRESS="${SOMEDAY_DOCKER_PUBLISHED_BIND_ADDRESS:-127.0.0.1}"
+PUBLISHED_PORT="${SOMEDAY_DOCKER_PUBLISHED_PORT:-0}"
+HEALTH_PORT="${SOMEDAY_DOCKER_HEALTH_PORT:-}"
+
+usage() {
+    printf '%s\n' \
+        'Usage: server-release-compose-smoke --image IMAGE [options]' \
+        '' \
+        'Options:' \
+        '  --platform linux/amd64|linux/arm64' \
+        '  --topology standalone|external|all' \
+        '  --skip-pull  Use an image already present in the local daemon'
+}
+
+die() {
+    printf 'server release Compose smoke error: %s\n' "$*" >&2
+    exit 1
+}
+
+info() {
+    printf '[server release Compose smoke] %s\n' "$*" >&2
+}
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+while (($# > 0)); do
+    case "$1" in
+        --image)
+            [[ $# -ge 2 ]] || die '--image requires a value'
+            IMAGE="$2"
+            shift 2
+            ;;
+        --platform)
+            [[ $# -ge 2 ]] || die '--platform requires a value'
+            PLATFORM="$2"
+            shift 2
+            ;;
+        --topology)
+            [[ $# -ge 2 ]] || die '--topology requires a value'
+            TOPOLOGY="$2"
+            shift 2
+            ;;
+        --skip-pull)
+            PULL_IMAGE=false
+            shift
+            ;;
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        *)
+            die "unknown argument: $1"
+            ;;
+    esac
+done
+
+[[ -n "$IMAGE" ]] || die '--image is required'
+[[ "$PLATFORM" == linux/amd64 || "$PLATFORM" == linux/arm64 ]] ||
+    die "unsupported platform: $PLATFORM"
+[[ "$TOPOLOGY" == standalone || "$TOPOLOGY" == external || "$TOPOLOGY" == all ]] ||
+    die "unsupported topology: $TOPOLOGY"
+
+require_command curl
+require_command docker
+docker info >/dev/null 2>&1 || die 'Docker daemon is unavailable'
+compose_version="$(docker compose version --short 2>/dev/null)" ||
+    die 'Docker Compose is unavailable'
+compose_version="${compose_version#v}"
+IFS=. read -r compose_major compose_minor _ <<<"$compose_version"
+[[ "$compose_major" =~ ^[0-9]+$ && "$compose_minor" =~ ^[0-9]+$ ]] ||
+    die "could not parse Docker Compose version: $compose_version"
+((compose_major > 2 || (compose_major == 2 && compose_minor >= 20))) ||
+    die "Docker Compose 2.20 or newer is required; found $compose_version"
+
+run_suffix="$(date +%s)-$$"
+run_parent="${TMPDIR:-/tmp}"
+run_parent="${run_parent%/}"
+RUN_DIR="$(mktemp -d "$run_parent/someday-release-compose-smoke.XXXXXX")"
+DEPLOY_DIR="$RUN_DIR/deploy"
+STANDALONE_PROJECT="someday-release-standalone-$run_suffix"
+EXTERNAL_PROJECT="someday-release-external-$run_suffix"
+STANDALONE_DIR="$DEPLOY_DIR/standalone"
+EXTERNAL_DIR="$DEPLOY_DIR/external"
+export DOCKER_DEFAULT_PLATFORM="$PLATFORM"
+
+cp -R "$ROOT_DIR/deploy" "$DEPLOY_DIR"
+
+standalone_compose() {
+    docker compose \
+        --project-name "$STANDALONE_PROJECT" \
+        --env-file "$STANDALONE_DIR/.env" \
+        --file "$STANDALONE_DIR/compose.yaml" \
+        "$@"
+}
+
+external_compose() {
+    docker compose \
+        --project-name "$EXTERNAL_PROJECT" \
+        --env-file "$EXTERNAL_DIR/.env" \
+        --file "$EXTERNAL_DIR/compose.yaml" \
+        --file "$EXTERNAL_DIR/compose.smoke.yaml" \
+        "$@"
+}
+
+cleanup() {
+    local status=$?
+    trap - EXIT INT TERM
+    if ((status != 0)); then
+        if [[ -f "$STANDALONE_DIR/.env" ]]; then
+            standalone_compose logs --no-color --tail 200 >&2 || true
+        fi
+        if [[ -f "$EXTERNAL_DIR/compose.smoke.yaml" ]]; then
+            external_compose logs --no-color --tail 200 >&2 || true
+        fi
+    fi
+    if [[ -f "$STANDALONE_DIR/.env" ]]; then
+        standalone_compose down --volumes --remove-orphans >/dev/null 2>&1 || true
+    fi
+    if [[ -f "$EXTERNAL_DIR/compose.smoke.yaml" ]]; then
+        external_compose down --volumes --remove-orphans >/dev/null 2>&1 || true
+    fi
+    case "$RUN_DIR" in
+        "$run_parent"/someday-release-compose-smoke.*)
+            rm -rf "$RUN_DIR"
+            ;;
+        *)
+            printf 'refusing to remove unexpected smoke directory: %s\n' "$RUN_DIR" >&2
+            ;;
+    esac
+    exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+wait_for_server() {
+    local label="$1"
+    local port="$2"
+    local target_port="${HEALTH_PORT:-$port}"
+    local attempt
+    for attempt in $(seq 1 240); do
+        if curl --fail --silent --show-error --noproxy '*' \
+            "http://$PUBLISHED_HOST:$target_port/health" 2>/dev/null |
+            grep --fixed-strings '"status":"ok"' >/dev/null; then
+            return 0
+        fi
+        sleep 1
+    done
+    die "$label did not become healthy within 240 seconds"
+}
+
+assert_server_platform() {
+    local compose_name="$1"
+    local container_id="$2"
+    local image_id actual_arch expected_arch
+    image_id="$(docker inspect --format '{{.Image}}' "$container_id")"
+    actual_arch="$(docker image inspect --format '{{.Architecture}}' "$image_id")"
+    expected_arch="${PLATFORM#linux/}"
+    [[ "$actual_arch" == "$expected_arch" ]] ||
+        die "$compose_name started $actual_arch instead of $expected_arch"
+}
+
+write_standalone_environment() {
+    printf '%s\n' \
+        "SOMEDAY_IMAGE=$IMAGE" \
+        "SOMEDAY_HTTP_BIND_ADDRESS=$PUBLISHED_BIND_ADDRESS" \
+        'SOMEDAY_PUBLIC_BASE_URL=https://standalone-smoke.invalid' \
+        "SOMEDAY_HTTP_PORT=$PUBLISHED_PORT" \
+        'SOMEDAY_DB_NAME=someday' \
+        'SOMEDAY_DB_USER=someday' \
+        'SOMEDAY_DB_PASSWORD=standalone-smoke-app-password' \
+        'SOMEDAY_POSTGRES_ADMIN_PASSWORD=standalone-smoke-admin-password' \
+        'SOMEDAY_DB_MAX_POOL_SIZE=4' \
+        'SOMEDAY_MEDIA_QUOTA_BYTES=10485760' \
+        'SOMEDAY_JWT_SECRET=0123456789abcdef0123456789abcdef' \
+        'SOMEDAY_REGISTRATION_ENABLED=false' \
+        'SOMEDAY_TRUST_PROXY_HEADERS=false' >"$STANDALONE_DIR/.env"
+    chmod 0600 "$STANDALONE_DIR/.env"
+}
+
+run_standalone() {
+    local config server_id published_address published_port
+    write_standalone_environment
+    config="$(standalone_compose config --format json)"
+    [[ "$config" != *'"build"'* ]] ||
+        die 'standalone release Compose unexpectedly contains a source build'
+
+    info "starting standalone from copied deploy/ on $PLATFORM"
+    standalone_compose up --detach --no-build
+    server_id="$(standalone_compose ps --quiet server)"
+    [[ -n "$server_id" ]] || die 'standalone Compose did not create the server'
+    published_address="$(standalone_compose port server 3180)"
+    published_port="${published_address##*:}"
+    [[ "$published_port" =~ ^[0-9]+$ ]] ||
+        die 'could not resolve the standalone server port'
+    wait_for_server standalone "$published_port"
+    assert_server_platform standalone "$server_id"
+    standalone_compose run --rm --no-deps server verify-media-integrity |
+        grep --fixed-strings 'Media integrity verification passed' >/dev/null ||
+        die 'standalone media integrity command failed'
+    standalone_compose down --volumes --remove-orphans >/dev/null
+}
+
+generate_tls_material() {
+    local cert_dir="$EXTERNAL_DIR/smoke-certs"
+    local host
+    require_command keytool
+    require_command openssl
+    mkdir -p "$cert_dir"
+    openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+        -subj '/CN=Someday release smoke CA' \
+        -keyout "$cert_dir/ca.key" \
+        -out "$cert_dir/ca.crt" >/dev/null 2>&1
+    for host in postgres minio; do
+        openssl req -newkey rsa:2048 -nodes \
+            -subj "/CN=$host" \
+            -keyout "$cert_dir/$host.key" \
+            -out "$cert_dir/$host.csr" >/dev/null 2>&1
+        openssl x509 -req -days 1 \
+            -in "$cert_dir/$host.csr" \
+            -CA "$cert_dir/ca.crt" \
+            -CAkey "$cert_dir/ca.key" \
+            -CAcreateserial \
+            -extfile <(
+                printf 'subjectAltName=DNS:%s\nextendedKeyUsage=serverAuth\n' "$host"
+            ) \
+            -out "$cert_dir/$host.crt" >/dev/null 2>&1
+    done
+    keytool -importcert -noprompt \
+        -alias someday-smoke-ca \
+        -file "$cert_dir/ca.crt" \
+        -keystore "$cert_dir/truststore.p12" \
+        -storetype PKCS12 \
+        -storepass someday-smoke-trust >/dev/null 2>&1
+    chmod 0600 "$cert_dir"/*.key
+    chmod 0644 "$cert_dir"/*.crt "$cert_dir/truststore.p12"
+}
+
+write_external_environment() {
+    printf '%s\n' \
+        "SOMEDAY_IMAGE=$IMAGE" \
+        "SOMEDAY_HTTP_BIND_ADDRESS=$PUBLISHED_BIND_ADDRESS" \
+        'SOMEDAY_PUBLIC_BASE_URL=https://external-smoke.invalid' \
+        "SOMEDAY_HTTP_PORT=$PUBLISHED_PORT" \
+        'SOMEDAY_DB_URL=jdbc:postgresql://postgres:5432/someday' \
+        'SOMEDAY_DB_USER=someday' \
+        'SOMEDAY_DB_PASSWORD=external-smoke-app-password' \
+        'SOMEDAY_DB_MAX_POOL_SIZE=4' \
+        'SOMEDAY_JWT_SECRET=0123456789abcdef0123456789abcdef' \
+        'SOMEDAY_MEDIA_QUOTA_BYTES=10485760' \
+        'SOMEDAY_MEDIA_S3_BUCKET=someday-media' \
+        'SOMEDAY_MEDIA_S3_REGION=us-east-1' \
+        'SOMEDAY_MEDIA_S3_ENDPOINT=https://minio:9000' \
+        'SOMEDAY_MEDIA_S3_PATH_STYLE=true' \
+        'AWS_ACCESS_KEY_ID=someday-minio-smoke' \
+        'AWS_SECRET_ACCESS_KEY=external-smoke-minio-password' \
+        'SOMEDAY_REGISTRATION_ENABLED=false' \
+        'SOMEDAY_TRUST_PROXY_HEADERS=false' >"$EXTERNAL_DIR/.env"
+    chmod 0600 "$EXTERNAL_DIR/.env"
+}
+
+write_external_smoke_override() {
+    [[ -f "$EXTERNAL_SMOKE_FILE" ]] ||
+        die "missing external smoke fixture: $EXTERNAL_SMOKE_FILE"
+    cp "$EXTERNAL_SMOKE_FILE" "$EXTERNAL_DIR/compose.smoke.yaml"
+}
+
+run_external() {
+    local config server_id published_address published_port untrusted_log
+    generate_tls_material
+    write_external_environment
+    write_external_smoke_override
+    config="$(external_compose config --format json)"
+    [[ "$config" != *'"build"'* ]] ||
+        die 'external release Compose unexpectedly contains a source build'
+
+    info "starting external PostgreSQL/S3 from copied deploy/ on $PLATFORM"
+    external_compose up --detach --no-build
+    server_id="$(external_compose ps --quiet server)"
+    [[ -n "$server_id" ]] || die 'external Compose did not create the server'
+    published_address="$(external_compose port server 3180)"
+    published_port="${published_address##*:}"
+    [[ "$published_port" =~ ^[0-9]+$ ]] ||
+        die 'could not resolve the external server port'
+    wait_for_server external "$published_port"
+    assert_server_platform external "$server_id"
+
+    untrusted_log="$RUN_DIR/untrusted-postgres.log"
+    if external_compose run --rm --no-deps \
+        --env JAVA_TOOL_OPTIONS= \
+        server >"$untrusted_log" 2>&1; then
+        die 'external server accepted an untrusted PostgreSQL certificate'
+    fi
+    grep -E 'PKIX path building failed|unable to find valid certification path' \
+        "$untrusted_log" >/dev/null ||
+        die 'external server failed for an unexpected reason without its PostgreSQL trust root'
+    grep -E 'org\.postgresql|PostgreSQL' "$untrusted_log" >/dev/null ||
+        die 'external server did not attribute the untrusted certificate to PostgreSQL'
+
+    external_compose run --rm --no-deps server verify-media-integrity |
+        grep --fixed-strings 'Media integrity verification passed' >/dev/null ||
+        die 'external media integrity command failed'
+    external_compose down --volumes --remove-orphans >/dev/null
+}
+
+if [[ "$PULL_IMAGE" == true ]]; then
+    info "pulling the exact release image anonymously: $IMAGE"
+    docker pull --platform "$PLATFORM" "$IMAGE" >/dev/null
+else
+    docker image inspect "$IMAGE" >/dev/null 2>&1 ||
+        die "local image is unavailable: $IMAGE"
+fi
+
+case "$TOPOLOGY" in
+    standalone)
+        run_standalone
+        ;;
+    external)
+        run_external
+        ;;
+    all)
+        run_standalone
+        run_external
+        ;;
+esac
+
+info "passed: $TOPOLOGY on $PLATFORM"

@@ -1,6 +1,7 @@
 package saien.someday.server
 
 import java.sql.Connection
+import java.sql.DriverManager
 import java.util.UUID
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
@@ -65,6 +66,59 @@ class DatabaseConnectionPoolRlsIntegrationTest {
                     listOf(Scope(first.userId, WORKSPACE_A)),
                     visibleScopes(connection),
                 )
+            }
+        }
+    }
+
+    @Test
+    fun checkoutOverridesDangerousRoleAndDatabaseDefaultsWithEmptyScope() {
+        val identity = database.seedIdentity("pool-rls-defaults-${System.nanoTime()}")
+        val config = database.config.copy(databaseMaxPoolSize = 1)
+        val names = databaseConnection(config).use { connection ->
+            assumeTrue(
+                "Database-default RLS verification requires the NOBYPASSRLS application role.",
+                isRestrictedApplicationRole(connection),
+            )
+            connection.createStatement().use { statement ->
+                statement.executeQuery("SELECT current_user, current_database()").use { result ->
+                    check(result.next())
+                    result.getString(1) to result.getString(2)
+                }
+            }
+        }
+
+        try {
+            administratorConnection(config).use { connection ->
+                connection.createStatement().use { statement ->
+                    statement.execute(
+                        "ALTER ROLE ${quoteIdentifier(names.first)} SET \"someday.user_id\" TO '*'",
+                    )
+                    statement.execute(
+                        "ALTER DATABASE ${quoteIdentifier(names.second)} SET \"someday.workspace_id\" TO '*'",
+                    )
+                }
+            }
+            databaseConnection(config).use { connection ->
+                assertEquals("*" to "*", currentScope(connection))
+                insertWorkspace(connection, identity, WORKSPACE_A)
+            }
+
+            DatabaseConnectionPool.create(config).use { pool ->
+                pool.connection().use { connection ->
+                    assertEquals("" to "", currentScope(connection))
+                    assertEquals(emptyList(), visibleScopes(connection))
+                }
+            }
+        } finally {
+            administratorConnection(config).use { connection ->
+                connection.createStatement().use { statement ->
+                    statement.execute(
+                        "ALTER ROLE ${quoteIdentifier(names.first)} RESET \"someday.user_id\"",
+                    )
+                    statement.execute(
+                        "ALTER DATABASE ${quoteIdentifier(names.second)} RESET \"someday.workspace_id\"",
+                    )
+                }
             }
         }
     }
@@ -138,6 +192,22 @@ class DatabaseConnectionPoolRlsIntegrationTest {
             statement.executeQuery().close()
         }
     }
+
+    private fun databaseConnection(config: ServerConfig): Connection = DriverManager.getConnection(
+        config.databaseConnectionUrl,
+        config.databaseUser,
+        config.databasePassword,
+    )
+
+    private fun administratorConnection(config: ServerConfig): Connection = DriverManager.getConnection(
+        System.getenv("SOMEDAY_DB_ADMIN_URL")
+            ?.let(::productionTestDatabaseConnectionUrl)
+            ?: config.databaseConnectionUrl,
+        System.getenv("SOMEDAY_DB_ADMIN_USER") ?: config.databaseUser,
+        System.getenv("SOMEDAY_DB_ADMIN_PASSWORD") ?: config.databasePassword,
+    )
+
+    private fun quoteIdentifier(value: String): String = "\"${value.replace("\"", "\"\"")}\""
 
     private data class Scope(val userId: UUID, val workspaceId: String)
 

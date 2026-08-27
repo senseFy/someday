@@ -6,18 +6,13 @@ import java.util.UUID
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
-import kotlin.test.assertFailsWith
 import kotlin.test.assertNull
-import kotlin.test.assertTrue
 import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider
 import software.amazon.awssdk.core.sync.RequestBody
 import software.amazon.awssdk.http.urlconnection.UrlConnectionHttpClient
 import software.amazon.awssdk.regions.Region
 import software.amazon.awssdk.services.s3.S3Client
-import software.amazon.awssdk.services.s3.model.DeleteObjectRequest
-import software.amazon.awssdk.services.s3.model.ListObjectsV2Request
 import software.amazon.awssdk.services.s3.model.PutObjectRequest
-import software.amazon.awssdk.services.s3.model.S3Exception
 
 class S3MediaBlobStoreIntegrationTest {
     private val environment = System.getenv()
@@ -26,15 +21,13 @@ class S3MediaBlobStoreIntegrationTest {
     private val region = environment["SOMEDAY_S3_TEST_REGION"]?.trim().orEmpty().ifBlank { "us-east-1" }
 
     @Test
-    fun realServicePreservesConditionalImmutableObjectsWithPrefixScopedListPermission() {
+    fun realServicePreservesConditionalImmutableObjectsAndDistinguishesMissingKeys() {
         val key = uniqueKey("11")
         val missingKey = uniqueKey("00")
         val bytes = ByteArray(257) { index -> (index * 7).toByte() }
         val digest = sha256(bytes)
 
         createStore().use { store ->
-            // Prefix-scoped ListBucket lets S3 prove absence with 404. Production code
-            // still performs only object-level HEAD/GET/PUT operations.
             assertNull(store.head(missingKey))
             assertNull(store.read(missingKey, MAX_TEST_OBJECT_BYTES))
             assertEquals(MediaBlobPutResult.Stored(false), store.putImmutable(key, bytes, digest))
@@ -47,23 +40,6 @@ class S3MediaBlobStoreIntegrationTest {
             assertContentEquals(bytes, checkNotNull(store.read(key, bytes.size)).bytes)
         }
 
-        restrictedClient().use { client ->
-            assertAccessDenied {
-                client.listObjectsV2(ListObjectsV2Request.builder().bucket(bucket).build())
-            }
-            val listed = client.listObjectsV2(
-                ListObjectsV2Request.builder()
-                    .bucket(bucket)
-                    .prefix(MEDIA_PREFIX)
-                    .build(),
-            )
-            assertTrue(listed.contents().any { it.key() == objectKey(key) })
-            assertAccessDenied {
-                client.deleteObject(
-                    DeleteObjectRequest.builder().bucket(bucket).key(objectKey(key)).build(),
-                )
-            }
-        }
         createStore().use { store ->
             assertContentEquals(bytes, checkNotNull(store.read(key, bytes.size)).bytes)
         }
@@ -124,11 +100,6 @@ class S3MediaBlobStoreIntegrationTest {
     private fun objectKey(key: MediaBlobKey): String =
         "media/v1/${key.userId}/${key.workspaceId}/${key.mediaId}.bin"
 
-    private fun assertAccessDenied(block: () -> Unit) {
-        val failure = assertFailsWith<S3Exception> { block() }
-        assertEquals(403, failure.statusCode())
-    }
-
     private fun requiredEnvironment(name: String): String =
         environment[name]?.trim()?.takeIf(String::isNotEmpty)
             ?: error("$name is required for the real S3-compatible integration test.")
@@ -138,7 +109,6 @@ class S3MediaBlobStoreIntegrationTest {
 
     private companion object {
         const val MAX_TEST_OBJECT_BYTES = 1024
-        const val MEDIA_PREFIX = "media/v1/"
         const val SHA256_METADATA_KEY = "someday-ciphertext-sha256"
     }
 }

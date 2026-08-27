@@ -7,6 +7,7 @@
 - JVM tests that create a local database should use the shared schema-aware factory. A raw driver is only appropriate when reopening an already-created database to verify persisted state without owning schema lifecycle.
 - Server schema changes are owned by Flyway files in `server/src/main/resources/db/migration`. Do not patch server schema from application startup or request handling.
 - Migrations must be deterministic version-to-version transitions. Do not use `IF EXISTS` or `IF NOT EXISTS` to hide uncertain schema state; model the old state explicitly and migrate it.
+- The first-release server migration set is byte-frozen through V8. Add a version newer than V8; do not add repeatable, undo, or backfilled lower-version SQL migrations. Tenant-row DML must set transaction-local account and workspace wildcard scopes before its first write, remain transactional, and pass the non-empty previous-release upgrade gate.
 - After schema changes, update the SQLDelight schema snapshot and run `./gradlew :shared:data:verifySqlDelightMigration` plus relevant client/server tests. See `docs/database-migrations.md`.
 
 ## UI and Main-Thread IO
@@ -88,11 +89,18 @@
   public object URLs, or S3-mounted filesystem emulation.
 - Blob publication precedes PostgreSQL metadata. Preserve immutable exact
   replay, retain safe untracked blobs after a database failure, and give the
-  first-release application runtime no list/delete operations, no
-  `DeleteObject` permission, and no compensation state machine. An AWS runtime
-  policy may grant `ListBucket` only for `media/v1/*` so missing HEAD/GET is
-  distinguishable from permission denial. Exact-replay adoption must hash the
-  actual existing bytes rather than trusting object metadata.
+  first-release application runtime no list/delete operations, no effective
+  delete path, and no compensation state machine. Provider permissions must
+  make a missing HEAD/GET distinguishable from an authorization failure; grant
+  only the smallest bucket-level permission needed for `media/v1/*`.
+  Exact-replay adoption must hash the actual existing bytes rather than
+  trusting object metadata.
+- Production supports PostgreSQL 17 through a direct, session-affine
+  connection. The application role must be neither superuser nor `BYPASSRLS`.
+  Use verified hostname/certificate TLS outside a trusted private network.
+- Pool checkout must overwrite both PostgreSQL RLS session settings with empty
+  values. Do not use `RESET`, because role or database defaults may contain a
+  wildcard scope.
 - Production registration defaults off, admin cookies are `Secure`, browser
   admin mutations require the configured same-origin `Origin`, and proxy
   forwarding headers are ignored unless the operator opts in.
@@ -103,6 +111,6 @@
 - `compose.yaml` is loopback-only local infrastructure. Do not turn its known
   credentials or exposed dependency ports into a production recipe.
 - Portable export/restore omits image bytes. Operator backup and recovery of
-  published media must treat PostgreSQL and the configured media blob store as
+  published media must treat PostgreSQL and the configured media store as
   one recovery unit. Standalone needs coordinated off-host directory backups;
   external needs PostgreSQL recovery points plus bucket versioning/retention.

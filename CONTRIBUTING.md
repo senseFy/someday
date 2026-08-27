@@ -76,4 +76,4 @@ Important defaults:
   General files, SVG, animation, video, and map SDKs remain outside the initial
   product scope.
 - Portable export/restore intentionally omits image bytes. Self-hosted operator
-  recovery must preserve PostgreSQL and the media blob directory together.
+  recovery must preserve PostgreSQL and the configured media store together.
