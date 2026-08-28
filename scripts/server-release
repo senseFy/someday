@@ -1,0 +1,726 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+REMOTE="${SOMEDAY_SERVER_RELEASE_REMOTE:-origin}"
+IMAGE_REPOSITORY="ghcr.io/sensefy/someday-server"
+EXPECTED_REPOSITORY="senseFy/someday"
+GRADLEW="${GRADLEW:-$ROOT_DIR/gradlew}"
+HISTORY_CHECK="${SOMEDAY_SERVER_RELEASE_HISTORY_CHECK:-$ROOT_DIR/scripts/verify-public-history}"
+PRIVATE_MATERIAL_CHECK="${SOMEDAY_SERVER_RELEASE_PRIVATE_CHECK:-$ROOT_DIR/scripts/verify-private-release-material}"
+CONTRACT_CHECK="${SOMEDAY_SERVER_RELEASE_CONTRACT_CHECK:-$ROOT_DIR/scripts/verify-server-release-contract}"
+SYSTEM_GATE="${SOMEDAY_SERVER_RELEASE_SYSTEM_GATE:-$ROOT_DIR/scripts/sync-v3-reliability-gate}"
+COMPOSE_SMOKE="${SOMEDAY_SERVER_RELEASE_COMPOSE_SMOKE:-$ROOT_DIR/scripts/server-release-compose-smoke}"
+SYSTEM_REPORT="${SOMEDAY_SERVER_RELEASE_SYSTEM_REPORT:-$ROOT_DIR/build/system-v3-reliability-gate/report.json}"
+MANAGED_REPORT_ROOT="${SOMEDAY_SERVER_RELEASE_MANAGED_REPORT_ROOT:-$ROOT_DIR/build/managed-storage-profile-gate}"
+REPORT_ROOT="${SOMEDAY_SERVER_RELEASE_REPORT_ROOT:-$ROOT_DIR/build/server-release}"
+DOCKER_COMMAND="${SOMEDAY_SERVER_RELEASE_DOCKER:-docker}"
+
+VERSION=""
+TAG=""
+IMAGE=""
+
+usage() {
+    cat <<'EOF'
+Understand and rehearse the Someday server release workflow.
+
+Usage:
+  scripts/server-release plan X.Y.Z
+  scripts/server-release status X.Y.Z
+  scripts/server-release rehearse X.Y.Z
+
+Commands:
+  plan       Print the complete workflow without running checks.
+  status     Read local evidence and remote GitHub state without changing it.
+  rehearse  Run local checks and both deployment topologies. It never runs
+             managed-provider gates or performs a remote write.
+
+This script never creates or pushes a tag, publishes a release or image, or
+changes repository/package visibility. The final annotated-tag commands are
+printed by `plan` and remain an explicit maintainer action.
+EOF
+}
+
+die() {
+    printf 'server release error: %s\n' "$*" >&2
+    exit 1
+}
+
+info() {
+    printf '[server release] %s\n' "$*" >&2
+}
+
+status_line() {
+    printf '%-7s %-14s %s\n' "$1" "$2" "$3"
+}
+
+set_version() {
+    VERSION="$1"
+    [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ||
+        die "version must be plain SemVer X.Y.Z: $VERSION"
+    ((${#VERSION} <= 64)) || die 'version is too long'
+    TAG="server-v$VERSION"
+    IMAGE="$IMAGE_REPOSITORY:$VERSION"
+}
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+require_executable() {
+    [[ -x "$1" ]] || die "required executable is unavailable: $1"
+}
+
+head_sha() {
+    git -C "$ROOT_DIR" rev-parse HEAD
+}
+
+short_sha() {
+    git -C "$ROOT_DIR" rev-parse --short=12 HEAD
+}
+
+remote_main_sha() {
+    local output status
+    set +e
+    output="$(git -C "$ROOT_DIR" ls-remote --exit-code --heads "$REMOTE" refs/heads/main 2>/dev/null)"
+    status=$?
+    set -e
+    [[ "$status" -eq 0 ]] || return "$status"
+    awk 'NR == 1 { print $1 }' <<<"$output"
+}
+
+remote_tag_commit() {
+    local output status direct peeled
+    set +e
+    output="$(
+        git -C "$ROOT_DIR" ls-remote --exit-code --tags "$REMOTE" \
+            "refs/tags/$TAG" "refs/tags/$TAG^{}" 2>/dev/null
+    )"
+    status=$?
+    set -e
+    [[ "$status" -eq 0 ]] || return "$status"
+    direct="$(awk -v ref="refs/tags/$TAG" '$2 == ref { print $1 }' <<<"$output")"
+    peeled="$(awk -v ref="refs/tags/$TAG^{}" '$2 == ref { print $1 }' <<<"$output")"
+    printf '%s\n' "${peeled:-$direct}"
+}
+
+local_tag_commit() {
+    git -C "$ROOT_DIR" rev-parse "$TAG^{commit}" 2>/dev/null
+}
+
+json_evidence_detail() {
+    local path="$1"
+    local profile="$2"
+    local commit="$3"
+    python3 - "$path" "$profile" "$commit" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+profile = sys.argv[2]
+commit = sys.argv[3]
+if not path.is_file():
+    print(f"{profile}: missing")
+    raise SystemExit(2)
+try:
+    value = json.loads(path.read_text(encoding="utf-8"))
+except (OSError, json.JSONDecodeError):
+    print(f"{profile}: invalid result.json")
+    raise SystemExit(1)
+expected = {
+    "profile": profile,
+    "commit": commit,
+    "treeState": "clean",
+    "result": "passed",
+    "releaseEligible": True,
+}
+for key, wanted in expected.items():
+    if value.get(key) != wanted:
+        print(f"{profile}: {key} does not match HEAD")
+        raise SystemExit(1)
+print(f"{profile}: passed for {commit[:12]}")
+PY
+}
+
+rehearsal_detail() {
+    local path="$1"
+    local commit="$2"
+    python3 - "$path" "$VERSION" "$TAG" "$commit" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+version, tag, commit = sys.argv[2:]
+if not path.is_file():
+    print("missing")
+    raise SystemExit(2)
+try:
+    value = json.loads(path.read_text(encoding="utf-8"))
+except (OSError, json.JSONDecodeError):
+    print("invalid rehearsal report")
+    raise SystemExit(1)
+expected = {
+    "contractId": "someday-server-release-rehearsal",
+    "version": version,
+    "tag": tag,
+    "commit": commit,
+    "treeState": "clean",
+    "result": "passed",
+}
+for key, wanted in expected.items():
+    if value.get(key) != wanted:
+        print(f"{key} does not match HEAD")
+        raise SystemExit(1)
+print(f"passed for {commit[:12]}")
+PY
+}
+
+system_report_matches_head() {
+    local commit="$1"
+    python3 - "$SYSTEM_REPORT" "$commit" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+commit = sys.argv[2]
+if not path.is_file():
+    raise SystemExit("System V3 gate did not produce report.json")
+value = json.loads(path.read_text(encoding="utf-8"))
+if value.get("commit") != commit:
+    raise SystemExit("System V3 report commit does not match HEAD")
+if value.get("dirtyWorktree") is not False:
+    raise SystemExit("System V3 report was produced from a dirty worktree")
+if value.get("result") != "passed":
+    raise SystemExit("System V3 report is not passing")
+PY
+}
+
+repository_identity() {
+    if command -v gh >/dev/null 2>&1; then
+        gh repo view --json nameWithOwner,visibility \
+            --jq '[.nameWithOwner, .visibility] | @tsv' 2>/dev/null || true
+    fi
+}
+
+tag_ruleset_matches() {
+    local detail="$1"
+    python3 - "$TAG" "$detail" <<'PY'
+import fnmatch
+import json
+import sys
+
+tag = f"refs/tags/{sys.argv[1]}"
+try:
+    value = json.loads(sys.argv[2])
+except json.JSONDecodeError:
+    raise SystemExit(1)
+conditions = value.get("conditions", {}).get("ref_name", {})
+includes = conditions.get("include", [])
+excludes = conditions.get("exclude", [])
+
+def matches(pattern):
+    return pattern == "~ALL" or fnmatch.fnmatchcase(tag, pattern)
+
+rule_types = {rule.get("type") for rule in value.get("rules", [])}
+bypass = any(
+    actor.get("bypass_mode") == "always"
+    for actor in value.get("bypass_actors", [])
+)
+valid = (
+    value.get("target") == "tag"
+    and value.get("enforcement") == "active"
+    and any(matches(pattern) for pattern in includes)
+    and not any(matches(pattern) for pattern in excludes)
+    and {"creation", "update", "deletion"}.issubset(rule_types)
+    and bypass
+)
+if not valid:
+    raise SystemExit(1)
+print(value.get("name", "active server tag ruleset"))
+PY
+}
+
+github_tag_policy_detail() {
+    local repository="$1"
+    local ids id detail name
+    ids="$(
+        gh api "repos/$repository/rulesets?includes_parents=true&per_page=100" \
+            --jq '.[] | select(.target == "tag" and .enforcement == "active") | .id' \
+            2>/dev/null
+    )" || {
+        printf 'GitHub tag policy unavailable\n'
+        return 2
+    }
+    while IFS= read -r id; do
+        [[ -n "$id" ]] || continue
+        detail="$(gh api "repos/$repository/rulesets/$id" 2>/dev/null)" || continue
+        if name="$(tag_ruleset_matches "$detail")"; then
+            printf '%s protects %s creation, updates, and deletion\n' "$name" "$TAG"
+            return 0
+        fi
+    done <<<"$ids"
+    printf 'missing active protected ruleset for server-v* tags\n'
+    return 1
+}
+
+github_ci_detail() {
+    local repository="$1"
+    local commit="$2"
+    local run run_status conclusion run_ref run_sha run_url
+    [[ -n "$repository" ]] || {
+        printf 'GitHub CI state unavailable\n'
+        return 2
+    }
+    run="$(
+        gh run list \
+            --repo "$repository" \
+            --workflow ci.yml \
+            --branch main \
+            --event push \
+            --commit "$commit" \
+            --limit 1 \
+            --json status,conclusion,headBranch,headSha,url \
+            --jq '.[] | [.status, (.conclusion // ""), .headBranch, .headSha, .url] | @tsv' \
+            2>/dev/null || true
+    )"
+    [[ -n "$run" ]] || {
+        printf 'no main CI run found for %s\n' "${commit:0:12}"
+        return 2
+    }
+    IFS=$'\t' read -r run_status conclusion run_ref run_sha run_url <<<"$run"
+    [[ "$run_ref" == main && "$run_sha" == "$commit" ]] || {
+        printf 'CI run targets another ref or commit: %s\n' "$run_url"
+        return 1
+    }
+    [[ "$run_status" == completed ]] || {
+        printf '%s: %s\n' "$run_status" "$run_url"
+        return 3
+    }
+    [[ "$conclusion" == success ]] || {
+        printf '%s: %s\n' "$conclusion" "$run_url"
+        return 1
+    }
+    printf 'passed: %s\n' "$run_url"
+}
+
+github_publish_detail() {
+    local commit="$1"
+    local identity repository run release
+    identity="$(repository_identity)"
+    [[ -n "$identity" ]] || {
+        printf 'GitHub state unavailable; install/authenticate gh\n'
+        return 2
+    }
+    repository="${identity%%$'\t'*}"
+    run="$(
+        gh run list \
+            --repo "$repository" \
+            --workflow server-release.yml \
+            --commit "$commit" \
+            --limit 1 \
+            --json status,conclusion,headBranch,headSha,url \
+            --jq '.[] | [.status, (.conclusion // ""), .headBranch, .headSha, .url] | @tsv' \
+            2>/dev/null || true
+    )"
+    [[ -n "$run" ]] || {
+        printf 'tag exists; no Server Release workflow run found\n'
+        return 2
+    }
+    IFS=$'\t' read -r run_status conclusion run_ref run_sha run_url <<<"$run"
+    if [[ "$run_ref" != "$TAG" || "$run_sha" != "$commit" ]]; then
+        printf 'workflow run targets another commit: %s\n' "$run_url"
+        return 1
+    fi
+    if [[ "$run_status" != completed ]]; then
+        printf '%s: %s\n' "$run_status" "$run_url"
+        return 3
+    fi
+    if [[ "$conclusion" != success ]]; then
+        printf '%s: %s\n' "$conclusion" "$run_url"
+        return 1
+    fi
+    release="$(
+        gh release view "$TAG" --repo "$repository" \
+            --json isDraft,url \
+            --jq '[.isDraft, .url] | @tsv' 2>/dev/null || true
+    )"
+    [[ -n "$release" ]] || {
+        printf 'workflow passed; GitHub Release is not present yet: %s\n' "$run_url"
+        return 3
+    }
+    IFS=$'\t' read -r is_draft release_url <<<"$release"
+    [[ "$is_draft" == false ]] || {
+        printf 'workflow passed; Release remains draft: %s\n' "$release_url"
+        return 3
+    }
+    printf 'published: %s\n' "$release_url"
+}
+
+run_status() {
+    local commit short branch tree_clean=true identity identity_detail history_ready=true
+    local local_tag_state=absent remote_tag_state=absent remote_main="" remote_tag=""
+    local identity_ready=true policy_ready=true ci_ready=true rehearsal_ready=true providers_ready=true
+    local publish_state publish_detail policy_detail ci_detail repository
+    local rehearsal_path="$REPORT_ROOT/$VERSION/rehearsal.json"
+    local detail code planetscale_detail r2_detail visibility
+
+    require_command git
+    require_command python3
+    commit="$(head_sha)"
+    short="$(short_sha)"
+    branch="$(git -C "$ROOT_DIR" branch --show-current)"
+    [[ -z "$(git -C "$ROOT_DIR" status --porcelain --untracked-files=all)" ]] || tree_clean=false
+
+    identity_detail="branch=$branch; tree=$([[ "$tree_clean" == true ]] && printf clean || printf dirty)"
+    [[ "$branch" == main && "$tree_clean" == true ]] || identity_ready=false
+
+    if remote_main="$(remote_main_sha)"; then
+        if [[ "$remote_main" == "$commit" ]]; then
+            identity_detail+="; $REMOTE/main matches"
+        else
+            identity_detail+="; $REMOTE/main differs"
+            identity_ready=false
+        fi
+    else
+        identity_detail+="; $REMOTE/main unavailable"
+        identity_ready=false
+    fi
+
+    if detail="$(local_tag_commit)"; then
+        local_tag_state="$detail"
+        if [[ "$detail" != "$commit" ]]; then
+            identity_detail+="; local $TAG points elsewhere"
+            identity_ready=false
+        fi
+    fi
+    if remote_tag="$(remote_tag_commit)"; then
+        remote_tag_state="$remote_tag"
+        if [[ "$remote_tag" == "$commit" ]]; then
+            identity_detail+="; tag published"
+        else
+            identity_detail+="; remote $TAG points elsewhere"
+            identity_ready=false
+        fi
+    else
+        code=$?
+        if [[ "$code" -eq 2 ]]; then
+            identity_detail+="; tag unused"
+        else
+            identity_detail+="; remote tag state unavailable"
+            identity_ready=false
+        fi
+    fi
+    if [[ "$local_tag_state" != absent && "$remote_tag_state" == absent ]]; then
+        identity_detail+="; local tag not pushed"
+        identity_ready=false
+    fi
+
+    identity="$(repository_identity)"
+    if [[ -n "$identity" ]]; then
+        repository="${identity%%$'\t'*}"
+        visibility="${identity#*$'\t'}"
+        identity_detail+="; repository=$repository; visibility=$visibility (unchanged)"
+        [[ "$repository" == "$EXPECTED_REPOSITORY" && "$visibility" == PUBLIC ]] ||
+            identity_ready=false
+    else
+        identity_detail+='; repository visibility unavailable'
+        identity_ready=false
+    fi
+
+    printf 'Someday server %s  commit %s\n' "$VERSION" "$short"
+    if [[ "$identity_ready" == true ]]; then
+        status_line PASS identity "$identity_detail"
+    else
+        status_line ACTION identity "$identity_detail"
+    fi
+
+    if [[ -n "${repository:-}" ]] && policy_detail="$(github_tag_policy_detail "$repository")"; then
+        status_line PASS policy "$policy_detail"
+    else
+        status_line ACTION policy "${policy_detail:-GitHub tag policy unavailable}"
+        policy_ready=false
+    fi
+
+    set +e
+    ci_detail="$(github_ci_detail "${repository:-}" "$commit")"
+    code=$?
+    set -e
+    case "$code" in
+        0) status_line PASS ci "$ci_detail" ;;
+        3)
+            status_line RUNNING ci "$ci_detail"
+            ci_ready=false
+            ;;
+        *)
+            status_line ACTION ci "$ci_detail"
+            ci_ready=false
+            ;;
+    esac
+
+    if [[ -x "$HISTORY_CHECK" ]] && "$HISTORY_CHECK" --quiet; then
+        status_line PASS history 'reachable history passed the public-material scan'
+    else
+        status_line FAIL history "run $HISTORY_CHECK"
+        history_ready=false
+    fi
+
+    if detail="$(rehearsal_detail "$rehearsal_path" "$commit")"; then
+        status_line PASS rehearsal "$detail"
+    else
+        status_line ACTION rehearsal "$detail"
+        rehearsal_ready=false
+    fi
+
+    if planetscale_detail="$(
+        json_evidence_detail \
+            "$MANAGED_REPORT_ROOT/planetscale/result.json" \
+            planetscale "$commit"
+    )"; then
+        :
+    else
+        providers_ready=false
+    fi
+    if r2_detail="$(
+        json_evidence_detail \
+            "$MANAGED_REPORT_ROOT/r2/result.json" \
+            r2 "$commit"
+    )"; then
+        :
+    else
+        providers_ready=false
+    fi
+    if [[ "$providers_ready" == true ]]; then
+        status_line PASS providers "$planetscale_detail; $r2_detail"
+    else
+        status_line ACTION providers "$planetscale_detail; $r2_detail"
+    fi
+
+    if [[ "$remote_tag_state" == absent ]]; then
+        status_line CI publish "explicit $TAG push starts the immutable GitHub workflow"
+    else
+        set +e
+        publish_detail="$(github_publish_detail "$commit")"
+        code=$?
+        set -e
+        case "$code" in
+            0) publish_state=PASS ;;
+            3) publish_state=RUNNING ;;
+            *) publish_state=ACTION ;;
+        esac
+        status_line "$publish_state" publish "$publish_detail"
+    fi
+
+    if [[ "$identity_ready" == true && "$policy_ready" == true && "$ci_ready" == true && \
+        "$history_ready" == true && \
+        "$rehearsal_ready" == true && "$providers_ready" == true && \
+        "$remote_tag_state" == absent ]]; then
+        printf 'READY TO TAG\n'
+        return 0
+    fi
+    if [[ "$remote_tag_state" != absent && "$publish_state" == PASS ]]; then
+        printf 'RELEASE COMPLETE\n'
+        return 0
+    fi
+    if [[ "$remote_tag_state" != absent && "$publish_state" == RUNNING ]]; then
+        printf 'RELEASE IN PROGRESS\n'
+        printf 'Next: rerun status after the GitHub workflow advances.\n'
+        return 1
+    fi
+
+    printf 'NOT READY\n'
+    if [[ "$identity_ready" != true ]]; then
+        printf 'Next: make clean main exactly match %s/main, then rerun status.\n' "$REMOTE"
+    elif [[ "$policy_ready" != true ]]; then
+        printf 'Next: configure the server-v* tag ruleset in docs/server-release.md.\n'
+    elif [[ "$ci_ready" != true ]]; then
+        printf 'Next: wait for the main CI run to pass, then rerun status.\n'
+    elif [[ "$history_ready" != true ]]; then
+        printf 'Next: %s\n' "$HISTORY_CHECK"
+    elif [[ "$rehearsal_ready" != true ]]; then
+        printf 'Next: scripts/server-release rehearse %s\n' "$VERSION"
+    elif [[ "$providers_ready" != true ]]; then
+        printf 'Next: run the missing managed gate from docs/managed-storage-profile-gates.md.\n'
+    else
+        printf 'Next: inspect the Server Release workflow, fix the failure, and rerun status.\n'
+    fi
+    return 1
+}
+
+run_plan() {
+    cat <<EOF
+Someday server release $VERSION
+
+1. Confirm the one-time GitHub controls in docs/server-release.md.
+2. Merge the reviewed commit to main and wait for CI.
+3. Configure the dedicated resources in docs/managed-storage-profile-gates.md,
+   then run:
+   scripts/managed-storage-profile-gate planetscale
+   scripts/managed-storage-profile-gate r2
+4. Run: scripts/server-release rehearse $VERSION
+5. For the second and later releases, complete the previous-version upgrade
+   acceptance in docs/server-upgrades.md.
+6. Run: scripts/server-release status $VERSION
+7. Only after status prints READY TO TAG, create and push the immutable tag:
+   git tag -a $TAG -m "Someday Server $VERSION"
+   git push $REMOTE refs/tags/$TAG:refs/tags/$TAG
+8. Run: scripts/server-release status $VERSION
+
+The tag starts .github/workflows/server-release.yml. It builds and tests the
+multi-architecture image, verifies anonymous pulls and both deployment
+topologies, then creates the GitHub Release. For the first release only, a
+maintainer must make the GHCR package public while the workflow waits. That is
+a package-level visibility change; this script never performs it.
+EOF
+}
+
+write_rehearsal_report() {
+    local path="$1"
+    local commit="$2"
+    mkdir -p "$(dirname "$path")"
+    python3 - "$path" "$VERSION" "$TAG" "$commit" <<'PY'
+import datetime
+import json
+import os
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+version, tag, commit = sys.argv[2:]
+value = {
+    "contractId": "someday-server-release-rehearsal",
+    "version": version,
+    "tag": tag,
+    "commit": commit,
+    "treeState": "clean",
+    "completedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    "result": "passed",
+}
+temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+temporary.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+os.replace(temporary, path)
+PY
+}
+
+run_rehearsal() {
+    local commit branch remote_main remote_tag code platform architecture
+    local report="$REPORT_ROOT/$VERSION/rehearsal.json"
+    local temporary_image="someday-server:release-rehearsal-$VERSION-$(short_sha)-$$"
+
+    require_command git
+    require_command python3
+    require_command "$DOCKER_COMMAND"
+    require_executable "$GRADLEW"
+    require_executable "$HISTORY_CHECK"
+    require_executable "$PRIVATE_MATERIAL_CHECK"
+    require_executable "$CONTRACT_CHECK"
+    require_executable "$SYSTEM_GATE"
+    require_executable "$COMPOSE_SMOKE"
+
+    commit="$(head_sha)"
+    branch="$(git -C "$ROOT_DIR" branch --show-current)"
+    [[ "$branch" == main ]] || die "rehearsal requires main; found $branch"
+    [[ -z "$(git -C "$ROOT_DIR" status --porcelain --untracked-files=all)" ]] ||
+        die 'rehearsal requires a clean worktree'
+    remote_main="$(remote_main_sha)" || die "could not read $REMOTE/main"
+    [[ "$remote_main" == "$commit" ]] || die "HEAD must exactly match $REMOTE/main"
+    if local_tag_commit >/dev/null; then
+        die "local tag already exists: $TAG"
+    fi
+    if remote_tag="$(remote_tag_commit)"; then
+        die "remote tag already exists at $remote_tag: $TAG"
+    else
+        code=$?
+        [[ "$code" -eq 2 ]] || die "could not prove that remote tag is unused: $TAG"
+    fi
+
+    architecture="$(uname -m)"
+    case "$architecture" in
+        arm64|aarch64) platform=linux/arm64 ;;
+        x86_64|amd64) platform=linux/amd64 ;;
+        *) die "unsupported Docker host architecture: $architecture" ;;
+    esac
+
+    mkdir -p "$(dirname "$report")"
+    rm -f "$report"
+
+    cleanup_rehearsal() {
+        local status=$?
+        trap - EXIT INT TERM
+        "$DOCKER_COMMAND" image rm --force "$temporary_image" >/dev/null 2>&1 || true
+        exit "$status"
+    }
+    trap cleanup_rehearsal EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    info 'checking the complete reachable Git history'
+    "$HISTORY_CHECK"
+    "$PRIVATE_MATERIAL_CHECK"
+    "$CONTRACT_CHECK" "$TAG" "$IMAGE"
+
+    info 'running the hermetic project check'
+    "$GRADLEW" check \
+        --max-workers="${SOMEDAY_SERVER_RELEASE_GRADLE_WORKERS:-6}" \
+        --continue \
+        --dependency-verification=strict \
+        --stacktrace
+
+    info 'running the complete System V3 reliability gate'
+    "$SYSTEM_GATE"
+    system_report_matches_head "$commit"
+
+    info "building the local release image for $platform"
+    "$DOCKER_COMMAND" build \
+        --target runtime \
+        --tag "$temporary_image" \
+        --label "org.opencontainers.image.version=$VERSION" \
+        --label "org.opencontainers.image.revision=$commit" \
+        "$ROOT_DIR"
+
+    info 'starting standalone and external release Compose topologies'
+    "$COMPOSE_SMOKE" \
+        --image "$temporary_image" \
+        --platform "$platform" \
+        --topology all \
+        --skip-pull
+
+    [[ -z "$(git -C "$ROOT_DIR" status --porcelain --untracked-files=all)" ]] ||
+        die 'worktree changed during rehearsal'
+    write_rehearsal_report "$report" "$commit"
+    "$DOCKER_COMMAND" image rm --force "$temporary_image" >/dev/null 2>&1 || true
+    trap - EXIT INT TERM
+    info "passed; report: $report"
+}
+
+[[ $# -ge 1 ]] || {
+    usage
+    exit 0
+}
+
+command_name="$1"
+shift
+case "$command_name" in
+    --help|-h|help)
+        [[ $# -eq 0 ]] || die 'help accepts no arguments'
+        usage
+        ;;
+    plan|status|rehearse)
+        [[ $# -eq 1 ]] || die "$command_name requires exactly one X.Y.Z version"
+        set_version "$1"
+        cd "$ROOT_DIR"
+        case "$command_name" in
+            plan) run_plan ;;
+            status) run_status ;;
+            rehearse) run_rehearsal ;;
+        esac
+        ;;
+    *)
+        usage >&2
+        die "unknown command: $command_name"
+        ;;
+esac

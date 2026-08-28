@@ -1,4 +1,5 @@
 import org.gradle.api.plugins.JavaPluginExtension
+import org.gradle.api.tasks.Exec
 import org.gradle.jvm.toolchain.JavaLanguageVersion
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import org.jetbrains.kotlin.gradle.tasks.KotlinJvmCompile
@@ -172,10 +173,41 @@ val privateReleaseMaterialCheck = tasks.register("privateReleaseMaterialCheck") 
     }
 }
 
+val serverReleaseWorkflowCheck = tasks.register<Exec>("serverReleaseWorkflowCheck") {
+    group = "verification"
+    description = "Tests the POSIX server release interfaces, history scan, and bundle builder."
+    workingDir(rootDir)
+    commandLine("bash", "scripts/tests/server-release-test.sh")
+    onlyIf("server release workflow tests require a POSIX host") {
+        !System.getProperty("os.name").startsWith("Windows", ignoreCase = true)
+    }
+    inputs.files(
+        ".github/workflows/android.yml",
+        ".github/workflows/ci.yml",
+        ".github/workflows/server-release.yml",
+        "Dockerfile",
+        "LICENSE",
+        "Makefile",
+        "scripts/server-release",
+        "scripts/server-release-tui",
+        "scripts/build-server-release-bundle",
+        "scripts/verify-public-history",
+        "scripts/verify-server-release-contract",
+        "scripts/verify-server-release-tag",
+        "scripts/tests/server-release-test.sh",
+        "scripts/tests/server-release-interface-test.sh",
+        "scripts/tests/build-server-release-bundle-test.sh",
+        "scripts/tests/verify-public-history-test.sh",
+        "scripts/tests/verify-server-release-contract-test.sh",
+        "scripts/tests/verify-server-release-tag-test.sh",
+        fileTree("deploy"),
+    )
+}
+
 tasks.register("check") {
     group = "verification"
     description = "Runs root source and private-release-material hygiene in addition to subproject checks."
-    dependsOn(sourceHygieneCheck, privateReleaseMaterialCheck)
+    dependsOn(sourceHygieneCheck, privateReleaseMaterialCheck, serverReleaseWorkflowCheck)
 }
 
 tasks.register("clientPlatformSmoke") {

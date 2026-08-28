@@ -163,6 +163,8 @@ The Ubuntu gate also:
 `scripts/managed-storage-profile-gate planetscale|r2` applies the focused
 recovery journey to dedicated managed resources. A named profile is verified
 only when a current `result.json` records a complete passing live run.
+The release controller consumes that evidence as described in
+[Server release](server-release.md).
 
 `scripts/server-container-smoke` owns the separate packaging boundary: it
 builds the production image, starts the standalone Compose topology with a

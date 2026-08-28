@@ -41,6 +41,7 @@ You may run, study, share, and modify it under the terms of that license. If you
 - Vulnerability reports: [SECURITY.md](SECURITY.md) (please do not file public issues for security bugs)
 - Self-hosted production contract: [docs/self-hosting.md](docs/self-hosting.md)
 - Server storage architecture: [docs/server-storage-architecture.md](docs/server-storage-architecture.md)
+- Server maintainer release workflow: [docs/server-release.md](docs/server-release.md)
 
 ## Repository layout
 
@@ -163,6 +164,10 @@ self-hosted journeys; it never contacts developer localhost services. The
 macOS gate runs shared behavior and app-shell tests on an iOS simulator. The
 separate `Android` workflow builds a debug APK when a tag is pushed or when the
 workflow is run manually.
+
+Server releases use a separate `server-vX.Y.Z` tag and a single maintainer
+entry point. Start with `make server-release`; the complete flow is in
+[docs/server-release.md](docs/server-release.md).
 
 Workflow actions are pinned to immutable commit SHAs. The Gradle wrapper JAR
 matches the declared Gradle release, the distribution checksum is pinned, and

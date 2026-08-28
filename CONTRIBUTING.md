@@ -65,6 +65,18 @@ Important defaults:
   ignored paths.
 - Follow the project [Code of Conduct](CODE_OF_CONDUCT.md).
 
+## Server releases
+
+Open the maintainer workflow from the repository root:
+
+```bash
+make server-release
+```
+
+The terminal assistant delegates planning, status, and rehearsal to the release
+controller. Publication remains an explicit maintainer action. See
+[Server release](docs/server-release.md).
+
 ## Scope notes
 
 - Sync is the single self-hosted **System V3** contract: the internal entity

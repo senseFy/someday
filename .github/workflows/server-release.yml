@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: server-release-${{ github.ref_name }}
+  group: server-release
   cancel-in-progress: false
 
 env:
@@ -34,17 +34,39 @@ jobs:
 
       - name: Validate tag and image identity
         id: identity
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
           tag="$GITHUB_REF_NAME"
-          if [[ ! "$tag" =~ ^server-v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+          if [[ ! "$tag" =~ ^server-v(.+)$ ]]; then
             printf 'Server release tags must match server-vX.Y.Z: %s\n' "$tag" >&2
             exit 1
           fi
           version="${BASH_REMATCH[1]}"
+          component='(0|[1-9][0-9]*)'
+          if [[ ! "$version" =~ ^${component}\.${component}\.${component}$ ]] ||
+            ((${#version} > 64)); then
+            printf 'Server release versions must be canonical X.Y.Z: %s\n' "$version" >&2
+            exit 1
+          fi
           image="$IMAGE_REPOSITORY:$version"
           [[ "$(git rev-parse "$tag^{commit}")" == "$GITHUB_SHA" ]]
+          [[ "$(git cat-file -t "$tag")" == tag ]] || {
+            printf 'Server releases require an annotated tag: %s\n' "$tag" >&2
+            exit 1
+          }
+          git fetch --no-tags origin \
+            '+refs/heads/main:refs/remotes/origin/main'
+          main_commit="$(git rev-parse 'refs/remotes/origin/main^{commit}')"
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" "$main_commit"; then
+            printf 'Server releases must identify a commit in origin/main history.\n' >&2
+            printf 'Release commit: %s\norigin/main: %s\n' \
+              "$GITHUB_SHA" "$main_commit" >&2
+            exit 1
+          fi
+          ./scripts/verify-server-release-tag "$tag" "$GITHUB_SHA"
           ./scripts/verify-server-release-contract "$tag" "$image"
           {
             printf 'tag=%s\n' "$tag"
@@ -58,30 +80,18 @@ jobs:
           RELEASE_TAG: ${{ steps.identity.outputs.tag }}
         run: |
           set -euo pipefail
-          response_file="$(mktemp)"
-          status="$(
-            curl --silent --show-error \
-              --output "$response_file" \
-              --write-out '%{http_code}' \
-              --header 'Accept: application/vnd.github+json' \
-              --header "Authorization: Bearer $GH_TOKEN" \
-              --header 'X-GitHub-Api-Version: 2022-11-28' \
-              "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG"
-          )"
-          case "$status" in
-            404)
-              ;;
-            200)
-              printf 'GitHub Release already exists: %s\n' "$RELEASE_TAG" >&2
-              exit 1
-              ;;
-            *)
-              printf 'Could not verify GitHub Release absence (HTTP %s):\n' \
-                "$status" >&2
-              sed -n '1,40p' "$response_file" >&2
-              exit 1
-              ;;
-          esac
+          error_file="$(mktemp)"
+          if gh api \
+            "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \
+            >/dev/null 2>"$error_file"; then
+            printf 'GitHub Release already exists: %s\n' "$RELEASE_TAG" >&2
+            exit 1
+          fi
+          if ! grep -Eq 'Not Found|HTTP 404' "$error_file"; then
+            printf 'Could not verify GitHub Release absence:\n' >&2
+            sed -n '1,40p' "$error_file" >&2
+            exit 1
+          fi
 
   publish-image:
     name: Publish AMD64 and ARM64 image
@@ -101,6 +111,12 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+
+      - name: Reconfirm the protected release tag before publishing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+        run: ./scripts/verify-server-release-tag "$RELEASE_TAG" "$GITHUB_SHA"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
@@ -191,6 +207,7 @@ jobs:
       - name: Checkout the release tag
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Set up JDK
@@ -215,6 +232,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends --yes ripgrep
           rg --version
+
+      - name: Verify public history
+        run: ./scripts/verify-public-history
 
       - name: Install Android SDK packages
         shell: bash
@@ -480,24 +500,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.validate.outputs.tag }}
-        run: |
-          set -euo pipefail
-          object="$(
-            gh api \
-              "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG"
-          )"
-          object_type="$(jq -r '.object.type' <<<"$object")"
-          object_sha="$(jq -r '.object.sha' <<<"$object")"
-          for _ in $(seq 1 5); do
-            [[ "$object_type" == tag ]] || break
-            object="$(
-              gh api "repos/$GITHUB_REPOSITORY/git/tags/$object_sha"
-            )"
-            object_type="$(jq -r '.object.type' <<<"$object")"
-            object_sha="$(jq -r '.object.sha' <<<"$object")"
-          done
-          [[ "$object_type" == commit ]]
-          [[ "$object_sha" == "$GITHUB_SHA" ]]
+        run: ./scripts/verify-server-release-tag "$RELEASE_TAG" "$GITHUB_SHA"
 
       - name: Build the image-only deployment bundle
         env:
@@ -506,27 +509,12 @@ jobs:
           VERSION: ${{ needs.validate.outputs.version }}
         run: |
           set -euo pipefail
-          package="someday-server-$VERSION"
-          mkdir -p "release/$package"
-          cp -R deploy "release/$package/deploy"
-          find "release/$package/deploy" -name 'compose.source.yaml' -delete
-          release_reference="$RELEASE_IMAGE@$DIGEST"
-          while IFS= read -r env_file; do
-            sed -i \
-              "s#ghcr.io/sensefy/someday-server:X.Y.Z@sha256:<release-digest>#$release_reference#" \
-              "$env_file"
-            grep -Fqx "SOMEDAY_IMAGE=$release_reference" "$env_file"
-          done < <(find "release/$package/deploy" -name '.env.example' -print)
-          printf '%s\n' \
-            "Image: $release_reference" \
-            "Digest: $DIGEST" \
-            'Platforms: linux/amd64, linux/arm64' \
-            "Source: $GITHUB_SHA" >"release/$package/IMAGE.txt"
-          tar -C release -czf "release/$package.tar.gz" "$package"
-          (
-            cd release
-            sha256sum "$package.tar.gz" >"$package.tar.gz.sha256"
-          )
+          ./scripts/build-server-release-bundle \
+            --version "$VERSION" \
+            --image "$RELEASE_IMAGE" \
+            --digest "$DIGEST" \
+            --commit "$GITHUB_SHA" \
+            --output-dir release
 
       - name: Create the GitHub Release after every gate
         env:
@@ -540,7 +528,10 @@ jobs:
             "Image: \`$RELEASE_IMAGE\`" \
             "Digest: \`$DIGEST\`" \
             '' \
-            'Platforms: `linux/amd64`, `linux/arm64`.' >release-notes.md
+            'Platforms: `linux/amd64`, `linux/arm64`.' \
+            '' \
+            "Deployment: https://github.com/$GITHUB_REPOSITORY/blob/$RELEASE_TAG/docs/self-hosting.md" \
+            >release-notes.md
           gh release create "$RELEASE_TAG" \
             "release/someday-server-$VERSION.tar.gz" \
             "release/someday-server-$VERSION.tar.gz.sha256" \

@@ -31,21 +31,31 @@ object return `404` instead of an authorization error.
 
 ## 3. Configure and start
 
-Replace `X.Y.Z` and `<release-digest>` with values from the matching GitHub
-Release. Its deployment bundle already fills the image reference.
+Replace `X.Y.Z` in these commands with the server version. The release bundle
+contains the digest-pinned image reference.
 
 ```bash
-git clone --depth 1 --branch server-vX.Y.Z \
-  https://github.com/sensefy/someday.git
-cd someday/deploy/external
+VERSION=X.Y.Z
+ASSET="someday-server-$VERSION"
+curl --fail --location --remote-name \
+  "https://github.com/senseFy/someday/releases/download/server-v$VERSION/$ASSET.tar.gz"
+curl --fail --location --remote-name \
+  "https://github.com/senseFy/someday/releases/download/server-v$VERSION/$ASSET.tar.gz.sha256"
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256sum --check "$ASSET.tar.gz.sha256"
+else
+  shasum -a 256 --check "$ASSET.tar.gz.sha256"
+fi
+tar -xzf "$ASSET.tar.gz"
+cd "$ASSET/deploy/external"
 cp .env.example .env
 chmod 600 .env
 ```
 
-Set the required values in `.env`:
+Keep the generated `SOMEDAY_IMAGE` value and set the remaining required values
+in `.env`:
 
 ```dotenv
-SOMEDAY_IMAGE=ghcr.io/sensefy/someday-server:X.Y.Z@sha256:<release-digest>
 SOMEDAY_PUBLIC_BASE_URL=https://notes.example.com
 SOMEDAY_DB_URL=jdbc:postgresql://db.example.com:5432/someday
 SOMEDAY_DB_USER=someday_app

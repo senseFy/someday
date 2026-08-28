@@ -6,21 +6,30 @@ images live in a separate media volume.
 
 ## 1. Get the exact release
 
-Replace `X.Y.Z` and `<release-digest>` with values from the matching GitHub
-Release. Its deployment bundle already fills the image reference.
+Replace `X.Y.Z` in these commands with the server version. The release bundle
+contains the digest-pinned image reference.
 
 ```bash
-git clone --depth 1 --branch server-vX.Y.Z \
-  https://github.com/sensefy/someday.git
-cd someday/deploy/standalone
+VERSION=X.Y.Z
+ASSET="someday-server-$VERSION"
+curl --fail --location --remote-name \
+  "https://github.com/senseFy/someday/releases/download/server-v$VERSION/$ASSET.tar.gz"
+curl --fail --location --remote-name \
+  "https://github.com/senseFy/someday/releases/download/server-v$VERSION/$ASSET.tar.gz.sha256"
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256sum --check "$ASSET.tar.gz.sha256"
+else
+  shasum -a 256 --check "$ASSET.tar.gz.sha256"
+fi
+tar -xzf "$ASSET.tar.gz"
+cd "$ASSET/deploy/standalone"
 cp .env.example .env
 chmod 600 .env
 ```
 
-Set these values in `.env`:
+Keep the generated `SOMEDAY_IMAGE` value and set these values in `.env`:
 
 ```dotenv
-SOMEDAY_IMAGE=ghcr.io/sensefy/someday-server:X.Y.Z@sha256:<release-digest>
 SOMEDAY_PUBLIC_BASE_URL=https://notes.example.com
 SOMEDAY_DB_PASSWORD=<random application password>
 SOMEDAY_POSTGRES_ADMIN_PASSWORD=<different random admin password>
@@ -75,9 +84,16 @@ docker compose start
 `docker compose down --volumes` unless you intend to destroy both database and
 media storage.
 
-To build the exact source tag instead of pulling the release image:
+The release bundle is image-only. To build the exact source tag, clone it and
+configure its `.env` with the same values above:
 
 ```bash
+VERSION=X.Y.Z
+git clone --depth 1 --branch "server-v$VERSION" \
+  https://github.com/senseFy/someday.git "someday-source-$VERSION"
+cd "someday-source-$VERSION/deploy/standalone"
+cp .env.example .env
+# Edit .env before continuing.
 docker compose -f compose.yaml -f compose.source.yaml build server
 docker compose -f compose.yaml -f compose.source.yaml up -d
 ```

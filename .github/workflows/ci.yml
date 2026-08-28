@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   check:
-    name: Linux, PostgreSQL, S3, and real journeys
+    name: Hermetic project check
     runs-on: ubuntu-24.04
     timeout-minutes: 60
 
@@ -24,6 +24,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Set up JDK
@@ -43,6 +44,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends --yes ripgrep
           rg --version
+
+      - name: Verify public history
+        run: ./scripts/verify-public-history
 
       - name: Install Android SDK packages
         shell: bash

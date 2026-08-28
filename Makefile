@@ -15,6 +15,11 @@ RELEASE_READINESS_WORKERS ?= 2
 SERVER_PORT ?= 3180
 DB_PORT ?= 54329
 SERVER_DB_URL ?= jdbc:postgresql://127.0.0.1:$(DB_PORT)/someday
+SERVER_RELEASE_VERSION ?=
+# Freeze raw command-line text before recipes receive it; never expand Make functions here.
+override _SOMEDAY_SERVER_RELEASE_VERSION_ARG := $(value SERVER_RELEASE_VERSION)
+unexport SERVER_RELEASE_VERSION
+export _SOMEDAY_SERVER_RELEASE_VERSION_ARG
 ANDROID_ARTIFACT_NAME ?= someday-android-debug-apk
 ANDROID_ARTIFACT_DIR ?= artifacts/android-$(RUN_ID)
 ANDROID_PLAY_AAB ?= app/android/build/outputs/bundle/release/android-release.aab
@@ -277,6 +282,26 @@ desktop-release-macos: ## Build macOS release DMG with developer options disable
 
 desktop-test: ## Run desktop JVM tests
 	$(GRADLE) :app:desktop:jvmTest --stacktrace
+
+##@ Server release
+.PHONY: server-release server-release-plan server-release-status server-release-rehearse require-server-release-version
+server-release: ## Open the interactive server release workflow; optional SERVER_RELEASE_VERSION=X.Y.Z
+	@SERVER_RELEASE_VERSION="$$_SOMEDAY_SERVER_RELEASE_VERSION_ARG" ./scripts/server-release-tui
+
+require-server-release-version:
+	@if [[ -z "$${_SOMEDAY_SERVER_RELEASE_VERSION_ARG:-}" ]]; then \
+		printf 'ERROR: SERVER_RELEASE_VERSION=X.Y.Z is required.\n' >&2; \
+		exit 2; \
+	fi
+
+server-release-plan: require-server-release-version ## Print the server release plan; requires SERVER_RELEASE_VERSION=X.Y.Z
+	@./scripts/server-release plan "$$_SOMEDAY_SERVER_RELEASE_VERSION_ARG"
+
+server-release-status: require-server-release-version ## Inspect release state without changing it; requires SERVER_RELEASE_VERSION=X.Y.Z
+	@./scripts/server-release status "$$_SOMEDAY_SERVER_RELEASE_VERSION_ARG"
+
+server-release-rehearse: require-server-release-version ## Run the local server release rehearsal; requires SERVER_RELEASE_VERSION=X.Y.Z
+	@./scripts/server-release rehearse "$$_SOMEDAY_SERVER_RELEASE_VERSION_ARG"
 
 ##@ Validation
 .PHONY: lint compile check client-smoke shared-smoke server-test server-container-smoke integration-test real-remote-test sync-v3-gate sync-v3-apple-gate release-readiness validate android-lint
