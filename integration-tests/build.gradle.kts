@@ -38,12 +38,23 @@ tasks.named<Test>("test") {
 }
 
 tasks.register<Test>("realRemoteTest") {
-    description = "Runs real WebDAV and self-hosted end-to-end tests; explicit service environment is required."
+    description = "Runs every real System V3 self-hosted journey; explicit service environment is required."
     group = "verification"
     val testSourceSet = sourceSets.test.get()
     testClassesDirs = testSourceSet.output.classesDirs
     classpath = testSourceSet.runtimeClasspath
-    include("**/WorkspaceV2RealProfilesIntegrationTest.class")
-    include("**/SelfHostedV2ConflictLiveTest.class")
+    include("**/*JourneyTest.class")
+    exclude("**/ServerRecoveryJourneyTest.class")
     shouldRunAfter(tasks.test)
+}
+
+tasks.register<Test>("serverRecoveryTest") {
+    description = "Runs the paired-client journey across an orchestrated isolated server restore."
+    group = "verification"
+    val testSourceSet = sourceSets.test.get()
+    testClassesDirs = testSourceSet.output.classesDirs
+    classpath = testSourceSet.runtimeClasspath
+    include("**/ServerRecoveryJourneyTest.class")
+    outputs.upToDateWhen { false }
+    shouldRunAfter(tasks.named("realRemoteTest"))
 }

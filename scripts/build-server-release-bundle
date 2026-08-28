@@ -1,0 +1,325 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+
+usage() {
+    cat <<'EOF'
+Usage:
+  scripts/build-server-release-bundle \
+    --version X.Y.Z \
+    --image ghcr.io/sensefy/someday-server:X.Y.Z \
+    --digest sha256:<64-lowercase-hex> \
+    --commit <40-lowercase-hex> \
+    --output-dir <directory>
+
+Builds a deterministic image-only deployment bundle and its SHA-256 file.
+The command never overwrites an existing artifact.
+EOF
+}
+
+die() {
+    printf 'server release bundle error: %s\n' "$*" >&2
+    exit 1
+}
+
+VERSION=""
+IMAGE=""
+DIGEST=""
+COMMIT=""
+OUTPUT_DIR=""
+VERSION_SET=false
+IMAGE_SET=false
+DIGEST_SET=false
+COMMIT_SET=false
+OUTPUT_DIR_SET=false
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    [[ "$#" -eq 1 ]] || die '--help does not accept other arguments'
+    usage
+    exit 0
+fi
+
+while (($# > 0)); do
+    [[ "$#" -ge 2 ]] || die "$1 requires a value"
+    case "$1" in
+        --version)
+            [[ "$VERSION_SET" == false ]] || die '--version was provided more than once'
+            VERSION="$2"
+            VERSION_SET=true
+            ;;
+        --image)
+            [[ "$IMAGE_SET" == false ]] || die '--image was provided more than once'
+            IMAGE="$2"
+            IMAGE_SET=true
+            ;;
+        --digest)
+            [[ "$DIGEST_SET" == false ]] || die '--digest was provided more than once'
+            DIGEST="$2"
+            DIGEST_SET=true
+            ;;
+        --commit)
+            [[ "$COMMIT_SET" == false ]] || die '--commit was provided more than once'
+            COMMIT="$2"
+            COMMIT_SET=true
+            ;;
+        --output-dir)
+            [[ "$OUTPUT_DIR_SET" == false ]] || die '--output-dir was provided more than once'
+            OUTPUT_DIR="$2"
+            OUTPUT_DIR_SET=true
+            ;;
+        *)
+            die "unknown argument: $1"
+            ;;
+    esac
+    shift 2
+done
+
+[[ "$VERSION_SET" == true && -n "$VERSION" ]] || die '--version is required'
+[[ "$IMAGE_SET" == true && -n "$IMAGE" ]] || die '--image is required'
+[[ "$DIGEST_SET" == true && -n "$DIGEST" ]] || die '--digest is required'
+[[ "$COMMIT_SET" == true && -n "$COMMIT" ]] || die '--commit is required'
+[[ "$OUTPUT_DIR_SET" == true && -n "$OUTPUT_DIR" ]] || die '--output-dir is required'
+
+component='(0|[1-9][0-9]*)'
+[[ "$VERSION" =~ ^${component}\.${component}\.${component}$ ]] ||
+    die "version must be canonical X.Y.Z: $VERSION"
+((${#VERSION} <= 64)) || die 'version is too long'
+expected_image="ghcr.io/sensefy/someday-server:$VERSION"
+[[ "$IMAGE" == "$expected_image" ]] || die "image must be $expected_image"
+[[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] ||
+    die 'digest must be sha256 followed by 64 lowercase hexadecimal characters'
+[[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]] ||
+    die 'commit must be a full 40-character lowercase hexadecimal Git object ID'
+case "$OUTPUT_DIR" in
+    *$'\n'* | *$'\r'* | *$'\t'*)
+        die 'output directory must not contain control characters'
+        ;;
+esac
+
+command -v python3 >/dev/null 2>&1 || die 'python3 is required'
+
+python3 -B - \
+    "$ROOT_DIR" \
+    "$VERSION" \
+    "$IMAGE" \
+    "$DIGEST" \
+    "$COMMIT" \
+    "$OUTPUT_DIR" <<'PY'
+import gzip
+import hashlib
+import os
+import pathlib
+import shutil
+import stat
+import sys
+import tarfile
+import tempfile
+
+
+class BundleError(Exception):
+    pass
+
+
+def fail(message: str) -> None:
+    raise BundleError(message)
+
+
+def lexists(path: pathlib.Path) -> bool:
+    return os.path.lexists(os.fspath(path))
+
+
+def validate_source_tree(source: pathlib.Path) -> None:
+    if not source.is_dir():
+        fail(f"missing deploy directory: {source}")
+    for path in sorted(source.rglob("*"), key=lambda item: item.as_posix()):
+        relative = path.relative_to(source)
+        if path.is_symlink():
+            fail(f"deploy tree contains a symbolic link: {relative.as_posix()}")
+        mode = path.lstat().st_mode
+        if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
+            fail(f"deploy tree contains a special file: {relative.as_posix()}")
+        if relative.is_absolute() or ".." in relative.parts:
+            fail(f"deploy path escapes its source root: {relative.as_posix()}")
+
+
+def normalize_staging(package_root: pathlib.Path, image_reference: str) -> None:
+    deploy_root = package_root / "deploy"
+    source_overrides = sorted(deploy_root.rglob("compose.source.yaml"))
+    if not source_overrides:
+        fail("deploy tree contains no source Compose override")
+    for path in source_overrides:
+        path.unlink()
+    if any(deploy_root.rglob("compose.source.yaml")):
+        fail("source Compose override remains in the image-only bundle")
+
+    placeholder = (
+        "SOMEDAY_IMAGE="
+        "ghcr.io/sensefy/someday-server:X.Y.Z@sha256:<release-digest>"
+    )
+    replacement = f"SOMEDAY_IMAGE={image_reference}"
+    environment_files = sorted(deploy_root.rglob(".env.example"))
+    if not environment_files:
+        fail("deploy tree contains no .env.example")
+    for path in environment_files:
+        text = path.read_text(encoding="utf-8")
+        if text.count(placeholder) != 1:
+            relative = path.relative_to(package_root).as_posix()
+            fail(f"{relative} must contain exactly one release image placeholder")
+        path.write_text(text.replace(placeholder, replacement), encoding="utf-8")
+
+    placeholder_bytes = placeholder.encode("utf-8")
+    for path in sorted(package_root.rglob("*"), key=lambda item: item.as_posix()):
+        if path.is_file() and placeholder_bytes in path.read_bytes():
+            fail(f"release image placeholder remains in {path.relative_to(package_root)}")
+
+
+def add_deterministic_member(
+    archive: tarfile.TarFile,
+    staging_root: pathlib.Path,
+    path: pathlib.Path,
+) -> None:
+    relative = path.relative_to(staging_root).as_posix()
+    mode = path.lstat().st_mode
+    if stat.S_ISDIR(mode):
+        info = tarfile.TarInfo(f"{relative}/")
+        info.type = tarfile.DIRTYPE
+        info.size = 0
+        info.mode = 0o755
+        file_object = None
+    elif stat.S_ISREG(mode):
+        info = tarfile.TarInfo(relative)
+        info.type = tarfile.REGTYPE
+        info.size = path.stat().st_size
+        info.mode = 0o755 if mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH) else 0o644
+        file_object = path.open("rb")
+    else:
+        fail(f"staging tree contains an unsupported entry: {relative}")
+
+    info.mtime = 0
+    info.uid = 0
+    info.gid = 0
+    info.uname = ""
+    info.gname = ""
+    try:
+        archive.addfile(info, file_object)
+    finally:
+        if file_object is not None:
+            file_object.close()
+
+
+def write_archive(staging_root: pathlib.Path, package_root: pathlib.Path, output: pathlib.Path) -> None:
+    paths = [package_root, *package_root.rglob("*")]
+    paths.sort(key=lambda item: item.relative_to(staging_root).as_posix())
+    output_created = False
+    try:
+        with output.open("xb") as raw_output:
+            output_created = True
+            with gzip.GzipFile(
+                filename="",
+                mode="wb",
+                compresslevel=9,
+                fileobj=raw_output,
+                mtime=0,
+            ) as compressed:
+                with tarfile.open(
+                    fileobj=compressed,
+                    mode="w",
+                    format=tarfile.USTAR_FORMAT,
+                ) as archive:
+                    for path in paths:
+                        add_deterministic_member(archive, staging_root, path)
+    except Exception:
+        if output_created:
+            try:
+                output.unlink()
+            except FileNotFoundError:
+                pass
+        raise
+
+
+def build():
+    root = pathlib.Path(sys.argv[1]).resolve(strict=True)
+    version, image, digest, commit = sys.argv[2:6]
+    source = (root / "deploy").resolve(strict=True)
+    license_source = root / "LICENSE"
+    validate_source_tree(source)
+    if not license_source.is_file() or license_source.is_symlink():
+        fail(f"missing regular license file: {license_source}")
+
+    raw_output = pathlib.Path(sys.argv[6])
+    output_dir = raw_output if raw_output.is_absolute() else pathlib.Path.cwd() / raw_output
+    if lexists(output_dir) and output_dir.is_symlink():
+        fail(f"output directory must not be a symbolic link: {output_dir}")
+    resolved_output = output_dir.resolve(strict=False)
+    if resolved_output == source or source in resolved_output.parents:
+        fail("output directory must be outside the deploy source tree")
+    if lexists(output_dir) and not output_dir.is_dir():
+        fail(f"output path is not a directory: {output_dir}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    package_name = f"someday-server-{version}"
+    archive_path = output_dir / f"{package_name}.tar.gz"
+    checksum_path = output_dir / f"{package_name}.tar.gz.sha256"
+    for path in (archive_path, checksum_path):
+        if lexists(path):
+            fail(f"refusing to overwrite existing artifact: {path}")
+
+    created = []
+    try:
+        with tempfile.TemporaryDirectory(prefix="someday-server-release-") as temporary:
+            staging_root = pathlib.Path(temporary)
+            package_root = staging_root / package_name
+            shutil.copytree(source, package_root / "deploy", copy_function=shutil.copy2)
+            shutil.copyfile(license_source, package_root / "LICENSE")
+            normalize_staging(package_root, f"{image}@{digest}")
+            guide = (
+                "https://github.com/senseFy/someday/blob/"
+                f"server-v{version}/docs/self-hosting.md"
+            )
+            readme_text = (
+                f"# Someday Server {version}\n\n"
+                "Choose `deploy/standalone` for one Docker host or "
+                "`deploy/external` for PostgreSQL plus S3. The image in each "
+                "`.env.example` is already pinned by digest.\n\n"
+                f"Deployment guide: {guide}\n"
+            )
+            (package_root / "README.md").write_text(readme_text, encoding="utf-8")
+            image_text = (
+                f"Image: {image}@{digest}\n"
+                f"Digest: {digest}\n"
+                "Platforms: linux/amd64, linux/arm64\n"
+                f"Source: {commit}\n"
+            )
+            (package_root / "IMAGE.txt").write_text(image_text, encoding="utf-8")
+            (package_root / "IMAGE.txt").chmod(0o644)
+            validate_source_tree(package_root)
+            write_archive(staging_root, package_root, archive_path)
+            created.append(archive_path)
+
+        checksum = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+        with checksum_path.open("x", encoding="ascii", newline="\n") as output:
+            created.append(checksum_path)
+            output.write(f"{checksum}  {archive_path.name}\n")
+        archive_path.chmod(0o644)
+        checksum_path.chmod(0o644)
+        return archive_path, checksum_path
+    except Exception:
+        for path in reversed(created):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        raise
+
+
+try:
+    archive, checksum = build()
+except (BundleError, OSError, UnicodeError, tarfile.TarError) as error:
+    raise SystemExit(f"server release bundle error: {error}") from error
+
+print(f"server release bundle: {archive}")
+print(f"server release checksum: {checksum}")
+PY

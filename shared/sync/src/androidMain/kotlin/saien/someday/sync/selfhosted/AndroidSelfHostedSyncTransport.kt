@@ -15,4 +15,10 @@ class AndroidSelfHostedSyncTransport(
             }
         },
     ),
-) : SelfHostedSyncTransport by delegate, SelfHostedSyncTransportV2 by delegate
+) : SelfHostedSyncTransport by delegate,
+    SelfHostedSyncTransportV2 by delegate,
+    SelfHostedMediaTransportV3 by delegate {
+    fun close() {
+        delegate.close()
+    }
+}

@@ -8,8 +8,8 @@ import saien.someday.domain.notes.CausalEditToken
 import saien.someday.domain.notes.DeletedWorkspaceItem
 import saien.someday.domain.notes.DeletedWorkspaceItemType
 import saien.someday.domain.notes.ConflictDetails
+import saien.someday.domain.notes.ConflictBranchResolutionResult
 import saien.someday.domain.notes.ConflictHistory
-import saien.someday.domain.notes.ConflictResolutionAction
 import saien.someday.domain.notes.MemoryDayCount
 import saien.someday.domain.notes.MemoryMonth
 import saien.someday.domain.notes.NoteDetails
@@ -28,6 +28,7 @@ import saien.someday.domain.notes.NotesLocationInput
 import saien.someday.domain.notes.NotesRepository
 import saien.someday.domain.notes.VersionConflictBranch
 import saien.someday.domain.notes.noteCalendarDate
+import saien.someday.sync.WorkspaceAuthorityMutationCoordinator
 import kotlin.time.Clock
 import kotlin.time.Instant
 import kotlinx.datetime.LocalDate
@@ -39,9 +40,7 @@ class SystemV2NotesRepository(
     writerDeviceIdProvider: () -> String,
     remoteProfileProvider: () -> String,
     private val clock: () -> Instant = { Clock.System.now() },
-    private val workspaceKeyForEpochProvider: (StoredSyncEpochV2) -> WorkspaceMasterKey? = {
-        workspaceKeyProvider()
-    },
+    private val authorityMutationCoordinator: WorkspaceAuthorityMutationCoordinator? = null,
 ) : NotesRepository {
     private val protocolStore = SqlDelightSyncProtocolStoreV2(localRepository.database)
     private val contexts = WorkspaceSystemV2ContextProvider(
@@ -70,7 +69,7 @@ class SystemV2NotesRepository(
     }
 
     override fun createNotebook(title: String): NotebookSummary {
-        val context = contexts.requireActive()
+        val context = contexts.requireWritable()
         val now = clock()
         val entityId = context.factory.newEntityId()
         val maxSort = listNotebooks()
@@ -101,7 +100,7 @@ class SystemV2NotesRepository(
         title: String,
         causalToken: CausalEditToken,
     ): NotebookSummary {
-        val context = contexts.requireActive()
+        val context = contexts.requireWritable()
         val now = clock()
         val base = requireTokenBase(context, notebookKey(notebookId), causalToken)
         val content = base.contentPayload as? NotebookContentV2
@@ -115,7 +114,7 @@ class SystemV2NotesRepository(
     override fun reorderNotebooks(edits: List<NotebookOrderEdit>): List<NotebookSummary> {
         if (edits.isEmpty()) return listNotebooks()
         require(edits.map { it.notebookId }.distinct().size == edits.size) { "A reorder batch repeats a notebook." }
-        val context = contexts.requireActive()
+        val context = contexts.requireWritable()
         val now = clock()
         val versions = edits.mapNotNull { edit ->
             val base = requireTokenBase(context, notebookKey(edit.notebookId), edit.causalToken)
@@ -136,7 +135,7 @@ class SystemV2NotesRepository(
 
     override fun deleteNotebook(notebookId: String, causalToken: CausalEditToken) {
         require(notebookId != RECOVERY_INBOX_EFFECTIVE_NOTEBOOK_ID_V2) { "Recovery Inbox is a local projection." }
-        val context = contexts.requireActive()
+        val context = contexts.requireWritable()
         val key = notebookKey(notebookId)
         val base = requireTokenBase(context, key, causalToken)
         if (base.kind == WorkspaceEntityVersionKindV2.DELETION) return
@@ -155,13 +154,12 @@ class SystemV2NotesRepository(
         retainedContentVersionId: String,
         causalToken: CausalEditToken,
     ): NotebookSummary {
-        val context = contexts.requireActive()
+        val context = contexts.requireWritable()
         val base = requireTokenBase(context, notebookKey(notebookId), causalToken)
         require(base.kind == WorkspaceEntityVersionKindV2.DELETION) { "Notebook restore requires a deletion base." }
         val retained = context.store.loadVersion(retainedContentVersionId)
             ?.takeIf { it.key == base.key }
             ?.contentPayload as? NotebookContentV2
-            ?: findRetainedContentVersion(base.key, retainedContentVersionId)?.contentPayload as? NotebookContentV2
             ?: error("The selected retained notebook content is unavailable.")
         val now = clock()
         commitTokenEdit(context, causalToken, retained, deletedAt = null, now = now)
@@ -178,7 +176,7 @@ class SystemV2NotesRepository(
                 val deletion = heads.singleOrNull()
                     ?.takeIf { it.kind == WorkspaceEntityVersionKindV2.DELETION }
                     ?: return@mapNotNull null
-                val retained = findRetainedContentForDeletion(context, deletion)
+                val retained = findContentForDeletion(context, deletion)
                 val title = when (val payload = retained?.contentPayload) {
                     is NoteContentV2 -> payload.title.ifBlank { "Untitled note" }
                     is NotebookContentV2 -> payload.title.ifBlank { "Untitled notebook" }
@@ -228,7 +226,7 @@ class SystemV2NotesRepository(
         selectedVersionId: String,
         expectedHeadVersionIds: List<String>,
     ): NotebookSummary? {
-        val context = contexts.requireActive()
+        val context = contexts.requireWritable()
         val conflict = context.store.loadActiveConflicts().singleOrNull { it.descriptor.conflictId == conflictId }
             ?: error("The notebook conflict is no longer active.")
         val selected = resolveSelectedBranch(context, conflict, selectedVersionId, expectedHeadVersionIds)
@@ -263,7 +261,7 @@ class SystemV2NotesRepository(
     }
 
     override fun createNote(input: NoteInput): NoteDetails {
-        val context = contexts.requireActive()
+        val context = contexts.requireWritable()
         val notebookId = requireWritableNotebook(context, input.notebookId)
         val now = clock()
         val noteId = context.factory.newEntityId()
@@ -286,7 +284,7 @@ class SystemV2NotesRepository(
     override fun updateNote(noteId: String, input: NoteInput): NoteDetails {
         val token = input.causalToken
             ?: error("A V2 note save requires the causal token captured when the editor opened.")
-        val context = contexts.requireActive()
+        val context = contexts.requireWritable()
         val base = requireTokenBase(context, noteKey(noteId), token)
         val current = base.contentPayload as? NoteContentV2
             ?: error("Use the explicit undelete action for a deleted note.")
@@ -311,7 +309,7 @@ class SystemV2NotesRepository(
             "A note can only appear once in a batch update."
         }
         if (edits.isEmpty()) return emptyList()
-        val context = contexts.requireActive()
+        val context = contexts.requireWritable()
         val now = clock()
         val versions = edits.mapNotNull { edit ->
             val token = edit.input.causalToken
@@ -342,7 +340,7 @@ class SystemV2NotesRepository(
     }
 
     override fun deleteNote(noteId: String, causalToken: CausalEditToken) {
-        val context = contexts.requireActive()
+        val context = contexts.requireWritable()
         val base = requireTokenBase(context, noteKey(noteId), causalToken)
         if (base.kind == WorkspaceEntityVersionKindV2.DELETION) return
         val now = clock()
@@ -354,7 +352,7 @@ class SystemV2NotesRepository(
             "A note can only appear once in a batch deletion."
         }
         if (deletions.isEmpty()) return
-        val context = contexts.requireActive()
+        val context = contexts.requireWritable()
         val now = clock()
         val versions = deletions.mapNotNull { deletion ->
             val token = deletion.causalToken
@@ -376,13 +374,12 @@ class SystemV2NotesRepository(
         retainedContentVersionId: String,
         causalToken: CausalEditToken,
     ): NoteDetails {
-        val context = contexts.requireActive()
+        val context = contexts.requireWritable()
         val base = requireTokenBase(context, noteKey(noteId), causalToken)
         require(base.kind == WorkspaceEntityVersionKindV2.DELETION) { "Note undelete requires a deletion base." }
         val retained = context.store.loadVersion(retainedContentVersionId)
             ?.takeIf { it.key == base.key }
             ?.contentPayload as? NoteContentV2
-            ?: findRetainedContentVersion(base.key, retainedContentVersionId)?.contentPayload as? NoteContentV2
             ?: error("The selected retained note snapshot is unavailable.")
         val now = clock()
         val created = commitTokenEdit(context, causalToken, retained, deletedAt = null, now = now)
@@ -394,7 +391,7 @@ class SystemV2NotesRepository(
             "A note can only appear once in a batch restore."
         }
         if (restores.isEmpty()) return emptyList()
-        val context = contexts.requireActive()
+        val context = contexts.requireWritable()
         val now = clock()
         val versions = restores.map { restore ->
             val base = requireTokenBase(context, noteKey(restore.noteId), restore.causalToken)
@@ -404,8 +401,6 @@ class SystemV2NotesRepository(
             val retained = context.store.loadVersion(restore.retainedContentVersionId)
                 ?.takeIf { it.key == base.key }
                 ?.contentPayload as? NoteContentV2
-                ?: findRetainedContentVersion(base.key, restore.retainedContentVersionId)
-                    ?.contentPayload as? NoteContentV2
                 ?: error("The selected retained note snapshot is unavailable.")
             createFromToken(context, restore.causalToken, retained, deletedAt = null, now = now)
         }
@@ -414,30 +409,16 @@ class SystemV2NotesRepository(
     }
 
     override fun listNoteVersions(noteId: String): List<NoteVersionSummary> {
-        val context = contexts.requireActive()
+        val context = contexts.requireWritable()
         val key = noteKey(noteId)
-        val current = context.store.loadVersions(key).map { context.syncEpochId to it }
-        val retained = retainedEpochContexts().flatMap { retainedContext ->
-            retainedContext.store.loadVersions(key).map { retainedContext.syncEpochId to it }
-        }
-        val candidates = (current + retained)
-            .filter { (_, version) -> version.contentPayload is NoteContentV2 }
-        require(candidates.groupBy { it.second.versionId }.none { (_, versions) ->
-            versions.map { it.second.objectDigest }.distinct().size > 1
-        }) { "A retained V2 history id is ambiguous across epochs." }
-        return candidates
-            .distinctBy { it.second.versionId }
-            .sortedWith(compareBy<Pair<String, WorkspaceEntityVersionV2>>(
-                { it.second.authoredAt },
-                { it.second.generation },
-                { it.first },
-                { it.second.versionId },
+        return context.store.loadVersions(key)
+            .filter { it.contentPayload is NoteContentV2 }
+            .sortedWith(compareBy<WorkspaceEntityVersionV2>(
+                { it.authoredAt },
+                { it.generation },
+                { it.versionId },
             ))
-            .map { (epochId, version) ->
-                version.toNoteVersionSummary(
-                    retainedEpochId = epochId.takeUnless { it == context.syncEpochId },
-                )
-            }
+            .map(WorkspaceEntityVersionV2::toNoteVersionSummary)
     }
 
     override fun restoreNoteVersion(noteId: String, versionId: String): NoteDetails =
@@ -448,14 +429,13 @@ class SystemV2NotesRepository(
         versionId: String,
         causalToken: CausalEditToken,
     ): NoteDetails {
-        val context = contexts.requireActive()
+        val context = contexts.requireWritable()
         val currentVersion = requireTokenBase(context, noteKey(noteId), causalToken)
         val current = currentVersion.contentPayload as? NoteContentV2
             ?: error("History restore is distinct from undelete; choose the explicit undelete action.")
         val historical = context.store.loadVersion(versionId)
             ?.takeIf { it.key == currentVersion.key }
             ?.contentPayload as? NoteContentV2
-            ?: findRetainedContentVersion(currentVersion.key, versionId)?.contentPayload as? NoteContentV2
             ?: error("The selected V2 history snapshot is unavailable.")
         // Product history restore intentionally copies only title/body.  Every
         // other current field, including the atomic location, is retained.
@@ -478,22 +458,12 @@ class SystemV2NotesRepository(
     override fun getConflictDetailsForOriginal(originalNoteId: String): ConflictDetails? =
         getConflictDetails(originalNoteId)
 
-    override fun resolveConflict(
-        conflictNoteId: String,
-        action: ConflictResolutionAction,
-    ): NoteDetails? = error(
-        "Whole-product V2 has no original/conflict-copy roles. Select an exact immutable branch or submit an explicit full resolution.",
-    )
-
-    override fun resolveConflictBranch(conflictNoteId: String, versionId: String): NoteDetails? =
-        error("A V2 conflict resolution requires the exact expected head set displayed by the conflict view.")
-
     override fun resolveConflictBranch(
         conflictNoteId: String,
         versionId: String,
         expectedHeadVersionIds: List<String>,
-    ): NoteDetails? {
-        val context = contexts.requireActive()
+    ): ConflictBranchResolutionResult {
+        val context = contexts.requireWritable()
         val conflict = context.store.loadActiveConflicts().singleOrNull {
             it.descriptor.entityType == WorkspaceEntityTypeV2.NOTE &&
                 (it.descriptor.conflictId == conflictNoteId || it.descriptor.entityId == conflictNoteId)
@@ -508,7 +478,16 @@ class SystemV2NotesRepository(
             authoredAt = now,
         )
         commit(context, chain.map { it to context.factory.newMutationId() }, now)
-        return getNoteDetails(conflict.descriptor.entityId)
+        val resolvedNote = getNoteDetails(conflict.descriptor.entityId)
+        return when (selected.kind) {
+            WorkspaceEntityVersionKindV2.CONTENT -> ConflictBranchResolutionResult.Content(
+                checkNotNull(resolvedNote) { "Resolved note content is unavailable." },
+            )
+            WorkspaceEntityVersionKindV2.DELETION -> {
+                check(resolvedNote == null) { "Resolved note deletion was not projected." }
+                ConflictBranchResolutionResult.Deletion
+            }
+        }
     }
 
     override fun listMemoryDayCounts(month: MemoryMonth): List<MemoryDayCount> =
@@ -611,78 +590,25 @@ class SystemV2NotesRepository(
         timeZoneId = timeZoneId,
     )
 
-    private fun retainedEpochContexts(): List<ActiveWorkspaceSystemV2> =
-        protocolStore.loadAllEpochs()
-            .asSequence()
-            .filter { it.lifecycle == SyncEpochLifecycleV2.READ_ONLY }
-            .sortedByDescending { it.descriptor.createdAt }
-            .mapNotNull { epoch ->
-                val key = workspaceKeyForEpochProvider(epoch) ?: return@mapNotNull null
-                contexts.openRetainedEpochOrNull(epoch, key)
-            }
-            .toList()
-
-    private fun findRetainedContentVersion(
-        key: WorkspaceEntityKeyV2,
-        versionId: String,
-    ): WorkspaceEntityVersionV2? {
-        val matches = retainedEpochContexts().mapNotNull { retained ->
-            retained.store.loadVersion(versionId)?.takeIf {
-                it.key == key && it.kind == WorkspaceEntityVersionKindV2.CONTENT
-            }
-        }
-        require(matches.map { it.objectDigest }.distinct().size <= 1) {
-            "A retained V2 version id is ambiguous across epochs."
-        }
-        return matches.firstOrNull()
-    }
-
-    /**
-     * Finds the last complete content snapshot in exact deletion ancestry.
-     * A checkpoint deletion root has no parents in the new epoch, so its
-     * authenticated provenance is followed into retained read-only epochs.
-     * No old id is ever attached as a new-epoch parent.
-     */
-    private fun findRetainedContentForDeletion(
+    /** Finds the last complete content snapshot in this generation's exact deletion ancestry. */
+    private fun findContentForDeletion(
         context: ActiveWorkspaceSystemV2,
         deletion: WorkspaceEntityVersionV2,
     ): WorkspaceEntityVersionV2? {
-        val retainedByEpoch = retainedEpochContexts().associateBy { it.syncEpochId }
-        val seen = mutableSetOf<Pair<String, String>>()
-
-        fun search(
-            epochContext: ActiveWorkspaceSystemV2,
-            start: WorkspaceEntityVersionV2,
-        ): WorkspaceEntityVersionV2? {
-            if (!seen.add(epochContext.syncEpochId to start.versionId)) return null
-            val versions = epochContext.store.loadVersions(start.key).associateBy { it.versionId }
-            val reachable = mutableListOf<WorkspaceEntityVersionV2>()
-            val queue = ArrayDeque<String>().apply { add(start.versionId) }
-            val visited = mutableSetOf<String>()
-            while (queue.isNotEmpty()) {
-                val id = queue.removeFirst()
-                if (!visited.add(id)) continue
-                val version = versions[id] ?: continue
-                if (version.kind == WorkspaceEntityVersionKindV2.CONTENT) reachable += version
-                version.parentVersionIds.forEach(queue::addLast)
-            }
-            reachable.maxWithOrNull(
-                compareBy<WorkspaceEntityVersionV2>({ it.generation }, { it.authoredAt }, { it.versionId }),
-            )?.let { return it }
-
-            val provenance = start.provenance
-                ?.takeIf { it.type == WorkspaceVersionProvenanceTypeV2.EPOCH_CHECKPOINT }
-                ?: return null
-            val sourceEpoch = provenance.sourceEpoch ?: return null
-            val sourceId = provenance.sourceObjectId ?: return null
-            val prior = retainedByEpoch[sourceEpoch] ?: return null
-            val priorVersion = prior.store.loadVersion(sourceId)
-                ?.takeIf { it.key == start.key }
-                ?: return null
-            return search(prior, priorVersion)
+        val versions = context.store.loadVersions(deletion.key).associateBy { it.versionId }
+        val reachable = mutableListOf<WorkspaceEntityVersionV2>()
+        val queue = ArrayDeque<String>().apply { add(deletion.versionId) }
+        val visited = mutableSetOf<String>()
+        while (queue.isNotEmpty()) {
+            val id = queue.removeFirst()
+            if (!visited.add(id)) continue
+            val version = versions[id] ?: continue
+            if (version.kind == WorkspaceEntityVersionKindV2.CONTENT) reachable += version
+            version.parentVersionIds.forEach(queue::addLast)
         }
-
-        return search(context, deletion)
+        return reachable.maxWithOrNull(
+            compareBy<WorkspaceEntityVersionV2>({ it.generation }, { it.authoredAt }, { it.versionId }),
+        )
     }
 
     private fun projectedNoteView(context: ActiveWorkspaceSystemV2, noteId: String): SystemV2NoteView? {
@@ -780,15 +706,18 @@ class SystemV2NotesRepository(
         versions: List<Pair<WorkspaceEntityVersionV2, String>>,
         now: Instant,
     ) {
-        versions.forEach { context.wireCodec.encode(it.first) }
-        when (val result = context.store.commitLocalMutations(versions.map { (version, mutationId) ->
-            LocalWorkspaceMutationV2(context.remoteProfile, mutationId, version, now)
-        })) {
-            is WorkspaceLocalCommitResultV2.Committed,
-            is WorkspaceLocalCommitResultV2.AlreadyCommitted,
-            -> Unit
-            is WorkspaceLocalCommitResultV2.Rejected -> error(result.error.safeMessage)
+        val action = {
+            versions.forEach { context.wireCodec.encode(it.first) }
+            when (val result = context.store.commitLocalMutations(versions.map { (version, mutationId) ->
+                LocalWorkspaceMutationV2(context.remoteProfile, mutationId, version, now)
+            })) {
+                is WorkspaceLocalCommitResultV2.Committed,
+                is WorkspaceLocalCommitResultV2.AlreadyCommitted,
+                -> Unit
+                is WorkspaceLocalCommitResultV2.Rejected -> error(result.error.safeMessage)
+            }
         }
+        authorityMutationCoordinator?.productAccess(action) ?: action()
     }
 
     private fun requireTokenBase(
@@ -967,7 +896,7 @@ private val NOTE_LIST_COMPARATOR_V2 =
     compareByDescending<NoteSummary> { it.createdAt }
         .thenBy { it.id }
 
-private fun WorkspaceEntityVersionV2.toNoteVersionSummary(retainedEpochId: String? = null): NoteVersionSummary {
+private fun WorkspaceEntityVersionV2.toNoteVersionSummary(): NoteVersionSummary {
     val content = contentPayload as NoteContentV2
     return NoteVersionSummary(
         versionId = versionId,
@@ -979,9 +908,7 @@ private fun WorkspaceEntityVersionV2.toNoteVersionSummary(retainedEpochId: Strin
         markdownBody = content.markdownBody,
         contentHash = payloadDigest,
         deviceId = authorActorId,
-        mergeMetadata = retainedEpochId?.let { epoch ->
-            listOfNotNull("retained-v2:$epoch", mergeAlgorithmVersion).joinToString(";")
-        } ?: mergeAlgorithmVersion,
+        mergeMetadata = mergeAlgorithmVersion,
         createdAt = authoredAt,
     )
 }
@@ -1024,7 +951,6 @@ private fun WorkspaceConflictStateV2.toNoteConflictDetails(context: ActiveWorksp
         conflictHistory = second.history,
         sourceDeviceId = second.authorDeviceId,
         sourceUpdatedAt = branches.drop(1).maxOfOrNull { it.updatedAt },
-        availableActions = emptyList(),
         versionBranches = branches,
         expectedHeadVersionIds = descriptor.headVersionIds,
     )

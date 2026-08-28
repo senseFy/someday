@@ -1,0 +1,45 @@
+name: someday-external
+
+services:
+  server:
+    image: ${SOMEDAY_IMAGE:?Set SOMEDAY_IMAGE to an exact server release}
+    restart: unless-stopped
+    init: true
+    environment:
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      SOMEDAY_DEPLOYMENT_MODE: production
+      SOMEDAY_HOST: 0.0.0.0
+      SOMEDAY_PORT: 3180
+      SOMEDAY_PUBLIC_BASE_URL: ${SOMEDAY_PUBLIC_BASE_URL:?Set SOMEDAY_PUBLIC_BASE_URL in .env}
+      SOMEDAY_DB_URL: ${SOMEDAY_DB_URL:?Set SOMEDAY_DB_URL in .env}
+      SOMEDAY_DB_USER: ${SOMEDAY_DB_USER:?Set SOMEDAY_DB_USER in .env}
+      SOMEDAY_DB_PASSWORD: ${SOMEDAY_DB_PASSWORD:?Set SOMEDAY_DB_PASSWORD in .env}
+      SOMEDAY_DB_MAX_POOL_SIZE: ${SOMEDAY_DB_MAX_POOL_SIZE:-10}
+      SOMEDAY_DB_TLS_MODE: verify-full
+      SOMEDAY_JWT_SECRET: ${SOMEDAY_JWT_SECRET:?Set SOMEDAY_JWT_SECRET in .env}
+      SOMEDAY_MEDIA_BACKEND: s3
+      SOMEDAY_MEDIA_QUOTA_BYTES: ${SOMEDAY_MEDIA_QUOTA_BYTES:-5368709120}
+      SOMEDAY_MEDIA_S3_BUCKET: ${SOMEDAY_MEDIA_S3_BUCKET:?Set SOMEDAY_MEDIA_S3_BUCKET in .env}
+      SOMEDAY_MEDIA_S3_REGION: ${SOMEDAY_MEDIA_S3_REGION:?Set SOMEDAY_MEDIA_S3_REGION in .env}
+      SOMEDAY_MEDIA_S3_ENDPOINT: ${SOMEDAY_MEDIA_S3_ENDPOINT:-}
+      SOMEDAY_MEDIA_S3_PATH_STYLE: ${SOMEDAY_MEDIA_S3_PATH_STYLE:-false}
+      SOMEDAY_REGISTRATION_ENABLED: ${SOMEDAY_REGISTRATION_ENABLED:-false}
+      SOMEDAY_TRUST_PROXY_HEADERS: ${SOMEDAY_TRUST_PROXY_HEADERS:-false}
+    ports:
+      - ${SOMEDAY_HTTP_BIND_ADDRESS:-127.0.0.1}:${SOMEDAY_HTTP_PORT:-3180}:3180
+    read_only: true
+    tmpfs:
+      # Argon2's JNA binding extracts a native library here and must map it.
+      - /tmp:rw,exec,nosuid,nodev,size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"

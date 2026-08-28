@@ -6,8 +6,8 @@ import saien.someday.domain.notes.DeletedWorkspaceItem
 import saien.someday.domain.notes.MemoryDayCount
 import saien.someday.domain.notes.MemoryMonth
 import saien.someday.domain.notes.ConflictDetails
+import saien.someday.domain.notes.ConflictBranchResolutionResult
 import saien.someday.domain.notes.ConflictHistory
-import saien.someday.domain.notes.ConflictResolutionAction
 import saien.someday.domain.notes.NoteDetails
 import saien.someday.domain.notes.NoteBatchDeletion
 import saien.someday.domain.notes.NoteBatchUpdate
@@ -19,6 +19,7 @@ import saien.someday.domain.notes.NotebookConflictDetails
 import saien.someday.domain.notes.NotebookSummary
 import saien.someday.domain.notes.NotesLocationInput
 import saien.someday.domain.notes.NotesRepository
+import saien.someday.domain.notes.VersionConflictBranch
 import saien.someday.domain.notes.noteCalendarDate
 import kotlin.time.Instant
 import kotlinx.datetime.LocalDate
@@ -224,21 +225,29 @@ class InMemoryNotesRepository : NotesRepository {
         val originalNoteId = conflictSources[noteId] ?: return null
         val original = notes[originalNoteId] ?: return null
         val conflict = notes[noteId] ?: return null
+        val originalHistory = ConflictHistory(
+            noteId = originalNoteId,
+            title = original.title,
+            versions = versions[originalNoteId].orEmpty(),
+        )
+        val conflictHistory = ConflictHistory(
+            noteId = noteId,
+            title = conflict.title,
+            versions = versions[noteId].orEmpty(),
+        )
+        val branches = listOfNotNull(
+            originalHistory.toConflictBranch(),
+            conflictHistory.toConflictBranch(),
+        )
         return ConflictDetails(
             conflictNoteId = noteId,
             originalNoteId = originalNoteId,
-            originalHistory = ConflictHistory(
-                noteId = originalNoteId,
-                title = original.title,
-                versions = versions[originalNoteId].orEmpty(),
-            ),
-            conflictHistory = ConflictHistory(
-                noteId = noteId,
-                title = conflict.title,
-                versions = versions[noteId].orEmpty(),
-            ),
+            originalHistory = originalHistory,
+            conflictHistory = conflictHistory,
             sourceDeviceId = "in-memory-remote",
             sourceUpdatedAt = versions[noteId]?.lastOrNull()?.createdAt,
+            versionBranches = branches,
+            expectedHeadVersionIds = branches.map { it.versionId },
         )
     }
 
@@ -248,79 +257,38 @@ class InMemoryNotesRepository : NotesRepository {
             ?.key
             ?.let(::getConflictDetails)
 
-    override fun resolveConflict(
+    override fun resolveConflictBranch(
         conflictNoteId: String,
-        action: ConflictResolutionAction,
-    ): NoteDetails? {
-        val conflict = notes[conflictNoteId] ?: return null
-        return when (action) {
-            ConflictResolutionAction.KeepConflictCopy -> {
-                val kept = conflict.copy(syncBadge = NoteSyncBadge.Pending)
-                notes[conflictNoteId] = kept
-                conflictSources.remove(conflictNoteId)
-                kept
-            }
-            ConflictResolutionAction.DeleteConflictCopy -> {
-                notes.remove(conflictNoteId)
-                versions.remove(conflictNoteId)
-                conflictSources.remove(conflictNoteId)
-                null
-            }
-            ConflictResolutionAction.RestoreOriginalFromConflict -> {
-                val originalNoteId = conflictSources[conflictNoteId] ?: return resolveConflict(
-                    conflictNoteId = conflictNoteId,
-                    action = ConflictResolutionAction.KeepConflictCopy,
-                )
-                val original = notes[originalNoteId] ?: return resolveConflict(
-                    conflictNoteId = conflictNoteId,
-                    action = ConflictResolutionAction.KeepConflictCopy,
-                )
-                val restored = original.copy(
-                    title = conflict.title,
-                    markdownBody = conflict.markdownBody,
-                    createdAt = conflict.createdAt,
-                    updatedAt = nextInstant(),
-                    syncBadge = NoteSyncBadge.Pending,
-                )
-                notes[originalNoteId] = restored
-                appendVersion(
-                    note = restored,
-                    parentVersionId = versions[originalNoteId]?.lastOrNull()?.versionId,
-                    baseVersionId = versions[conflictNoteId]?.lastOrNull()?.versionId,
-                    deviceId = "in-memory-device",
-                    mergeMetadata = """{"source":"conflict-restore","conflictNoteId":"$conflictNoteId"}""",
-                )
-                notes.remove(conflictNoteId)
-                conflictSources.remove(conflictNoteId)
-                restored
-            }
-            ConflictResolutionAction.MergeIntoOriginal -> {
-                val originalNoteId = conflictSources[conflictNoteId] ?: return resolveConflict(
-                    conflictNoteId = conflictNoteId,
-                    action = ConflictResolutionAction.KeepConflictCopy,
-                )
-                val original = notes[originalNoteId] ?: return resolveConflict(
-                    conflictNoteId = conflictNoteId,
-                    action = ConflictResolutionAction.KeepConflictCopy,
-                )
-                val merged = original.copy(
-                    markdownBody = "${original.markdownBody}\n\n---\n${conflict.markdownBody}",
-                    updatedAt = nextInstant(),
-                    syncBadge = NoteSyncBadge.Pending,
-                )
-                notes[originalNoteId] = merged
-                appendVersion(
-                    note = merged,
-                    parentVersionId = versions[originalNoteId]?.lastOrNull()?.versionId,
-                    baseVersionId = versions[conflictNoteId]?.lastOrNull()?.versionId,
-                    deviceId = "in-memory-device",
-                    mergeMetadata = """{"source":"conflict-manual-merge","conflictNoteId":"$conflictNoteId"}""",
-                )
-                notes.remove(conflictNoteId)
-                conflictSources.remove(conflictNoteId)
-                merged
-            }
+        versionId: String,
+        expectedHeadVersionIds: List<String>,
+    ): ConflictBranchResolutionResult {
+        val details = getConflictDetails(conflictNoteId) ?: return ConflictBranchResolutionResult.Rejected
+        if (expectedHeadVersionIds.sorted() != details.expectedHeadVersionIds.sorted()) {
+            return ConflictBranchResolutionResult.Rejected
         }
+        val selected = details.versionBranches.firstOrNull { it.versionId == versionId }
+            ?: return ConflictBranchResolutionResult.Rejected
+        val selectedVersion = selected.history.versions.lastOrNull { it.versionId == versionId }
+            ?: return ConflictBranchResolutionResult.Rejected
+        val original = notes[details.originalNoteId] ?: return ConflictBranchResolutionResult.Rejected
+        val resolved = original.copy(
+            title = selectedVersion.title,
+            markdownBody = selectedVersion.markdownBody,
+            updatedAt = nextInstant(),
+            syncBadge = NoteSyncBadge.Pending,
+        )
+        notes[original.id] = resolved
+        appendVersion(
+            note = resolved,
+            parentVersionId = versions[original.id]?.lastOrNull()?.versionId,
+            baseVersionId = selectedVersion.versionId,
+            deviceId = "in-memory-device",
+            mergeMetadata = """{"source":"branch-resolution","conflictNoteId":"$conflictNoteId"}""",
+        )
+        notes.remove(conflictNoteId)
+        versions.remove(conflictNoteId)
+        conflictSources.remove(conflictNoteId)
+        return ConflictBranchResolutionResult.Content(resolved)
     }
 
     override fun deleteNote(noteId: String) {
@@ -557,6 +525,17 @@ class InMemoryNotesRepository : NotesRepository {
 
     private fun LocalDate.toInstantAtStartOfDay(): Instant =
         atStartOfDayIn(TimeZone.UTC)
+}
+
+private fun ConflictHistory.toConflictBranch(): VersionConflictBranch? {
+    val head = versions.lastOrNull() ?: return null
+    return VersionConflictBranch(
+        versionId = head.versionId,
+        history = this,
+        deleted = false,
+        authorDeviceId = head.deviceId,
+        updatedAt = head.createdAt,
+    )
 }
 
 data class SeededConflictPair(

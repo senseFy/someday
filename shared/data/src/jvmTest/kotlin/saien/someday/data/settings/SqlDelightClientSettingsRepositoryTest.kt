@@ -4,7 +4,6 @@
 package saien.someday.data.settings
 
 import app.cash.sqldelight.driver.jdbc.sqlite.JdbcSqliteDriver
-import saien.someday.data.local.EntityType
 import saien.someday.data.local.SqlDelightLocalDataRepository
 import saien.someday.data.local.createSomedayJdbcDriver
 import saien.someday.data.local.db.SomedayDatabase
@@ -13,13 +12,11 @@ import saien.someday.domain.settings.ClientTheme
 import saien.someday.domain.settings.EditorPreferences
 import saien.someday.domain.settings.OnThisDayNotificationPreferences
 import saien.someday.domain.settings.SyncConfiguration
-import saien.someday.domain.settings.SyncErrorCode
 import saien.someday.domain.settings.SyncMode
 import kotlin.time.Instant
 import java.nio.file.Files
 import kotlin.test.Test
 import kotlin.test.assertEquals
-import kotlin.test.assertTrue
 
 class SqlDelightClientSettingsRepositoryTest {
     @Test
@@ -40,28 +37,17 @@ class SqlDelightClientSettingsRepositoryTest {
                 lastSelectedNotebookId = "notebook-last-selected",
                 activeDeviceId = "device-persisted",
                 syncConfiguration = SyncConfiguration(
-                    mode = SyncMode.WebDav,
-                    webDavEndpoint = "https://dav.example/someday",
+                    mode = SyncMode.SelfHosted,
                     selfHostedEndpoint = "https://sync.example",
                     lastError = "last retry failed",
-                    lastErrorCode = SyncErrorCode.WebDavWorkspaceKeyMismatch,
                 ),
             )
 
             fixture.settingsRepository.save(expected)
 
-            assertTrue(
-                fixture.localRepository.getSyncMetadata("client.theme", EntityType.SETTING)?.dirty == true,
-                "Theme setting should be durable local state and dirty for later sync.",
-            )
-            assertTrue(
-                fixture.localRepository.getSyncMetadata("client.active_device_id", EntityType.SETTING)?.dirty == true,
-                "Active device id should be persisted as client settings state.",
-            )
-            assertTrue(
-                fixture.localRepository.getSyncMetadata("client.last_selected_notebook_id", EntityType.SETTING)?.dirty == true,
-                "Last selected notebook should be persisted as client settings state.",
-            )
+            assertEquals("Dark", fixture.localRepository.getSetting("client.theme")?.value)
+            assertEquals("device-persisted", fixture.localRepository.getSetting("client.active_device_id")?.value)
+            assertEquals("notebook-last-selected", fixture.localRepository.getSetting("client.last_selected_notebook_id")?.value)
 
             withReopenedSettingsRepository(fixture.jdbcUrl) { reopened ->
                 val reloaded = reopened.load()
@@ -76,6 +62,18 @@ class SqlDelightClientSettingsRepositoryTest {
     fun defaultSettingsAreStableWhenNoRowsExist() =
         withFixture { fixture ->
             assertEquals(ClientSettings(), fixture.settingsRepository.load())
+        }
+
+    @Test
+    fun removedAndUnknownSyncModesFailClosedAfterRestart() =
+        withFixture { fixture ->
+            listOf("Web" + "Dav", "future-provider").forEach { storedMode ->
+                fixture.localRepository.putSetting(ClientSettingsKeys.SYNC_MODE, storedMode)
+
+                withReopenedSettingsRepository(fixture.jdbcUrl) { reopened ->
+                    assertEquals(SyncMode.Off, reopened.load().syncConfiguration.mode)
+                }
+            }
         }
 
     private fun withFixture(block: (SettingsFixture) -> Unit) {

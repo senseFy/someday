@@ -153,7 +153,7 @@ class SyncV2CanonicalAndEnvelopeConformanceTest {
             null,
             WorkspaceVersionProvenanceV2(
                 WorkspaceVersionProvenanceTypeV2.EPOCH_CHECKPOINT,
-                SyncRemoteProfileV2.WEB_DAV.wireValue,
+                SyncRemoteProfileV2.SELF_HOSTED.wireValue,
                 PREVIOUS_EPOCH,
                 WRITER,
                 MUTATION,
@@ -202,7 +202,7 @@ class SyncV2CanonicalAndEnvelopeConformanceTest {
         val manifestOuter = control.encodeCheckpointManifest(manifest, WRITER)
         val descriptor = SyncEpochDescriptorV2(
             syncEpochId = EPOCH,
-            remoteProfile = SyncRemoteProfileV2.WEB_DAV.wireValue,
+            remoteProfile = SyncRemoteProfileV2.SELF_HOSTED.wireValue,
             checkpointId = CHECKPOINT,
             checkpointDigest = manifestOuter.objectDigest,
             previousEpochId = PREVIOUS_EPOCH,
@@ -215,35 +215,7 @@ class SyncV2CanonicalAndEnvelopeConformanceTest {
             WorkspaceSyncEpochPointerV2(previousPointerDigest = CONTROL_DIGEST, descriptor = descriptor),
             WRITER,
         )
-        val segment = WorkspaceWebDavLogSegmentV2(
-            syncEpochId = EPOCH,
-            writerDeviceId = WRITER,
-            ordinal = 1,
-            segmentId = SEGMENT,
-            previousSegmentDigest = null,
-            createdAt = AT,
-            objects = listOf(fixedOuter),
-        )
-        val segmentOuter = control.encodeLogSegment(segment, WRITER)
-        val segmentRef = WorkspaceWebDavSegmentRefV2(
-            1,
-            SEGMENT,
-            segmentOuter.objectDigest,
-            null,
-            1,
-            decodedPlaintext(segmentOuter).size,
-            AT,
-        )
-        val writerManifestOuter = control.encodeWriterManifest(
-            WorkspaceWebDavWriterManifestV2(
-                syncEpochId = EPOCH,
-                writerDeviceId = WRITER,
-                previousManifestDigest = null,
-                segments = listOf(segmentRef),
-            ),
-            WRITER,
-        )
-        val controlBytes = listOf(pointerOuter, manifestOuter, chunkOuter, writerManifestOuter, segmentOuter)
+        val controlBytes = listOf(pointerOuter, manifestOuter, chunkOuter)
             .map(::decodedPlaintext)
         val outerAssociatedData = cipher.associatedDataBytes(fixedOuter)
         val corpus = (entityBytes + controlBytes + listOf(outerAssociatedData))
@@ -363,18 +335,6 @@ class SyncV2CanonicalAndEnvelopeConformanceTest {
                 ),
             ).error.code,
         )
-        assertEquals(
-            WorkspaceControlErrorCodeV2.BOUNDS_EXCEEDED,
-            assertIs<WorkspaceControlDecodeResultV2.Rejected>(
-                control.decodeWriterManifest(
-                    oversizedControl(
-                        "webdav_writer_manifest_v2",
-                        "writer-manifest:$WRITER",
-                        MAX_CHECKPOINT_CHUNK_PLAINTEXT_SYSTEM_V2,
-                    ),
-                ),
-            ).error.code,
-        )
     }
 
     @Test
@@ -471,7 +431,7 @@ class SyncV2CanonicalAndEnvelopeConformanceTest {
 
         // Frozen after the exact commonMain corpus below is reviewed. A
         // mismatch is a schema-set change, not a test update by convenience.
-        const val EXPECTED_CANONICAL_CORPUS_SHA256 = "8760d79a432871cd743af2c6c9abbe17ac6b6374e8596d0b8f22fe78a6391961"
+        const val EXPECTED_CANONICAL_CORPUS_SHA256 = "15e6a0e9879992b13c32c1ec0bfa64d55778e89a9ba27b86ddd4ecf3b166a903"
         const val EXPECTED_NOTE_PAYLOAD_DIGEST = "pd2:sha256:e1a1e4b09f1e8ef7f7400b40a90091a9b85b417d9c25e5b939a4c0dc8f88516c"
         const val EXPECTED_NOTE_OBJECT_DIGEST = "od2:hmac-sha256:53cc6e64df5c37ed5ce73477baec2214a0c4d4f15d32fe2d04257af0f371c631"
         const val EXPECTED_EQUIVALENT_VERSION_ID = "05193d7e-a621-4e86-815d-3f5e9b8f019d"

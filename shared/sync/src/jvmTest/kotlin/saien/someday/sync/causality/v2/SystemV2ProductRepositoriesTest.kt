@@ -6,7 +6,6 @@ import saien.someday.data.crypto.SodiumWorkspaceCrypto
 import saien.someday.data.export.LocalDataExporter
 import saien.someday.data.export.LocalDataImporter
 import saien.someday.data.local.SqlDelightLocalDataRepository
-import saien.someday.data.local.SqlDelightNotesRepository
 import saien.someday.data.local.createSomedayJdbcDriver
 import saien.someday.data.local.db.SomedayDatabase
 import saien.someday.data.settings.SqlDelightClientSettingsRepository
@@ -18,6 +17,7 @@ import saien.someday.domain.notes.NotebookOrderEdit
 import saien.someday.domain.notes.NoteSyncBadge
 import saien.someday.domain.notes.NotesLocationInput
 import saien.someday.domain.notes.DeletedWorkspaceItemType
+import saien.someday.domain.notes.ConflictBranchResolutionResult
 import saien.someday.domain.settings.ClientSettings
 import saien.someday.domain.settings.ClientTheme
 import saien.someday.domain.settings.EditorPreferences
@@ -35,6 +35,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertFails
 import kotlin.test.assertFailsWith
+import kotlin.test.assertIs
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -162,7 +163,7 @@ class SystemV2ProductRepositoriesTest {
         fixture.notes.deleteNote(note.id, checkNotNull(note.causalToken))
         fixture.notes.deleteNotebook(notebook.id, checkNotNull(notebook.causalToken))
 
-        val deleted = fixture.routedNotes.listDeletedWorkspaceItems()
+        val deleted = fixture.notes.listDeletedWorkspaceItems()
 
         assertEquals(setOf(DeletedWorkspaceItemType.Note, DeletedWorkspaceItemType.Notebook), deleted.map { it.type }.toSet())
         assertTrue(deleted.all { it.canRestore })
@@ -421,15 +422,55 @@ class SystemV2ProductRepositoriesTest {
         val selectedId = conflict.expectedHeadVersionIds.single { id ->
             (fixture.context().store.loadVersion(id)?.contentPayload as? NoteContentV2)?.title == "Remote title"
         }
-        val resolved = assertNotNull(
+        val resolved = assertIs<ConflictBranchResolutionResult.Content>(
             fixture.notes.resolveConflictBranch(conflict.conflictNoteId, selectedId, conflict.expectedHeadVersionIds),
-        )
+        ).note
         assertEquals("Remote title", resolved.title)
         assertEquals(secondNotebook.id, resolved.notebookId)
         assertEquals("Current place", resolved.location?.placeText)
         assertNull(fixture.notes.getConflictDetails(original.id))
         val resolution = fixture.context().store.loadHeads(noteKeyForTest(original.id)).single()
         assertTrue(conflict.expectedHeadVersionIds.all { fixture.isAncestor(it, resolution.versionId) })
+    }
+
+    @Test
+    fun selectingADeletionHeadReturnsAnExplicitSuccessfulDeletion() = withFixture { fixture ->
+        val notebook = fixture.notes.createNotebook("Diary")
+        val note = fixture.notes.createNote(NoteInput(notebook.id, "Local", "Body"))
+        val base = fixture.context().store.loadVersion(
+            checkNotNull(note.causalToken).expectedBaseVersionId,
+        )!!
+        val remoteDeletion = fixture.context().factory.createDeletion(
+            parent = base,
+            deletedAt = T2,
+            deviceActorId = "device:$WRITER_B",
+            authoredAt = T2,
+        )
+        fixture.applyRemote(remoteDeletion, "remote-deletion")
+        fixture.notes.updateNote(
+            note.id,
+            NoteInput(
+                notebookId = note.notebookId,
+                title = "Local edit",
+                markdownBody = note.markdownBody,
+                createdAt = note.createdAt,
+                location = note.location,
+                timeZoneId = note.timeZoneId,
+                causalToken = note.causalToken,
+            ),
+        )
+        val conflict = assertNotNull(fixture.notes.getConflictDetails(note.id))
+        val deletionHead = conflict.versionBranches.single { it.deleted }
+
+        val result = fixture.notes.resolveConflictBranch(
+            conflict.conflictNoteId,
+            deletionHead.versionId,
+            conflict.expectedHeadVersionIds,
+        )
+
+        assertEquals(ConflictBranchResolutionResult.Deletion, result)
+        assertNull(fixture.notes.getNoteDetails(note.id))
+        assertNull(fixture.notes.getConflictDetails(note.id))
     }
 
     @Test
@@ -779,7 +820,6 @@ class SystemV2ProductRepositoriesTest {
                 location = NotesLocationInput(31.2, 121.4, "V2 place", capturedAt = T1),
             ),
         )
-        assertNull(fixture.local.getNote(note.id))
         val transfer = WorkspaceLocalDataTransferV2(
             fixture.local,
             fixture.rawSettings,
@@ -788,9 +828,8 @@ class SystemV2ProductRepositoriesTest {
             { PROFILE },
         )
         val exporter = LocalDataExporter(
-            fixture.local,
-            clock = { T2 },
             authoritativeDocumentProvider = transfer::exportDocument,
+            clock = { T2 },
         )
 
         val exported = exporter.exportDocument()
@@ -802,12 +841,10 @@ class SystemV2ProductRepositoriesTest {
             notes = listOf(exported.notes.single().copy(title = "Restored branch")),
         )
         val summary = LocalDataImporter(
-            fixture.local,
             authoritativeImporter = transfer::importDocument,
         ).importDocument(restored)
 
         assertEquals(1, summary.noteConflictsCreated)
-        assertNull(fixture.local.getNote(note.id))
         val key = WorkspaceEntityKeyV2(WorkspaceEntityTypeV2.NOTE, note.id)
         assertEquals(2, fixture.context().store.loadHeads(key).size)
         assertEquals(1, fixture.context().store.loadConflicts(key).count {
@@ -826,7 +863,7 @@ class SystemV2ProductRepositoriesTest {
             rawSettings.saveLocalSnapshot(
                 ClientSettings(
                     activeDeviceId = WRITER_A,
-                    syncConfiguration = SyncConfiguration(mode = SyncMode.WebDav),
+                    syncConfiguration = SyncConfiguration(mode = SyncMode.SelfHosted),
                 ),
             )
             val protocol = SqlDelightSyncProtocolStoreV2(database)
@@ -842,11 +879,6 @@ class SystemV2ProductRepositoriesTest {
             protocol.activateEpoch(PROFILE, EPOCH, T1)
             val contextProvider = WorkspaceSystemV2ContextProvider(local, { key }, { WRITER_A }, { PROFILE })
             val notes = SystemV2NotesRepository(local, { key }, { WRITER_A }, { PROFILE }, clock = { T1 })
-            val routedNotes = ProtocolRoutingNotesRepository(
-                SqlDelightNotesRepository(local),
-                notes,
-                { true },
-            )
             val settings = SystemV2ClientSettingsRepository(
                 local,
                 rawSettings,
@@ -855,7 +887,7 @@ class SystemV2ProductRepositoriesTest {
                 { PROFILE },
                 clock = { T1 },
             )
-            block(Fixture(database, EPOCH, local, key, rawSettings, contextProvider, notes, routedNotes, settings))
+            block(Fixture(database, EPOCH, local, key, rawSettings, contextProvider, notes, settings))
         } finally {
             driver.close()
         }
@@ -869,7 +901,6 @@ class SystemV2ProductRepositoriesTest {
         val rawSettings: SqlDelightClientSettingsRepository,
         val contextProvider: WorkspaceSystemV2ContextProvider,
         val notes: SystemV2NotesRepository,
-        val routedNotes: ProtocolRoutingNotesRepository,
         val settings: SystemV2ClientSettingsRepository,
     ) {
         private var remoteCursor: String? = null
@@ -941,7 +972,7 @@ class SystemV2ProductRepositoriesTest {
         WorkspaceEntityKeyV2(WorkspaceEntityTypeV2.NOTEBOOK, notebookId)
 
     private companion object {
-        const val PROFILE = "webdav-log-v2"
+        const val PROFILE = "self-hosted-v2"
         const val WRITER_A = "00000000-0000-4000-8000-000000000001"
         const val WRITER_B = "00000000-0000-4000-8000-000000000002"
         const val EPOCH = "00000000-0000-4000-8000-000000000010"

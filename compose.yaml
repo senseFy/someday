@@ -1,8 +1,8 @@
 # Local development dependencies only. This file intentionally publishes
-# database and WebDAV ports on loopback and is not a production deployment.
+# database port on loopback and is not a production deployment.
 services:
   postgres:
-    image: postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
+    image: postgres:17-alpine@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73
     environment:
       POSTGRES_DB: someday
       POSTGRES_USER: someday
@@ -16,19 +16,5 @@ services:
       interval: 2s
       timeout: 3s
       retries: 20
-
-  webdav:
-    image: bytemark/webdav:2.4@sha256:bcabbc024c511b9c63ed3345f88573e31d84c952ee493c9acb3fe345f4f80f57
-    environment:
-      AUTH_TYPE: Basic
-      USERNAME: someday
-      PASSWORD: someday
-      LOCATION: /
-    ports:
-      - "127.0.0.1:3182:80"
-    volumes:
-      - webdav-data:/var/lib/dav
-
 volumes:
   postgres-data:
-  webdav-data:

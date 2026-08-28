@@ -8,7 +8,6 @@ import saien.someday.domain.location.StaticLocationCaptureAdapter
 import saien.someday.ui.notes.InMemoryNotesRepository
 import saien.someday.ui.notes.NotesUiController
 import saien.someday.ui.notes.markdownEditorCapabilityLog
-import saien.someday.ui.settings.settingsCapabilityLog
 import kotlinx.coroutines.runBlocking
 
 fun sharedUiStartupSemantics(platform: String): ClientShellSemantics = clientShellSemanticsFor(platform)
@@ -18,7 +17,7 @@ fun sharedUiStartupLog(platform: String): String =
         "memories=calendar-counts|month-navigation|selected-day|prior-year " +
         "location=system-coordinates|manual-place|permission-denied-usable|no-map-sdk " +
         "platform-smoke=workspace-setup|unlock|create-note|markdown-preview|denied-location|restart-persistence " +
-        "search=local-title-body-active-only ${settingsCapabilityLog()}"
+        "search=local-title-body-active-only"
 
 fun grantedLocationSmokeLog(
     platform: String,

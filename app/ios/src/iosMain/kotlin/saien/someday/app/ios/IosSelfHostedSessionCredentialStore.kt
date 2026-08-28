@@ -4,6 +4,7 @@ package saien.someday.app.ios
 
 import saien.someday.domain.settings.SelfHostedSessionCredentialStore
 import saien.someday.domain.settings.SelfHostedSessionCredentials
+import saien.someday.domain.settings.authorityBindingId
 import saien.someday.domain.settings.decodeSelfHostedSessionCredentials
 import saien.someday.domain.settings.encodeForSecureStorage
 import kotlinx.cinterop.CPointer
@@ -59,10 +60,10 @@ class IosSelfHostedSessionCredentialStore : SelfHostedSessionCredentialStore {
     override fun loadForAuthority(authorityBindingId: String): SelfHostedSessionCredentials? =
         loadText(authorityAccount(authorityBindingId))
             ?.let(::decodeSelfHostedSessionCredentials)
-            ?.takeIf { saien.someday.domain.settings.selfHostedV2AuthorityBindingId(it.endpoint) == authorityBindingId }
+            ?.takeIf { it.authorityBindingId == authorityBindingId }
 
     override fun saveForAuthority(authorityBindingId: String, credentials: SelfHostedSessionCredentials) {
-        require(saien.someday.domain.settings.selfHostedV2AuthorityBindingId(credentials.endpoint) == authorityBindingId)
+        require(credentials.authorityBindingId == authorityBindingId)
         saveText(authorityAccount(authorityBindingId), credentials.encodeForSecureStorage())
     }
 

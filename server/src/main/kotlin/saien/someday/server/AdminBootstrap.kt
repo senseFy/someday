@@ -7,6 +7,7 @@ import saien.someday.server.auth.isValidAccountEmail
 import saien.someday.server.auth.isValidAccountPassword
 import saien.someday.server.auth.normalizeAccountEmail
 import saien.someday.server.persistence.AuthRepository
+import saien.someday.server.persistence.DatabaseConnectionPool
 import saien.someday.server.persistence.DatabaseMigrator
 import java.nio.file.Files
 import java.nio.file.Path
@@ -28,7 +29,9 @@ fun main() {
     val passwordHash = Argon2idPasswordHasher(
         maxConcurrent = config.argon2MaxConcurrent,
     ).hash(password)
-    val user = AuthRepository(config).createAdminUser(email, passwordHash)
+    val user = DatabaseConnectionPool.create(config).use { databaseConnectionPool ->
+        AuthRepository(config, databaseConnectionPool).createAdminUser(email, passwordHash)
+    }
         ?: error("An account with SOMEDAY_ADMIN_EMAIL already exists; no privileges were changed.")
     println("Created Someday admin ${user.email} (${user.id}).")
 }

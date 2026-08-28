@@ -1,0 +1,337 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+TAG="${1:-}"
+IMAGE="${2:-}"
+DIGEST="${3:-}"
+
+die() {
+    printf 'server release contract error: %s\n' "$*" >&2
+    exit 1
+}
+
+workflow_job() {
+    local workflow="$1"
+    local job="$2"
+    awk -v start="  $job:" '
+        $0 == start {
+            capture = 1
+            found = 1
+        }
+        capture && $0 != start && $0 ~ /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { exit }
+        capture { print }
+        END {
+            if (!found) exit 2
+        }
+    ' "$workflow"
+}
+
+workflow_step_text() {
+    local job_text="$1"
+    local step_name="$2"
+    awk -v target="      - name: $step_name" '
+        $0 == target {
+            in_step = 1
+            found_step = 1
+            print
+            next
+        }
+        in_step && $0 ~ /^      - / { exit }
+        in_step { print }
+        END {
+            if (!found_step) exit 2
+        }
+    ' <<<"$job_text"
+}
+
+workflow_step_run() {
+    local job_text="$1"
+    local step_name="$2"
+    local step_text
+    step_text="$(workflow_step_text "$job_text" "$step_name")" || return
+    if grep -Eq '^        (if|continue-on-error):' <<<"$step_text"; then
+        return 3
+    fi
+    awk '
+        $0 ~ /^        run:[[:space:]]*/ {
+            line = $0
+            sub(/^        run:[[:space:]]*/, "", line)
+            found_run = 1
+            if (line == "|" || line == "|-") {
+                in_block = 1
+                next
+            }
+            print line
+            exit
+        }
+        in_block && $0 ~ /^          / {
+            line = $0
+            sub(/^          /, "", line)
+            print line
+            next
+        }
+        in_block && $0 ~ /^[[:space:]]*$/ {
+            print
+            next
+        }
+        in_block { exit }
+        END { if (!found_run) exit 2 }
+    ' <<<"$step_text"
+}
+
+active_run_lines() {
+    awk '
+        {
+            line = $0
+            sub(/^[[:space:]]+/, "", line)
+            sub(/[[:space:]]+$/, "", line)
+            if (line != "" && line !~ /^#/) print line
+        }
+    '
+}
+
+require_run_line() {
+    local run_text="$1"
+    local expected="$2"
+    local message="$3"
+    local active_lines
+    active_lines="$(active_run_lines <<<"$run_text")"
+    grep -Fqx -- "$expected" <<<"$active_lines" || die "$message"
+}
+
+require_step_order() {
+    local job_text="$1"
+    local first="$2"
+    local second="$3"
+    local message="$4"
+    local first_line second_line
+    first_line="$(
+        grep -Fnx "      - name: $first" <<<"$job_text" | cut -d: -f1 || true
+    )"
+    second_line="$(
+        grep -Fnx "      - name: $second" <<<"$job_text" | cut -d: -f1 || true
+    )"
+    [[ -n "$first_line" && -n "$second_line" && "$first_line" -lt "$second_line" ]] ||
+        die "$message"
+}
+
+require_strict_job() {
+    local job_text="$1"
+    local job_name="$2"
+    if grep -Eq '^    (if|continue-on-error):|^        (if|continue-on-error):' \
+        <<<"$job_text"; then
+        die "$job_name must run every step unconditionally and fail closed"
+    fi
+}
+
+[[ "$TAG" =~ ^server-v((0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))$ ]] ||
+    die "tag must match server-vX.Y.Z: ${TAG:-<empty>}"
+version="${BASH_REMATCH[1]}"
+((${#version} <= 64)) || die "version is too long: $version"
+expected_image="ghcr.io/sensefy/someday-server:$version"
+[[ "$IMAGE" == "$expected_image" ]] ||
+    die "image must be $expected_image: ${IMAGE:-<empty>}"
+if [[ -n "$DIGEST" ]]; then
+    [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] ||
+        die "invalid OCI digest: $DIGEST"
+fi
+
+grep -Eq '^# syntax=docker/dockerfile:[^@[:space:]]+@sha256:[0-9a-f]{64}$' \
+    "$ROOT_DIR/Dockerfile" ||
+    die "Dockerfile frontend must be pinned by digest"
+
+for topology in standalone external; do
+    compose_file="$ROOT_DIR/deploy/$topology/compose.yaml"
+    source_file="$ROOT_DIR/deploy/$topology/compose.source.yaml"
+    env_file="$ROOT_DIR/deploy/$topology/.env.example"
+
+    [[ -f "$compose_file" ]] || die "missing $compose_file"
+    [[ -f "$source_file" ]] || die "missing $source_file"
+    [[ -f "$env_file" ]] || die "missing $env_file"
+    grep -Fq 'image: ${SOMEDAY_IMAGE:?' "$compose_file" ||
+        die "$topology release Compose must require SOMEDAY_IMAGE"
+    grep -Fq '${SOMEDAY_HTTP_BIND_ADDRESS:-127.0.0.1}' "$compose_file" ||
+        die "$topology release Compose must bind HTTP to loopback by default"
+    if grep -Eq '^[[:space:]]+build:' "$compose_file"; then
+        die "$topology release Compose must not build from source"
+    fi
+    grep -Eq '^[[:space:]]+build:' "$source_file" ||
+        die "$topology source override must define a build"
+    grep -Fq 'image: ${SOMEDAY_SOURCE_IMAGE:-someday-server:source}' "$source_file" ||
+        die "$topology source override must use a separate local image"
+    grep -Fq 'target: runtime' "$source_file" ||
+        die "$topology source override must build the runtime image"
+    grep -Fq \
+        'SOMEDAY_IMAGE=ghcr.io/sensefy/someday-server:X.Y.Z@sha256:<release-digest>' \
+        "$env_file" ||
+        die "$topology environment example must pin the release digest"
+done
+
+grep -Fq 'postgres:17-alpine@sha256:' \
+    "$ROOT_DIR/deploy/standalone/compose.yaml" ||
+    die "standalone Compose must pin PostgreSQL 17"
+if grep -Eq 'postgres:16|someday-server:(latest|main)' \
+    "$ROOT_DIR/deploy/standalone/compose.yaml" \
+    "$ROOT_DIR/deploy/external/compose.yaml"; then
+    die "release Compose contains an unsupported or floating image"
+fi
+
+grep -Fqx -- "      - 'v*.*.*'" "$ROOT_DIR/.github/workflows/android.yml" ||
+    die "Android releases must use client vX.Y.Z tags"
+if grep -Fqx -- "      - '**'" "$ROOT_DIR/.github/workflows/android.yml"; then
+    die "Android workflow still accepts server release tags"
+fi
+server_workflow="$ROOT_DIR/.github/workflows/server-release.yml"
+grep -Fqx -- "      - 'server-v*.*.*'" "$server_workflow" ||
+    die "server workflow must use independent server-vX.Y.Z tags"
+grep -Eq '^  group: server-release$' "$server_workflow" ||
+    die "server release runs must use one global concurrency group"
+grep -Eq '^  cancel-in-progress: false$' "$server_workflow" ||
+    die "server release runs must not cancel each other"
+grep -Eq '^  IMAGE_REPOSITORY: ghcr.io/sensefy/someday-server$' "$server_workflow" ||
+    die "server workflow uses an unexpected image repository"
+
+ci_workflow="$ROOT_DIR/.github/workflows/ci.yml"
+linux_section="$(workflow_job "$ci_workflow" check)" ||
+    die "Linux CI must define the check job"
+require_strict_job "$linux_section" 'Linux CI protected check'
+grep -Fqx '    name: Hermetic project check' <<<"$linux_section" ||
+    die "Linux CI must preserve the protected-branch check name"
+grep -Fqx '          fetch-depth: 0' <<<"$linux_section" ||
+    die "Linux CI must fetch complete Git history"
+linux_history_run="$(workflow_step_run "$linux_section" 'Verify public history')" ||
+    die "Linux CI must define the public-history step"
+require_run_line "$linux_history_run" './scripts/verify-public-history' \
+    "Linux CI must actively verify public history"
+
+validate_section="$(workflow_job "$server_workflow" validate)" ||
+    die "server release workflow must define the validate job"
+require_strict_job "$validate_section" 'server release validation'
+grep -Fqx '          fetch-depth: 0' <<<"$validate_section" ||
+    die "server release validation must fetch complete Git history"
+identity_run="$(workflow_step_run "$validate_section" 'Validate tag and image identity')" ||
+    die "server release validation must define the identity step"
+require_run_line "$identity_run" '[[ "$(git cat-file -t "$tag")" == tag ]] || {' \
+    "server release validation must actively require an annotated tag"
+require_run_line "$identity_run" 'git fetch --no-tags origin \' \
+    "server release validation must refresh origin/main"
+require_run_line "$identity_run" "'+refs/heads/main:refs/remotes/origin/main'" \
+    "server release validation must fetch the exact origin/main ref"
+require_run_line "$identity_run" \
+    "main_commit=\"\$(git rev-parse 'refs/remotes/origin/main^{commit}')\"" \
+    "server release validation must resolve origin/main to a commit"
+require_run_line "$identity_run" \
+    'if ! git merge-base --is-ancestor "$GITHUB_SHA" "$main_commit"; then' \
+    "server release validation must actively require GITHUB_SHA in origin/main history"
+require_run_line "$identity_run" \
+    './scripts/verify-server-release-tag "$tag" "$GITHUB_SHA"' \
+    "server release validation must verify the protected remote tag identity"
+release_absence_run="$(workflow_step_run "$validate_section" 'Refuse an existing GitHub Release')" ||
+    die "server release validation must check GitHub Release absence"
+require_run_line "$release_absence_run" 'if gh api \' \
+    "GitHub Release absence must be checked with gh api"
+require_run_line "$release_absence_run" \
+    '"repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \' \
+    "GitHub Release absence check uses an unexpected endpoint"
+if [[ "$validate_section" == *'Authorization: Bearer'* ||
+    "$validate_section" == *'curl '* ]]; then
+    die "GitHub API credentials must not be passed in curl arguments"
+fi
+
+quality_section="$(workflow_job "$server_workflow" quality)" ||
+    die "server release workflow must define the quality job"
+require_strict_job "$quality_section" 'server release quality gates'
+grep -Fqx '          fetch-depth: 0' <<<"$quality_section" ||
+    die "server release quality gates must fetch complete Git history"
+quality_history_run="$(workflow_step_run "$quality_section" 'Verify public history')" ||
+    die "server release quality gates must define the public-history step"
+require_run_line "$quality_history_run" './scripts/verify-public-history' \
+    "server release quality gates must actively verify public history"
+
+for strict_job in public-image runtime-smoke engine-24-smoke; do
+    strict_section="$(workflow_job "$server_workflow" "$strict_job")" ||
+        die "server release workflow must define the $strict_job job"
+    require_strict_job "$strict_section" "$strict_job"
+done
+
+publish_image_section="$(workflow_job "$server_workflow" publish-image)" ||
+    die "server release workflow must define the image publication job"
+require_strict_job "$publish_image_section" 'image publication'
+grep -Fqx '      - validate' <<<"$publish_image_section" ||
+    die "image publication must depend on identity validation"
+grep -Fqx '      - quality' <<<"$publish_image_section" ||
+    die "image publication must depend on release quality gates"
+pre_publish_tag_run="$(
+    workflow_step_run "$publish_image_section" \
+        'Reconfirm the protected release tag before publishing'
+)" || die "image publication must reconfirm the protected tag"
+require_run_line "$pre_publish_tag_run" \
+    './scripts/verify-server-release-tag "$RELEASE_TAG" "$GITHUB_SHA"' \
+    "image publication must actively reconfirm the protected tag"
+require_step_order "$publish_image_section" \
+    'Reconfirm the protected release tag before publishing' \
+    'Build and push the immutable image' \
+    "protected tag reconfirmation must run before the image is published"
+
+github_release_section="$(workflow_job "$server_workflow" github-release)" ||
+    die "server release workflow must define the GitHub Release job"
+require_strict_job "$github_release_section" 'GitHub Release publication'
+for dependency in validate publish-image public-image runtime-smoke engine-24-smoke; do
+    grep -Fqx "      - $dependency" <<<"$github_release_section" ||
+        die "GitHub Release must depend on $dependency"
+done
+final_tag_run="$(
+    workflow_step_run "$github_release_section" \
+        'Reconfirm that the tag still identifies the tested commit'
+)" || die "GitHub Release must reconfirm the protected tag"
+require_run_line "$final_tag_run" \
+    './scripts/verify-server-release-tag "$RELEASE_TAG" "$GITHUB_SHA"' \
+    "GitHub Release must actively reconfirm the protected tag"
+require_step_order "$github_release_section" \
+    'Reconfirm that the tag still identifies the tested commit' \
+    'Create the GitHub Release after every gate' \
+    "protected tag reconfirmation must run before the GitHub Release is created"
+bundle_run="$(workflow_step_run "$github_release_section" 'Build the image-only deployment bundle')" ||
+    die "GitHub Release must define the deployment-bundle step"
+require_run_line "$bundle_run" './scripts/build-server-release-bundle \' \
+    "GitHub Release must actively use the deterministic bundle builder"
+for argument_line in \
+    '--version "$VERSION" \' \
+    '--image "$RELEASE_IMAGE" \' \
+    '--digest "$DIGEST" \' \
+    '--commit "$GITHUB_SHA" \' \
+    '--output-dir release'; do
+    require_run_line "$bundle_run" "$argument_line" \
+        "bundle builder invocation is missing: $argument_line"
+done
+release_run="$(workflow_step_run "$github_release_section" 'Create the GitHub Release after every gate')" ||
+    die "GitHub Release must define the publication step"
+grep -Fq 'docs/self-hosting.md' <<<"$(active_run_lines <<<"$release_run")" ||
+    die "GitHub Release must link the deployment guide"
+for release_line in \
+    'gh release create "$RELEASE_TAG" \' \
+    '"release/someday-server-$VERSION.tar.gz" \' \
+    '"release/someday-server-$VERSION.tar.gz.sha256" \' \
+    '--repo "$GITHUB_REPOSITORY" \' \
+    '--verify-tag \' \
+    '--latest=false \' \
+    '--notes-file release-notes.md'; do
+    require_run_line "$release_run" "$release_line" \
+        "GitHub Release command is missing: $release_line"
+done
+if [[ "$github_release_section" == *'cp -R deploy'* ||
+    "$github_release_section" == *'tar -C release -czf'* ]]; then
+    die "GitHub Release must not assemble deployment bundles inline"
+fi
+
+[[ -x "$ROOT_DIR/scripts/verify-public-history" ]] ||
+    die "public history verifier must exist and be executable"
+[[ -x "$ROOT_DIR/scripts/build-server-release-bundle" ]] ||
+    die "server release bundle builder must exist and be executable"
+[[ -x "$ROOT_DIR/scripts/verify-server-release-tag" ]] ||
+    die "server release tag verifier must exist and be executable"
+
+printf 'server release contract passed: %s (%s%s)\n' \
+    "$TAG" "$IMAGE" "${DIGEST:+@$DIGEST}"

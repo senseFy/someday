@@ -12,7 +12,7 @@
 
 - [ ] `make check` passes.
 - [ ] I added or updated tests for changed behavior.
-- [ ] Sync/crypto/protocol changes update their specification and pass `make sync-v2-gate`.
+- [ ] Sync/crypto/protocol changes update their specification and pass `make sync-v3-gate`.
 - [ ] Schema changes use SQLDelight migrations (client) or Flyway migrations (server).
 - [ ] The change does not add secrets, private note data, credentials, signing material, or local operator files.
 - [ ] Dependency metadata, wrapper checksums, Action SHAs, and image digests were reviewed if they changed.

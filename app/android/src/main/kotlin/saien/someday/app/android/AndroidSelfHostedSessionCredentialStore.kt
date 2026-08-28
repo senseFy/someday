@@ -7,6 +7,7 @@ import android.security.keystore.KeyProperties
 import android.util.Base64
 import saien.someday.domain.settings.SelfHostedSessionCredentialStore
 import saien.someday.domain.settings.SelfHostedSessionCredentials
+import saien.someday.domain.settings.authorityBindingId
 import saien.someday.domain.settings.decodeSelfHostedSessionCredentials
 import saien.someday.domain.settings.encodeForSecureStorage
 import java.security.KeyStore
@@ -36,10 +37,10 @@ class AndroidSelfHostedSessionCredentialStore(
     override fun loadForAuthority(authorityBindingId: String): SelfHostedSessionCredentials? =
         decrypt(authorityIvKey(authorityBindingId), authorityCiphertextKey(authorityBindingId))
             ?.let(::decodeSelfHostedSessionCredentials)
-            ?.takeIf { saien.someday.domain.settings.selfHostedV2AuthorityBindingId(it.endpoint) == authorityBindingId }
+            ?.takeIf { it.authorityBindingId == authorityBindingId }
 
     override fun saveForAuthority(authorityBindingId: String, credentials: SelfHostedSessionCredentials) {
-        require(saien.someday.domain.settings.selfHostedV2AuthorityBindingId(credentials.endpoint) == authorityBindingId)
+        require(credentials.authorityBindingId == authorityBindingId)
         encrypt(
             authorityIvKey(authorityBindingId),
             authorityCiphertextKey(authorityBindingId),

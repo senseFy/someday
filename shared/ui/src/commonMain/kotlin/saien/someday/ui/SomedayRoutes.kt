@@ -44,9 +44,6 @@ internal enum class SettingsPage {
     Editor,
     Notifications,
     Sync,
-    WebDav,
-    WebDavConfiguration,
-    SelfHosted,
     Import,
     Export,
     Developer,
@@ -58,9 +55,6 @@ internal val SettingsPage.routeId: String
         SettingsPage.Editor -> "editor"
         SettingsPage.Notifications -> "notifications"
         SettingsPage.Sync -> "sync"
-        SettingsPage.WebDav -> "webdav"
-        SettingsPage.WebDavConfiguration -> "webdav_configuration"
-        SettingsPage.SelfHosted -> "self_hosted"
         SettingsPage.Import -> "import"
         SettingsPage.Export -> "export"
         SettingsPage.Developer -> "developer"
@@ -72,9 +66,6 @@ internal fun settingsPageFromRouteId(routeId: String): SettingsPage? =
         SettingsPage.Editor.routeId -> SettingsPage.Editor
         SettingsPage.Notifications.routeId -> SettingsPage.Notifications
         SettingsPage.Sync.routeId -> SettingsPage.Sync
-        SettingsPage.WebDav.routeId -> SettingsPage.WebDav
-        SettingsPage.WebDavConfiguration.routeId -> SettingsPage.WebDavConfiguration
-        SettingsPage.SelfHosted.routeId -> SettingsPage.SelfHosted
         SettingsPage.Import.routeId -> SettingsPage.Import
         SettingsPage.Export.routeId -> SettingsPage.Export
         SettingsPage.Developer.routeId -> SettingsPage.Developer

@@ -5,10 +5,10 @@ package saien.someday.ui.settings
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withContext
 import saien.someday.domain.notes.NotebookSummary
 import saien.someday.domain.notifications.OnThisDayNotificationScheduler
@@ -16,9 +16,7 @@ import saien.someday.domain.notifications.UnavailableOnThisDayNotificationSchedu
 import saien.someday.domain.settings.AppLanguage
 import saien.someday.domain.settings.ClientSettings
 import saien.someday.domain.settings.ClientTheme
-import saien.someday.domain.settings.ManualSyncPhase
-import saien.someday.domain.settings.ManualSyncProgress
-import saien.someday.domain.settings.ManualSyncProgressListener
+import saien.someday.domain.settings.ManualSyncReason
 import saien.someday.domain.settings.ManualSyncResult
 import saien.someday.domain.settings.ManualSyncRunner
 import saien.someday.domain.settings.OnThisDayNotificationPreferences
@@ -26,31 +24,11 @@ import saien.someday.domain.settings.SelfHostedSessionCredentialStore
 import saien.someday.domain.settings.SelfHostedSessionSummary
 import saien.someday.domain.settings.SelfHostedSetupClient
 import saien.someday.domain.settings.SelfHostedSetupInput
+import saien.someday.domain.settings.SelfHostedSetupReason
 import saien.someday.domain.settings.SelfHostedSetupResult
-import saien.someday.domain.settings.SelfHostedSetupStatus
-import saien.someday.domain.settings.SyncConfiguration
-import saien.someday.domain.settings.SyncErrorCode
+import saien.someday.domain.settings.SelfHostedSetupValidationIssue
 import saien.someday.domain.settings.SyncMode
-import saien.someday.domain.settings.SyncV2MaintenanceRunner
 import saien.someday.domain.settings.UnavailableSelfHostedSessionCredentialStore
-import saien.someday.domain.settings.UnavailableWebDavCredentialStore
-import saien.someday.domain.settings.WebDavAutoBackupFrequency
-import saien.someday.domain.settings.WebDavBackupCatalogRunner
-import saien.someday.domain.settings.WebDavBackupListResult
-import saien.someday.domain.settings.WebDavBackupResult
-import saien.someday.domain.settings.WebDavBackupRunner
-import saien.someday.domain.settings.WebDavBackupStatus
-import saien.someday.domain.settings.WebDavBackupVersion
-import saien.someday.domain.settings.WebDavConnectionInput
-import saien.someday.domain.settings.WebDavConnectionStatus
-import saien.someday.domain.settings.WebDavConnectionTestResult
-import saien.someday.domain.settings.WebDavConnectionTester
-import saien.someday.domain.settings.WebDavAuthorityCredentials
-import saien.someday.domain.settings.WebDavCredentialStore
-import saien.someday.domain.settings.WebDavDiscoveredDevice
-import saien.someday.domain.settings.WebDavDiscoveredDevicesRunner
-import saien.someday.domain.settings.WebDavRestoreResult
-import saien.someday.domain.settings.WebDavRestoreRunner
 import saien.someday.domain.settings.WorkspaceJoinResult
 import saien.someday.domain.settings.WorkspacePreferencesConflictResolver
 import saien.someday.domain.settings.WorkspacePairingInvitation
@@ -58,10 +36,7 @@ import saien.someday.domain.settings.WorkspacePairingInvitationCanceller
 import saien.someday.domain.settings.WorkspacePairingInvitationCreator
 import saien.someday.domain.settings.WorkspacePairingInvitationJoiner
 import saien.someday.domain.settings.WorkspacePairingInvitationResult
-import saien.someday.domain.settings.isSecureSyncEndpoint
-import saien.someday.domain.settings.normalizeSelfHostedEndpoint
-import saien.someday.domain.settings.normalizeWebDavAppDirectory
-import saien.someday.domain.settings.webDavV2AuthorityBindingId
+import saien.someday.domain.settings.WorkspacePairingReason
 import saien.someday.ui.i18n.SettingsUiStrings
 import saien.someday.ui.i18n.formatUiString
 
@@ -74,9 +49,12 @@ data class OnThisDayNotificationStrings(
     val timeUpdated: String = "On This Day notification time updated.",
 )
 
-data class WebDavDiscoveredDeviceStrings(
-    val loadFailure: String = "Could not load discovered WebDAV devices. Sync once and try again.",
-)
+enum class SettingsFeedbackSeverity {
+    Info,
+    Success,
+    Warning,
+    Error,
+}
 
 class SettingsUiController(
     initialSettings: ClientSettings = ClientSettings(),
@@ -87,120 +65,159 @@ class SettingsUiController(
     private val dayOneImportRunner: DayOneImportRunner = DayOneImportRunner { onResult ->
         onResult(SettingsImportSummary.unavailable("Day One import is unavailable in this build."))
     },
-    private val webDavConnectionTester: WebDavConnectionTester = WebDavConnectionTester { input ->
-        val errors = input.validate()
-        if (errors.isEmpty()) {
-            WebDavConnectionTestResult(
-                success = false,
-                status = WebDavConnectionStatus(
-                    ready = false,
-                    message = "WebDAV connection testing is unavailable in this build.",
-                    appDirectory = input.sanitized().appDirectory,
-                ),
-            )
-        } else {
-            WebDavConnectionTestResult.validationFailed(errors)
-        }
-    },
-    private val webDavCredentialStore: WebDavCredentialStore = UnavailableWebDavCredentialStore,
-    private val webDavBackupRunner: WebDavBackupRunner? = null,
-    private val webDavBackupCatalogRunner: WebDavBackupCatalogRunner? = null,
-    private val webDavRestoreRunner: WebDavRestoreRunner? = null,
-    private val webDavDiscoveredDevicesRunner: WebDavDiscoveredDevicesRunner? = null,
-    private val webDavDiscoveredDeviceStrings: WebDavDiscoveredDeviceStrings =
-        WebDavDiscoveredDeviceStrings(),
     private val onDataRestored: () -> Unit = {},
-    private val selfHostedSetupClient: SelfHostedSetupClient = SelfHostedSetupClient { input ->
-        val errors = input.validate()
-        if (errors.isEmpty()) {
-            SelfHostedSetupResult.failure(
-                "Self-hosted setup is unavailable in this build.",
-            )
-        } else {
-            SelfHostedSetupResult.failure(errors.joinToString(separator = " "))
-        }
+    private val selfHostedSetupClient: SelfHostedSetupClient = SelfHostedSetupClient {
+        SelfHostedSetupResult.failure(SelfHostedSetupReason.Unavailable)
     },
     private val selfHostedSessionCredentialStore: SelfHostedSessionCredentialStore =
         UnavailableSelfHostedSessionCredentialStore,
+    selfHostedDeviceName: String = "Someday device",
+    private val selfHostedDevicePlatform: String = "shared",
     private val manualSyncRunner: ManualSyncRunner = ManualSyncRunner {
         ManualSyncResult.failure(
             mode = SyncMode.Off,
-            message = "Manual sync is not connected in this build.",
+            reason = ManualSyncReason.Unavailable,
         )
-    },
-    private val bindManualSyncProgressListener: (ManualSyncProgressListener?) -> Unit = {},
-    private val syncV2MaintenanceRunner: SyncV2MaintenanceRunner = object : SyncV2MaintenanceRunner {
-        override fun rollEpoch(): ManualSyncResult = ManualSyncResult.failure(
-            SyncMode.Off,
-            "Sync v2 maintenance is not connected in this build.",
-        )
-
-        override fun repairIntegrity(): ManualSyncResult = rollEpoch()
     },
     private val workspacePairingInvitationCreator: WorkspacePairingInvitationCreator =
         WorkspacePairingInvitationCreator {
-            WorkspacePairingInvitationResult.failure("Workspace pairing is unavailable in this build.")
+            WorkspacePairingInvitationResult.failure(WorkspacePairingReason.Unavailable)
         },
     private val workspacePairingInvitationJoiner: WorkspacePairingInvitationJoiner =
         WorkspacePairingInvitationJoiner {
-            WorkspaceJoinResult.failure("Workspace pairing is unavailable in this build.")
+            WorkspaceJoinResult.failure(WorkspacePairingReason.Unavailable)
         },
     private val workspacePairingInvitationCanceller: WorkspacePairingInvitationCanceller =
         WorkspacePairingInvitationCanceller {
-            WorkspaceJoinResult.failure("Workspace pairing is unavailable in this build.")
+            WorkspaceJoinResult.failure(WorkspacePairingReason.Unavailable)
         },
     private val onThisDayNotificationScheduler: OnThisDayNotificationScheduler =
         UnavailableOnThisDayNotificationScheduler,
-    private val onThisDayNotificationStrings: OnThisDayNotificationStrings =
-        OnThisDayNotificationStrings(),
-    private val uiStrings: SettingsUiStrings = SettingsUiStrings(),
+    onThisDayNotificationStrings: OnThisDayNotificationStrings = OnThisDayNotificationStrings(),
+    uiStrings: SettingsUiStrings = SettingsUiStrings(),
     private val currentEpochMillis: () -> Long = { kotlin.time.Clock.System.now().toEpochMilliseconds() },
     private val backgroundDispatcher: CoroutineDispatcher = Dispatchers.Default,
-    private val uiDispatcher: CoroutineDispatcher = Dispatchers.Main,
 ) {
     val onThisDayNotificationsSupported: Boolean = onThisDayNotificationScheduler.isSupported
+    private var onThisDayNotificationStrings = onThisDayNotificationStrings
+    private var uiStrings = uiStrings
+    private var selfHostedDeviceName = selfHostedDeviceName
 
-    private var webDavBackupVersions: List<WebDavBackupVersion> = emptyList()
-    private var webDavDiscoveredDevices: List<WebDavDiscoveredDevice> = emptyList()
     private var currentWorkspacePairingInvitation: WorkspacePairingInvitationUi? = null
+    private var currentSyncOperation: SyncUiOperation? = null
+    /**
+     * Serializes every read-modify-write of [ClientSettings] with sync and pairing.
+     * The persistence callback stores the whole immutable settings value, so a
+     * narrower "sync-only" lock would allow unrelated preference writes to
+     * silently restore stale session metadata.
+     */
+    private val settingsMutationMutex = Mutex()
+    private var secureSessionAccess: SecureSessionAccess = SecureSessionAccess.Unknown
+    private var currentSyncIssue: SyncIssueUi? =
+        syncIssueFromLastError(initialSettings.syncConfiguration.lastError)
     private var currentImportSummary: SettingsImportSummary? = null
     private var importRunning: Boolean = false
     private var nextFeedbackEventId = 0L
-    private var webDavCredentialSaved: Boolean = false
 
-    var state: SettingsUiState by mutableStateOf(
-        buildState(
-            settings = initialSettings,
-            manualSyncProgress = ManualSyncProgress.idle(initialSettings.syncConfiguration.mode),
-        ),
-    )
+    var state: SettingsUiState by mutableStateOf(buildState(settings = initialSettings))
         private set
 
-    suspend fun refresh() {
-        webDavCredentialSaved = withContext(backgroundDispatcher) {
-            runCatching { webDavCredentialStore.hasSavedCredential() }.getOrDefault(false)
+    fun updateLocalizedStrings(
+        settings: SettingsUiStrings,
+        notifications: OnThisDayNotificationStrings,
+        hostDeviceName: String? = null,
+    ) {
+        uiStrings = settings
+        onThisDayNotificationStrings = notifications
+        if (hostDeviceName != null) {
+            selfHostedDeviceName = hostDeviceName
         }
-        state = buildState(
-            settings = state.settings,
-            exportSummary = state.exportSummary,
-            feedbackMessage = state.feedbackMessage,
-            feedbackEventId = state.feedbackEventId,
-            manualSyncProgress = state.manualSyncProgress,
-        )
-        rescheduleOnThisDayNotifications()
     }
 
-    suspend fun refreshWebDavDiscoveredDevices(): Boolean {
-        val runner = webDavDiscoveredDevicesRunner ?: return false
-        val result = withContext(backgroundDispatcher) { runner.listDiscoveredDevices() }
-        if (result.success) webDavDiscoveredDevices = result.devices
-        state = buildState(
-            settings = state.settings,
-            exportSummary = state.exportSummary,
-            feedbackMessage = if (result.success) null else webDavDiscoveredDeviceStrings.loadFailure,
-            manualSyncProgress = state.manualSyncProgress,
+    suspend fun refresh() = withSettingsMutation { refreshLocked() }
+
+    private suspend fun refreshLocked() {
+        val previousSettings = state.settings
+        val previousConfiguration = previousSettings.syncConfiguration
+        val credentialsResult = runCatching {
+            withContext(backgroundDispatcher) { selfHostedSessionCredentialStore.load() }
+        }
+        val reconciledSettings = credentialsResult.fold(
+            onSuccess = { credentials ->
+                val recovered = previousSettings.copy(
+                    activeDeviceId = credentials?.deviceId ?: previousSettings.activeDeviceId,
+                    syncConfiguration = previousConfiguration.copy(
+                        mode = if (credentials != null) SyncMode.SelfHosted else previousConfiguration.mode,
+                        selfHostedEndpoint = credentials?.endpoint ?: previousConfiguration.selfHostedEndpoint,
+                        selfHostedSession = credentials?.toSummary() ?: SelfHostedSessionSummary(),
+                    ),
+                )
+                val persistenceResult = if (recovered == previousSettings) {
+                    Result.success(recovered)
+                } else {
+                    runCatching {
+                        withContext(backgroundDispatcher) { persistSettings(recovered) }
+                    }
+                }
+                persistenceResult.fold(
+                    onSuccess = { persisted ->
+                        secureSessionAccess = if (credentials == null) {
+                            SecureSessionAccess.Missing
+                        } else {
+                            SecureSessionAccess.Available
+                        }
+                        when {
+                            credentials == null &&
+                                (
+                                    previousConfiguration.selfHostedSession.loggedIn ||
+                                        !previousConfiguration.selfHostedEndpoint.isNullOrBlank()
+                                ) -> {
+                                currentSyncIssue = SyncIssueUi(SyncIssueReason.SignInRequired)
+                            }
+                            credentials != null && currentSyncIssue?.reason in setOf(
+                                SyncIssueReason.SignInRequired,
+                                SyncIssueReason.SecureSessionUnavailable,
+                            ) -> currentSyncIssue = null
+                            credentials == null &&
+                                currentSyncIssue?.reason == SyncIssueReason.SecureSessionUnavailable -> {
+                                currentSyncIssue = null
+                            }
+                        }
+                        persisted
+                    },
+                    onFailure = { failure ->
+                        failure.rethrowCancellation()
+                        secureSessionAccess = if (credentials == null) {
+                            SecureSessionAccess.Missing
+                        } else {
+                            SecureSessionAccess.Unavailable
+                        }
+                        currentSyncIssue = SyncIssueUi(
+                            if (credentials == null) {
+                                SyncIssueReason.SignInRequired
+                            } else {
+                                SyncIssueReason.SecureSessionUnavailable
+                            },
+                        )
+                        previousSettings
+                    },
+                )
+            },
+            onFailure = { failure ->
+                failure.rethrowCancellation()
+                secureSessionAccess = SecureSessionAccess.Unavailable
+                currentSyncIssue = SyncIssueUi(SyncIssueReason.SecureSessionUnavailable)
+                previousSettings
+            },
         )
-        return result.success
+        state = buildState(
+            settings = reconciledSettings,
+            exportSummary = state.exportSummary,
+            feedbackMessage = state.feedbackMessage,
+            feedbackSeverity = state.feedbackSeverity,
+            feedbackEventId = state.feedbackEventId,
+        )
+        rescheduleOnThisDayNotifications()
     }
 
     suspend fun rescheduleOnThisDayNotifications() {
@@ -213,7 +230,7 @@ class SettingsUiController(
                 settings = state.settings,
                 exportSummary = state.exportSummary,
                 feedbackMessage = onThisDayNotificationStrings.unavailable,
-                manualSyncProgress = state.manualSyncProgress,
+                feedbackSeverity = SettingsFeedbackSeverity.Error,
             )
             return false
         }
@@ -226,24 +243,26 @@ class SettingsUiController(
                     settings = state.settings,
                     exportSummary = state.exportSummary,
                     feedbackMessage = onThisDayNotificationStrings.permissionRequired,
-                    manualSyncProgress = state.manualSyncProgress,
+                    feedbackSeverity = SettingsFeedbackSeverity.Warning,
                 )
                 return false
             }
         }
-        val updatedPreferences = state.settings.onThisDayNotifications.copy(enabled = enabled)
-        val persisted = persist(
-            updated = state.settings.copy(onThisDayNotifications = updatedPreferences),
-            successMessage = if (enabled) {
-                onThisDayNotificationStrings.enabled
-            } else {
-                onThisDayNotificationStrings.disabled
-            },
-        )
-        if (persisted) {
-            syncOnThisDayNotificationSchedule(updatedPreferences)
+        return withSettingsMutation {
+            val updatedPreferences = state.settings.onThisDayNotifications.copy(enabled = enabled)
+            val persisted = persistLocked(
+                updated = state.settings.copy(onThisDayNotifications = updatedPreferences),
+                successMessage = if (enabled) {
+                    onThisDayNotificationStrings.enabled
+                } else {
+                    onThisDayNotificationStrings.disabled
+                },
+            )
+            if (persisted) {
+                syncOnThisDayNotificationSchedule(updatedPreferences)
+            }
+            persisted
         }
-        return persisted
     }
 
     suspend fun setOnThisDayNotificationTime(
@@ -258,22 +277,24 @@ class SettingsUiController(
                 settings = state.settings,
                 exportSummary = state.exportSummary,
                 feedbackMessage = onThisDayNotificationStrings.invalidTime,
-                manualSyncProgress = state.manualSyncProgress,
+                feedbackSeverity = SettingsFeedbackSeverity.Error,
             )
             return false
         }
-        val updatedPreferences = state.settings.onThisDayNotifications.copy(
-            hour = hour,
-            minute = minute,
-        )
-        val persisted = persist(
-            updated = state.settings.copy(onThisDayNotifications = updatedPreferences),
-            successMessage = onThisDayNotificationStrings.timeUpdated,
-        )
-        if (persisted) {
-            syncOnThisDayNotificationSchedule(updatedPreferences)
+        return withSettingsMutation {
+            val updatedPreferences = state.settings.onThisDayNotifications.copy(
+                hour = hour,
+                minute = minute,
+            )
+            val persisted = persistLocked(
+                updated = state.settings.copy(onThisDayNotifications = updatedPreferences),
+                successMessage = onThisDayNotificationStrings.timeUpdated,
+            )
+            if (persisted) {
+                syncOnThisDayNotificationSchedule(updatedPreferences)
+            }
+            persisted
         }
-        return persisted
     }
 
     private suspend fun syncOnThisDayNotificationSchedule(preferences: OnThisDayNotificationPreferences) {
@@ -288,795 +309,441 @@ class SettingsUiController(
     }
 
     suspend fun selectTheme(theme: ClientTheme): Boolean =
-        persist(
-            updated = state.settings.copy(theme = theme),
-            successMessage = uiStrings.themeUpdated,
-        )
+        withSettingsMutation {
+            persistLocked(
+                updated = state.settings.copy(theme = theme),
+                successMessage = uiStrings.themeUpdated,
+            )
+        }
 
     /**
      * Device-local language override. Always editable, including during workspace
      * preferences conflicts, because it is not workspace-synced.
      */
     suspend fun selectLanguage(language: AppLanguage): Boolean =
-        persist(
-            updated = state.settings.copy(appLanguage = language),
-            successMessage = uiStrings.languageUpdated,
-        )
+        withSettingsMutation {
+            persistLocked(
+                updated = state.settings.copy(appLanguage = language),
+                successMessage = uiStrings.languageUpdated,
+            )
+        }
 
     suspend fun togglePreviewByDefault(enabled: Boolean): Boolean =
-        persist(
-            updated = state.settings.copy(
-                editorPreferences = state.settings.editorPreferences.copy(previewByDefault = enabled),
-            ),
-            successMessage = uiStrings.previewUpdated,
-        )
+        withSettingsMutation {
+            persistLocked(
+                updated = state.settings.copy(
+                    editorPreferences = state.settings.editorPreferences.copy(previewByDefault = enabled),
+                ),
+                successMessage = uiStrings.previewUpdated,
+            )
+        }
 
     suspend fun toggleMarkdownToolbarVisible(enabled: Boolean): Boolean =
-        persist(
-            updated = state.settings.copy(
-                editorPreferences = state.settings.editorPreferences.copy(markdownToolbarVisible = enabled),
-            ),
-            successMessage = uiStrings.toolbarUpdated,
-        )
-
-    suspend fun selectDefaultNotebook(notebookId: String?): Boolean {
-        val validNotebookId = notebookId?.takeIf { candidate ->
-            state.defaultNotebookOptions.any { it.id == candidate }
-        }
-        if (notebookId != null && validNotebookId == null) {
-            state = buildState(
-                settings = state.settings,
-                exportSummary = state.exportSummary,
-                feedbackMessage = uiStrings.missingNotebook,
+        withSettingsMutation {
+            persistLocked(
+                updated = state.settings.copy(
+                    editorPreferences = state.settings.editorPreferences.copy(markdownToolbarVisible = enabled),
+                ),
+                successMessage = uiStrings.toolbarUpdated,
             )
-            return false
         }
 
-        return persist(
-            updated = state.settings.copy(defaultNotebookId = validNotebookId),
-            successMessage = if (validNotebookId == null) {
-                uiStrings.defaultNotebookCleared
-            } else {
-                uiStrings.defaultNotebookUpdated
-            },
-        )
-    }
-
-    suspend fun resolveWorkspacePreferencesBranch(versionId: String): Boolean {
-        val conflict = state.settings.workspacePreferencesState.conflict ?: return false
-        val resolver = workspacePreferencesConflictResolver ?: run {
-            state = buildState(
-                settings = state.settings,
-                exportSummary = state.exportSummary,
-                feedbackMessage = uiStrings.prefsConflictUnavailable,
-                manualSyncProgress = state.manualSyncProgress,
-            )
-            return false
-        }
-        return runCatching {
-            withContext(backgroundDispatcher) {
-                resolver.resolveWorkspacePreferencesBranch(
-                    conflict.conflictId,
-                    versionId,
-                    conflict.expectedHeadVersionIds,
-                )
+    suspend fun selectDefaultNotebook(notebookId: String?): Boolean =
+        withSettingsMutation {
+            val validNotebookId = notebookId?.takeIf { candidate ->
+                state.defaultNotebookOptions.any { it.id == candidate }
             }
-        }.fold(
-            onSuccess = { resolved ->
-                state = buildState(
-                    settings = resolved,
-                    exportSummary = state.exportSummary,
-                    feedbackMessage = uiStrings.prefsConflictResolved,
-                    manualSyncProgress = state.manualSyncProgress,
-                )
-                true
-            },
-            onFailure = { failure ->
+            if (notebookId != null && validNotebookId == null) {
                 state = buildState(
                     settings = state.settings,
                     exportSummary = state.exportSummary,
-                    feedbackMessage = formatUiString(uiStrings.cannotResolvePrefs, failure.message ?: uiStrings.unknownError),
-                    manualSyncProgress = state.manualSyncProgress,
+                    feedbackMessage = uiStrings.missingNotebook,
+                    feedbackSeverity = SettingsFeedbackSeverity.Error,
                 )
                 false
-            },
-        )
-    }
-
-    suspend fun recordLastSelectedNotebook(notebookId: String): Boolean {
-        if (state.settings.lastSelectedNotebookId == notebookId) {
-            return true
-        }
-        val validNotebookId = notebookId.takeIf { candidate ->
-            notebooksProvider().any { it.id == candidate }
-        } ?: return false
-
-        return runCatching {
-            withContext(backgroundDispatcher) {
-                persistSettings(state.settings.copy(lastSelectedNotebookId = validNotebookId))
-            }
-        }.fold(
-            onSuccess = { persisted ->
-                state = buildState(
-                    settings = persisted,
-                    exportSummary = state.exportSummary,
-                    feedbackMessage = state.feedbackMessage,
-                    feedbackEventId = state.feedbackEventId,
-                    manualSyncProgress = if (persisted.syncConfiguration.mode == state.manualSyncProgress.mode) {
-                        state.manualSyncProgress
+            } else {
+                persistLocked(
+                    updated = state.settings.copy(defaultNotebookId = validNotebookId),
+                    successMessage = if (validNotebookId == null) {
+                        uiStrings.defaultNotebookCleared
                     } else {
-                        ManualSyncProgress.idle(persisted.syncConfiguration.mode)
+                        uiStrings.defaultNotebookUpdated
                     },
                 )
-                true
-            },
-            onFailure = { false },
-        )
-    }
-
-    suspend fun selectSyncMode(mode: SyncMode): Boolean =
-        persist(
-            updated = state.settings.copy(
-                syncConfiguration = state.settings.syncConfiguration.copy(mode = mode),
-            ),
-            successMessage = uiStrings.syncModeUpdated,
-        )
-
-    suspend fun toggleWebDavAutoBackup(enabled: Boolean): Boolean =
-        persist(
-            updated = state.settings.copy(
-                syncConfiguration = state.settings.syncConfiguration.copy(
-                    mode = SyncMode.WebDav,
-                    webDavAutoBackupEnabled = enabled,
-                ),
-            ),
-            successMessage = if (enabled) {
-                uiStrings.autoBackupEnabled
-            } else {
-                uiStrings.autoBackupDisabled
-            },
-        )
-
-    suspend fun selectWebDavAutoBackupFrequency(frequency: WebDavAutoBackupFrequency): Boolean =
-        persist(
-            updated = state.settings.copy(
-                syncConfiguration = state.settings.syncConfiguration.copy(
-                    mode = SyncMode.WebDav,
-                    webDavAutoBackupFrequency = frequency,
-                ),
-            ),
-            successMessage = formatUiString(uiStrings.cadenceSet, frequencyDisplayName(frequency)),
-        )
-
-    suspend fun saveWebDavEndpoint(endpoint: String): Boolean =
-        saveWebDavConfiguration(
-            endpoint = endpoint,
-            username = state.settings.syncConfiguration.webDavUsername,
-            password = null,
-            appDirectory = state.settings.syncConfiguration.webDavAppDirectory,
-            successMessage = uiStrings.webdavSaved,
-        )
-
-    suspend fun saveWebDavConfiguration(
-        endpoint: String,
-        username: String?,
-        password: String? = null,
-        appDirectory: String,
-        lastTest: WebDavConnectionStatus? = null,
-        successMessage: String = uiStrings.webdavSaved,
-    ): Boolean {
-        val input = WebDavConnectionInput(
-            endpoint = endpoint,
-            username = username,
-            password = null,
-            appDirectory = appDirectory,
-        ).sanitized()
-        val validationErrors = input.validate()
-        if (validationErrors.isNotEmpty()) {
-            state = buildState(
-                settings = state.settings,
-                exportSummary = state.exportSummary,
-                feedbackMessage = validationErrors.joinToString(separator = " "),
-                manualSyncProgress = state.manualSyncProgress,
-            )
-            return false
+            }
         }
 
-        val connectionChanged = !state.settings.syncConfiguration.matchesWebDavConnection(input)
-        if (connectionChanged && !retainCurrentWebDavAuthorityBeforeChange()) return false
-        val credentialUpdated = persistWebDavCredentialIfProvided(password) ?: return false
-        if (!retainConfiguredWebDavAuthority(input)) return false
-        val persistedLastTest = lastTest ?: state.settings.syncConfiguration.webDavLastTest
-            ?.takeIf { state.settings.syncConfiguration.matchesWebDavConnection(input) }
-        val shouldClearSyncError = connectionChanged || lastTest?.ready != false
-        return persist(
-            updated = state.settings.copy(
-                syncConfiguration = state.settings.syncConfiguration.copy(
-                    webDavEndpoint = input.endpoint,
-                    webDavUsername = input.username,
-                    webDavAppDirectory = input.appDirectory,
-                    webDavLastTest = persistedLastTest,
-                    lastError = if (shouldClearSyncError) null else state.settings.syncConfiguration.lastError,
-                    lastErrorCode = if (shouldClearSyncError) null else state.settings.syncConfiguration.lastErrorCode,
-                ),
-            ),
-            successMessage = if (credentialUpdated) {
-                "$successMessage ${uiStrings.credentialSavedSuffix}"
-            } else {
-                successMessage
-            },
-        )
-    }
-
-    suspend fun testAndSaveWebDavConnection(
-        endpoint: String,
-        username: String?,
-        password: String?,
-        appDirectory: String,
-    ): Boolean {
-        val input = createWebDavInput(
-            endpoint = endpoint,
-            username = username,
-            password = password,
-            appDirectory = appDirectory,
-        ).sanitized()
-        val validationErrors = input.validate()
-        val credentialErrors = input.validateWebDavCredential()
-        if (validationErrors.isNotEmpty() || credentialErrors.isNotEmpty()) {
-            val status = WebDavConnectionStatus(
-                ready = false,
-                message = (validationErrors + credentialErrors).joinToString(separator = " "),
-                appDirectory = input.appDirectory,
-            )
-            state = buildState(
-                settings = state.settings.copy(
-                    syncConfiguration = state.settings.syncConfiguration.copy(webDavLastTest = status),
-                ),
-                exportSummary = state.exportSummary,
-                feedbackMessage = status.message,
-                manualSyncProgress = state.manualSyncProgress,
-            )
-            return false
-        }
-
-        val result = runCatching {
-            withContext(backgroundDispatcher) { webDavConnectionTester.testConnection(input) }
-        }.getOrElse { failure ->
-            WebDavConnectionTestResult(
-                success = false,
-                status = WebDavConnectionStatus(
-                    ready = false,
-                    message = formatUiString(uiStrings.webdavConnectionFailed, failure.message ?: uiStrings.unknownError),
-                    appDirectory = input.appDirectory,
-                ),
-            )
-        }
-        if (!result.success) {
-            val current = state.settings.syncConfiguration
-            if (current.mode == SyncMode.WebDav && !current.matchesWebDavConnection(input)) {
+    suspend fun resolveWorkspacePreferencesBranch(versionId: String): Boolean =
+        withSettingsMutation {
+            val conflict = state.settings.workspacePreferencesState.conflict ?: return@withSettingsMutation false
+            val resolver = workspacePreferencesConflictResolver
+            if (resolver == null) {
                 state = buildState(
                     settings = state.settings,
                     exportSummary = state.exportSummary,
-                    feedbackMessage = result.status.message,
-                    manualSyncProgress = state.manualSyncProgress,
+                    feedbackMessage = uiStrings.prefsConflictUnavailable,
+                    feedbackSeverity = SettingsFeedbackSeverity.Error,
                 )
-                return false
-            }
-            persist(
-                updated = state.settings.copy(
-                    syncConfiguration = current.copy(
-                        mode = if (current.mode == SyncMode.WebDav) SyncMode.WebDav else SyncMode.Off,
-                        webDavEndpoint = input.endpoint,
-                        webDavUsername = input.username,
-                        webDavAppDirectory = input.appDirectory,
-                        webDavLastTest = result.status,
-                    ),
-                ),
-                successMessage = result.status.message,
-            )
-            return false
-        }
-
-        val connectionChanged = !state.settings.syncConfiguration.matchesWebDavConnection(input)
-        if (connectionChanged && !retainCurrentWebDavAuthorityBeforeChange()) return false
-        val credentialUpdated = persistWebDavCredentialIfProvided(password) ?: return false
-        if (!retainConfiguredWebDavAuthority(input)) return false
-        return persist(
-            updated = state.settings.copy(
-                syncConfiguration = state.settings.syncConfiguration.copy(
-                    mode = SyncMode.WebDav,
-                    webDavEndpoint = input.endpoint,
-                    webDavUsername = input.username,
-                    webDavAppDirectory = input.appDirectory,
-                    webDavLastTest = result.status,
-                    lastError = null,
-                    lastErrorCode = null,
-                ),
-            ),
-            successMessage = if (credentialUpdated) {
-                uiStrings.webdavConnectionOkSaved
+                false
             } else {
-                uiStrings.webdavConnectionOk
-            },
-        )
-    }
+                runCatching {
+                    withContext(backgroundDispatcher) {
+                        resolver.resolveWorkspacePreferencesBranch(
+                            conflict.conflictId,
+                            versionId,
+                            conflict.expectedHeadVersionIds,
+                        )
+                    }
+                }.fold(
+                    onSuccess = { resolved ->
+                        state = buildState(
+                            settings = resolved,
+                            exportSummary = state.exportSummary,
+                            feedbackMessage = uiStrings.prefsConflictResolved,
+                            feedbackSeverity = SettingsFeedbackSeverity.Success,
+                        )
+                        true
+                    },
+                    onFailure = { failure ->
+                        failure.rethrowCancellation()
+                        state = buildState(
+                            settings = state.settings,
+                            exportSummary = state.exportSummary,
+                            feedbackMessage = formatUiString(
+                                uiStrings.cannotResolvePrefs,
+                                failure.message ?: uiStrings.unknownError,
+                            ),
+                            feedbackSeverity = SettingsFeedbackSeverity.Error,
+                        )
+                        false
+                    },
+                )
+            }
+        }
 
-    suspend fun backupToWebDav(
+    suspend fun recordLastSelectedNotebook(notebookId: String): Boolean =
+        withSettingsMutation {
+            if (state.settings.lastSelectedNotebookId == notebookId) {
+                return@withSettingsMutation true
+            }
+            val validNotebookId = notebookId.takeIf { candidate ->
+                notebooksProvider().any { it.id == candidate }
+            } ?: return@withSettingsMutation false
+
+            runCatching {
+                withContext(backgroundDispatcher) {
+                    persistSettings(state.settings.copy(lastSelectedNotebookId = validNotebookId))
+                }
+            }.fold(
+                onSuccess = { persisted ->
+                    state = buildState(
+                        settings = persisted,
+                        exportSummary = state.exportSummary,
+                        feedbackMessage = state.feedbackMessage,
+                        feedbackSeverity = state.feedbackSeverity,
+                        feedbackEventId = state.feedbackEventId,
+                    )
+                    true
+                },
+                onFailure = { failure ->
+                    failure.rethrowCancellation()
+                    false
+                },
+            )
+        }
+
+    suspend fun setupSelfHosted(
         endpoint: String,
-        username: String?,
-        password: String?,
-        appDirectory: String,
-    ): Boolean {
-        val input = createWebDavInput(
-            endpoint = endpoint,
-            username = username,
-            password = password,
-            appDirectory = appDirectory,
-        ).sanitized()
-        val validationErrors = input.validate()
-        val credentialErrors = input.validateWebDavCredential()
-        if (validationErrors.isNotEmpty() || credentialErrors.isNotEmpty()) {
-            return recordWebDavBackupResult(
-                WebDavBackupResult.failure((validationErrors + credentialErrors).joinToString(separator = " ")),
-            )
-        }
-        val runner = webDavBackupRunner ?: return recordWebDavBackupResult(
-            WebDavBackupResult.failure(uiStrings.webdavBackupUnavailable),
-        )
-        val result = runCatching {
-            withContext(backgroundDispatcher) { runner.backup(input) }
-        }.getOrElse { failure ->
-            WebDavBackupResult.failure(formatUiString(uiStrings.webdavBackupFailed, failure.message ?: uiStrings.unknownError))
-        }
-        if (result.success && persistWebDavCredentialIfProvided(password) == null) {
-            return false
-        }
-        val updated = state.settings.copy(
-            syncConfiguration = state.settings.syncConfiguration.copy(
-                mode = SyncMode.WebDav,
-                webDavEndpoint = input.endpoint,
-                webDavUsername = input.username,
-                webDavAppDirectory = input.appDirectory,
-                webDavLastTest = WebDavConnectionStatus(
-                    ready = result.success,
-                    message = result.message,
-                    appDirectory = input.appDirectory,
-                ),
-                webDavLastBackup = WebDavBackupStatus(
-                    success = result.success,
-                    message = result.message,
-                    versionLabel = result.version?.label,
-                    completedAtEpochMillis = currentEpochMillis(),
-                ),
-                lastError = if (result.success) null else result.message,
-                lastErrorCode = null,
-            ),
-        )
-        val persisted = runCatching {
-            withContext(backgroundDispatcher) { persistSettings(updated) }
-        }.getOrElse { failure ->
-            state = buildState(
-                settings = state.settings.copy(
-                    syncConfiguration = state.settings.syncConfiguration.copy(
-                        lastError = failure.message,
-                        lastErrorCode = null,
-                    ),
-                ),
-                exportSummary = state.exportSummary,
-                feedbackMessage = formatUiString(uiStrings.webdavSaveFailed, failure.message ?: uiStrings.unknownError),
-                manualSyncProgress = state.manualSyncProgress,
-            )
-            return false
-        }
-        result.version?.let { version ->
-            webDavBackupVersions = (listOf(version) + webDavBackupVersions).distinctBy { it.path ?: it.id }
-        }
-        state = buildState(
-            settings = persisted,
-            exportSummary = state.exportSummary,
-            feedbackMessage = result.message,
-            manualSyncProgress = state.manualSyncProgress,
-        )
-        return result.success
+        email: String,
+        password: String,
+        createAccount: Boolean,
+    ): Boolean = runExclusiveSyncLifecycle(false) {
+        setupSelfHostedLocked(endpoint, email, password, createAccount)
     }
 
-    suspend fun runDueWebDavAutoBackup(): Boolean {
-        val sync = state.settings.syncConfiguration
-        if (!sync.webDavAutoBackupEnabled || sync.mode != SyncMode.WebDav) {
-            return false
-        }
-        val endpoint = sync.webDavEndpoint ?: return false
-        val username = sync.webDavUsername ?: return false
-        if (!webDavCredentialSaved) {
-            return false
-        }
-        val now = currentEpochMillis()
-        val lastCompletedAt = sync.webDavLastBackup?.completedAtEpochMillis
-        if (lastCompletedAt != null && now - lastCompletedAt < sync.webDavAutoBackupFrequency.intervalMillis) {
-            return false
-        }
-        return backupToWebDav(
-            endpoint = endpoint,
-            username = username,
-            password = null,
-            appDirectory = sync.webDavAppDirectory,
-        )
-    }
-
-    suspend fun refreshWebDavBackupVersions(
+    private suspend fun setupSelfHostedLocked(
         endpoint: String,
-        username: String?,
-        password: String?,
-        appDirectory: String,
+        email: String,
+        password: String,
+        createAccount: Boolean,
     ): Boolean {
-        val input = createWebDavInput(
+        val currentSession = state.settings.syncConfiguration.selfHostedSession
+        val sanitized = SelfHostedSetupInput(
             endpoint = endpoint,
-            username = username,
+            email = email,
             password = password,
-            appDirectory = appDirectory,
+            deviceName = currentSession.deviceName ?: hostDeviceLabel(),
+            platform = currentSession.devicePlatform ?: selfHostedDevicePlatform,
+            createAccount = createAccount,
         ).sanitized()
-        val validationErrors = input.validate()
-        val credentialErrors = input.validateWebDavCredential()
-        if (validationErrors.isNotEmpty() || credentialErrors.isNotEmpty()) {
-            return recordWebDavBackupListResult(
-                WebDavBackupListResult.failure((validationErrors + credentialErrors).joinToString(separator = " ")),
-            )
-        }
-        val runner = webDavBackupCatalogRunner ?: return recordWebDavBackupListResult(
-            WebDavBackupListResult.failure(uiStrings.backupHistoryUnavailable),
-        )
-        val result = runCatching {
-            withContext(backgroundDispatcher) { runner.listBackups(input) }
-        }.getOrElse { failure ->
-            WebDavBackupListResult.failure(formatUiString(uiStrings.backupHistoryFailed, failure.message ?: uiStrings.unknownError))
-        }
-        return recordWebDavBackupListResult(result)
-    }
-
-    suspend fun restoreFromWebDav(
-        endpoint: String,
-        username: String?,
-        password: String?,
-        appDirectory: String,
-        backupPath: String? = null,
-    ): Boolean {
-        val input = createWebDavInput(
-            endpoint = endpoint,
-            username = username,
-            password = password,
-            appDirectory = appDirectory,
-        ).sanitized()
-        val validationErrors = input.validate()
-        val credentialErrors = input.validateWebDavCredential()
-        if (validationErrors.isNotEmpty() || credentialErrors.isNotEmpty()) {
-            return recordWebDavRestoreResult(
-                WebDavRestoreResult.failure((validationErrors + credentialErrors).joinToString(separator = " ")),
-            )
-        }
-        val runner = webDavRestoreRunner ?: return recordWebDavRestoreResult(
-            WebDavRestoreResult.failure(uiStrings.restoreUnavailable),
-        )
-        val result = runCatching {
-            withContext(backgroundDispatcher) { runner.restore(input, backupPath) }
-        }.getOrElse { failure ->
-            WebDavRestoreResult.failure(formatUiString(uiStrings.restoreFailed, failure.message ?: uiStrings.unknownError))
-        }
-        if (result.success && persistWebDavCredentialIfProvided(password) == null) {
-            return false
-        }
-        val updated = state.settings.copy(
-            syncConfiguration = state.settings.syncConfiguration.copy(
-                mode = SyncMode.WebDav,
-                webDavEndpoint = input.endpoint,
-                webDavUsername = input.username,
-                webDavAppDirectory = input.appDirectory,
-                webDavLastTest = WebDavConnectionStatus(
-                    ready = result.success,
-                    message = result.message,
-                    appDirectory = input.appDirectory,
-                ),
-                lastError = if (result.success) null else result.message,
-                lastErrorCode = null,
-            ),
-        )
-        val persisted = runCatching {
-            withContext(backgroundDispatcher) { persistSettings(updated) }
-        }.getOrElse { failure ->
-            state = buildState(
-                settings = state.settings.copy(
-                    syncConfiguration = state.settings.syncConfiguration.copy(
-                        lastError = failure.message,
-                        lastErrorCode = null,
-                    ),
-                ),
-                exportSummary = state.exportSummary,
-                feedbackMessage = formatUiString(uiStrings.webdavSaveFailed, failure.message ?: uiStrings.unknownError),
-                manualSyncProgress = state.manualSyncProgress,
-            )
-            return false
-        }
-        state = buildState(
-            settings = persisted,
-            exportSummary = state.exportSummary,
-            feedbackMessage = result.message,
-            manualSyncProgress = state.manualSyncProgress,
-        )
-        if (result.success) {
-            onDataRestored()
-        }
-        return result.success
-    }
-
-    suspend fun clearWebDavCredential(): Boolean {
-        runCatching {
-            withContext(backgroundDispatcher) { webDavCredentialStore.clear() }
-        }.getOrElse { failure ->
-            state = buildState(
-                settings = state.settings,
-                exportSummary = state.exportSummary,
-                feedbackMessage = formatUiString(uiStrings.credentialRemoveFailed, failure.message ?: uiStrings.unknownError),
-                manualSyncProgress = state.manualSyncProgress,
-            )
-            return false
-        }
-        webDavCredentialSaved = false
-        state = buildState(
-            settings = state.settings,
-            exportSummary = state.exportSummary,
-            feedbackMessage = uiStrings.credentialRemoved,
-            manualSyncProgress = state.manualSyncProgress,
-        )
-        return true
-    }
-
-    suspend fun saveSelfHostedEndpoint(endpoint: String): Boolean {
-        val normalizedEndpoint = normalizeSelfHostedEndpoint(endpoint)
-        if (!isSecureSyncEndpoint(normalizedEndpoint)) {
-            state = buildState(
-                settings = state.settings,
-                exportSummary = state.exportSummary,
-                feedbackMessage = uiStrings.selfHostedHttps,
-                manualSyncProgress = state.manualSyncProgress,
-            )
-            return false
-        }
-        return persist(
-            updated = state.settings.copy(
-                syncConfiguration = state.settings.syncConfiguration.copy(
-                    mode = SyncMode.SelfHosted,
-                    selfHostedEndpoint = normalizedEndpoint,
-                ),
-            ),
-            successMessage = uiStrings.selfHostedSaved,
-        )
-    }
-
-    suspend fun setupSelfHosted(input: SelfHostedSetupInput): Boolean {
-        val sanitized = input.sanitized()
         val validationErrors = sanitized.validate()
         if (validationErrors.isNotEmpty()) {
             state = buildState(
                 settings = state.settings,
                 exportSummary = state.exportSummary,
-                feedbackMessage = validationErrors.joinToString(separator = " "),
-                manualSyncProgress = state.manualSyncProgress,
+                feedbackMessage = validationErrors.joinToString(separator = " ", transform = ::selfHostedValidationMessage),
+                feedbackSeverity = SettingsFeedbackSeverity.Error,
             )
             return false
         }
 
-        val result = runCatching {
-            withContext(backgroundDispatcher) { selfHostedSetupClient.setup(sanitized) }
-        }.getOrElse { failure ->
-            SelfHostedSetupResult.failure(
-                formatUiString(uiStrings.selfHostedSetupFailed, failure.message ?: uiStrings.unknownError),
-            )
-        }
-        val session = result.session ?: state.settings.syncConfiguration.selfHostedSession.copy(loggedIn = false)
-        val updatedSettings = state.settings.copy(
-            activeDeviceId = session.deviceId ?: state.settings.activeDeviceId,
-            syncConfiguration = state.settings.syncConfiguration.copy(
-                mode = SyncMode.SelfHosted,
-                selfHostedEndpoint = sanitized.endpoint,
-                selfHostedSession = session,
-                lastError = if (result.success) null else result.status.message,
-                lastErrorCode = null,
-            ),
-        )
-        return persist(
-            updated = updatedSettings,
-            successMessage = result.status.message,
-        ) && result.success
-    }
-
-    suspend fun clearSelfHostedSession(): Boolean {
-        runCatching {
-            withContext(backgroundDispatcher) { selfHostedSessionCredentialStore.clear() }
-        }.getOrElse { failure ->
-            state = buildState(
-                settings = state.settings,
-                exportSummary = state.exportSummary,
-                feedbackMessage = formatUiString(uiStrings.sessionRemoveFailed, failure.message ?: uiStrings.unknownError),
-                manualSyncProgress = state.manualSyncProgress,
-            )
-            return false
-        }
-        return persist(
-            updated = state.settings.copy(
-                syncConfiguration = state.settings.syncConfiguration.copy(
-                    mode = SyncMode.SelfHosted,
-                    selfHostedSession = SelfHostedSessionSummary(),
-                ),
-            ),
-            successMessage = uiStrings.sessionCleared,
-        )
-    }
-
-    fun canRunAutomaticSync(): Boolean =
-        !state.manualSyncProgress.running &&
-            state.settings.syncConfiguration.mode != SyncMode.Off &&
-            syncBlockingMessage(state.settings.syncConfiguration.mode) == null
-
-    fun beginManualSync(): Boolean =
-        beginManualSync(showFeedback = true)
-
-    private fun beginManualSync(showFeedback: Boolean): Boolean {
-        val mode = state.settings.syncConfiguration.mode
-        val blockingMessage = syncBlockingMessage(mode)
-        if (blockingMessage != null) {
-            state = buildState(
-                settings = state.settings,
-                exportSummary = state.exportSummary,
-                feedbackMessage = if (showFeedback) blockingMessage else state.feedbackMessage,
-                feedbackEventId = if (showFeedback) null else state.feedbackEventId,
-                manualSyncProgress = ManualSyncProgress.idle(mode),
-            )
-            return false
+        if (currentSyncOperation != null) return false
+        currentSyncOperation = if (createAccount) {
+            SyncUiOperation.CreatingAccount
+        } else {
+            SyncUiOperation.Authenticating
         }
         state = buildState(
             settings = state.settings,
             exportSummary = state.exportSummary,
+            feedbackMessage = state.feedbackMessage,
+            feedbackSeverity = state.feedbackSeverity,
+            feedbackEventId = state.feedbackEventId,
+        )
+
+        return try {
+            val result = try {
+                withContext(backgroundDispatcher) { selfHostedSetupClient.setup(sanitized) }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Throwable) {
+                SelfHostedSetupResult.failure(
+                    reason = SelfHostedSetupReason.Failed,
+                    diagnosticMessage = failure.message,
+                )
+            }
+            val displayMessage = selfHostedSetupMessage(result.status.reason)
+            if (!result.success || result.session == null) {
+                val rejectedReplacement = currentSession.loggedIn &&
+                    result.status.reason in setOf(
+                        SelfHostedSetupReason.AccountChangeBlocked,
+                        SelfHostedSetupReason.EndpointMismatch,
+                    )
+                if (!rejectedReplacement) {
+                    currentSyncIssue = SyncIssueUi(SyncIssueReason.SetupFailed)
+                }
+                // Failed account/device replacement must not damage the previously
+                // bound endpoint or its usable session summary.
+                val preserved = state.settings.copy(
+                    syncConfiguration = state.settings.syncConfiguration.copy(
+                        lastError = if (rejectedReplacement) {
+                            state.settings.syncConfiguration.lastError
+                        } else {
+                            "setup:${result.status.reason.name}"
+                        },
+                    ),
+                )
+                persistLocked(
+                    updated = preserved,
+                    successMessage = displayMessage,
+                    successSeverity = SettingsFeedbackSeverity.Error,
+                )
+                false
+            } else {
+                val session = checkNotNull(result.session)
+                secureSessionAccess = SecureSessionAccess.Available
+                currentSyncIssue = null
+                val updatedSettings = state.settings.copy(
+                    activeDeviceId = session.deviceId ?: state.settings.activeDeviceId,
+                    syncConfiguration = state.settings.syncConfiguration.copy(
+                        mode = SyncMode.SelfHosted,
+                        selfHostedEndpoint = sanitized.endpoint,
+                        selfHostedSession = session,
+                        lastError = null,
+                    ),
+                )
+                val persisted = persistLocked(
+                    updated = updatedSettings,
+                    successMessage = displayMessage,
+                )
+                if (!persisted) {
+                    secureSessionAccess = SecureSessionAccess.Unavailable
+                    currentSyncIssue = SyncIssueUi(SyncIssueReason.SecureSessionUnavailable)
+                    publishCurrentState()
+                }
+                persisted
+            }
+        } finally {
+            currentSyncOperation = null
+            publishCurrentState()
+        }
+    }
+
+    fun canRunAutomaticSync(): Boolean =
+        !settingsMutationMutex.isLocked && canStartSync()
+
+    private fun canStartSync(): Boolean =
+        currentSyncOperation == null &&
+            state.sync.connection is SyncConnectionUi.Connected &&
+            (currentSyncIssue == null || currentSyncIssue?.action == SyncIssueAction.RetrySync)
+
+    private fun canUseWorkspacePairing(): Boolean =
+        state.sync.pairingAvailable
+
+    private fun beginSync(showFeedback: Boolean): Boolean {
+        if (currentSyncOperation != null) return false
+        val connected = state.sync.connection is SyncConnectionUi.Connected
+        val blockingIssue = currentSyncIssue
+            ?.takeUnless { it.action == SyncIssueAction.RetrySync }
+        val blockingMessage = when {
+            !connected -> uiStrings.signInBeforeSync
+            blockingIssue != null -> syncIssueMessage(blockingIssue.reason)
+            else -> null
+        }
+        if (blockingMessage != null) {
+            if (!connected && currentSyncIssue == null) {
+                currentSyncIssue = SyncIssueUi(reason = SyncIssueReason.SignInRequired)
+            }
+            state = buildState(
+                settings = state.settings,
+                exportSummary = state.exportSummary,
+                feedbackMessage = if (showFeedback) blockingMessage else state.feedbackMessage,
+                feedbackSeverity = if (showFeedback) SettingsFeedbackSeverity.Error else state.feedbackSeverity,
+                feedbackEventId = if (showFeedback) null else state.feedbackEventId,
+            )
+            return false
+        }
+        currentSyncOperation = SyncUiOperation.Syncing
+        state = buildState(
+            settings = state.settings,
+            exportSummary = state.exportSummary,
             feedbackMessage = if (showFeedback) uiStrings.syncStarted else state.feedbackMessage,
+            feedbackSeverity = if (showFeedback) SettingsFeedbackSeverity.Info else state.feedbackSeverity,
             feedbackEventId = if (showFeedback) null else state.feedbackEventId,
-            manualSyncProgress = ManualSyncProgress.inProgress(mode, uiStrings.syncInProgress),
         )
         return true
     }
 
-    suspend fun completeManualSync(result: ManualSyncResult): Boolean =
-        completeManualSync(result, showFeedback = true)
-
-    private suspend fun completeManualSync(
+    private suspend fun completeSync(
         result: ManualSyncResult,
         showFeedback: Boolean,
     ): Boolean {
+        val displayMessage = syncResultMessage(result)
+        if (result.reason == ManualSyncReason.AlreadyRunning) {
+            state = buildState(
+                settings = state.settings,
+                exportSummary = state.exportSummary,
+                feedbackMessage = if (showFeedback) displayMessage else state.feedbackMessage,
+                feedbackSeverity = if (showFeedback) SettingsFeedbackSeverity.Info else state.feedbackSeverity,
+                feedbackEventId = if (showFeedback) null else state.feedbackEventId,
+            )
+            return false
+        }
+        currentSyncIssue = if (result.success) {
+            null
+        } else {
+            SyncIssueUi(
+                reason = syncIssueReason(result.reason),
+            )
+        }
         val updatedSettings = state.settings.copy(
             syncConfiguration = state.settings.syncConfiguration.copy(
-                lastError = if (result.success) null else result.message,
-                lastErrorCode = if (result.success) null else result.errorCode,
+                lastError = if (result.success) null else "sync:${result.reason.name}",
             ),
         )
-        val persisted = runCatching {
+        val persistenceResult = runCatching {
             withContext(backgroundDispatcher) { persistSettings(updatedSettings) }
-        }.getOrElse { state.settings }
+        }
+        persistenceResult.exceptionOrNull()?.rethrowCancellation()
+        val persistenceFailure = persistenceResult.exceptionOrNull()
+        if (persistenceFailure != null && result.success) {
+            currentSyncIssue = SyncIssueUi(SyncIssueReason.SyncFailed)
+        }
         state = buildState(
-            settings = persisted,
+            settings = persistenceResult.getOrNull() ?: state.settings,
             exportSummary = state.exportSummary,
-            feedbackMessage = if (showFeedback) result.message else state.feedbackMessage,
-            feedbackEventId = if (showFeedback) null else state.feedbackEventId,
-            manualSyncProgress = ManualSyncProgress.fromResult(result),
-        )
-        // Always refresh product lists after a successful sync: first-time V2
-        // activation / join bootstrap can materialize notebooks and notes even
-        // when a later no-op pass reports zero transport deltas. Partial
-        // failures that already surfaced conflicts or pulls also need a refresh.
-        if (result.success || result.hasVisibleSyncChanges) {
-            onDataRestored()
-        }
-        return result.success
-    }
-
-    suspend fun runManualSync(): Boolean {
-        if (!beginManualSync()) {
-            return false
-        }
-        return completeManualSync(executeManualSyncRunner())
-    }
-
-    private suspend fun executeManualSyncRunner(): ManualSyncResult {
-        val mode = state.settings.syncConfiguration.mode
-        return runCatching {
-            coroutineScope {
-                bindManualSyncProgressListener(
-                    ManualSyncProgressListener { phase ->
-                        val message = formatManualSyncPhase(phase)
-                        launch(uiDispatcher) {
-                            if (state.manualSyncProgress.running &&
-                                state.manualSyncProgress.mode == mode
-                            ) {
-                                state = buildState(
-                                    settings = state.settings,
-                                    exportSummary = state.exportSummary,
-                                    feedbackMessage = state.feedbackMessage,
-                                    feedbackEventId = state.feedbackEventId,
-                                    manualSyncProgress = ManualSyncProgress.inProgress(mode, message),
-                                )
-                            }
-                        }
-                    },
+            feedbackMessage = when {
+                persistenceFailure != null -> formatUiString(
+                    uiStrings.settingsSaveFailed,
+                    persistenceFailure.message ?: uiStrings.unknownError,
                 )
-                try {
-                    withContext(backgroundDispatcher) { manualSyncRunner.run() }
-                } finally {
-                    bindManualSyncProgressListener(null)
+                showFeedback -> displayMessage
+                else -> state.feedbackMessage
+            },
+            feedbackSeverity = when {
+                persistenceFailure != null -> SettingsFeedbackSeverity.Error
+                showFeedback && result.success -> SettingsFeedbackSeverity.Success
+                showFeedback -> SettingsFeedbackSeverity.Error
+                else -> state.feedbackSeverity
+            },
+            feedbackEventId = if (showFeedback || persistenceFailure != null) null else state.feedbackEventId,
+        )
+        return result.success && persistenceFailure == null
+    }
+
+    suspend fun runUserSync(): Boolean = runSync(userInitiated = true)
+
+    suspend fun runAutomaticSync(): Boolean = runSync(userInitiated = false)
+
+    suspend fun recoverSyncIssue(): Boolean =
+        when (currentSyncIssue?.action) {
+            SyncIssueAction.RetrySync -> runUserSync()
+            SyncIssueAction.ReloadSession -> {
+                if (currentSyncOperation != null) {
+                    false
+                } else {
+                    runExclusiveSyncLifecycle(false) {
+                        currentSyncOperation = SyncUiOperation.ReloadingSession
+                        publishCurrentState()
+                        try {
+                            refreshLocked()
+                            currentSyncIssue?.reason != SyncIssueReason.SecureSessionUnavailable
+                        } finally {
+                            currentSyncOperation = null
+                            publishCurrentState()
+                        }
+                    }
                 }
             }
+            SyncIssueAction.Reauthenticate,
+            null,
+            -> false
+        }
+
+    private suspend fun runSync(userInitiated: Boolean): Boolean {
+        val completion = runExclusiveSyncLifecycle(SyncCompletion()) {
+            runSyncLocked(userInitiated)
+        }
+        if (completion.refreshProductData) {
+            onDataRestored()
+        }
+        return completion.success
+    }
+
+    private suspend fun runSyncLocked(userInitiated: Boolean): SyncCompletion {
+        if (!userInitiated && !canStartSync()) return SyncCompletion()
+        if (!beginSync(showFeedback = userInitiated)) return SyncCompletion()
+        return try {
+            val result = executeSyncRunner()
+            val shouldShowFeedback = userInitiated || !result.success
+            SyncCompletion(
+                success = completeSync(result, showFeedback = shouldShowFeedback),
+                // First-time activation can materialize product data even when
+                // a later transport pass reports zero deltas. Partial failures
+                // with pulls or conflicts also need a product refresh.
+                refreshProductData = result.success || result.hasVisibleSyncChanges,
+            )
+        } finally {
+            if (currentSyncOperation == SyncUiOperation.Syncing) {
+                currentSyncOperation = null
+                publishCurrentState()
+            }
+        }
+    }
+
+    private suspend fun executeSyncRunner(): ManualSyncResult {
+        val mode = state.settings.syncConfiguration.mode
+        return runCatching {
+            withContext(backgroundDispatcher) { manualSyncRunner.run() }
         }.getOrElse { failure ->
-            bindManualSyncProgressListener(null)
+            failure.rethrowCancellation()
             ManualSyncResult.failure(
                 mode = mode,
-                message = formatUiString(uiStrings.syncFailed, failure.message ?: uiStrings.unknownError),
+                reason = ManualSyncReason.Failed,
+                diagnosticMessage = failure.message,
             )
         }
     }
-
-    suspend fun rollSyncV2Epoch(): Boolean = runV2Maintenance { syncV2MaintenanceRunner.rollEpoch() }
-
-    suspend fun repairSyncV2Integrity(): Boolean = runV2Maintenance {
-        syncV2MaintenanceRunner.repairIntegrity()
-    }
-
-    suspend fun recoverSyncV2FromVerifiedLocalCheckpoint(): Boolean = runV2Maintenance {
-        syncV2MaintenanceRunner.recoverWithVerifiedLocalCheckpoint(userConfirmedPotentialDataLoss = true)
-    }
-
-    suspend fun migrateSyncV2Authority(): Boolean = runV2Maintenance {
-        syncV2MaintenanceRunner.migrateToConfiguredRemote()
-    }
-
-    suspend fun collectExpiredSyncV2History(): Boolean = runV2Maintenance {
-        syncV2MaintenanceRunner.collectExpiredLocalHistory()
-    }
-
-    private suspend fun runV2Maintenance(operation: () -> ManualSyncResult): Boolean {
-        if (!beginManualSync()) return false
-        val mode = state.settings.syncConfiguration.mode
-        val result = runCatching {
-            withContext(backgroundDispatcher) { operation() }
-        }.getOrElse { failure ->
-            ManualSyncResult.failure(
-                mode,
-                formatUiString(uiStrings.v2MaintenanceFailed, failure.message ?: uiStrings.unknownError),
-            )
-        }
-        return completeManualSync(result)
-    }
-
-    suspend fun runAutomaticSync(): Boolean {
-        if (!canRunAutomaticSync() || !beginManualSync(showFeedback = false)) {
-            return false
-        }
-        val result = executeManualSyncRunner()
-        val shouldShowFeedback = !result.success || result.pulledObjects > 0 || result.conflicts > 0
-        return completeManualSync(result, showFeedback = shouldShowFeedback)
-    }
-
-    suspend fun recordSyncError(
-        error: String?,
-        errorCode: SyncErrorCode? = null,
-    ): Boolean =
-        persist(
-            updated = state.settings.copy(
-                syncConfiguration = state.settings.syncConfiguration.copy(
-                    lastError = error?.takeIf { it.isNotBlank() },
-                    lastErrorCode = error?.takeIf { it.isNotBlank() }?.let { errorCode },
-                ),
-            ),
-            successMessage = if (error.isNullOrBlank()) {
-                uiStrings.syncStatusCleared
-            } else {
-                uiStrings.syncStatusUpdated
-            },
-        )
 
     suspend fun runLocalExport(): Boolean =
         runCatching {
@@ -1091,16 +758,17 @@ class SettingsUiController(
                     } else {
                         formatUiString(uiStrings.exportSaved, summary.notebookCount, summary.noteCount)
                     },
-                    manualSyncProgress = state.manualSyncProgress,
+                    feedbackSeverity = SettingsFeedbackSeverity.Success,
                 )
                 true
             },
             onFailure = { failure ->
+                failure.rethrowCancellation()
                 state = buildState(
                     settings = state.settings,
                     exportSummary = state.exportSummary,
                     feedbackMessage = formatUiString(uiStrings.exportFailed, failure.message ?: uiStrings.unknownError),
-                    manualSyncProgress = state.manualSyncProgress,
+                    feedbackSeverity = SettingsFeedbackSeverity.Error,
                 )
                 false
             },
@@ -1115,7 +783,6 @@ class SettingsUiController(
             settings = state.settings,
             exportSummary = state.exportSummary,
             feedbackMessage = uiStrings.chooseDayOne,
-            manualSyncProgress = state.manualSyncProgress,
         )
         return runCatching {
             dayOneImportRunner.start { summary ->
@@ -1125,7 +792,11 @@ class SettingsUiController(
                     settings = state.settings,
                     exportSummary = state.exportSummary,
                     feedbackMessage = summary.message,
-                    manualSyncProgress = state.manualSyncProgress,
+                    feedbackSeverity = if (summary.success) {
+                        SettingsFeedbackSeverity.Success
+                    } else {
+                        SettingsFeedbackSeverity.Error
+                    },
                 )
                 if (summary.success) {
                     onDataRestored()
@@ -1144,51 +815,79 @@ class SettingsUiController(
                     settings = state.settings,
                     exportSummary = state.exportSummary,
                     feedbackMessage = summary.message,
-                    manualSyncProgress = state.manualSyncProgress,
+                    feedbackSeverity = SettingsFeedbackSeverity.Error,
                 )
                 false
             },
         )
     }
 
-    suspend fun createWorkspacePairingInvitation(): Boolean {
-        val result = runCatching {
-            withContext(backgroundDispatcher) { workspacePairingInvitationCreator.createInvitation() }
-        }.getOrElse {
-            WorkspacePairingInvitationResult.failure(uiStrings.pairingInvitationFailed)
+    suspend fun createWorkspacePairingInvitation(): Boolean =
+        runExclusiveSyncLifecycle(false) { createWorkspacePairingInvitationLocked() }
+
+    private suspend fun createWorkspacePairingInvitationLocked(): Boolean {
+        if (!canUseWorkspacePairing()) return false
+        if (currentSyncOperation != null) return false
+        currentSyncOperation = SyncUiOperation.CreatingInvitation
+        publishCurrentState()
+        return try {
+            val result = try {
+                withContext(backgroundDispatcher) { workspacePairingInvitationCreator.createInvitation() }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Throwable) {
+                WorkspacePairingInvitationResult.failure(WorkspacePairingReason.Failed)
+            }
+            currentWorkspacePairingInvitation = result.invitation?.let(::WorkspacePairingInvitationUi)
+            state = buildState(
+                settings = state.settings,
+                exportSummary = state.exportSummary,
+                feedbackMessage = workspacePairingMessage(result.reason, invitationOperation = true),
+                feedbackSeverity = if (result.success) SettingsFeedbackSeverity.Success else SettingsFeedbackSeverity.Error,
+            )
+            result.success
+        } finally {
+            currentSyncOperation = null
+            publishCurrentState()
         }
-        currentWorkspacePairingInvitation = result.invitation?.let(::WorkspacePairingInvitationUi)
-        state = buildState(
-            settings = state.settings,
-            exportSummary = state.exportSummary,
-            feedbackMessage = result.message,
-            manualSyncProgress = state.manualSyncProgress,
-        )
-        return result.success
     }
 
-    suspend fun cancelWorkspacePairingInvitation(): Boolean {
+    suspend fun cancelWorkspacePairingInvitation(): Boolean =
+        runExclusiveSyncLifecycle(false) { cancelWorkspacePairingInvitationLocked() }
+
+    private suspend fun cancelWorkspacePairingInvitationLocked(): Boolean {
         val invitation = currentWorkspacePairingInvitation?.domainInvitation()
         if (invitation == null) {
             return true
         }
-        val result = runCatching {
-            withContext(backgroundDispatcher) {
-                workspacePairingInvitationCanceller.cancelInvitation(invitation)
+        if (!canUseWorkspacePairing()) return false
+        if (currentSyncOperation != null) return false
+        currentSyncOperation = SyncUiOperation.CancellingInvitation
+        publishCurrentState()
+        return try {
+            val result = try {
+                withContext(backgroundDispatcher) {
+                    workspacePairingInvitationCanceller.cancelInvitation(invitation)
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Throwable) {
+                WorkspaceJoinResult.failure(WorkspacePairingReason.Failed)
             }
-        }.getOrElse {
-            WorkspaceJoinResult.failure(uiStrings.pairingFailed)
+            if (result.success) {
+                currentWorkspacePairingInvitation = null
+            }
+            state = buildState(
+                settings = state.settings,
+                exportSummary = state.exportSummary,
+                feedbackMessage = workspacePairingMessage(result.reason),
+                feedbackSeverity = if (result.success) SettingsFeedbackSeverity.Success else SettingsFeedbackSeverity.Error,
+            )
+            result.success
+        } finally {
+            currentSyncOperation = null
+            publishCurrentState()
         }
-        if (result.success) {
-            currentWorkspacePairingInvitation = null
-        }
-        state = buildState(
-            settings = state.settings,
-            exportSummary = state.exportSummary,
-            feedbackMessage = result.message,
-            manualSyncProgress = state.manualSyncProgress,
-        )
-        return result.success
     }
 
     fun discardWorkspacePairingInvitationAtExpiry(expiresAtEpochMillis: Long) {
@@ -1203,260 +902,240 @@ class SettingsUiController(
             settings = state.settings,
             exportSummary = state.exportSummary,
             feedbackMessage = state.feedbackMessage,
+            feedbackSeverity = state.feedbackSeverity,
             feedbackEventId = state.feedbackEventId,
-            manualSyncProgress = state.manualSyncProgress,
         )
     }
 
     suspend fun joinWorkspaceWithToken(tokenInput: String): Boolean {
+        val completion = runExclusiveSyncLifecycle(WorkspaceJoinCompletion()) {
+            joinWorkspaceWithTokenLocked(tokenInput)
+        }
+        if (completion.refreshProductData) {
+            onDataRestored()
+        }
+        return completion.joined
+    }
+
+    private suspend fun joinWorkspaceWithTokenLocked(tokenInput: String): WorkspaceJoinCompletion {
         if (tokenInput.isBlank()) {
             state = buildState(
                 settings = state.settings,
                 exportSummary = state.exportSummary,
                 feedbackMessage = uiStrings.enterPairingToken,
-                manualSyncProgress = state.manualSyncProgress,
+                feedbackSeverity = SettingsFeedbackSeverity.Warning,
             )
-            return false
+            return WorkspaceJoinCompletion()
         }
-        val result = runCatching {
-            withContext(backgroundDispatcher) {
-                workspacePairingInvitationJoiner.joinWithToken(tokenInput)
-            }
-        }.getOrElse {
-            WorkspaceJoinResult.failure(uiStrings.pairingFailed)
-        }
-        if (result.success) {
-            currentWorkspacePairingInvitation = null
-            // Prior sync failures (wrong first-run key against a remote epoch)
-            // are stale after a successful join package restore.
-            val cleared = state.settings.copy(
-                syncConfiguration = state.settings.syncConfiguration.copy(
-                    lastError = null,
-                    lastErrorCode = null,
-                ),
-            )
-            val persisted = runCatching {
-                withContext(backgroundDispatcher) { persistSettings(cleared) }
-            }.getOrElse { cleared }
-            state = buildState(
-                settings = persisted,
-                exportSummary = state.exportSummary,
-                feedbackMessage = result.message,
-                manualSyncProgress = state.manualSyncProgress,
-            )
-            return true
-        }
-        state = buildState(
-            settings = state.settings,
-            exportSummary = state.exportSummary,
-            feedbackMessage = result.message,
-            manualSyncProgress = state.manualSyncProgress,
-        )
-        return false
-    }
-
-    private val WebDavAutoBackupFrequency.intervalMillis: Long
-        get() =
-            when (this) {
-                WebDavAutoBackupFrequency.Daily -> 24L * 60L * 60L * 1000L
-                WebDavAutoBackupFrequency.Weekly -> 7L * 24L * 60L * 60L * 1000L
-            }
-
-    private fun recordWebDavBackupResult(result: WebDavBackupResult): Boolean {
-        state = buildState(
-            settings = state.settings,
-            exportSummary = state.exportSummary,
-            feedbackMessage = result.message,
-            manualSyncProgress = state.manualSyncProgress,
-        )
-        return result.success
-    }
-
-    private fun recordWebDavRestoreResult(result: WebDavRestoreResult): Boolean {
-        state = buildState(
-            settings = state.settings,
-            exportSummary = state.exportSummary,
-            feedbackMessage = result.message,
-            manualSyncProgress = state.manualSyncProgress,
-        )
-        return result.success
-    }
-
-    private fun recordWebDavBackupListResult(result: WebDavBackupListResult): Boolean {
-        if (result.success) {
-            webDavBackupVersions = result.versions
-        }
-        state = buildState(
-            settings = state.settings,
-            exportSummary = state.exportSummary,
-            feedbackMessage = result.message,
-            manualSyncProgress = state.manualSyncProgress,
-        )
-        return result.success
-    }
-
-    private suspend fun createWebDavInput(
-        endpoint: String,
-        username: String?,
-        password: String?,
-        appDirectory: String,
-    ): WebDavConnectionInput {
-        val typedSecret = password?.takeIf { it.isNotBlank() }
-        val savedSecret = if (typedSecret == null) {
-            withContext(backgroundDispatcher) {
-                runCatching { webDavCredentialStore.load() }.getOrNull()?.takeIf { it.isNotBlank() }
-            }
-        } else {
-            null
-        }
-        if (savedSecret != null) {
-            webDavCredentialSaved = true
-        }
-        return WebDavConnectionInput(
-            endpoint = endpoint,
-            username = username,
-            password = typedSecret ?: savedSecret,
-            appDirectory = appDirectory,
-        ).sanitized()
-    }
-
-    private suspend fun persistWebDavCredentialIfProvided(password: String?): Boolean? {
-        val secret = password?.takeIf { it.isNotBlank() } ?: return false
-        return runCatching {
-            withContext(backgroundDispatcher) { webDavCredentialStore.save(secret) }
-            webDavCredentialSaved = true
-            true
-        }.getOrElse { failure ->
-            state = buildState(
-                settings = state.settings,
-                exportSummary = state.exportSummary,
-                feedbackMessage = formatUiString(uiStrings.credentialSaveFailed, failure.message ?: uiStrings.unknownError),
-                manualSyncProgress = state.manualSyncProgress,
-            )
-            null
-        }
-    }
-
-    private suspend fun retainCurrentWebDavAuthorityBeforeChange(): Boolean {
-        val current = state.settings.syncConfiguration
-        val endpoint = current.webDavEndpoint?.takeIf(String::isNotBlank) ?: return true
-        val username = current.webDavUsername?.takeIf(String::isNotBlank) ?: return true
-        val secret = withContext(backgroundDispatcher) {
-            runCatching(webDavCredentialStore::load).getOrNull()
-        }?.takeIf(String::isNotBlank) ?: return credentialVaultFailure(
-            "The current V2 WebDAV credential is missing; the source authority was not replaced.",
-        )
-        val record = runCatching {
-            WebDavAuthorityCredentials(
-                webDavV2AuthorityBindingId(endpoint, current.webDavAppDirectory),
-                endpoint,
-                username,
-                current.webDavAppDirectory,
-                secret,
-            )
-        }.getOrElse { return credentialVaultFailure(it.message ?: "The current WebDAV authority binding is invalid.") }
-        return runCatching {
-            withContext(backgroundDispatcher) { webDavCredentialStore.saveForAuthority(record) }
-        }.fold(
-            onSuccess = { true },
-            onFailure = { credentialVaultFailure(it.message ?: "The current WebDAV authority credential could not be retained.") },
-        )
-    }
-
-    private suspend fun retainConfiguredWebDavAuthority(input: WebDavConnectionInput): Boolean {
-        val username = input.username?.takeIf(String::isNotBlank)
-            ?: return credentialVaultFailure("The target WebDAV username is missing.")
-        val secret = withContext(backgroundDispatcher) {
-            runCatching(webDavCredentialStore::load).getOrNull()
-        }?.takeIf(String::isNotBlank)
-            ?: return credentialVaultFailure("The target V2 WebDAV credential is missing.")
-        val record = WebDavAuthorityCredentials(
-            webDavV2AuthorityBindingId(input.endpoint, input.appDirectory),
-            input.endpoint,
-            username,
-            input.appDirectory,
-            secret,
-        )
-        return runCatching {
-            withContext(backgroundDispatcher) { webDavCredentialStore.saveForAuthority(record) }
-        }.fold(
-            onSuccess = { true },
-            onFailure = { credentialVaultFailure(it.message ?: "The target WebDAV authority credential could not be retained.") },
-        )
-    }
-
-    private fun credentialVaultFailure(message: String): Boolean {
-        state = buildState(
-            settings = state.settings,
-            exportSummary = state.exportSummary,
-            feedbackMessage = formatUiString(uiStrings.credentialSaveFailed, message),
-            manualSyncProgress = state.manualSyncProgress,
-        )
-        return false
-    }
-
-
-    private fun frequencyDisplayName(frequency: WebDavAutoBackupFrequency): String =
-        when (frequency) {
-            WebDavAutoBackupFrequency.Daily -> uiStrings.freqDaily
-            WebDavAutoBackupFrequency.Weekly -> uiStrings.freqWeekly
-        }
-
-    private fun WebDavConnectionInput.validateWebDavCredential(): List<String> =
-        buildList {
-            if (username.isNullOrBlank()) {
-                add(uiStrings.enterUsername)
-            }
-            if (password.isNullOrBlank()) {
-                add(uiStrings.enterCredential)
-            }
-        }
-
-    private fun SyncConfiguration.webDavSyncBlockingMessage(): String? =
-        when {
-            webDavEndpoint.isNullOrBlank() -> uiStrings.configureBeforeSync
-            webDavUsername.isNullOrBlank() -> uiStrings.usernameBeforeSync
-            !webDavCredentialSaved ->
-                uiStrings.credentialBeforeSync
-            else -> null
-        }
-
-    private fun syncBlockingMessage(mode: SyncMode): String? =
-        when (mode) {
-            SyncMode.WebDav -> state.settings.syncConfiguration.webDavSyncBlockingMessage()
-            SyncMode.SelfHosted -> if (state.settings.syncConfiguration.selfHostedSession.loggedIn) {
-                null
-            } else {
-                uiStrings.signInBeforeSync
-            }
-            SyncMode.Off -> uiStrings.chooseWebdavOrSelf
-        }
-
-    private fun SyncConfiguration.matchesWebDavConnection(input: WebDavConnectionInput): Boolean =
-        webDavEndpoint == input.endpoint &&
-            webDavUsername == input.username &&
-            normalizeWebDavAppDirectory(webDavAppDirectory) == input.appDirectory
-
-    private fun formatManualSyncPhase(phase: ManualSyncPhase): String =
-        when (phase) {
-            is ManualSyncPhase.UploadingChunks ->
-                if (phase.total <= 0) {
-                    uiStrings.syncUploadingCheckpoint
-                } else {
-                    formatUiString(
-                        uiStrings.syncUploadingCheckpointChunks,
-                        phase.completed.toString(),
-                        phase.total.toString(),
-                    )
+        if (!canUseWorkspacePairing()) return WorkspaceJoinCompletion()
+        if (currentSyncOperation != null) return WorkspaceJoinCompletion()
+        currentSyncOperation = SyncUiOperation.JoiningInvitation
+        publishCurrentState()
+        return try {
+            val result = try {
+                withContext(backgroundDispatcher) {
+                    workspacePairingInvitationJoiner.joinWithToken(tokenInput)
                 }
-            ManualSyncPhase.UploadingManifest -> uiStrings.syncUploadingManifest
-            ManualSyncPhase.VerifyingRemote -> uiStrings.syncVerifyingRemote
-            ManualSyncPhase.CommittingPointer -> uiStrings.syncCommittingEpoch
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Throwable) {
+                WorkspaceJoinResult.failure(WorkspacePairingReason.Failed)
+            }
+            if (result.success) {
+                currentWorkspacePairingInvitation = null
+                currentSyncIssue = null
+                // Prior sync failures (wrong first-run key against a remote epoch)
+                // are stale after a successful join package restore.
+                val cleared = state.settings.copy(
+                    syncConfiguration = state.settings.syncConfiguration.copy(
+                        lastError = null,
+                    ),
+                )
+                val persisted = runCatching {
+                    withContext(backgroundDispatcher) { persistSettings(cleared) }
+                }.getOrElse { failure ->
+                    failure.rethrowCancellation()
+                    cleared
+                }
+                state = buildState(
+                    settings = persisted,
+                    exportSummary = state.exportSummary,
+                    feedbackMessage = workspacePairingMessage(result.reason),
+                    feedbackSeverity = SettingsFeedbackSeverity.Success,
+                )
+                currentSyncOperation = SyncUiOperation.Syncing
+                publishCurrentState()
+                val syncResult = executeSyncRunner()
+                completeSync(syncResult, showFeedback = !syncResult.success)
+                WorkspaceJoinCompletion(
+                    joined = true,
+                    refreshProductData = syncResult.success || syncResult.hasVisibleSyncChanges,
+                )
+            } else {
+                state = buildState(
+                    settings = state.settings,
+                    exportSummary = state.exportSummary,
+                    feedbackMessage = workspacePairingMessage(result.reason),
+                    feedbackSeverity = SettingsFeedbackSeverity.Error,
+                )
+                WorkspaceJoinCompletion()
+            }
+        } finally {
+            currentSyncOperation = null
+            publishCurrentState()
+        }
+    }
+
+    private fun selfHostedValidationMessage(issue: SelfHostedSetupValidationIssue): String =
+        when (issue) {
+            SelfHostedSetupValidationIssue.EndpointRequired -> uiStrings.selfHostedEndpointRequired
+            SelfHostedSetupValidationIssue.EndpointSchemeRequired -> uiStrings.selfHostedEndpointSchemeRequired
+            SelfHostedSetupValidationIssue.HttpsRequired -> uiStrings.selfHostedHttps
+            SelfHostedSetupValidationIssue.EmailInvalid -> uiStrings.selfHostedEmailInvalid
+            SelfHostedSetupValidationIssue.PasswordTooShort -> uiStrings.selfHostedPasswordTooShort
+            SelfHostedSetupValidationIssue.DeviceNameRequired -> uiStrings.selfHostedDeviceNameRequired
+            SelfHostedSetupValidationIssue.PlatformRequired -> uiStrings.selfHostedPlatformRequired
         }
 
-    private suspend fun persist(
+    private fun hostDeviceLabel(): String {
+        val stableSuffix = state.settings.activeDeviceId
+            .trim()
+            .takeUnless { it.isBlank() || it == ClientSettings.DefaultActiveDeviceId }
+            ?.takeLast(6)
+        return stableSuffix?.let { "$selfHostedDeviceName · $it" } ?: selfHostedDeviceName
+    }
+
+    private fun selfHostedSetupMessage(reason: SelfHostedSetupReason): String =
+        when (reason) {
+            SelfHostedSetupReason.Ready -> uiStrings.selfHostedReady
+            SelfHostedSetupReason.BoundSessionRenewed -> uiStrings.selfHostedBoundSessionRenewed
+            SelfHostedSetupReason.AccountChangeBlocked -> uiStrings.selfHostedAccountChangeBlocked
+            SelfHostedSetupReason.AuthorityInvalid -> uiStrings.selfHostedAuthorityInvalid
+            SelfHostedSetupReason.EndpointMismatch -> uiStrings.selfHostedEndpointMismatch
+            SelfHostedSetupReason.Unavailable -> uiStrings.selfHostedSetupUnavailable
+            SelfHostedSetupReason.AuthorityMismatch,
+            SelfHostedSetupReason.DeviceRevoked,
+            SelfHostedSetupReason.Failed,
+            -> uiStrings.selfHostedSetupFailed
+        }
+
+    private fun syncResultMessage(result: ManualSyncResult): String =
+        when (result.reason) {
+            ManualSyncReason.Completed -> uiStrings.syncCompleted
+            ManualSyncReason.Initialized -> uiStrings.syncInitialized
+            ManualSyncReason.Disabled -> uiStrings.syncDisabled
+            ManualSyncReason.Unavailable -> uiStrings.syncUnavailable
+            ManualSyncReason.AlreadyRunning -> uiStrings.syncAlreadyRunning
+            ManualSyncReason.ProviderChanged -> uiStrings.syncConfigurationChanged
+            ManualSyncReason.AuthorityMismatch -> uiStrings.syncAuthorityMismatch
+            ManualSyncReason.WorkspaceLocked -> uiStrings.syncWorkspaceLocked
+            ManualSyncReason.RemoteHistoryConflict -> uiStrings.syncRemoteHistoryConflict
+            ManualSyncReason.RetryRequired -> uiStrings.syncRetryRequired
+            ManualSyncReason.Blocked -> uiStrings.syncBlocked
+            ManualSyncReason.CheckpointInvalid -> uiStrings.syncCheckpointInvalid
+            ManualSyncReason.Failed -> uiStrings.syncFailed
+        }
+
+    private fun syncIssueReason(reason: ManualSyncReason): SyncIssueReason =
+        when (reason) {
+            ManualSyncReason.AuthorityMismatch -> SyncIssueReason.AuthorityMismatch
+            ManualSyncReason.WorkspaceLocked -> SyncIssueReason.WorkspaceLocked
+            ManualSyncReason.RemoteHistoryConflict -> SyncIssueReason.RemoteHistoryConflict
+            ManualSyncReason.CheckpointInvalid -> SyncIssueReason.CheckpointInvalid
+            ManualSyncReason.RetryRequired -> SyncIssueReason.RetryRequired
+            ManualSyncReason.Blocked -> SyncIssueReason.Blocked
+            ManualSyncReason.Disabled,
+            ManualSyncReason.Unavailable,
+            -> SyncIssueReason.SyncUnavailable
+            ManualSyncReason.ProviderChanged -> SyncIssueReason.ConfigurationChanged
+            ManualSyncReason.Completed,
+            ManualSyncReason.Initialized,
+            ManualSyncReason.AlreadyRunning,
+            ManualSyncReason.Failed,
+            -> SyncIssueReason.SyncFailed
+        }
+
+    private fun syncIssueMessage(reason: SyncIssueReason): String =
+        when (reason) {
+            SyncIssueReason.SignInRequired -> uiStrings.signInBeforeSync
+            SyncIssueReason.SecureSessionUnavailable -> uiStrings.secureSessionUnavailable
+            SyncIssueReason.SetupFailed -> uiStrings.selfHostedSetupFailed
+            SyncIssueReason.ConfigurationChanged -> uiStrings.syncConfigurationChanged
+            SyncIssueReason.SyncUnavailable -> uiStrings.syncUnavailable
+            SyncIssueReason.AuthorityMismatch -> uiStrings.syncAuthorityMismatch
+            SyncIssueReason.WorkspaceLocked -> uiStrings.syncWorkspaceLocked
+            SyncIssueReason.RemoteHistoryConflict -> uiStrings.syncRemoteHistoryConflict
+            SyncIssueReason.CheckpointInvalid -> uiStrings.syncCheckpointInvalid
+            SyncIssueReason.RetryRequired -> uiStrings.syncRetryRequired
+            SyncIssueReason.Blocked -> uiStrings.syncBlocked
+            SyncIssueReason.SyncFailed -> uiStrings.syncFailed
+        }
+
+    private fun workspacePairingMessage(
+        reason: WorkspacePairingReason,
+        invitationOperation: Boolean = false,
+    ): String =
+        when (reason) {
+            WorkspacePairingReason.PackageCreated,
+            WorkspacePairingReason.InvitationCreated,
+            -> uiStrings.pairingInvitationCreated
+            WorkspacePairingReason.InvitationCancelled -> uiStrings.pairingInvitationCancelled
+            WorkspacePairingReason.InvitationUnavailable -> uiStrings.pairingInvitationUnavailable
+            WorkspacePairingReason.Joined -> uiStrings.pairingJoined
+            WorkspacePairingReason.PublishRequired -> uiStrings.pairingPublishRequired
+            WorkspacePairingReason.SessionRequired -> uiStrings.pairingSessionRequired
+            WorkspacePairingReason.InvalidToken -> uiStrings.enterPairingToken
+            WorkspacePairingReason.InvitationExpired -> uiStrings.pairingExpired
+            WorkspacePairingReason.InvitationNotFound,
+            WorkspacePairingReason.InvitationAlreadyUsed,
+            -> uiStrings.pairingInvitationUnavailable
+            WorkspacePairingReason.WorkspaceLocked -> uiStrings.pairingWorkspaceLocked
+            WorkspacePairingReason.LocalWorkspaceNotReplaceable -> uiStrings.pairingLocalWorkspaceNotReplaceable
+            WorkspacePairingReason.LocalContentPresent -> uiStrings.pairingLocalContentPresent
+            WorkspacePairingReason.VerificationFailed,
+            WorkspacePairingReason.AuthorityMismatch,
+            WorkspacePairingReason.AdoptionFailed,
+            WorkspacePairingReason.Unavailable,
+            WorkspacePairingReason.Failed,
+            -> if (invitationOperation) uiStrings.pairingInvitationFailed else uiStrings.pairingFailed
+        }
+
+    private fun publishCurrentState() {
+        state = buildState(
+            settings = state.settings,
+            exportSummary = state.exportSummary,
+            feedbackMessage = state.feedbackMessage,
+            feedbackSeverity = state.feedbackSeverity,
+            feedbackEventId = state.feedbackEventId,
+        )
+    }
+
+    private suspend fun <T> runExclusiveSyncLifecycle(
+        unavailable: T,
+        block: suspend () -> T,
+    ): T {
+        if (!settingsMutationMutex.tryLock()) return unavailable
+        return try {
+            block()
+        } finally {
+            settingsMutationMutex.unlock()
+        }
+    }
+
+    private suspend fun <T> withSettingsMutation(block: suspend () -> T): T {
+        settingsMutationMutex.lock()
+        return try {
+            block()
+        } finally {
+            settingsMutationMutex.unlock()
+        }
+    }
+
+    /** Caller must hold [settingsMutationMutex]. */
+    private suspend fun persistLocked(
         updated: ClientSettings,
         successMessage: String,
+        successSeverity: SettingsFeedbackSeverity = SettingsFeedbackSeverity.Success,
     ): Boolean =
         runCatching {
             withContext(backgroundDispatcher) { persistSettings(updated) }
@@ -1466,20 +1145,17 @@ class SettingsUiController(
                     settings = persisted,
                     exportSummary = state.exportSummary,
                     feedbackMessage = successMessage,
-                    manualSyncProgress = if (persisted.syncConfiguration.mode == state.manualSyncProgress.mode) {
-                        state.manualSyncProgress
-                    } else {
-                        ManualSyncProgress.idle(persisted.syncConfiguration.mode)
-                    },
+                    feedbackSeverity = successSeverity,
                 )
                 true
             },
             onFailure = { failure ->
+                failure.rethrowCancellation()
                 state = buildState(
                     settings = state.settings,
                     exportSummary = state.exportSummary,
                     feedbackMessage = formatUiString(uiStrings.settingsSaveFailed, failure.message ?: uiStrings.unknownError),
-                    manualSyncProgress = state.manualSyncProgress,
+                    feedbackSeverity = SettingsFeedbackSeverity.Error,
                 )
                 false
             },
@@ -1489,12 +1165,15 @@ class SettingsUiController(
         settings: ClientSettings,
         exportSummary: SettingsExportSummary? = null,
         feedbackMessage: String? = null,
+        feedbackSeverity: SettingsFeedbackSeverity = SettingsFeedbackSeverity.Info,
         feedbackEventId: Long? = null,
-        manualSyncProgress: ManualSyncProgress = ManualSyncProgress.idle(settings.syncConfiguration.mode),
-    ): SettingsUiState =
-        SettingsUiState(
+    ): SettingsUiState {
+        val syncConfiguration = settings.syncConfiguration
+        val session = syncConfiguration.selfHostedSession
+        val visibleInvitation = currentWorkspacePairingInvitation
+            ?.takeIf { it.expiresAtEpochMillis > currentEpochMillis() }
+        return SettingsUiState(
             settings = settings,
-            sections = requiredSettingsSections(settings),
             defaultNotebookOptions = notebooksProvider().map { notebook ->
                 DefaultNotebookOption(
                     id = notebook.id,
@@ -1506,37 +1185,95 @@ class SettingsUiController(
             importSummary = currentImportSummary,
             importRunning = importRunning,
             feedbackMessage = feedbackMessage,
+            feedbackSeverity = feedbackSeverity,
             feedbackEventId = when {
                 feedbackMessage == null -> 0L
                 feedbackEventId != null -> feedbackEventId
                 else -> ++nextFeedbackEventId
             },
-            manualSyncProgress = manualSyncProgress,
-            webDavCredentialSaved = webDavCredentialSaved,
-            webDavBackupVersions = webDavBackupVersions,
-            workspacePairingInvitation = currentWorkspacePairingInvitation
-                ?.takeIf { it.expiresAtEpochMillis > currentEpochMillis() },
-            webDavDiscoveredDevices = webDavDiscoveredDevices,
+            sync = SyncUiState(
+                connection = when {
+                    secureSessionAccess == SecureSessionAccess.Unavailable && session.loggedIn -> SyncConnectionUi.Unavailable(
+                        configuredEndpoint = syncConfiguration.selfHostedEndpoint,
+                        accountEmail = session.userEmail,
+                        deviceLabel = session.deviceLabel,
+                    )
+                    secureSessionAccess != SecureSessionAccess.Missing &&
+                        session.loggedIn &&
+                        syncConfiguration.mode == SyncMode.SelfHosted -> SyncConnectionUi.Connected(
+                        endpoint = syncConfiguration.selfHostedEndpoint,
+                        accountEmail = session.userEmail,
+                        deviceLabel = session.deviceLabel,
+                    )
+                    else -> SyncConnectionUi.LocalOnly(syncConfiguration.selfHostedEndpoint)
+                },
+                operation = currentSyncOperation,
+                issue = currentSyncIssue,
+                invitation = visibleInvitation,
+            ),
         )
+    }
 }
+
+private enum class SecureSessionAccess {
+    Unknown,
+    Available,
+    Missing,
+    Unavailable,
+}
+
+private data class SyncCompletion(
+    val success: Boolean = false,
+    val refreshProductData: Boolean = false,
+)
+
+private data class WorkspaceJoinCompletion(
+    val joined: Boolean = false,
+    val refreshProductData: Boolean = false,
+)
 
 private val ManualSyncResult.hasVisibleSyncChanges: Boolean
     get() = pushedObjects > 0 || pulledObjects > 0 || conflicts > 0
 
+private fun Throwable.rethrowCancellation() {
+    if (this is CancellationException) throw this
+}
+
+private fun syncIssueFromLastError(lastError: String?): SyncIssueUi? {
+    val marker = lastError?.substringAfter(':', missingDelimiterValue = "")
+        ?.takeIf(String::isNotBlank)
+        ?: return null
+    val reason = if (lastError.startsWith("setup:")) {
+        SyncIssueReason.SetupFailed
+    } else {
+        when (marker) {
+            ManualSyncReason.AuthorityMismatch.name -> SyncIssueReason.AuthorityMismatch
+            ManualSyncReason.WorkspaceLocked.name -> SyncIssueReason.WorkspaceLocked
+            ManualSyncReason.RemoteHistoryConflict.name -> SyncIssueReason.RemoteHistoryConflict
+            ManualSyncReason.CheckpointInvalid.name -> SyncIssueReason.CheckpointInvalid
+            ManualSyncReason.RetryRequired.name -> SyncIssueReason.RetryRequired
+            ManualSyncReason.Blocked.name -> SyncIssueReason.Blocked
+            ManualSyncReason.Disabled.name,
+            ManualSyncReason.Unavailable.name,
+            -> SyncIssueReason.SyncUnavailable
+            ManualSyncReason.ProviderChanged.name -> SyncIssueReason.ConfigurationChanged
+            ManualSyncReason.AlreadyRunning.name -> return null
+            else -> SyncIssueReason.SyncFailed
+        }
+    }
+    return SyncIssueUi(reason)
+}
+
 data class SettingsUiState(
     val settings: ClientSettings,
-    val sections: List<SettingsSectionUi>,
     val defaultNotebookOptions: List<DefaultNotebookOption>,
+    val sync: SyncUiState,
     val exportSummary: SettingsExportSummary? = null,
     val importSummary: SettingsImportSummary? = null,
     val importRunning: Boolean = false,
     val feedbackMessage: String? = null,
+    val feedbackSeverity: SettingsFeedbackSeverity = SettingsFeedbackSeverity.Info,
     val feedbackEventId: Long = 0L,
-    val manualSyncProgress: ManualSyncProgress = ManualSyncProgress.idle(settings.syncConfiguration.mode),
-    val webDavCredentialSaved: Boolean = false,
-    val webDavBackupVersions: List<WebDavBackupVersion> = emptyList(),
-    val workspacePairingInvitation: WorkspacePairingInvitationUi? = null,
-    val webDavDiscoveredDevices: List<WebDavDiscoveredDevice> = emptyList(),
 ) {
     val selectedDefaultNotebookTitle: String? =
         defaultNotebookOptions.firstOrNull { it.selected }?.title
@@ -1555,12 +1292,6 @@ class WorkspacePairingInvitationUi(
         "WorkspacePairingInvitationUi(expiresAtEpochMillis=$expiresAtEpochMillis, token=<redacted>)"
 }
 
-data class SettingsSectionUi(
-    val title: String,
-    val description: String,
-    val entryPoints: List<String>,
-)
-
 data class DefaultNotebookOption(
     val id: String,
     val title: String,
@@ -1572,6 +1303,8 @@ data class SettingsExportSummary(
     val notebookCount: Int,
     val noteCount: Int,
     val excludedSensitiveFields: List<String>,
+    val includesMediaBytes: Boolean = false,
+    val assetReferencesMayBeUnresolved: Boolean = true,
     val destinationLabel: String? = null,
 ) {
     companion object {
@@ -1588,7 +1321,7 @@ data class SettingsExportSummary(
 
         fun unavailable(): SettingsExportSummary =
             SettingsExportSummary(
-                formatName = "someday.local-export.v2+json",
+                formatName = "Someday JSON export",
                 notebookCount = 0,
                 noteCount = 0,
                 excludedSensitiveFields = defaultExcludedSensitiveFields,
@@ -1613,6 +1346,8 @@ data class SettingsImportSummary(
     val richTextConverted: Int = 0,
     val mediaReferenced: Int = 0,
     val unsupportedItems: Int = 0,
+    val includesMediaBytes: Boolean = false,
+    val assetReferencesMayBeUnresolved: Boolean = true,
 ) {
     val notesImported: Int = notesCreated + notesUpdated
 
@@ -1646,108 +1381,3 @@ fun resolveAppliedTheme(
         ClientTheme.Light -> AppliedTheme.Light
         ClientTheme.Dark -> AppliedTheme.Dark
     }
-
-fun settingsCapabilityLog(): String =
-    "settings-sections=sync-mode-account|webdav-config|self-hosted-device-management|device-pairing|" +
-        "editor-preferences|theme-default-notebook|sync-status-last-error|import-export-entry-points " +
-        "self-hosted=endpoint|login-register|device-session|manual-sync-progress|tokens-redacted " +
-        "workspace-pairing=one-use-invitation|qr-or-token|redacted-logs " +
-        "theme=system|light|dark default-notebook=add-target-unless-overridden " +
-        "import=day-one-json-zip export=notes-notebooks|excludes-raw-keys-tokens-passwords-recovery-material"
-
-private fun requiredSettingsSections(settings: ClientSettings): List<SettingsSectionUi> {
-    val selfHostedSession = settings.syncConfiguration.selfHostedSession
-    return listOf(
-        SettingsSectionUi(
-            title = "Sync mode/account",
-            description = "Choose Off, WebDAV, or Self-hosted sync without blocking local-first note editing.",
-            entryPoints = listOf(
-                "Current mode: ${settings.syncConfiguration.mode.name}",
-                "Account/session entry point",
-            ),
-        ),
-        SettingsSectionUi(
-            title = "WebDAV config",
-            description = "Configure WebDAV Sync V2 and disaster recovery backup without showing credentials.",
-            entryPoints = listOf(
-                "Endpoint: ${settings.syncConfiguration.webDavEndpoint ?: "not configured"}",
-                "Username: ${settings.syncConfiguration.webDavUsername ?: "anonymous"}",
-                "App-owned path: ${normalizeWebDavAppDirectory(settings.syncConfiguration.webDavAppDirectory)}",
-                "Manual WebDAV Sync V2 trigger",
-                "Disaster recovery backup and restore versions",
-                "Test WebDAV connection",
-                "Credentials: redacted and stored in local encrypted credential storage",
-                "WebDAV readiness: ${settings.syncConfiguration.webDavLastTest?.message ?: "not tested"}",
-            ),
-        ),
-        SettingsSectionUi(
-            title = "Self-hosted device management",
-            description = "Configure self-hosted endpoint, account session, current device identity, and manual sync without plaintext note data.",
-            entryPoints = listOf(
-                "Endpoint: ${settings.syncConfiguration.selfHostedEndpoint ?: "not configured"}",
-                if (selfHostedSession.loggedIn && selfHostedSession.userEmail != null) {
-                    "Logged in as ${selfHostedSession.userEmail}"
-                } else {
-                    "Logged out"
-                },
-                "Active self-hosted device: ${selfHostedSession.deviceId ?: settings.activeDeviceId}",
-                "Device label: ${selfHostedSession.deviceLabel}",
-                "Register or log in and register this device",
-                "Device management entry",
-                "Manual sync now with progress and error state",
-                "Plaintext note data: not shown",
-            ),
-        ),
-        SettingsSectionUi(
-            title = "Device pairing",
-            description = "Pair through the selected WebDAV or Self-hosted profile without exposing workspace secrets to the remote.",
-            entryPoints = listOf(
-                "Create a one-use workspace pairing invitation",
-                "Join a workspace with a QR scan or high-entropy token before Sync V2",
-                "Pairing messages must not log raw tokens",
-            ),
-        ),
-        SettingsSectionUi(
-            title = "Editor preferences",
-            description = "Control Markdown preview and toolbar assistance defaults.",
-            entryPoints = listOf(
-                "Preview by default: ${settings.editorPreferences.previewByDefault}",
-                "Markdown toolbar visible: ${settings.editorPreferences.markdownToolbarVisible}",
-            ),
-        ),
-        SettingsSectionUi(
-            title = "Theme/default notebook",
-            description = "Theme applies across primary tabs; default notebook controls the persistent add-note target unless a notebook is selected.",
-            entryPoints = listOf(
-                "Theme: ${settings.theme.name}",
-                "Default notebook: ${settings.defaultNotebookId ?: "selected notebook context"}",
-            ),
-        ),
-        SettingsSectionUi(
-            title = "Sync status/last error",
-            description = "Show sync readiness, active mode, manual sync progress, and the most recent issue.",
-            entryPoints = listOf(
-                "Current mode: ${settings.syncConfiguration.mode.name}",
-                "Manual sync trigger available for WebDAV and Self-hosted modes",
-                "Last error: ${settings.syncConfiguration.lastError ?: "none"}",
-            ),
-        ),
-        SettingsSectionUi(
-            title = "Import external journals",
-            description = "Import notes from supported journal apps while preserving source dates, time zones, and supported location metadata.",
-            entryPoints = listOf(
-                "Day One JSON zip import",
-                "Rich text converted to Markdown",
-                "Unsupported media remains as references",
-            ),
-        ),
-        SettingsSectionUi(
-            title = "Export local data",
-            description = "Export local notes and notebooks in someday.local-export.v2+json while excluding raw keys, refresh tokens, passwords, and recovery material.",
-            entryPoints = listOf(
-                "Export local data",
-                "Secrets excluded by default",
-            ),
-        ),
-    )
-}

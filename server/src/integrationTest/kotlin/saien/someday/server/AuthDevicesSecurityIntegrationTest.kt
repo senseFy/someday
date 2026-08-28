@@ -32,6 +32,7 @@ class AuthDevicesSecurityIntegrationTest {
     private val dbUrl = System.getenv("SOMEDAY_DB_URL") ?: "jdbc:postgresql://127.0.0.1:54329/someday"
     private val dbUser = System.getenv("SOMEDAY_DB_USER") ?: "someday"
     private val dbPassword = System.getenv("SOMEDAY_DB_PASSWORD") ?: "someday"
+    private val dbConnectionUrl = productionTestDatabaseConnectionUrl(dbUrl)
 
     @Before
     fun setUp() {
@@ -210,7 +211,7 @@ class AuthDevicesSecurityIntegrationTest {
         }
         assertEquals(HttpStatusCode.OK, revoke.status, revoke.bodyAsText())
 
-        val revokedSync = client.get("/sync/v2/capabilities") {
+        val revokedSync = client.get("/sync/v3/capabilities") {
             bearerAuth(userOneDevice.accessToken)
         }
         assertTrue(
@@ -218,10 +219,108 @@ class AuthDevicesSecurityIntegrationTest {
             "Revoked device sync must be denied, got ${revokedSync.status}: ${revokedSync.bodyAsText()}",
         )
 
-        val unaffected = client.get("/sync/v2/capabilities") {
+        val unaffected = client.get("/sync/v3/capabilities") {
             bearerAuth(userTwoDevice.accessToken)
         }
         assertEquals(HttpStatusCode.OK, unaffected.status, unaffected.bodyAsText())
+    }
+
+    @Test
+    fun deviceRegistrationRetryRecoversSameInstallationAfterResponseLoss() = testApplication {
+        application { somedayServerModule() }
+        val account = json.decodeFromString<AuthTokensResponse>(
+            register("claim-${System.nanoTime()}@example.com", "password-claim").bodyAsText(),
+        )
+        val installationId = java.util.UUID.randomUUID().toString()
+        val claimed = registerDevice(account.accessToken, "Claimed", "desktop", installationId)
+        assertEquals(installationId, claimed.device.id)
+
+        // Model a committed registration whose HTTP response was lost: retry using the original
+        // account session and recover the already-owned installation UUID.
+        val recovered = registerDevice(account.accessToken, "Claimed", "desktop", installationId)
+        assertEquals(claimed.device, recovered.device)
+        assertNotEquals(claimed.accessToken, recovered.accessToken)
+
+        val lostAccess = client.get("/sync/v3/capabilities") { bearerAuth(claimed.accessToken) }
+        assertEquals(HttpStatusCode.Unauthorized, lostAccess.status, lostAccess.bodyAsText())
+        val lostRefresh = client.post("/auth/refresh") {
+            contentType(ContentType.Application.Json)
+            setBody(json.encodeToString(RefreshRequest(claimed.refreshToken)))
+        }
+        assertEquals(HttpStatusCode.Unauthorized, lostRefresh.status, lostRefresh.bodyAsText())
+        val recoveredAccess = client.get("/sync/v3/capabilities") { bearerAuth(recovered.accessToken) }
+        assertEquals(HttpStatusCode.OK, recoveredAccess.status, recoveredAccess.bodyAsText())
+    }
+
+    @Test
+    fun deviceRegistrationRecoversForSameAccountButNeverClaimsAcrossAccounts() = testApplication {
+        application { somedayServerModule() }
+        val email = "recover-${System.nanoTime()}@example.com"
+        val firstLogin = json.decodeFromString<AuthTokensResponse>(
+            register(email, "password-recover").bodyAsText(),
+        )
+        val installationId = java.util.UUID.randomUUID().toString()
+        val claimed = registerDevice(firstLogin.accessToken, "Desktop", "desktop", installationId)
+        val secondLogin = json.decodeFromString<AuthTokensResponse>(
+            login(email, "password-recover").bodyAsText(),
+        )
+        val recovered = registerDevice(secondLogin.accessToken, "Desktop", "desktop", installationId)
+        assertEquals(claimed.device, recovered.device)
+
+        val otherAccount = json.decodeFromString<AuthTokensResponse>(
+            register("other-${System.nanoTime()}@example.com", "password-other").bodyAsText(),
+        )
+        val conflict = client.post("/devices/register") {
+            bearerAuth(otherAccount.accessToken)
+            contentType(ContentType.Application.Json)
+            setBody(json.encodeToString(DeviceRegistrationRequest("Other", "desktop", installationId)))
+        }
+        assertEquals(HttpStatusCode.Conflict, conflict.status, conflict.bodyAsText())
+        assertEquals("device_id_already_claimed", json.decodeFromString<ErrorResponse>(conflict.bodyAsText()).error)
+    }
+
+    @Test
+    fun revokedInstallationCannotBeRecoveredByRegistrationRetry() = testApplication {
+        application { somedayServerModule() }
+        val account = json.decodeFromString<AuthTokensResponse>(
+            register("revoked-retry-${System.nanoTime()}@example.com", "password-revoked").bodyAsText(),
+        )
+        val installationId = java.util.UUID.randomUUID().toString()
+        val claimed = registerDevice(account.accessToken, "Revoked", "desktop", installationId)
+        val revoke = client.delete("/devices/$installationId") { bearerAuth(claimed.accessToken) }
+        assertEquals(HttpStatusCode.OK, revoke.status, revoke.bodyAsText())
+
+        val retry = client.post("/devices/register") {
+            bearerAuth(account.accessToken)
+            contentType(ContentType.Application.Json)
+            setBody(json.encodeToString(DeviceRegistrationRequest("Revoked", "desktop", installationId)))
+        }
+        assertEquals(HttpStatusCode.Conflict, retry.status, retry.bodyAsText())
+        assertEquals("device_revoked", json.decodeFromString<ErrorResponse>(retry.bodyAsText()).error)
+        val devices = json.decodeFromString<DevicesResponse>(
+            client.get("/devices") { bearerAuth(account.accessToken) }.bodyAsText(),
+        )
+        assertTrue(devices.devices.single { it.id == installationId }.revoked)
+    }
+
+    @Test
+    fun deviceRegistrationRejectsNonVersionFourUuid() = testApplication {
+        application { somedayServerModule() }
+        val account = json.decodeFromString<AuthTokensResponse>(
+            register("invalid-device-id-${System.nanoTime()}@example.com", "password-device-id").bodyAsText(),
+        )
+
+        val response = client.post("/devices/register") {
+            bearerAuth(account.accessToken)
+            contentType(ContentType.Application.Json)
+            setBody(json.encodeToString(DeviceRegistrationRequest(
+                name = "Version One Device",
+                platform = "desktop",
+                deviceId = "f47ac10b-58cc-11cf-a447-001122334455",
+            )))
+        }
+
+        assertEquals(HttpStatusCode.BadRequest, response.status, response.bodyAsText())
     }
 
     @Test
@@ -290,7 +389,7 @@ class AuthDevicesSecurityIntegrationTest {
             register(email = "rate-sync-${System.nanoTime()}@example.com", password = "valid-password").bodyAsText(),
         )
         val syncToken = registerDevice(syncUser.accessToken, "Sync Rate Device", "desktop").accessToken
-        val syncOk = client.get("/sync/v2/capabilities") {
+        val syncOk = client.get("/sync/v3/capabilities") {
             bearerAuth(syncToken)
         }
         assertEquals(HttpStatusCode.OK, syncOk.status, syncOk.bodyAsText())
@@ -312,11 +411,12 @@ class AuthDevicesSecurityIntegrationTest {
         accessToken: String,
         name: String,
         platform: String,
+        deviceId: String = java.util.UUID.randomUUID().toString(),
     ): DeviceRegistrationResponse {
         val response = client.post("/devices/register") {
             bearerAuth(accessToken)
             contentType(ContentType.Application.Json)
-            setBody(json.encodeToString(DeviceRegistrationRequest(name, platform)))
+            setBody(json.encodeToString(DeviceRegistrationRequest(name, platform, deviceId)))
         }
         assertEquals(HttpStatusCode.OK, response.status, response.bodyAsText())
         return json.decodeFromString(response.bodyAsText())
@@ -324,7 +424,7 @@ class AuthDevicesSecurityIntegrationTest {
 
     private fun clearServerTables() {
         runCatching {
-            DriverManager.getConnection(dbUrl, dbUser, dbPassword).use { connection ->
+            DriverManager.getConnection(dbConnectionUrl, dbUser, dbPassword).use { connection ->
                 connection.createStatement().use { statement ->
                     statement.execute(
                         """
@@ -342,7 +442,7 @@ class AuthDevicesSecurityIntegrationTest {
     }
 
     private fun passwordHashFor(email: String): String? =
-        DriverManager.getConnection(dbUrl, dbUser, dbPassword).use { connection ->
+        DriverManager.getConnection(dbConnectionUrl, dbUser, dbPassword).use { connection ->
             connection.prepareStatement("SELECT password_hash FROM someday_users WHERE email = ?").use { statement ->
                 statement.setString(1, email)
                 statement.executeQuery().use { result ->
@@ -352,7 +452,7 @@ class AuthDevicesSecurityIntegrationTest {
         }
 
     private fun userCountFor(email: String): Int =
-        DriverManager.getConnection(dbUrl, dbUser, dbPassword).use { connection ->
+        DriverManager.getConnection(dbConnectionUrl, dbUser, dbPassword).use { connection ->
             connection.prepareStatement("SELECT COUNT(*) FROM someday_users WHERE email = ?").use { statement ->
                 statement.setString(1, email)
                 statement.executeQuery().use { result ->
@@ -363,7 +463,7 @@ class AuthDevicesSecurityIntegrationTest {
         }
 
     private fun activeRefreshTokenHashes(): List<String> =
-        DriverManager.getConnection(dbUrl, dbUser, dbPassword).use { connection ->
+        DriverManager.getConnection(dbConnectionUrl, dbUser, dbPassword).use { connection ->
             connection.createStatement().use { statement ->
                 statement.executeQuery(
                     """
@@ -412,6 +512,7 @@ private data class LogoutRequest(
 private data class DeviceRegistrationRequest(
     val name: String,
     val platform: String,
+    val deviceId: String = java.util.UUID.randomUUID().toString(),
 )
 
 @Serializable

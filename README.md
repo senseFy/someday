@@ -1,6 +1,6 @@
 # Someday
 
-Someday is a Kotlin Multiplatform, Compose Multiplatform, local-first notes and journal app. It includes notebook and note management, Markdown editing and preview, version history, conflict handling, memories by calendar date, location capture, settings, encrypted sync objects, WebDAV sync, and a self-hosted Ktor sync/admin server.
+Someday is a Kotlin Multiplatform, Compose Multiplatform, local-first notes and journal app. It includes notebook and note management, Markdown editing and preview, version history, conflict handling, memories by calendar date, location capture, settings, encrypted self-hosted sync, and a Ktor sync/admin server.
 
 ## License
 
@@ -11,38 +11,55 @@ You may run, study, share, and modify it under the terms of that license. If you
 ## Status
 
 - **Local-first notes, memories, Markdown, export, and recovery-key workflows** are the core product surface.
-- **Sync** is **System V2** only: immutable workspace-entity DAG + epoch/checkpoint on WebDAV and self-hosted transports. See `docs/sync-system-v2-spec.md`.
+- **Sync** is the single self-hosted **System V3** contract: the proven
+  immutable workspace-entity DAG plus one immutable encrypted object per
+  image. Its canonical surfaces are
+  `/sync/v3/workspaces/{workspaceId}/entities` and
+  `/sync/v3/workspaces/{workspaceId}/media`. See
+  `docs/sync-system-v3-spec.md`.
 - **Device pairing** uses a one-use encrypted invitation transferred by QR or
-  a checksummed high-entropy manual token. WebDAV and the self-hosted server
-  never receive the workspace key in plaintext. See
+  a checksummed high-entropy manual token. The self-hosted server never receives
+  the workspace key in plaintext. See
   `docs/workspace-pairing-protocol.md`.
-- **Attachments and map SDKs** are intentionally out of scope for the current product.
-- Disaster-recovery WebDAV **backup** is a separate action from incremental sync.
+- **Images** use app-owned opaque Markdown references and lazy cross-device
+  materialization. The initial surface accepts static JPEG, PNG, and WebP
+  originals up to 4 MiB and 12MP. General files, video, SVG, animation, and map
+  SDKs remain outside it.
+- **Portable export/restore does not include image bytes.** Preserve the
+  app-private media store locally, or back up both PostgreSQL and the configured
+  server media store when operating a self-hosted service. The accepted
+  production topology delegates persistence to external PostgreSQL and private
+  S3-compatible object storage; standalone PostgreSQL plus a filesystem volume
+  remains supported. Both backends use the same production server image; see
+  the deployment examples under `deploy/`.
 
 ## Contributing and security
 
 - How to build, test, and open changes: [CONTRIBUTING.md](CONTRIBUTING.md)
 - Community expectations: [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
-- Engineering constraints (schema, UI threading, Sync V2): [agent.md](agent.md)
+- Engineering constraints (schema, UI threading, System V3): [agent.md](agent.md)
 - Vulnerability reports: [SECURITY.md](SECURITY.md) (please do not file public issues for security bugs)
 - Self-hosted production contract: [docs/self-hosting.md](docs/self-hosting.md)
+- Server storage architecture: [docs/server-storage-architecture.md](docs/server-storage-architecture.md)
+- Server maintainer release workflow: [docs/server-release.md](docs/server-release.md)
 
 ## Repository layout
 
 - `shared:domain` — shared note, notebook, navigation, settings, location, and merge domain models.
-- `shared:data` — local-first persistence, SQLDelight repositories, encryption/recovery key support, settings, and export helpers.
-- `shared:sync` — encrypted sync object handling, WebDAV sync, self-hosted sync clients, and conflict resolution.
+- `shared:data` — local-first persistence, app-private media storage, SQLDelight repositories, encryption/recovery key support, settings, and export helpers.
+- `shared:sync` — System V3 encrypted entity/media sync, self-hosted clients, and conflict resolution.
 - `shared:ui` — shared Compose UI controllers and app shell.
 - `app:android`, `app:ios`, `app:desktop` — platform entry points and platform adapters.
-- `server` — Ktor API/admin service backed by PostgreSQL.
-- `integration-tests` — real WebDAV and self-hosted end-to-end validation.
+- `server` — Ktor API/admin service backed by PostgreSQL and a configured media store.
+- `integration-tests` — real self-hosted end-to-end validation.
 
 ## Requirements
 
 - JDK 21 (Temurin/JBR/OpenJDK) for the Gradle wrapper, Kotlin/Compose toolchain,
   Desktop run/package, and server. The monorepo `jvmTarget` and Java toolchains
   are 21-wide; older JDKs cannot load dependencies such as backdrop 2.x.
-- Docker and Docker Compose for PostgreSQL and WebDAV integration services.
+- Docker and Docker Compose for local PostgreSQL, the S3/PostgreSQL reliability
+  gate, and containerized self-hosting.
 - Android SDK/emulator for Android smoke or instrumented tests.
 - Xcode/iOS Simulator on macOS for iOS simulator tests.
 
@@ -55,10 +72,9 @@ production stack; see [the self-hosting guide](docs/self-hosting.md).
 | Service | Port | Start command | Health check |
 | --- | ---: | --- | --- |
 | PostgreSQL | `54329` | `docker compose up -d postgres` | `pg_isready -h 127.0.0.1 -p 54329 -U someday` |
-| WebDAV | `3182` | `docker compose up -d webdav` | `curl -sf -X OPTIONS http://127.0.0.1:3182/` |
 | Ktor server | `3180` | `SOMEDAY_PORT=3180 SOMEDAY_DB_URL=jdbc:postgresql://127.0.0.1:54329/someday ./gradlew :server:run` | `curl -sf http://127.0.0.1:3180/health` |
 
-Stop containers with `docker compose stop postgres webdav`. Stop the Ktor server with your terminal interrupt, or by terminating the process listening on port `3180`.
+Stop the container with `docker compose stop postgres`. Stop the Ktor server with your terminal interrupt, or by terminating the process listening on port `3180`.
 
 ## Setup
 
@@ -70,7 +86,7 @@ Manual equivalent:
 
 ```bash
 ./gradlew --version
-docker compose up -d postgres webdav
+docker compose up -d postgres
 ```
 
 Start the self-hosted server when testing API/admin or self-hosted sync flows:
@@ -113,17 +129,12 @@ The runner prompts for a platform when one is not provided, prompts for Android/
 Manual equivalents:
 
 ```bash
-# Desktop app (local debug enables Sync V2 first-epoch activation)
-./gradlew :app:desktop:run \
-  -Psomeday.systemV2DevelopmentEnabled=true \
-  -Psomeday.systemV2ReleaseEnabled=false
+# Desktop app
+./gradlew :app:desktop:run
 
 # Server only
 SOMEDAY_PORT=3180 SOMEDAY_DB_URL=jdbc:postgresql://127.0.0.1:54329/someday ./gradlew :server:run
 ```
-
-`make run-desktop` and `./scripts/run desktop` pass the same V2 development flags.
-Release packaging keeps both flags off unless the release scripts set them explicitly.
 
 For Android Studio, open the project and use the `app:android` module. Desktop produces a JVM app and package-readiness checks for Windows/Linux; signing, notarization, and store packaging are outside the first release scope.
 
@@ -145,11 +156,18 @@ Android `versionName`, iOS `MARKETING_VERSION`, and the macOS/Windows/Linux Desk
 
 ## Continuous integration
 
-The `CI` workflow runs the hermetic Gradle `check` contract and the complete
-Sync V2 release gate for every pull request and every push to `main`. The gate
-starts pinned disposable PostgreSQL and WebDAV containers; it never contacts
-developer localhost services. The separate `Android` workflow builds a debug
-APK when a tag is pushed or when the workflow is run manually.
+The `CI` workflow runs the hermetic Gradle `check` contract and both System V3
+release gates for every pull request and every push to `main`. The Ubuntu gate
+starts pinned disposable PostgreSQL and S3-compatible services, runs the real
+backend contracts, starts a production-mode Ktor server, and executes the real
+self-hosted journeys; it never contacts developer localhost services. The
+macOS gate runs shared behavior and app-shell tests on an iOS simulator. The
+separate `Android` workflow builds a debug APK when a tag is pushed or when the
+workflow is run manually.
+
+Server releases use a separate `server-vX.Y.Z` tag and a single maintainer
+entry point. Start with `make server-release`; the complete flow is in
+[docs/server-release.md](docs/server-release.md).
 
 Workflow actions are pinned to immutable commit SHAs. The Gradle wrapper JAR
 matches the declared Gradle release, the distribution checksum is pinned, and
@@ -166,12 +184,8 @@ make release-readiness
 
 It resolves the Android release runtime, compiles the unsigned Android Release
 variant, validates the Compose Desktop packaging runtime, and builds the iOS
-device Release framework/resources with strict dependency verification. It
-also verifies that every generated shipping BuildConfig enables V2
-first-epoch activation while development activation remains off. Low-level
-Gradle properties default off; canonical Android, iOS, and macOS release
-entrypoints supply the accepted shipping value explicitly, and direct release
-packaging refuses an omitted value. The preflight does not access signing
+device Release framework/resources with strict dependency verification. The
+preflight does not access signing
 credentials, notarize artifacts, or contact an app store.
 
 To trigger an Android package build from Git:
@@ -225,7 +239,9 @@ The upload tooling never searches a home-directory default for credentials. Prov
 
 Before the first upload, create the app in Play Console and choose the option to provide an existing app signing key when cross-channel APK updates must remain compatible. Import that key as Someday's **app signing key**, not only as its upload key, so externally distributed and Play-delivered APKs share the same signing certificate. Keep the private key backed up securely and never commit it.
 
-iOS CI is intentionally not enabled as a required GitHub-hosted job yet. GitHub-hosted macOS runners can build iOS simulator targets with preinstalled Xcode, but physical-device packaging needs signing certificates, provisioning profiles, and team configuration in repository secrets. Add a separate macOS workflow when those release credentials and cost expectations are ready.
+iOS simulator behavior is a required unsigned CI job. Physical-device and App
+Store packaging remain outside CI because they require signing certificates,
+provisioning profiles, and team configuration in repository secrets.
 
 ### iOS App Store / TestFlight release
 
@@ -324,8 +340,8 @@ make check
 ```
 
 `make check` is hermetic: it runs source hygiene, unit tests, platform-host
-tests, migration checks, and Android lint without assuming PostgreSQL, WebDAV,
-or a server on fixed localhost ports.
+tests, migration checks, and Android lint without assuming PostgreSQL or a
+server on fixed localhost ports.
 
 Targeted smoke and integration checks:
 
@@ -333,13 +349,23 @@ Targeted smoke and integration checks:
 make client-smoke
 make shared-smoke
 make server-test
+make server-container-smoke
 make integration-test
-make sync-v2-gate
+make sync-v3-gate
+# On Apple Silicon macOS with Xcode:
+make sync-v3-apple-gate
 ```
 
 `make integration-test` contains only hermetic repository topology checks.
-`make sync-v2-gate` provisions isolated PostgreSQL, WebDAV, and Ktor endpoints,
-then runs the no-skip real remote corpus. `make real-remote-test` and
+`make server-container-smoke` verifies the production image, standalone
+Compose boundary, and operator subcommands without duplicating sync journeys.
+`make sync-v3-gate` provisions isolated PostgreSQL, S3-compatible storage, and
+Ktor endpoints for the System V3 contract, then runs the no-skip real
+self-hosted journeys, an isolated PostgreSQL-plus-media restore, and the
+production container smoke.
+`make sync-v3-apple-gate` runs shared behavior and app-shell evidence on the
+iOS simulator; it does not claim a platform-native HTTP transport journey.
+`make real-remote-test` and
 `make validate` are lower-level entry points for an explicitly supplied
 `SOMEDAY_*` live-service environment.
 
@@ -354,7 +380,16 @@ make ios-simulator-test
 
 - The app is local-first: clients use local SQLite/SQLDelight as the primary store and sync in the background.
 - Database evolution rules are documented in `docs/database-migrations.md`; local schema changes go through SQLDelight migrations and server schema changes go through Flyway.
-- Sync payloads are encrypted client-side before upload; the self-hosted service does not need plaintext note bodies.
-- WebDAV and self-hosted sync cover append-only version objects, tombstones, conflict handling, and recovery-key workflows.
+- Note and image payloads are encrypted client-side before upload; the
+  self-hosted service does not receive plaintext note bodies or image content.
+- Media routes are scoped by the authenticated account and canonical workspace;
+  server media quota is an account-wide ciphertext total across workspaces.
+- Self-hosted sync covers append-only versions, tombstones, conflict handling,
+  recovery-key workflows, and immutable lazy image materialization.
+- Portable export/restore omits app-private image bytes. An operator recovery
+  of published images requires PostgreSQL and the configured media store as one
+  recovery unit. External PostgreSQL plus S3-compatible object storage is the
+  accepted production recommendation; standalone filesystem storage remains a
+  supported topology.
 - Location capture records coordinates and place text without requiring a map SDK.
 - The first release targets Android, iOS, macOS, Windows, and Linux, with JVM Desktop as the primary desktop runtime.

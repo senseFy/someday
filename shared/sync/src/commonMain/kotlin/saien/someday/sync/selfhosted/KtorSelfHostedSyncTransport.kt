@@ -4,22 +4,23 @@ import io.ktor.client.HttpClient
 import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.request.get
 import io.ktor.client.request.header
+import io.ktor.client.request.head
 import io.ktor.client.request.post
 import io.ktor.client.request.put
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.HttpResponse
 import io.ktor.client.statement.bodyAsChannel
-import saien.someday.domain.settings.isSecureSyncEndpoint
-import saien.someday.sync.StrictJsonV2
 import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
 import io.ktor.http.contentType
+import io.ktor.utils.io.readAvailable
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
-import io.ktor.utils.io.readAvailable
-
+import saien.someday.domain.media.MediaAssetId
+import saien.someday.domain.settings.isSecureSyncEndpoint
+import saien.someday.sync.StrictJsonV2
 
 class KtorSelfHostedSyncTransport(
     private val client: HttpClient = HttpClient {
@@ -35,7 +36,11 @@ class KtorSelfHostedSyncTransport(
         explicitNulls = true
         isLenient = false
     },
-) : SelfHostedSyncTransport, SelfHostedSyncTransportV2 {
+) : SelfHostedSyncTransport, SelfHostedSyncTransportV2, SelfHostedMediaTransportV3 {
+    fun close() {
+        client.close()
+    }
+
     override fun register(
         endpoint: String,
         request: SelfHostedAuthRequest,
@@ -139,35 +144,28 @@ class KtorSelfHostedSyncTransport(
     override fun v2Capabilities(
         endpoint: String,
         accessToken: String,
-    ): SelfHostedV2CapabilitiesResponse =
+    ): SelfHostedV2CapabilitiesResponse = systemV3Capabilities(endpoint, accessToken).toInternalEntityV2Capabilities()
+
+    override fun systemV3Capabilities(
+        endpoint: String,
+        accessToken: String,
+    ): SelfHostedSystemV3CapabilitiesResponse =
         get(
             endpoint = endpoint,
-            path = "/sync/v2/capabilities",
+            path = "/sync/v3/capabilities",
             bearerToken = accessToken,
-            responseSerializer = SelfHostedV2CapabilitiesResponse.serializer(),
+            responseSerializer = SelfHostedSystemV3CapabilitiesResponse.serializer(),
         )
 
     override fun v2Epoch(
         endpoint: String,
         accessToken: String,
+        workspaceId: String,
     ): SelfHostedV2EpochResponse =
         get(
             endpoint = endpoint,
-            path = "/sync/v2/epoch",
+            path = entityPath(workspaceId, "/epoch"),
             bearerToken = accessToken,
-            responseSerializer = SelfHostedV2EpochResponse.serializer(),
-        )
-
-    override fun v2EpochHistory(
-        endpoint: String,
-        accessToken: String,
-        request: SelfHostedV2EpochHistoryRequest,
-    ): SelfHostedV2EpochResponse =
-        post(
-            endpoint = endpoint,
-            path = "/sync/v2/epoch/history",
-            bearerToken = accessToken,
-            encodedBody = json.encodeToString(request),
             responseSerializer = SelfHostedV2EpochResponse.serializer(),
         )
 
@@ -178,10 +176,11 @@ class KtorSelfHostedSyncTransport(
     ): SelfHostedV2ImmutablePutResponse =
         post(
             endpoint = endpoint,
-            path = "/sync/v2/checkpoint/chunk",
+            path = entityPath(request.workspaceId, "/checkpoint/chunk"),
             bearerToken = accessToken,
             encodedBody = json.encodeToString(request),
             responseSerializer = SelfHostedV2ImmutablePutResponse.serializer(),
+            acceptedStatuses = setOf(409),
         )
 
     override fun v2PutCheckpointManifest(
@@ -191,10 +190,11 @@ class KtorSelfHostedSyncTransport(
     ): SelfHostedV2ImmutablePutResponse =
         post(
             endpoint = endpoint,
-            path = "/sync/v2/checkpoint/manifest",
+            path = entityPath(request.workspaceId, "/checkpoint/manifest"),
             bearerToken = accessToken,
             encodedBody = json.encodeToString(request),
             responseSerializer = SelfHostedV2ImmutablePutResponse.serializer(),
+            acceptedStatuses = setOf(409),
         )
 
     override fun v2FetchCheckpoint(
@@ -204,7 +204,7 @@ class KtorSelfHostedSyncTransport(
     ): SelfHostedV2CheckpointFetchResponse =
         post(
             endpoint = endpoint,
-            path = "/sync/v2/checkpoint/fetch",
+            path = entityPath(request.workspaceId, "/checkpoint/fetch"),
             bearerToken = accessToken,
             encodedBody = json.encodeToString(request),
             responseSerializer = SelfHostedV2CheckpointFetchResponse.serializer(),
@@ -217,7 +217,7 @@ class KtorSelfHostedSyncTransport(
     ): SelfHostedV2EpochCompareAndSetResponse =
         post(
             endpoint = endpoint,
-            path = "/sync/v2/epoch/compare-and-set",
+            path = entityPath(request.workspaceId, "/epoch/compare-and-set"),
             bearerToken = accessToken,
             encodedBody = json.encodeToString(request),
             responseSerializer = SelfHostedV2EpochCompareAndSetResponse.serializer(),
@@ -231,7 +231,7 @@ class KtorSelfHostedSyncTransport(
     ): SelfHostedV2CheckpointCleanupResponse =
         post(
             endpoint = endpoint,
-            path = "/sync/v2/checkpoint/cleanup",
+            path = entityPath(request.workspaceId, "/checkpoint/cleanup"),
             bearerToken = accessToken,
             encodedBody = json.encodeToString(request),
             responseSerializer = SelfHostedV2CheckpointCleanupResponse.serializer(),
@@ -245,7 +245,7 @@ class KtorSelfHostedSyncTransport(
     ): SelfHostedV2PushResponse =
         post(
             endpoint = endpoint,
-            path = "/sync/v2/push",
+            path = entityPath(request.workspaceId, "/push"),
             bearerToken = accessToken,
             encodedBody = json.encodeToString(request),
             responseSerializer = SelfHostedV2PushResponse.serializer(),
@@ -259,7 +259,7 @@ class KtorSelfHostedSyncTransport(
     ): SelfHostedV2PullResponse =
         post(
             endpoint = endpoint,
-            path = "/sync/v2/pull",
+            path = entityPath(request.workspaceId, "/pull"),
             bearerToken = accessToken,
             encodedBody = json.encodeToString(request),
             responseSerializer = SelfHostedV2PullResponse.serializer(),
@@ -272,38 +272,130 @@ class KtorSelfHostedSyncTransport(
     ): SelfHostedV2FrontierResponse =
         post(
             endpoint = endpoint,
-            path = "/sync/v2/frontiers",
+            path = entityPath(request.workspaceId, "/frontiers"),
             bearerToken = accessToken,
             encodedBody = json.encodeToString(request),
             responseSerializer = SelfHostedV2FrontierResponse.serializer(),
         )
 
-    override fun v2RepairObject(
+    override fun putMediaObject(
         endpoint: String,
         accessToken: String,
-        request: SelfHostedV2RepairObjectRequest,
-    ): SelfHostedV2RepairObjectResponse =
-        post(
-            endpoint = endpoint,
-            path = "/sync/v2/repair/object",
-            bearerToken = accessToken,
-            encodedBody = json.encodeToString(request),
-            responseSerializer = SelfHostedV2RepairObjectResponse.serializer(),
+        workspaceId: String,
+        mediaId: String,
+        prepared: SelfHostedPreparedMediaObjectV3,
+    ): SelfHostedMediaPutResponseV3 {
+        requireSystemV3WorkspaceId(workspaceId)
+        requireMediaId(mediaId)
+        require(prepared.metadata.mediaId == mediaId)
+        return putMediaBytes(
+            endpoint,
+            "/sync/v3/workspaces/$workspaceId/media/$mediaId",
+            accessToken,
+            prepared.encryptedBytes,
+            prepared.encryptedSha256,
         )
+    }
 
-    override fun v2PublishRepairReplica(
+    override fun headMediaObject(
         endpoint: String,
         accessToken: String,
-        request: SelfHostedV2RepairReplicaRequest,
-    ): SelfHostedV2ImmutablePutResponse =
-        post(
-            endpoint = endpoint,
-            path = "/sync/v2/repair/replica",
-            bearerToken = accessToken,
-            encodedBody = json.encodeToString(request),
-            responseSerializer = SelfHostedV2ImmutablePutResponse.serializer(),
+        workspaceId: String,
+        mediaId: String,
+    ): SelfHostedMediaRemoteHeadV3? {
+        requireSystemV3WorkspaceId(workspaceId)
+        requireMediaId(mediaId)
+        return headMedia(endpoint, "/sync/v3/workspaces/$workspaceId/media/$mediaId", accessToken)
+    }
+
+    override fun getMediaObject(
+        endpoint: String,
+        accessToken: String,
+        workspaceId: String,
+        mediaId: String,
+    ): SelfHostedMediaRemoteObjectV3 {
+        requireSystemV3WorkspaceId(workspaceId)
+        requireMediaId(mediaId)
+        return getMediaBytes(
+            endpoint,
+            "/sync/v3/workspaces/$workspaceId/media/$mediaId",
+            accessToken,
+            SYSTEM_V3_MEDIA_MAX_CIPHERTEXT_BYTES,
+        )
+    }
+
+    private fun putMediaBytes(
+        endpoint: String,
+        path: String,
+        accessToken: String,
+        bytes: ByteArray,
+        ciphertextSha256: String,
+    ): SelfHostedMediaPutResponseV3 = runBlocking {
+        requireSecureEndpoint(endpoint)
+        val response = client.put("${endpoint.trim().trimEnd('/')}$path") {
+            contentType(ContentType.parse(SYSTEM_V3_MEDIA_OBJECT_CONTENT_TYPE))
+            header(HttpHeaders.Authorization, "Bearer $accessToken")
+            header(SYSTEM_V3_MEDIA_CIPHERTEXT_SHA256_HEADER, ciphertextSha256)
+            setBody(bytes)
+        }
+        decode(
+            response.status.value,
+            boundedBody(response),
+            SelfHostedMediaPutResponseV3.serializer(),
             acceptedStatuses = setOf(409),
         )
+    }
+
+    private fun headMedia(
+        endpoint: String,
+        path: String,
+        accessToken: String,
+    ): SelfHostedMediaRemoteHeadV3? = runBlocking {
+        requireSecureEndpoint(endpoint)
+        val response = client.head("${endpoint.trim().trimEnd('/')}$path") {
+            header(HttpHeaders.Authorization, "Bearer $accessToken")
+        }
+        boundedBytes(response, MEDIA_ERROR_BODY_LIMIT, enforceDeclaredLength = false)
+        if (response.status.value == 404) return@runBlocking null
+        if (response.status.value !in 200..299) requireSuccessful(response.status.value)
+        response.mediaHead()
+    }
+
+    private fun getMediaBytes(
+        endpoint: String,
+        path: String,
+        accessToken: String,
+        maxBytes: Int,
+    ): SelfHostedMediaRemoteObjectV3 = runBlocking {
+        requireSecureEndpoint(endpoint)
+        val response = client.get("${endpoint.trim().trimEnd('/')}$path") {
+            header(HttpHeaders.Authorization, "Bearer $accessToken")
+        }
+        if (response.status.value !in 200..299) {
+            boundedBytes(response, MEDIA_ERROR_BODY_LIMIT)
+            requireSuccessful(response.status.value)
+        }
+        require(response.headers[HttpHeaders.ContentType]?.substringBefore(';')?.trim() ==
+            SYSTEM_V3_MEDIA_OBJECT_CONTENT_TYPE)
+        val bytes = boundedBytes(response, maxBytes)
+        val head = response.mediaHead()
+        require(head.ciphertextBytes == bytes.size)
+        SelfHostedMediaRemoteObjectV3(
+            head.ciphertextBytes,
+            head.ciphertextSha256,
+            bytes,
+        )
+    }
+
+    private fun HttpResponse.mediaHead(): SelfHostedMediaRemoteHeadV3 {
+        val ciphertextBytes = headers[SYSTEM_V3_MEDIA_CIPHERTEXT_BYTES_HEADER]
+            ?.canonicalPositiveIntOrNull()
+            ?: error("Self-hosted media response has invalid size metadata.")
+        val ciphertextSha256 = headers[SYSTEM_V3_MEDIA_CIPHERTEXT_SHA256_HEADER]
+            ?.takeIf(MEDIA_DIGEST::matches)
+            ?: error("Self-hosted media response has invalid digest metadata.")
+        return SelfHostedMediaRemoteHeadV3(ciphertextBytes, ciphertextSha256)
+    }
 
     private fun <T> post(
         endpoint: String,
@@ -395,31 +487,47 @@ class KtorSelfHostedSyncTransport(
         }
 
     private suspend fun boundedBody(response: HttpResponse): String {
-        val declared = response.headers[HttpHeaders.ContentLength]?.toLongOrNull()
-        require(declared == null || declared in 0..MAX_ENCODED_BODY_BYTES.toLong()) {
-            "Self-hosted response exceeds the V2 encoded body limit."
-        }
+        return boundedBytes(response, MAX_ENCODED_BODY_BYTES).decodeToString(throwOnInvalidSequence = true)
+    }
+
+    private suspend fun boundedBytes(
+        response: HttpResponse,
+        maxBytes: Int,
+        enforceDeclaredLength: Boolean = true,
+    ): ByteArray {
         val channel = response.bodyAsChannel()
-        val chunks = mutableListOf<ByteArray>()
-        var total = 0
-        val buffer = ByteArray(8 * 1024)
-        while (true) {
-            val read = channel.readAvailable(buffer, 0, buffer.size)
-            if (read < 0) break
-            if (read == 0) continue
-            require(total + read <= MAX_ENCODED_BODY_BYTES) {
-                "Self-hosted response exceeds the V2 encoded body limit."
+        val declared = response.headers[HttpHeaders.ContentLength]?.toLongOrNull()
+        return try {
+            require(declared == null || declared in 0..maxBytes.toLong()) {
+                "Self-hosted response exceeds its configured body limit."
             }
-            chunks += buffer.copyOf(read)
-            total += read
+            val chunks = mutableListOf<ByteArray>()
+            var total = 0
+            val buffer = ByteArray(8 * 1024)
+            while (true) {
+                val read = channel.readAvailable(buffer, 0, buffer.size)
+                if (read < 0) break
+                if (read == 0) continue
+                require(total + read <= maxBytes) {
+                    "Self-hosted response exceeds its configured body limit."
+                }
+                chunks += buffer.copyOf(read)
+                total += read
+            }
+            val bytes = ByteArray(total)
+            var offset = 0
+            chunks.forEach { chunk ->
+                chunk.copyInto(bytes, offset)
+                offset += chunk.size
+            }
+            require(!enforceDeclaredLength || declared == null || declared == bytes.size.toLong()) {
+                "Self-hosted response body length does not match Content-Length."
+            }
+            bytes
+        } catch (failure: Throwable) {
+            channel.cancel(failure)
+            throw failure
         }
-        val bytes = ByteArray(total)
-        var offset = 0
-        chunks.forEach { chunk ->
-            chunk.copyInto(bytes, offset)
-            offset += chunk.size
-        }
-        return bytes.decodeToString(throwOnInvalidSequence = true)
     }
 
     private fun <T> decode(
@@ -448,7 +556,39 @@ class KtorSelfHostedSyncTransport(
             }
         }
 
+    private fun requireSecureEndpoint(endpoint: String) {
+        require(isSecureSyncEndpoint(endpoint)) {
+            "Self-hosted requires HTTPS unless the server is on this device's loopback interface."
+        }
+    }
+
+    private fun requireSuccessful(status: Int): Nothing {
+        throw SelfHostedSyncHttpException(
+            status = status,
+            safeMessage = "Self-hosted request failed with HTTP $status; credentials redacted.",
+        )
+    }
+
     private companion object {
         const val MAX_ENCODED_BODY_BYTES: Int = 16 * 1024 * 1024
+        const val MEDIA_ERROR_BODY_LIMIT: Int = 64 * 1024
+        val MEDIA_DIGEST = Regex("^sha256:[0-9a-f]{64}$")
     }
 }
+
+private fun entityPath(workspaceId: String, suffix: String): String {
+    require(TRANSPORT_WORKSPACE_ID.matches(workspaceId)) { "Invalid workspace scope." }
+    return "/sync/v3/workspaces/$workspaceId/entities$suffix"
+}
+
+private val TRANSPORT_WORKSPACE_ID = Regex("^workspace-[0-9a-f]{32}$")
+
+private fun requireMediaId(mediaId: String) {
+    MediaAssetId.fromCanonicalValue(mediaId)
+}
+
+private fun String.canonicalPositiveIntOrNull(): Int? =
+    toIntOrNull()?.takeIf { it > 0 && it.toString() == this }
+
+private fun String.canonicalPositiveLongOrNull(): Long? =
+    toLongOrNull()?.takeIf { it > 0L && it.toString() == this }

@@ -32,7 +32,7 @@ kotlin {
             implementation(libs.kotlinx.datetime)
             implementation(libs.kotlinx.serialization.json)
             implementation(libs.libsodium.bindings)
-            implementation(libs.okio)
+            api(libs.okio)
             implementation(libs.sqldelight.runtime)
         }
         androidMain.dependencies {
@@ -69,7 +69,7 @@ sqldelight {
 
 val verifySomedayDatabaseV2Baseline by tasks.registering(Exec::class) {
     group = "verification"
-    description = "Verifies the squashed V2-only SQLDelight baseline."
+    description = "Verifies the squashed System V3 SQLDelight baseline."
     commandLine(rootProject.file("scripts/verify-sqldelight-v2-baseline"))
     inputs.files(
         file("src/commonMain/sqldelight/databases/1.db"),

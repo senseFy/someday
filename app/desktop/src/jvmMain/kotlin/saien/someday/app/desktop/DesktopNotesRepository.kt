@@ -2,6 +2,7 @@
 
 package saien.someday.app.desktop
 
+import app.cash.sqldelight.driver.jdbc.sqlite.JdbcSqliteDriver
 import saien.someday.data.crypto.JvmFileSecureWorkspaceKeyStore
 import saien.someday.data.crypto.WorkspaceKeyRepository
 import saien.someday.data.crypto.WorkspaceMasterKey
@@ -12,57 +13,62 @@ import saien.someday.data.export.LocalDataExporter
 import saien.someday.data.importing.dayone.DayOneImportService
 import saien.someday.data.importing.dayone.DayOneImportSummary
 import saien.someday.data.local.SqlDelightLocalDataRepository
-import saien.someday.data.local.SqlDelightNotesRepository
 import saien.someday.data.local.createSomedayJdbcDriver
 import saien.someday.data.local.db.SomedayDatabase
+import saien.someday.data.media.LocalMediaAssetStore
 import saien.someday.data.settings.ClientSettingsRepository
 import saien.someday.data.settings.SqlDelightClientSettingsRepository
 import saien.someday.domain.notes.NotesRepository
 import saien.someday.domain.settings.ClientSettings
-import saien.someday.domain.settings.ManualSyncProgressListener
 import saien.someday.domain.settings.ManualSyncRunner
 import saien.someday.domain.settings.SelfHostedSessionCredentialStore
 import saien.someday.domain.settings.SelfHostedSetupClient
-import saien.someday.domain.settings.SyncV2MaintenanceRunner
-import saien.someday.domain.settings.WebDavCredentialStore
-import saien.someday.domain.settings.WebDavDiscoveredDevicesRunner
 import saien.someday.domain.settings.WorkspacePairingInvitationCanceller
 import saien.someday.domain.settings.WorkspacePairingInvitationCreator
 import saien.someday.domain.settings.WorkspacePairingInvitationJoiner
-import saien.someday.sync.causality.v2.SqlDelightSyncProtocolStoreV2
-import saien.someday.sync.createSyncV2ClientServices
+import saien.someday.sync.AuthorityCoordinatedMediaAssetStore
+import saien.someday.sync.createSystemV3ClientServices
 import saien.someday.sync.selfhosted.JdkSelfHostedSyncTransport
-import saien.someday.sync.selfhosted.ModeRoutingWorkspacePairingService
 import saien.someday.sync.selfhosted.SelfHostedSetupService
 import saien.someday.sync.selfhosted.SelfHostedWorkspacePairingService
-import saien.someday.sync.webdav.JdkWebDavTransport
-import saien.someday.sync.webdav.WebDavBackupService
-import saien.someday.sync.webdav.WebDavWorkspacePairingService
+import saien.someday.sync.selfhosted.SystemV3MediaCoordinator
+import saien.someday.sync.selfhosted.WorkspaceBoundSessionCredentialStore
 import saien.someday.ui.settings.SettingsExportSummary
 import saien.someday.ui.settings.SettingsImportSummary
 import java.io.File
 import java.util.UUID
+import okio.Path.Companion.toPath
 
-data class DesktopClientRepositories(
+class DesktopClientRepositories(
     val notesRepository: NotesRepository,
     val settingsRepository: ClientSettingsRepository,
-    val webDavBackupService: WebDavBackupService,
-    val webDavCredentialStore: WebDavCredentialStore,
     val selfHostedSetupClient: SelfHostedSetupClient,
     val selfHostedSessionCredentialStore: SelfHostedSessionCredentialStore,
     val manualSyncRunner: ManualSyncRunner,
-    val bindManualSyncProgressListener: (ManualSyncProgressListener?) -> Unit = {},
-    val syncV2MaintenanceRunner: SyncV2MaintenanceRunner,
     val workspacePairingInvitationCreator: WorkspacePairingInvitationCreator,
     val workspacePairingInvitationJoiner: WorkspacePairingInvitationJoiner,
     val workspacePairingInvitationCanceller: WorkspacePairingInvitationCanceller,
-    val webDavDiscoveredDevicesRunner: WebDavDiscoveredDevicesRunner,
-    private val localRepository: SqlDelightLocalDataRepository,
+    val localMediaAssetStore: AuthorityCoordinatedMediaAssetStore,
+    val mediaCoordinator: SystemV3MediaCoordinator,
     private val localDataExporter: LocalDataExporter,
     private val localDataImportProvider: (saien.someday.data.export.LocalDataExportDocument) ->
-        saien.someday.data.export.LocalDataImportSummary?,
+        saien.someday.data.export.LocalDataImportSummary,
     private val exportDirectory: File,
-) {
+    private val driver: JdbcSqliteDriver,
+    private val selfHostedTransport: JdkSelfHostedSyncTransport,
+) : AutoCloseable {
+    private var closed = false
+
+    override fun close() {
+        if (closed) return
+        closed = true
+        try {
+            selfHostedTransport.close()
+        } finally {
+            driver.close()
+        }
+    }
+
     fun exportLocalDataSummary(): SettingsExportSummary {
         val document = localDataExporter.exportDocument()
         exportDirectory.mkdirs()
@@ -73,131 +79,144 @@ data class DesktopClientRepositories(
             notebookCount = document.notebooks.size,
             noteCount = document.notes.size,
             excludedSensitiveFields = document.excludedSensitiveFields,
+            includesMediaBytes = document.includesMediaBytes,
+            assetReferencesMayBeUnresolved = document.assetReferencesMayBeUnresolved,
             destinationLabel = file.absolutePath,
         )
     }
 
     fun importDayOneArchive(file: File): SettingsImportSummary =
-        DayOneImportService(localRepository, localDataImportProvider)
+        DayOneImportService(localDataImportProvider)
             .importArchive(file.readBytes(), file.nameWithoutExtension)
             .toSettingsImportSummary()
 }
 
 fun createDesktopClientRepositories(): DesktopClientRepositories {
-    val localRepository = createDesktopLocalDataRepository(resolveDesktopLocalDeviceId())
+    val localData = createDesktopLocalDataRepository(resolveDesktopLocalDeviceId())
+    return runCatching {
+        assembleDesktopClientRepositoriesWithOwnedTransport(localData)
+    }.getOrElse { failure ->
+        runCatching { localData.driver.close() }
+        throw failure
+    }
+}
+
+private fun assembleDesktopClientRepositoriesWithOwnedTransport(
+    localData: DesktopLocalData,
+): DesktopClientRepositories {
+    val selfHostedTransport = JdkSelfHostedSyncTransport()
+    return runCatching {
+        assembleDesktopClientRepositories(localData, selfHostedTransport)
+    }.getOrElse { failure ->
+        runCatching { selfHostedTransport.close() }
+        throw failure
+    }
+}
+
+private fun assembleDesktopClientRepositories(
+    localData: DesktopLocalData,
+    selfHostedTransport: JdkSelfHostedSyncTransport,
+): DesktopClientRepositories {
+    val localRepository = localData.repository
     val settingsRepository = SqlDelightClientSettingsRepository(localRepository)
     ensureActiveDeviceId(
         settingsRepository = settingsRepository,
         deviceId = localRepository.localDeviceId,
     )
     val workspaceKeys = bootstrapDesktopWorkspaceKeys(localRepository)
-    val webDavTransport = JdkWebDavTransport()
-    val webDavCredentialStore = DesktopWebDavCredentialStore()
-    val selfHostedTransport = JdkSelfHostedSyncTransport()
     val selfHostedSessionCredentialStore = DesktopSelfHostedSessionCredentialStore()
-    val syncV2Services = createSyncV2ClientServices(
+    val localMediaAssetStore = LocalMediaAssetStore(
+        database = localRepository.database,
+        appPrivateRoot = File(System.getProperty("user.home"), ".someday").absolutePath.toPath(),
+        decodeValidator = DesktopMediaAssetDecodeValidator,
+    )
+    val systemV3Services = createSystemV3ClientServices(
         localRepository = localRepository,
-        localNotesRepository = SqlDelightNotesRepository(localRepository),
         settingsRepository = settingsRepository,
         workspaceKeyProvider = workspaceKeys::unlockedOrUnlock,
-        webDavTransport = webDavTransport,
-        webDavCredentialStore = webDavCredentialStore,
+        workspaceIdProvider = workspaceKeys::workspaceIdOrNull,
+        localMediaAssetStore = localMediaAssetStore,
         selfHostedTransport = selfHostedTransport,
         selfHostedTransportV2 = selfHostedTransport,
+        selfHostedMediaTransportV3 = selfHostedTransport,
         selfHostedSessionStore = selfHostedSessionCredentialStore,
-        systemV2ActivationEnabled =
-            DesktopBuildConfig.SOMEDAY_SYSTEM_V2_RELEASE_ENABLED ||
-                DesktopBuildConfig.SOMEDAY_SYSTEM_V2_DEVELOPMENT_ENABLED,
-        workspaceKeyForEpochProvider = { epoch ->
-            workspaceKeys.workspaceKeyForEpochOrNull(epoch.descriptor.syncEpochId)
-        },
-        releaseWorkspaceKeyForEpoch = { epochId ->
-            workspaceKeys.releaseWorkspaceKeyForEpoch(epochId)
-        },
     )
-    val webDavBackupService = WebDavBackupService(
-        localRepository = localRepository,
-        transport = webDavTransport,
-        authoritativeDocumentProvider = syncV2Services.localDataExportProvider,
-        authoritativeImporter = syncV2Services.localDataImportProvider,
-    )
+    runCatching { systemV3Services.localMediaAssetStore.cleanupOrphans() }
     val workspaceJoinPackageProvider = workspaceKeys.workspaceJoinPackageProvider()
-    val localV2KeyBoundStatePresent = {
-        SqlDelightSyncProtocolStoreV2(localRepository.database).hasKeyBoundLocalV2State()
-    }
     val workspaceJoiner = workspaceKeys.workspaceJoiner(
         deviceName = "Desktop device",
         platform = "desktop",
-        localV2KeyBoundStatePresent = localV2KeyBoundStatePresent,
-    )
-    val webDavPairingService = WebDavWorkspacePairingService(
-        settingsProvider = settingsRepository::load,
-        credentialStore = webDavCredentialStore,
-        transport = webDavTransport,
-        workspaceJoinPackageProvider = workspaceJoinPackageProvider,
-        workspaceJoiner = workspaceJoiner,
-        localV2KeyBoundStatePresent = localV2KeyBoundStatePresent,
-        authorityMutationCoordinator = syncV2Services.authorityMutationCoordinator,
+        adoptionPolicy = systemV3Services.workspaceAdoptionPolicy,
+        beforeWorkspaceReplacement = systemV3Services.discardEmptyDraftForWorkspaceAdoption,
+        afterWorkspaceReplacement = systemV3Services.bindAdoptedWorkspaceToCurrentSession,
     )
     val selfHostedPairingService = SelfHostedWorkspacePairingService(
         settingsProvider = settingsRepository::load,
         sessionStore = selfHostedSessionCredentialStore,
         transport = selfHostedTransport,
-        sessionExecutor = syncV2Services.selfHostedSessionExecutor,
+        sessionExecutor = systemV3Services.selfHostedSessionExecutor,
         workspaceJoinPackageProvider = workspaceJoinPackageProvider,
         workspaceJoiner = workspaceJoiner,
-        localV2KeyBoundStatePresent = localV2KeyBoundStatePresent,
-        authorityMutationCoordinator = syncV2Services.authorityMutationCoordinator,
-    )
-    val workspacePairingService = ModeRoutingWorkspacePairingService(
-        settingsProvider = settingsRepository::load,
-        webDavCreator = webDavPairingService,
-        webDavJoiner = webDavPairingService,
-        webDavCanceller = webDavPairingService,
-        selfHostedCreator = selfHostedPairingService,
-        selfHostedJoiner = selfHostedPairingService,
-        selfHostedCanceller = selfHostedPairingService,
+        adoptionPolicy = systemV3Services.workspaceAdoptionPolicy,
+        authorityMutationCoordinator = systemV3Services.authorityMutationCoordinator,
+        activeWorkspaceSessionGuard = systemV3Services.activeWorkspaceSessionGuard,
+        workspacePairingInviterReady = systemV3Services.workspacePairingInviterReady,
     )
     return DesktopClientRepositories(
-        notesRepository = syncV2Services.notesRepository,
-        settingsRepository = syncV2Services.settingsRepository,
-        webDavBackupService = webDavBackupService,
-        webDavCredentialStore = webDavCredentialStore,
+        notesRepository = systemV3Services.notesRepository,
+        settingsRepository = systemV3Services.settingsRepository,
         selfHostedSetupClient = SelfHostedSetupService(
             transport = selfHostedTransport,
             sessionStore = selfHostedSessionCredentialStore,
+            activeWorkspaceSessionGuard = systemV3Services.activeWorkspaceSessionGuard,
+            authorityMutationCoordinator = systemV3Services.authorityMutationCoordinator,
+            localDeviceIdProvider = { localRepository.localDeviceId },
         ),
-        selfHostedSessionCredentialStore = selfHostedSessionCredentialStore,
-        manualSyncRunner = syncV2Services.manualSyncRunner,
-        bindManualSyncProgressListener = syncV2Services.bindManualSyncProgressListener,
-        syncV2MaintenanceRunner = syncV2Services.maintenanceRunner,
-        workspacePairingInvitationCreator = workspacePairingService,
-        workspacePairingInvitationJoiner = workspacePairingService,
-        workspacePairingInvitationCanceller = workspacePairingService,
-        webDavDiscoveredDevicesRunner = syncV2Services.webDavDiscoveredDevicesRunner,
-        localRepository = localRepository,
+        selfHostedSessionCredentialStore = WorkspaceBoundSessionCredentialStore(
+            selfHostedSessionCredentialStore,
+            systemV3Services.activeWorkspaceSessionGuard,
+        ),
+        manualSyncRunner = systemV3Services.manualSyncRunner,
+        workspacePairingInvitationCreator = selfHostedPairingService,
+        workspacePairingInvitationJoiner = selfHostedPairingService,
+        workspacePairingInvitationCanceller = selfHostedPairingService,
+        localMediaAssetStore = systemV3Services.localMediaAssetStore,
+        mediaCoordinator = systemV3Services.mediaCoordinator,
         localDataExporter = LocalDataExporter(
-            localRepository,
-            authoritativeDocumentProvider = syncV2Services.localDataExportProvider,
+            authoritativeDocumentProvider = systemV3Services.localDataExportProvider,
         ),
-        localDataImportProvider = syncV2Services.localDataImportProvider,
+        localDataImportProvider = systemV3Services.localDataImportProvider,
         exportDirectory = File(File(System.getProperty("user.home"), ".someday"), "exports"),
+        driver = localData.driver,
+        selfHostedTransport = selfHostedTransport,
     )
 }
 
-private fun createDesktopLocalDataRepository(deviceId: String): SqlDelightLocalDataRepository {
+private fun createDesktopLocalDataRepository(deviceId: String): DesktopLocalData {
     val databaseFile = File(
         File(System.getProperty("user.home"), ".someday"),
         "someday.db",
     )
     databaseFile.parentFile?.mkdirs()
     val driver = createSomedayJdbcDriver("jdbc:sqlite:${databaseFile.absolutePath}")
-    val database = SomedayDatabase(driver)
-    return SqlDelightLocalDataRepository(
-        database = database,
-        deviceId = deviceId,
-    )
+    return runCatching {
+        DesktopLocalData(
+            repository = SqlDelightLocalDataRepository(
+                database = SomedayDatabase(driver),
+                deviceId = deviceId,
+            ),
+            driver = driver,
+        )
+    }.getOrElse { failure ->
+        driver.close()
+        throw failure
+    }
 }
+
+private data class DesktopLocalData(
+    val repository: SqlDelightLocalDataRepository,
+    val driver: JdbcSqliteDriver,
+)
 
 private fun resolveDesktopLocalDeviceId(): String {
     val somedayDirectory = File(System.getProperty("user.home"), ".someday")
@@ -275,4 +294,6 @@ private fun DayOneImportSummary.toSettingsImportSummary(): SettingsImportSummary
         richTextConverted = richTextConverted,
         mediaReferenced = photosReferenced + audiosReferenced + videosReferenced + pdfsReferenced,
         unsupportedItems = unsupportedEmbeddedObjects + tagsFound + starredFound + pinnedFound + weatherFound,
+        includesMediaBytes = false,
+        assetReferencesMayBeUnresolved = true,
     )

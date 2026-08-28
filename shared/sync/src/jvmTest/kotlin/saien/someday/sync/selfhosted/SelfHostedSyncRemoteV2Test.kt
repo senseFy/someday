@@ -44,6 +44,8 @@ class SelfHostedSyncRemoteV2Test {
         val transport = CheckpointPagingTransport(prepared)
         val remote = SelfHostedSyncRemoteV2(
             endpoint = "https://sync.example.test",
+            authenticatedUserId = "user-test",
+            workspaceId = WORKSPACE_ID,
             workspaceKey = workspaceKey,
             accessTokenProvider = { "opaque-test-token" },
             transport = transport,
@@ -80,6 +82,8 @@ class SelfHostedSyncRemoteV2Test {
         val transport = CheckpointPagingTransport(prepared, missingChunkIndex = missingIndex)
         val remote = SelfHostedSyncRemoteV2(
             endpoint = "https://sync.example.test",
+            authenticatedUserId = "user-test",
+            workspaceId = WORKSPACE_ID,
             workspaceKey = workspaceKey,
             accessTokenProvider = { "opaque-test-token" },
             transport = transport,
@@ -114,6 +118,8 @@ class SelfHostedSyncRemoteV2Test {
         val transport = CheckpointPagingTransport(prepared)
         val remote = SelfHostedSyncRemoteV2(
             endpoint = "https://sync.example.test",
+            authenticatedUserId = "user-test",
+            workspaceId = WORKSPACE_ID,
             workspaceKey = workspaceKey,
             accessTokenProvider = { "opaque-test-token" },
             transport = transport,
@@ -129,6 +135,7 @@ class SelfHostedSyncRemoteV2Test {
                 checkpointDigest = prepared.descriptor.checkpointDigest,
                 previousPointerDigest = prepared.pointer.previousPointerDigest,
                 chunks = prepared.chunks.map { it.ref },
+                workspaceId = WORKSPACE_ID,
             ),
             transport.cleanupRequest,
         )
@@ -159,12 +166,7 @@ class SelfHostedSyncRemoteV2Test {
         }
 
         override fun v2Capabilities(endpoint: String, accessToken: String): SelfHostedV2CapabilitiesResponse = unused()
-        override fun v2Epoch(endpoint: String, accessToken: String): SelfHostedV2EpochResponse = unused()
-        override fun v2EpochHistory(
-            endpoint: String,
-            accessToken: String,
-            request: SelfHostedV2EpochHistoryRequest,
-        ): SelfHostedV2EpochResponse = unused()
+        override fun v2Epoch(endpoint: String, accessToken: String, workspaceId: String): SelfHostedV2EpochResponse = unused()
         override fun v2PutCheckpointChunk(
             endpoint: String,
             accessToken: String,
@@ -203,21 +205,12 @@ class SelfHostedSyncRemoteV2Test {
             accessToken: String,
             request: SelfHostedV2FrontierRequest,
         ): SelfHostedV2FrontierResponse = unused()
-        override fun v2RepairObject(
-            endpoint: String,
-            accessToken: String,
-            request: SelfHostedV2RepairObjectRequest,
-        ): SelfHostedV2RepairObjectResponse = unused()
-        override fun v2PublishRepairReplica(
-            endpoint: String,
-            accessToken: String,
-            request: SelfHostedV2RepairReplicaRequest,
-        ): SelfHostedV2ImmutablePutResponse = unused()
 
         private fun <T> unused(): T = error("Unexpected transport operation")
     }
 
     private companion object {
         const val WRITER_ID = "00000000-0000-4000-8000-0000000000a1"
+        const val WORKSPACE_ID = "workspace-0123456789abcdef0123456789abcdef"
     }
 }

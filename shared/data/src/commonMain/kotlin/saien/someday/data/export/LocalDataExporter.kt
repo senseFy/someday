@@ -1,86 +1,32 @@
 @file:OptIn(kotlin.time.ExperimentalTime::class)
-@file:Suppress("DEPRECATION")
 
 package saien.someday.data.export
 
-import saien.someday.data.local.Note
-import saien.someday.data.local.NoteLocation
-import saien.someday.data.local.Notebook
-import saien.someday.data.local.SqlDelightLocalDataRepository
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
-import kotlin.time.Instant
 import kotlin.time.Clock
+import kotlin.time.Instant
+
+const val LOCAL_DATA_EXPORT_FORMAT_V3: String = "someday.local-export.v3"
+const val LOCAL_DATA_EXPORT_FORMAT_V2: String = "someday.local-export.v2"
+
+fun isSupportedLocalDataExportFormat(format: String): Boolean =
+    format == LOCAL_DATA_EXPORT_FORMAT_V3 || format == LOCAL_DATA_EXPORT_FORMAT_V2
 
 class LocalDataExporter(
-    private val localRepository: SqlDelightLocalDataRepository,
+    /** System V3's workspace DAG is the sole production source for portable exports. */
+    private val authoritativeDocumentProvider: (Instant) -> LocalDataExportDocument,
     private val clock: () -> Instant = { Clock.System.now() },
-    /** When present, owns authority routing; null delegates to pre-authority local product rows. */
-    private val authoritativeDocumentProvider: ((Instant) -> LocalDataExportDocument?)? = null,
 ) {
-    fun exportDocument(): LocalDataExportDocument {
-        val exportedAt = clock()
-        authoritativeDocumentProvider?.invoke(exportedAt)?.let { return it }
-        val notebooks = localRepository.listActiveNotebooks()
-        val notes = notebooks.flatMap { notebook ->
-            localRepository.listActiveNotes(notebook.id).map { note ->
-                note.toExportedNote(localRepository.getLocation(note.id))
-            }
-        }
-
-        return LocalDataExportDocument(
-            exportedAt = exportedAt.toString(),
-            notebooks = notebooks.map { it.toExportedNotebook() },
-            notes = notes,
-        )
-    }
+    fun exportDocument(): LocalDataExportDocument =
+        authoritativeDocumentProvider(clock())
 
     fun exportJson(): String =
         encodeDocument(exportDocument())
 
     fun encodeDocument(document: LocalDataExportDocument): String =
         jsonFormatter.encodeToString(document)
-
-    private fun Notebook.toExportedNotebook(): ExportedNotebook =
-        ExportedNotebook(
-            id = id,
-            title = title,
-            sortOrder = sortOrder,
-            createdAt = createdAt.toString(),
-            updatedAt = updatedAt.toString(),
-        )
-
-    private fun Note.toExportedNote(location: NoteLocation?): ExportedNote =
-        currentVersionId?.let(localRepository::getNoteVersion).let { currentVersion ->
-            ExportedNote(
-                id = id,
-                notebookId = notebookId,
-                title = title,
-                markdownBody = markdownBody,
-                excerpt = excerpt,
-                timeZoneId = timeZoneId,
-                createdAt = createdAt.toString(),
-                updatedAt = updatedAt.toString(),
-                revision = revision,
-                location = location?.toExportedLocation(),
-                currentVersionId = currentVersion?.versionId ?: currentVersionId,
-                parentVersionId = currentVersion?.parentVersionId,
-                baseVersionId = currentVersion?.baseVersionId,
-                versionDeviceId = currentVersion?.deviceId,
-                mergeMetadataJson = currentVersion?.mergeMetadataJson,
-            )
-        }
-
-    private fun NoteLocation.toExportedLocation(): ExportedLocation =
-        ExportedLocation(
-            latitude = latitude,
-            longitude = longitude,
-            accuracyMeters = accuracyMeters,
-            altitudeMeters = altitudeMeters,
-            placeText = placeText,
-            capturedAt = capturedAt.toString(),
-        )
 
     companion object {
         private val jsonFormatter = Json {
@@ -92,8 +38,14 @@ class LocalDataExporter(
 
 @Serializable
 data class LocalDataExportDocument(
-    val format: String = "someday.local-export.v2",
-    val formatDescription: String = "JSON export of local active notebooks and notes only; settings, devices, keys, tokens, passwords, and recovery material are intentionally excluded.",
+    val format: String = LOCAL_DATA_EXPORT_FORMAT_V3,
+    val formatDescription: String =
+        "JSON export of workspace notebooks and note Markdown only. " +
+            "Image bytes are not included in this release; asset references are preserved and may remain " +
+            "unresolved after restore. Settings, devices, keys, tokens, passwords, and recovery material " +
+            "are intentionally excluded.",
+    val includesMediaBytes: Boolean = false,
+    val assetReferencesMayBeUnresolved: Boolean = true,
     val exportedAt: String,
     val notebooks: List<ExportedNotebook>,
     val notes: List<ExportedNote>,

@@ -474,12 +474,8 @@ ios_simulator_target_suffix() {
 }
 
 run_desktop() {
-    info "Running Desktop app with Gradle cache (V2 development activation enabled)."
-    # Local debug must opt into first-epoch activation; never default this on in
-    # release packaging. See gradle.properties / agent.md.
-    exec "$GRADLEW" :app:desktop:run \
-        -Psomeday.systemV2DevelopmentEnabled=true \
-        -Psomeday.systemV2ReleaseEnabled=false
+    info "Running Desktop app with Gradle cache."
+    exec "$GRADLEW" :app:desktop:run
 }
 
 run_android() {

@@ -21,10 +21,11 @@ import kotlin.time.Clock
 
 class MemoriesUiController(
     private val repository: NotesRepository,
-    private val strings: MemoriesUiStrings = MemoriesUiStrings(),
+    strings: MemoriesUiStrings = MemoriesUiStrings(),
     initialSelectedDate: LocalDate = currentLocalDate(),
     private val backgroundDispatcher: CoroutineDispatcher = Dispatchers.Default,
 ) {
+    private var strings = strings
     var state: MemoriesUiState by mutableStateOf(
         MemoriesUiState(
             month = MemoryMonth(initialSelectedDate.year, initialSelectedDate.month.ordinal + 1),
@@ -32,6 +33,10 @@ class MemoriesUiController(
         ),
     )
         private set
+
+    fun updateLocalizedStrings(updated: MemoriesUiStrings) {
+        strings = updated
+    }
 
     suspend fun refresh() {
         applyRepositoryData(

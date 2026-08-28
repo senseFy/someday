@@ -1,0 +1,241 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+QUIET=false
+MAX_BLOB_BYTES="${SOMEDAY_PUBLIC_HISTORY_MAX_BLOB_BYTES:-10485760}"
+shopt -s nocasematch
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/verify-public-history [--quiet]
+
+Scans content and paths across every commit reachable from the repository's
+refs. Blobs larger than 10 MiB are rejected by default.
+Set SOMEDAY_PUBLIC_HISTORY_MAX_BLOB_BYTES to override that limit.
+EOF
+}
+
+die() {
+  printf 'public-history error: %s\n' "$*" >&2
+  exit 1
+}
+
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    --quiet)
+      QUIET=true
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "unknown argument: $1"
+      ;;
+  esac
+  shift
+done
+
+[[ "$MAX_BLOB_BYTES" =~ ^[0-9]+$ ]] ||
+  die "SOMEDAY_PUBLIC_HISTORY_MAX_BLOB_BYTES must be a non-negative integer"
+command -v git >/dev/null 2>&1 || die "git is required"
+git rev-parse --git-dir >/dev/null 2>&1 || die "run this command inside a Git repository"
+
+if [[ "$(git rev-parse --is-shallow-repository)" == "true" ]]; then
+  die "a complete clone is required to scan public history"
+fi
+
+umask 077
+WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/someday-public-history.XXXXXX")"
+trap 'rm -rf "$WORK_DIR"' EXIT HUP INT TERM
+
+COMMITS_FILE="$WORK_DIR/commits"
+OBJECT_LIST_FILE="$WORK_DIR/object-list"
+OBJECT_IDS_FILE="$WORK_DIR/object-ids"
+OBJECT_INFO_FILE="$WORK_DIR/object-info"
+PATHS_FILE="$WORK_DIR/paths"
+SENSITIVE_PATHS_FILE="$WORK_DIR/sensitive-paths"
+BLOB_MATCHES_FILE="$WORK_DIR/blob-matches"
+COMMIT_MESSAGES_FILE="$WORK_DIR/commit-messages"
+TAG_MESSAGES_FILE="$WORK_DIR/tag-messages"
+
+git rev-list --all > "$COMMITS_FILE"
+[[ -s "$COMMITS_FILE" ]] || die "repository has no reachable commits"
+
+is_sensitive_path() {
+  local path="$1"
+  local basename
+
+  basename="${path##*/}"
+
+  case "/$path/" in
+    */.factory/* | */.wrangler/* | */.aws/credentials/* | \
+      */.config/gcloud/application_default_credentials.json/* | \
+      */.docker/config.json/* | */private-keys-v1.d/*)
+      return 0
+      ;;
+  esac
+
+  case "$basename" in
+    .env)
+      return 0
+      ;;
+    .env.*)
+      case "$basename" in
+        *.example | *.sample | *.template)
+          ;;
+        *)
+          return 0
+          ;;
+      esac
+      ;;
+    .dev.vars)
+      return 0
+      ;;
+    .dev.vars.*)
+      case "$basename" in
+        *.example | *.sample | *.template)
+          ;;
+        *)
+          return 0
+          ;;
+      esac
+      ;;
+    .netrc | .pgpass | .pypirc | credentials.json | \
+      service-account.json | \
+      service_account.json | id_rsa | id_dsa | id_ecdsa | id_ed25519 | \
+      secring.gpg)
+      return 0
+      ;;
+    exportoptions*.plist)
+      return 0
+      ;;
+  esac
+
+  case "$path" in
+    *.p8 | *.p12 | *.pfx | *.key | *.jks | *.keystore | *.kdbx | \
+      *.mobileprovision | *.provisionprofile | *.developerprofile | *.aab | \
+      *.apk | *.ipa | *.xcarchive | *.xcarchive/*)
+      return 0
+      ;;
+  esac
+
+  return 1
+}
+
+# Inspect complete trees rather than only changed paths. This also covers files
+# introduced while resolving a merge and files that were deleted later.
+: > "$PATHS_FILE"
+while IFS= read -r commit; do
+  git ls-tree -r -z --name-only "$commit" >> "$PATHS_FILE"
+done < "$COMMITS_FILE"
+
+: > "$SENSITIVE_PATHS_FILE"
+while IFS= read -r -d '' path; do
+  if is_sensitive_path "$path"; then
+    printf -v escaped_path '%q' "$path"
+    if ! grep -Fqx -- "$escaped_path" "$SENSITIVE_PATHS_FILE"; then
+      printf '%s\n' "$escaped_path" >> "$SENSITIVE_PATHS_FILE"
+    fi
+  fi
+done < "$PATHS_FILE"
+
+git rev-list --objects --all > "$OBJECT_LIST_FILE"
+LC_ALL=C awk '
+  (length($1) == 40 || length($1) == 64) && $1 ~ /^[0-9a-f]+$/ { print $1 }
+' "$OBJECT_LIST_FILE" > "$OBJECT_IDS_FILE"
+git cat-file --batch-check='%(objectname) %(objecttype) %(objectsize)' \
+  < "$OBJECT_IDS_FILE" > "$OBJECT_INFO_FILE"
+
+private_key_begin='-----BEGIN'
+private_key_pattern="${private_key_begin} (RSA |DSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----|${private_key_begin} PGP PRIVATE KEY BLOCK-----|\"private_key\"[[:space:]]*:[[:space:]]*\"${private_key_begin}"
+token_pattern='(AKIA|ASIA)[0-9A-Z]{16}|github_pat_[A-Za-z0-9_]{70,255}|gh[pousr]_[A-Za-z0-9]{36,255}|glpat-[A-Za-z0-9_-]{20,255}|xox[baprs]-[A-Za-z0-9-]{10,255}|sk_live_[A-Za-z0-9]{20,255}|AIza[0-9A-Za-z_-]{35}|pscale_pw_[A-Za-z0-9._-]{20,255}|npm_[A-Za-z0-9]{36,255}'
+sensitive_content_pattern="$private_key_pattern|$token_pattern"
+
+oversized_blob_count=0
+while IFS=' ' read -r object_id object_type object_size; do
+  [[ "$object_size" =~ ^[0-9]+$ ]] || die "could not read object size for $object_id"
+
+  if [[ "$object_type" == "blob" && "$object_size" -gt "$MAX_BLOB_BYTES" ]]; then
+    oversized_blob_count=$((oversized_blob_count + 1))
+    printf '  oversized blob: %s (%s bytes)\n' "$object_id" "$object_size" >&2
+  fi
+done < "$OBJECT_INFO_FILE"
+
+# git grep batches revisions and does not print matching lines. This avoids
+# materializing secrets and avoids starting one Git process per historical blob.
+scan_blob_batch() {
+  local grep_status
+
+  if git grep -a -l -E -e "$sensitive_content_pattern" "$@" -- \
+    >> "$BLOB_MATCHES_FILE"; then
+    return 0
+  else
+    grep_status=$?
+  fi
+  [[ "$grep_status" -eq 1 ]] || die "git grep failed while scanning history"
+}
+
+: > "$BLOB_MATCHES_FILE"
+commit_batch=()
+while IFS= read -r commit; do
+  commit_batch+=("$commit")
+  if [[ "${#commit_batch[@]}" -eq 64 ]]; then
+    scan_blob_batch "${commit_batch[@]}"
+    commit_batch=()
+  fi
+done < "$COMMITS_FILE"
+if [[ "${#commit_batch[@]}" -gt 0 ]]; then
+  scan_blob_batch "${commit_batch[@]}"
+fi
+
+sensitive_content_count=0
+if [[ -s "$BLOB_MATCHES_FILE" ]]; then
+  sensitive_content_count=$((sensitive_content_count + 1))
+  printf '  sensitive content: reachable blob object(s)\n' >&2
+fi
+
+git log --all --format='%B' > "$COMMIT_MESSAGES_FILE"
+if LC_ALL=C grep -aEq -- "$sensitive_content_pattern" "$COMMIT_MESSAGES_FILE"; then
+  sensitive_content_count=$((sensitive_content_count + 1))
+  printf '  sensitive content: reachable commit message(s)\n' >&2
+fi
+
+git for-each-ref --format='%(contents)' refs/tags > "$TAG_MESSAGES_FILE"
+if LC_ALL=C grep -aEq -- "$sensitive_content_pattern" "$TAG_MESSAGES_FILE"; then
+  sensitive_content_count=$((sensitive_content_count + 1))
+  printf '  sensitive content: reachable annotated tag message(s)\n' >&2
+fi
+
+sensitive_path_count="$(wc -l < "$SENSITIVE_PATHS_FILE" | tr -d '[:space:]')"
+if [[ "$sensitive_path_count" -gt 0 ]]; then
+  printf '  sensitive paths: %s (names omitted)\n' "$sensitive_path_count" >&2
+fi
+
+non_noreply_email_count="$({
+  git log --all --format='%ae%n%ce'
+} | LC_ALL=C awk '
+  {
+    email = tolower($0)
+    if (email != "" && index(email, "noreply") == 0 && !(email in seen)) {
+      seen[email] = 1
+      count++
+    }
+  }
+  END { print count + 0 }
+')"
+
+if [[ "$QUIET" == "false" ]]; then
+  printf 'Non-noreply history email count: %s\n' "$non_noreply_email_count"
+fi
+
+if [[ "$sensitive_path_count" -gt 0 || "$sensitive_content_count" -gt 0 || \
+  "$oversized_blob_count" -gt 0 ]]; then
+  printf 'Public history check failed: %s sensitive path(s), %s sensitive content category match(es), %s oversized blob(s).\n' \
+    "$sensitive_path_count" "$sensitive_content_count" "$oversized_blob_count" >&2
+  exit 1
+fi
+
+if [[ "$QUIET" == "false" ]]; then
+  printf 'Public history check passed.\n'
+fi

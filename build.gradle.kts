@@ -1,4 +1,5 @@
 import org.gradle.api.plugins.JavaPluginExtension
+import org.gradle.api.tasks.Exec
 import org.gradle.jvm.toolchain.JavaLanguageVersion
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import org.jetbrains.kotlin.gradle.tasks.KotlinJvmCompile
@@ -32,27 +33,28 @@ subprojects {
     }
 }
 
-val syncV2ReliabilityGateRequested = providers
-    .gradleProperty("someday.syncV2ReliabilityGate")
+val systemV3ReliabilityGateRequested = providers
+    .gradleProperty("someday.systemV3ReliabilityGate")
     .map { value ->
         value.toBooleanStrictOrNull()
-            ?: error("someday.syncV2ReliabilityGate must be true or false")
+            ?: error("someday.systemV3ReliabilityGate must be true or false")
     }
     .orElse(false)
 
-val syncV2ReliabilityTestTaskNames = setOf(
+val systemV3ReliabilityTestTaskNames = setOf(
     "jvmTest",
     "testDebugUnitTest",
     "iosSimulatorArm64Test",
     "test",
     "integrationTest",
+    "s3IntegrationTest",
     "realRemoteTest",
 )
 
 subprojects {
     tasks.configureEach {
-        if (name in syncV2ReliabilityTestTaskNames) {
-            outputs.upToDateWhen { !syncV2ReliabilityGateRequested.get() }
+        if (name in systemV3ReliabilityTestTaskNames) {
+            outputs.upToDateWhen { !systemV3ReliabilityGateRequested.get() }
         }
     }
 }
@@ -171,10 +173,41 @@ val privateReleaseMaterialCheck = tasks.register("privateReleaseMaterialCheck") 
     }
 }
 
+val serverReleaseWorkflowCheck = tasks.register<Exec>("serverReleaseWorkflowCheck") {
+    group = "verification"
+    description = "Tests the POSIX server release interfaces, history scan, and bundle builder."
+    workingDir(rootDir)
+    commandLine("bash", "scripts/tests/server-release-test.sh")
+    onlyIf("server release workflow tests require a POSIX host") {
+        !System.getProperty("os.name").startsWith("Windows", ignoreCase = true)
+    }
+    inputs.files(
+        ".github/workflows/android.yml",
+        ".github/workflows/ci.yml",
+        ".github/workflows/server-release.yml",
+        "Dockerfile",
+        "LICENSE",
+        "Makefile",
+        "scripts/server-release",
+        "scripts/server-release-tui",
+        "scripts/build-server-release-bundle",
+        "scripts/verify-public-history",
+        "scripts/verify-server-release-contract",
+        "scripts/verify-server-release-tag",
+        "scripts/tests/server-release-test.sh",
+        "scripts/tests/server-release-interface-test.sh",
+        "scripts/tests/build-server-release-bundle-test.sh",
+        "scripts/tests/verify-public-history-test.sh",
+        "scripts/tests/verify-server-release-contract-test.sh",
+        "scripts/tests/verify-server-release-tag-test.sh",
+        fileTree("deploy"),
+    )
+}
+
 tasks.register("check") {
     group = "verification"
     description = "Runs root source and private-release-material hygiene in addition to subproject checks."
-    dependsOn(sourceHygieneCheck, privateReleaseMaterialCheck)
+    dependsOn(sourceHygieneCheck, privateReleaseMaterialCheck, serverReleaseWorkflowCheck)
 }
 
 tasks.register("clientPlatformSmoke") {
@@ -215,7 +248,7 @@ tasks.register("sharedBehaviorTargetSmoke") {
 
 tasks.register("endToEndPlatformValidation") {
     group = "verification"
-    description = "Runs self-hosted/WebDAV E2E checks and cross-platform smoke validators for final platform readiness."
+    description = "Runs self-hosted E2E checks and cross-platform smoke validators for final platform readiness."
     dependsOn(
         ":server:integrationTest",
         ":integration-tests:realRemoteTest",

@@ -28,7 +28,7 @@ body:
         - iOS
         - Desktop
         - Self-hosted server
-        - WebDAV sync
+        - Self-hosted sync
         - Build or developer tooling
         - Other
     validations:

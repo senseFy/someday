@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+TAG="${1:-}"
+COMMIT="${2:-}"
+REPOSITORY="${GITHUB_REPOSITORY:-}"
+
+die() {
+    printf 'server release tag error: %s\n' "$*" >&2
+    exit 1
+}
+
+[[ "$TAG" =~ ^server-v((0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))$ ]] ||
+    die "invalid server release tag: ${TAG:-<empty>}"
+((${#BASH_REMATCH[1]} <= 64)) || die 'server release version is too long'
+[[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]] || die "invalid release commit: ${COMMIT:-<empty>}"
+[[ "$REPOSITORY" =~ ^[^/]+/[^/]+$ ]] || die 'GITHUB_REPOSITORY is unavailable'
+[[ "${GITHUB_REF_NAME:-}" == "$TAG" ]] || die 'workflow ref name does not match the release tag'
+[[ "${GITHUB_REF_PROTECTED:-}" == true ]] ||
+    die 'the release tag is not protected by a GitHub rule'
+[[ -n "${GH_TOKEN:-}" ]] || die 'GH_TOKEN is unavailable'
+command -v gh >/dev/null 2>&1 || die 'gh is unavailable'
+command -v python3 >/dev/null 2>&1 || die 'python3 is unavailable'
+
+ruleset_matches() {
+    local detail="$1"
+    python3 - "$TAG" "$detail" <<'PY'
+import fnmatch
+import json
+import sys
+
+ref = f"refs/tags/{sys.argv[1]}"
+try:
+    value = json.loads(sys.argv[2])
+except json.JSONDecodeError:
+    raise SystemExit(1)
+conditions = value.get("conditions", {}).get("ref_name", {})
+includes = conditions.get("include", [])
+excludes = conditions.get("exclude", [])
+
+def matches(pattern):
+    return pattern == "~ALL" or fnmatch.fnmatchcase(ref, pattern)
+
+rule_types = {rule.get("type") for rule in value.get("rules", [])}
+valid = (
+    value.get("target") == "tag"
+    and value.get("enforcement") == "active"
+    and any(matches(pattern) for pattern in includes)
+    and not any(matches(pattern) for pattern in excludes)
+    and {"creation", "update", "deletion"}.issubset(rule_types)
+)
+raise SystemExit(0 if valid else 1)
+PY
+}
+
+ruleset_ids="$({
+    gh api "repos/$REPOSITORY/rulesets?includes_parents=true&per_page=100" \
+        --jq '.[] | select(.target == "tag" and .enforcement == "active") | .id'
+} 2>/dev/null)" || die 'could not read active tag rulesets from GitHub'
+policy_confirmed=false
+while IFS= read -r ruleset_id; do
+    [[ -n "$ruleset_id" ]] || continue
+    ruleset_detail="$(
+        gh api "repos/$REPOSITORY/rulesets/$ruleset_id" 2>/dev/null
+    )" || continue
+    if ruleset_matches "$ruleset_detail"; then
+        policy_confirmed=true
+        break
+    fi
+done <<<"$ruleset_ids"
+[[ "$policy_confirmed" == true ]] ||
+    die 'no active ruleset prevents creation, update, and deletion of this tag'
+
+ref_detail="$({
+    gh api "repos/$REPOSITORY/git/ref/tags/$TAG" \
+        --jq '[.object.type, .object.sha] | @tsv'
+} 2>/dev/null)" || die 'could not read the release tag ref from GitHub'
+IFS=$'\t' read -r ref_type tag_object_sha <<<"$ref_detail"
+[[ "$ref_type" == tag && "$tag_object_sha" =~ ^[0-9a-f]{40}$ ]] ||
+    die 'the release ref is not an annotated tag object'
+
+tag_detail="$({
+    gh api "repos/$REPOSITORY/git/tags/$tag_object_sha" \
+        --jq '[.tag, .object.type, .object.sha] | @tsv'
+} 2>/dev/null)" || die 'could not read the annotated tag object from GitHub'
+IFS=$'\t' read -r declared_tag target_type target_sha <<<"$tag_detail"
+[[ "$declared_tag" == "$TAG" ]] || die 'the tag object declares another tag name'
+[[ "$target_type" == commit ]] || die 'the annotated tag does not point directly to a commit'
+[[ "$target_sha" == "$COMMIT" ]] || die 'the release tag no longer points to the tested commit'
+
+printf 'protected annotated tag confirmed: %s -> %s\n' "$TAG" "$COMMIT"

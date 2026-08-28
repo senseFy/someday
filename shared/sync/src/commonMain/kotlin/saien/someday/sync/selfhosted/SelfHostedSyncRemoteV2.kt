@@ -2,7 +2,9 @@ package saien.someday.sync.selfhosted
 
 import saien.someday.data.crypto.WorkspaceMasterKey
 import saien.someday.domain.settings.SelfHostedSessionCredentialStore
-import saien.someday.domain.settings.selfHostedV2AuthorityBindingId
+import saien.someday.domain.settings.authorityBindingId
+import saien.someday.domain.settings.normalizeSelfHostedEndpoint
+import saien.someday.domain.settings.selfHostedAuthorityBindingId
 import saien.someday.sync.causality.v2.CanonicalWorkspaceCausalityMaterializerV2
 import saien.someday.sync.causality.v2.EncryptedWorkspaceObjectV2
 import saien.someday.sync.causality.v2.MINIMUM_WRITER_VERSION_V2
@@ -28,6 +30,7 @@ import saien.someday.sync.causality.v2.WorkspaceSyncRemoteV2
 import saien.someday.sync.causality.v2.WorkspaceSyncControlCodecV2
 import saien.someday.sync.causality.v2.WorkspaceObjectCipherV2
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.Transient
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -40,12 +43,13 @@ class RefreshingSelfHostedSessionExecutor(
 
     fun <T> authorized(
         endpoint: String,
+        authenticatedUserId: String,
         suppliedToken: String,
         request: (String) -> T,
     ): T {
-        val normalizedEndpoint = endpoint.trimEnd('/')
+        val expectedBinding = selfHostedAuthorityBindingId(endpoint, authenticatedUserId)
         val firstToken = sessionStore.load()
-            ?.takeIf { it.endpoint.trimEnd('/') == normalizedEndpoint }
+            ?.takeIf { it.authorityBindingId == expectedBinding }
             ?.accessToken
             ?: suppliedToken
         return try {
@@ -55,10 +59,10 @@ class RefreshingSelfHostedSessionExecutor(
             val retryToken = runBlocking {
                 refreshMutex.withLock {
                     val current = sessionStore.load()
-                        ?.takeIf { it.endpoint.trimEnd('/') == normalizedEndpoint }
+                        ?.takeIf { it.authorityBindingId == expectedBinding }
                         ?: throw SelfHostedSyncHttpException(
                             401,
-                            "Self-hosted session is missing; credentials redacted.",
+                            "Self-hosted account session is missing; credentials redacted.",
                         )
                     if (current.accessToken != firstToken) {
                         return@withLock current.accessToken
@@ -67,12 +71,18 @@ class RefreshingSelfHostedSessionExecutor(
                         current.endpoint,
                         SelfHostedRefreshRequest(current.refreshToken),
                     )
+                    if (refreshed.user.id != current.userId) {
+                        throw SelfHostedSyncHttpException(
+                            401,
+                            "Self-hosted refresh changed the authenticated account; credentials redacted.",
+                        )
+                    }
                     val updated = current.copy(
-                        userId = refreshed.user.id,
                         userEmail = refreshed.user.email,
                         accessToken = refreshed.accessToken,
                         refreshToken = refreshed.refreshToken,
                     )
+                    sessionStore.saveForAuthority(expectedBinding, updated)
                     sessionStore.save(updated)
                     updated.accessToken
                 }
@@ -84,12 +94,7 @@ class RefreshingSelfHostedSessionExecutor(
 
 interface SelfHostedSyncTransportV2 {
     fun v2Capabilities(endpoint: String, accessToken: String): SelfHostedV2CapabilitiesResponse
-    fun v2Epoch(endpoint: String, accessToken: String): SelfHostedV2EpochResponse
-    fun v2EpochHistory(
-        endpoint: String,
-        accessToken: String,
-        request: SelfHostedV2EpochHistoryRequest,
-    ): SelfHostedV2EpochResponse
+    fun v2Epoch(endpoint: String, accessToken: String, workspaceId: String): SelfHostedV2EpochResponse
     fun v2PutCheckpointChunk(
         endpoint: String,
         accessToken: String,
@@ -123,29 +128,17 @@ interface SelfHostedSyncTransportV2 {
     fun v2Push(endpoint: String, accessToken: String, request: SelfHostedV2PushRequest): SelfHostedV2PushResponse
     fun v2Pull(endpoint: String, accessToken: String, request: SelfHostedV2PullRequest): SelfHostedV2PullResponse
     fun v2Frontiers(endpoint: String, accessToken: String, request: SelfHostedV2FrontierRequest): SelfHostedV2FrontierResponse
-    fun v2RepairObject(
-        endpoint: String,
-        accessToken: String,
-        request: SelfHostedV2RepairObjectRequest,
-    ): SelfHostedV2RepairObjectResponse
-
-    fun v2PublishRepairReplica(
-        endpoint: String,
-        accessToken: String,
-        request: SelfHostedV2RepairReplicaRequest,
-    ): SelfHostedV2ImmutablePutResponse
 }
 
 class RefreshingSelfHostedSyncTransportV2(
     private val delegate: SelfHostedSyncTransportV2,
     private val sessionExecutor: RefreshingSelfHostedSessionExecutor,
+    private val authenticatedUserId: String,
 ) : SelfHostedSyncTransportV2 {
     override fun v2Capabilities(endpoint: String, accessToken: String) =
         authorized(endpoint, accessToken) { delegate.v2Capabilities(endpoint, it) }
-    override fun v2Epoch(endpoint: String, accessToken: String) =
-        authorized(endpoint, accessToken) { delegate.v2Epoch(endpoint, it) }
-    override fun v2EpochHistory(endpoint: String, accessToken: String, request: SelfHostedV2EpochHistoryRequest) =
-        authorized(endpoint, accessToken) { delegate.v2EpochHistory(endpoint, it, request) }
+    override fun v2Epoch(endpoint: String, accessToken: String, workspaceId: String) =
+        authorized(endpoint, accessToken) { delegate.v2Epoch(endpoint, it, workspaceId) }
     override fun v2PutCheckpointChunk(endpoint: String, accessToken: String, request: SelfHostedV2CheckpointChunkRequest) =
         authorized(endpoint, accessToken) { delegate.v2PutCheckpointChunk(endpoint, it, request) }
     override fun v2PutCheckpointManifest(endpoint: String, accessToken: String, request: SelfHostedV2CheckpointManifestRequest) =
@@ -165,13 +158,9 @@ class RefreshingSelfHostedSyncTransportV2(
         authorized(endpoint, accessToken) { delegate.v2Pull(endpoint, it, request) }
     override fun v2Frontiers(endpoint: String, accessToken: String, request: SelfHostedV2FrontierRequest) =
         authorized(endpoint, accessToken) { delegate.v2Frontiers(endpoint, it, request) }
-    override fun v2RepairObject(endpoint: String, accessToken: String, request: SelfHostedV2RepairObjectRequest) =
-        authorized(endpoint, accessToken) { delegate.v2RepairObject(endpoint, it, request) }
-    override fun v2PublishRepairReplica(endpoint: String, accessToken: String, request: SelfHostedV2RepairReplicaRequest) =
-        authorized(endpoint, accessToken) { delegate.v2PublishRepairReplica(endpoint, it, request) }
 
     private fun <T> authorized(endpoint: String, suppliedToken: String, request: (String) -> T): T {
-        return sessionExecutor.authorized(endpoint, suppliedToken, request)
+        return sessionExecutor.authorized(endpoint, authenticatedUserId, suppliedToken, request)
     }
 }
 
@@ -215,14 +204,12 @@ data class SelfHostedV2EpochResponse(
 )
 
 @Serializable
-data class SelfHostedV2EpochHistoryRequest(val epochId: String)
-
-@Serializable
 data class SelfHostedV2CheckpointChunkRequest(
     val epochId: String,
     val checkpointId: String,
     val ref: WorkspaceCheckpointChunkRefV2,
     val objectValue: EncryptedWorkspaceObjectV2,
+    @Transient val workspaceId: String = "",
 )
 
 @Serializable
@@ -233,6 +220,7 @@ data class SelfHostedV2CheckpointManifestRequest(
     val chunks: List<WorkspaceCheckpointChunkRefV2>,
     val totalObjectCount: Int,
     val objectValue: EncryptedWorkspaceObjectV2,
+    @Transient val workspaceId: String = "",
 )
 
 @Serializable
@@ -248,6 +236,7 @@ data class SelfHostedV2CheckpointFetchRequest(
     val checkpointId: String,
     /** Null fetches only the manifest; a value fetches exactly one immutable chunk. */
     val chunkIndex: Int? = null,
+    @Transient val workspaceId: String = "",
 )
 
 @Serializable
@@ -263,6 +252,7 @@ data class SelfHostedV2CheckpointCleanupRequest(
     val checkpointDigest: String,
     val previousPointerDigest: String? = null,
     val chunks: List<WorkspaceCheckpointChunkRefV2>,
+    @Transient val workspaceId: String = "",
 )
 
 @Serializable
@@ -277,6 +267,7 @@ data class SelfHostedV2EpochCompareAndSetRequest(
     val expectedCurrentDigest: String? = null,
     val metadata: SelfHostedV2EpochMetadata,
     val pointer: EncryptedWorkspaceObjectV2,
+    @Transient val workspaceId: String = "",
 )
 
 @Serializable
@@ -292,6 +283,7 @@ data class SelfHostedV2PushRequest(
     val epochId: String,
     val writerProtocolVersion: Int,
     val objects: List<EncryptedWorkspaceObjectV2>,
+    @Transient val workspaceId: String = "",
 )
 
 @Serializable
@@ -310,7 +302,12 @@ data class SelfHostedV2PushResponse(
 )
 
 @Serializable
-data class SelfHostedV2PullRequest(val epochId: String, val afterCursor: Long? = null, val limit: Int = 100)
+data class SelfHostedV2PullRequest(
+    val epochId: String,
+    val afterCursor: Long? = null,
+    val limit: Int = 100,
+    @Transient val workspaceId: String = "",
+)
 
 @Serializable
 data class SelfHostedV2CursorUnitResponse(
@@ -327,26 +324,27 @@ data class SelfHostedV2CursorUnitResponse(
 data class SelfHostedV2PullResponse(
     val units: List<SelfHostedV2CursorUnitResponse>,
     val complete: Boolean,
-    val rebootstrapRequired: Boolean = false,
     val error: String? = null,
 )
 
-@Serializable data class SelfHostedV2FrontierRequest(val epochId: String)
+@Serializable data class SelfHostedV2FrontierRequest(val epochId: String, @Transient val workspaceId: String = "")
 @Serializable data class SelfHostedV2StreamFrontier(val streamId: String, val cursorValue: String?, val streamDigest: String)
 @Serializable data class SelfHostedV2FrontierResponse(val frontiers: List<SelfHostedV2StreamFrontier>)
-@Serializable data class SelfHostedV2RepairObjectRequest(val epochId: String, val objectId: String, val expectedObjectDigest: String)
-@Serializable data class SelfHostedV2RepairObjectResponse(val replicas: List<EncryptedWorkspaceObjectV2> = emptyList())
-@Serializable data class SelfHostedV2RepairReplicaRequest(val objectValue: EncryptedWorkspaceObjectV2)
 
 class SelfHostedSyncRemoteV2(
     endpoint: String,
+    authenticatedUserId: String,
+    private val workspaceId: String,
     private val workspaceKey: WorkspaceMasterKey,
     private val accessTokenProvider: () -> String,
     private val transport: SelfHostedSyncTransportV2,
 ) : WorkspaceSyncRemoteV2 {
-    private val endpoint = endpoint.trim().trimEnd('/')
+    private val endpoint = normalizeSelfHostedEndpoint(endpoint)
+    init {
+        require(SELF_HOSTED_WORKSPACE_ID.matches(workspaceId)) { "Invalid workspace scope." }
+    }
     override val remoteProfile: String = SyncRemoteProfileV2.SELF_HOSTED.wireValue
-    override val authorityBindingId: String = selfHostedV2AuthorityBindingId(this.endpoint)
+    override val authorityBindingId: String = selfHostedAuthorityBindingId(this.endpoint, authenticatedUserId)
 
     override fun capabilities(): WorkspaceSyncCapabilitiesV2 {
         val value = transport.v2Capabilities(endpoint, token())
@@ -358,17 +356,16 @@ class SelfHostedSyncRemoteV2(
         )
     }
 
-    override fun loadEpochPointer(): EncryptedWorkspaceObjectV2? = transport.v2Epoch(endpoint, token()).pointer
-
-    override fun loadRetainedEpochPointer(syncEpochId: String): EncryptedWorkspaceObjectV2? =
-        transport.v2EpochHistory(endpoint, token(), SelfHostedV2EpochHistoryRequest(syncEpochId)).pointer
+    override fun loadEpochPointer(): EncryptedWorkspaceObjectV2? = transport.v2Epoch(endpoint, token(), workspaceId).pointer
 
     override fun fetchCheckpoint(
         pointer: EncryptedWorkspaceObjectV2,
         descriptor: SyncEpochDescriptorV2,
     ): WorkspaceRemoteCheckpointBundleV2 {
         val manifestValue = transport.v2FetchCheckpoint(
-            endpoint, token(), SelfHostedV2CheckpointFetchRequest(descriptor.syncEpochId, descriptor.checkpointId),
+            endpoint, token(), SelfHostedV2CheckpointFetchRequest(
+                descriptor.syncEpochId, descriptor.checkpointId, workspaceId = workspaceId,
+            ),
         )
         val manifestOuter = requireNotNull(manifestValue.manifest) {
             "Self-hosted V2 checkpoint manifest response is incomplete."
@@ -391,6 +388,7 @@ class SelfHostedSyncRemoteV2(
                     descriptor.syncEpochId,
                     descriptor.checkpointId,
                     chunkIndex = ref.chunkIndex,
+                    workspaceId = workspaceId,
                 ),
             )
             require(value.manifest == null) { "Chunk fetch returned an unexpected checkpoint manifest." }
@@ -405,7 +403,7 @@ class SelfHostedSyncRemoteV2(
         chunk: EncryptedWorkspaceObjectV2,
     ): WorkspaceImmutablePutResultV2 = transport.v2PutCheckpointChunk(
         endpoint, token(), SelfHostedV2CheckpointChunkRequest(
-            descriptor.syncEpochId, descriptor.checkpointId, ref, chunk,
+            descriptor.syncEpochId, descriptor.checkpointId, ref, chunk, workspaceId,
         ),
     ).toDomain()
 
@@ -432,6 +430,7 @@ class SelfHostedSyncRemoteV2(
                 decoded.chunks,
                 decoded.totalObjectCount,
                 manifest,
+                workspaceId,
             ),
         )
         return bundle.toDomain()
@@ -446,7 +445,7 @@ class SelfHostedSyncRemoteV2(
     ): WorkspaceImmutablePutResultV2 = transport.v2PutCheckpointManifest(
         endpoint, token(), SelfHostedV2CheckpointManifestRequest(
             descriptor.syncEpochId, descriptor.checkpointId, descriptor.checkpointDigest,
-            chunks, totalObjectCount, manifest,
+            chunks, totalObjectCount, manifest, workspaceId,
         ),
     ).toDomain()
 
@@ -457,7 +456,7 @@ class SelfHostedSyncRemoteV2(
     ): WorkspacePointerPublishResultV2 {
         val response = transport.v2CompareAndSetEpoch(
             endpoint, token(), SelfHostedV2EpochCompareAndSetRequest(
-                expectedCurrentDigest, descriptor.toWire(pointer.objectDigest), pointer,
+                expectedCurrentDigest, descriptor.toWire(pointer.objectDigest), pointer, workspaceId,
             ),
         )
         return when {
@@ -488,6 +487,7 @@ class SelfHostedSyncRemoteV2(
                 checkpointDigest = draft.descriptor.checkpointDigest,
                 previousPointerDigest = draft.pointer.previousPointerDigest,
                 chunks = draft.chunks.map { it.ref },
+                workspaceId = workspaceId,
             ),
         )
         return if (response.deleted) {
@@ -502,7 +502,9 @@ class SelfHostedSyncRemoteV2(
 
     override fun pull(syncEpochId: String, cursors: Map<String, String?>, limit: Int): WorkspaceSyncPullResultV2 {
         val value = transport.v2Pull(
-            endpoint, token(), SelfHostedV2PullRequest(syncEpochId, cursors["global"]?.toLongOrNull(), limit),
+            endpoint, token(), SelfHostedV2PullRequest(
+                syncEpochId, cursors["global"]?.toLongOrNull(), limit, workspaceId,
+            ),
         )
         return WorkspaceSyncPullResultV2(
             value.units.map { unit ->
@@ -512,14 +514,13 @@ class SelfHostedSyncRemoteV2(
                 )
             },
             frontierStable = value.complete,
-            rebootstrapRequired = value.rebootstrapRequired,
             safeErrorCode = value.error,
         )
     }
 
     override fun push(syncEpochId: String, objects: List<EncryptedWorkspaceObjectV2>): WorkspaceSyncPushResultV2 {
         val value = transport.v2Push(
-            endpoint, token(), SelfHostedV2PushRequest(syncEpochId, MINIMUM_WRITER_VERSION_V2, objects),
+            endpoint, token(), SelfHostedV2PushRequest(syncEpochId, MINIMUM_WRITER_VERSION_V2, objects, workspaceId),
         )
         return if (value.accepted) WorkspaceSyncPushResultV2.Accepted(value.acknowledgements.map {
             WorkspaceMutationAckV2(it.mutationId, it.objectId, it.objectDigest, it.idempotentReplay)
@@ -529,21 +530,9 @@ class SelfHostedSyncRemoteV2(
     }
 
     override fun epochFrontiers(syncEpochId: String): List<SyncStreamFrontierV2> = transport.v2Frontiers(
-        endpoint, token(), SelfHostedV2FrontierRequest(syncEpochId),
+        endpoint, token(), SelfHostedV2FrontierRequest(syncEpochId, workspaceId),
     ).frontiers.map { SyncStreamFrontierV2(it.streamId, it.cursorValue, it.streamDigest) }.sortedBy { it.streamId }
 
-    override fun fetchRepairReplicas(
-        syncEpochId: String,
-        objectId: String,
-        objectDigest: String,
-    ): List<EncryptedWorkspaceObjectV2> = transport.v2RepairObject(
-        endpoint, token(), SelfHostedV2RepairObjectRequest(syncEpochId, objectId, objectDigest),
-    ).replicas
-
-    override fun publishRepairReplica(objectValue: EncryptedWorkspaceObjectV2): WorkspaceImmutablePutResultV2 =
-        transport.v2PublishRepairReplica(
-            endpoint, token(), SelfHostedV2RepairReplicaRequest(objectValue),
-        ).toDomain()
 
     private fun token(): String = accessTokenProvider().takeIf(String::isNotBlank)
         ?: error("Self-hosted V2 session token is missing; credentials redacted.")
@@ -569,3 +558,5 @@ private fun SelfHostedV2ImmutablePutResponse.toDomain(): WorkspaceImmutablePutRe
     else WorkspaceImmutablePutResultV2.Rejected(
         error ?: "immutable_put_rejected", "Self-hosted server rejected an immutable V2 object.",
     )
+
+private val SELF_HOSTED_WORKSPACE_ID = Regex("^workspace-[0-9a-f]{32}$")

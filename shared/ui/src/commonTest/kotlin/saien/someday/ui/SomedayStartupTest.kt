@@ -29,8 +29,5 @@ class SomedayStartupTest {
         assertTrue(log.contains("location=system-coordinates|manual-place|permission-denied-usable|no-map-sdk"))
         assertTrue(log.contains("platform-smoke=workspace-setup|unlock|create-note|markdown-preview|denied-location|restart-persistence"))
         assertTrue(log.contains("search=local-title-body-active-only"))
-        assertTrue(log.contains("settings-sections=sync-mode-account|webdav-config|self-hosted-device-management"))
-        assertTrue(log.contains("workspace-pairing=one-use-invitation|qr-or-token|redacted-logs"))
-        assertTrue(log.contains("export=notes-notebooks|excludes-raw-keys-tokens-passwords-recovery-material"))
     }
 }

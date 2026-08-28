@@ -15,58 +15,65 @@ import saien.someday.data.export.LocalDataExporter
 import saien.someday.data.importing.dayone.DayOneImportService
 import saien.someday.data.importing.dayone.DayOneImportSummary
 import saien.someday.data.local.SqlDelightLocalDataRepository
-import saien.someday.data.local.SqlDelightNotesRepository
 import saien.someday.data.local.db.SomedayDatabase
+import saien.someday.data.media.LocalMediaAssetStore
 import saien.someday.data.settings.ClientSettingsRepository
 import saien.someday.data.settings.SqlDelightClientSettingsRepository
 import saien.someday.domain.notes.NotesRepository
 import saien.someday.domain.settings.ClientSettings
-import saien.someday.domain.settings.ManualSyncProgressListener
-import saien.someday.domain.settings.ManualSyncResult
 import saien.someday.domain.settings.ManualSyncRunner
 import saien.someday.domain.settings.SelfHostedSessionCredentialStore
 import saien.someday.domain.settings.SelfHostedSetupClient
-import saien.someday.domain.settings.SyncMode
-import saien.someday.domain.settings.SyncV2MaintenanceRunner
-import saien.someday.domain.settings.WebDavCredentialStore
-import saien.someday.domain.settings.WebDavDiscoveredDevicesRunner
 import saien.someday.domain.settings.WorkspacePairingInvitationCanceller
 import saien.someday.domain.settings.WorkspacePairingInvitationCreator
 import saien.someday.domain.settings.WorkspacePairingInvitationJoiner
-import saien.someday.sync.causality.v2.SqlDelightSyncProtocolStoreV2
-import saien.someday.sync.createSyncV2ClientServices
+import saien.someday.sync.AuthorityCoordinatedMediaAssetStore
+import saien.someday.sync.causality.v2.SyncRemoteProfileV2
+import saien.someday.sync.causality.v2.SystemV2ClientSettingsRepository
+import saien.someday.sync.causality.v2.SystemV2NotesRepository
+import saien.someday.sync.causality.v2.ensureWorkspaceLocalDraftV2
+import saien.someday.sync.createSystemV3ClientServices
 import saien.someday.sync.selfhosted.AndroidSelfHostedSyncTransport
-import saien.someday.sync.selfhosted.ModeRoutingWorkspacePairingService
 import saien.someday.sync.selfhosted.SelfHostedSetupService
 import saien.someday.sync.selfhosted.SelfHostedWorkspacePairingService
-import saien.someday.sync.webdav.AndroidWebDavTransport
-import saien.someday.sync.webdav.WebDavBackupService
-import saien.someday.sync.webdav.WebDavWorkspacePairingService
+import saien.someday.sync.selfhosted.SystemV3MediaCoordinator
+import saien.someday.sync.selfhosted.WorkspaceBoundSessionCredentialStore
 import saien.someday.ui.settings.SettingsExportSummary
 import saien.someday.ui.settings.SettingsImportSummary
 import java.io.File
 import java.util.UUID
+import okio.Path.Companion.toPath
 
-data class AndroidClientRepositories(
+class AndroidClientRepositories(
     val notesRepository: NotesRepository,
     val settingsRepository: ClientSettingsRepository,
-    val webDavBackupService: WebDavBackupService,
-    val webDavCredentialStore: WebDavCredentialStore,
     val selfHostedSetupClient: SelfHostedSetupClient,
     val selfHostedSessionCredentialStore: SelfHostedSessionCredentialStore,
     val manualSyncRunner: ManualSyncRunner,
-    val bindManualSyncProgressListener: (ManualSyncProgressListener?) -> Unit = {},
-    val syncV2MaintenanceRunner: SyncV2MaintenanceRunner,
     val workspacePairingInvitationCreator: WorkspacePairingInvitationCreator,
     val workspacePairingInvitationJoiner: WorkspacePairingInvitationJoiner,
     val workspacePairingInvitationCanceller: WorkspacePairingInvitationCanceller,
-    val webDavDiscoveredDevicesRunner: WebDavDiscoveredDevicesRunner,
-    private val localRepository: SqlDelightLocalDataRepository,
+    val localMediaAssetStore: AuthorityCoordinatedMediaAssetStore,
+    val mediaCoordinator: SystemV3MediaCoordinator,
     private val localDataExporter: LocalDataExporter,
     private val localDataImportProvider: (saien.someday.data.export.LocalDataExportDocument) ->
-        saien.someday.data.export.LocalDataImportSummary?,
+        saien.someday.data.export.LocalDataImportSummary,
     private val exportDirectory: File,
-) {
+    private val driver: AndroidSqliteDriver,
+    private val selfHostedTransport: AndroidSelfHostedSyncTransport,
+) : AutoCloseable {
+    private var closed = false
+
+    override fun close() {
+        if (closed) return
+        closed = true
+        try {
+            selfHostedTransport.close()
+        } finally {
+            driver.close()
+        }
+    }
+
     fun exportLocalDataSummary(): SettingsExportSummary {
         val document = localDataExporter.exportDocument()
         exportDirectory.mkdirs()
@@ -77,6 +84,8 @@ data class AndroidClientRepositories(
             notebookCount = document.notebooks.size,
             noteCount = document.notes.size,
             excludedSensitiveFields = document.excludedSensitiveFields,
+            includesMediaBytes = document.includesMediaBytes,
+            assetReferencesMayBeUnresolved = document.assetReferencesMayBeUnresolved,
             destinationLabel = file.absolutePath,
         )
     }
@@ -85,7 +94,7 @@ data class AndroidClientRepositories(
         archiveBytes: ByteArray,
         fallbackJournalTitle: String,
     ): SettingsImportSummary =
-        DayOneImportService(localRepository, localDataImportProvider)
+        DayOneImportService(localDataImportProvider)
             .importArchive(archiveBytes, fallbackJournalTitle)
             .toSettingsImportSummary()
 }
@@ -111,9 +120,27 @@ internal fun createAndroidOnThisDayRepositories(context: Context): AndroidOnThis
             database = SomedayDatabase(driver),
             deviceId = resolveAndroidLocalDeviceId(context),
         )
+        val localSettings = SqlDelightClientSettingsRepository(localRepository)
+        ensureActiveDeviceId(localSettings, localRepository.localDeviceId)
+        val workspaceKeys = bootstrapAndroidWorkspaceKeys(context, localRepository)
+        val keyProvider = workspaceKeys::unlockedOrUnlock
+        keyProvider()?.let { ensureWorkspaceLocalDraftV2(localRepository, localSettings, it) }
+        val profile = { SyncRemoteProfileV2.SELF_HOSTED.wireValue }
+        val settings = SystemV2ClientSettingsRepository(
+            localRepository,
+            localSettings,
+            keyProvider,
+            { localRepository.localDeviceId },
+            profile,
+        )
         AndroidOnThisDayRepositories(
-            notesRepository = SqlDelightNotesRepository(localRepository),
-            settingsRepository = SqlDelightClientSettingsRepository(localRepository),
+            notesRepository = SystemV2NotesRepository(
+                localRepository,
+                keyProvider,
+                { localRepository.localDeviceId },
+                profile,
+            ),
+            settingsRepository = settings,
             driver = driver,
         )
     }.getOrElse { failure ->
@@ -123,7 +150,34 @@ internal fun createAndroidOnThisDayRepositories(context: Context): AndroidOnThis
 }
 
 fun createAndroidClientRepositories(context: Context): AndroidClientRepositories {
-    val localRepository = createAndroidLocalDataRepository(context, resolveAndroidLocalDeviceId(context))
+    val localData = createAndroidLocalDataRepository(context, resolveAndroidLocalDeviceId(context))
+    return runCatching {
+        assembleAndroidClientRepositoriesWithOwnedTransport(context, localData)
+    }.getOrElse { failure ->
+        runCatching { localData.driver.close() }
+        throw failure
+    }
+}
+
+private fun assembleAndroidClientRepositoriesWithOwnedTransport(
+    context: Context,
+    localData: AndroidLocalData,
+): AndroidClientRepositories {
+    val selfHostedTransport = AndroidSelfHostedSyncTransport()
+    return runCatching {
+        assembleAndroidClientRepositories(context, localData, selfHostedTransport)
+    }.getOrElse { failure ->
+        runCatching { selfHostedTransport.close() }
+        throw failure
+    }
+}
+
+private fun assembleAndroidClientRepositories(
+    context: Context,
+    localData: AndroidLocalData,
+    selfHostedTransport: AndroidSelfHostedSyncTransport,
+): AndroidClientRepositories {
+    val localRepository = localData.repository
     val settingsRepository = SqlDelightClientSettingsRepository(localRepository)
     ensureActiveDeviceId(
         settingsRepository = settingsRepository,
@@ -133,114 +187,101 @@ fun createAndroidClientRepositories(context: Context): AndroidClientRepositories
         context = context,
         localRepository = localRepository,
     )
-    val webDavTransport = AndroidWebDavTransport()
-    val webDavCredentialStore = AndroidWebDavCredentialStore(context)
-    val selfHostedTransport = AndroidSelfHostedSyncTransport()
     val selfHostedSessionCredentialStore = AndroidSelfHostedSessionCredentialStore(context)
-    val syncV2Services = createSyncV2ClientServices(
+    val localMediaAssetStore = LocalMediaAssetStore(
+        database = localRepository.database,
+        appPrivateRoot = context.filesDir.absolutePath.toPath(),
+        decodeValidator = AndroidMediaAssetDecodeValidator,
+    )
+    val systemV3Services = createSystemV3ClientServices(
         localRepository = localRepository,
-        localNotesRepository = SqlDelightNotesRepository(localRepository),
         settingsRepository = settingsRepository,
         workspaceKeyProvider = workspaceKeys::unlockedOrUnlock,
-        webDavTransport = webDavTransport,
-        webDavCredentialStore = webDavCredentialStore,
+        workspaceIdProvider = workspaceKeys::workspaceIdOrNull,
+        localMediaAssetStore = localMediaAssetStore,
         selfHostedTransport = selfHostedTransport,
         selfHostedTransportV2 = selfHostedTransport,
+        selfHostedMediaTransportV3 = selfHostedTransport,
         selfHostedSessionStore = selfHostedSessionCredentialStore,
-        systemV2ActivationEnabled =
-            BuildConfig.SOMEDAY_SYSTEM_V2_RELEASE_ENABLED || BuildConfig.DEBUG,
-        workspaceKeyForEpochProvider = { epoch ->
-            workspaceKeys.workspaceKeyForEpochOrNull(epoch.descriptor.syncEpochId)
-        },
-        releaseWorkspaceKeyForEpoch = { epochId ->
-            workspaceKeys.releaseWorkspaceKeyForEpoch(epochId)
-        },
     )
-    val webDavBackupService = WebDavBackupService(
-        localRepository = localRepository,
-        transport = webDavTransport,
-        authoritativeDocumentProvider = syncV2Services.localDataExportProvider,
-        authoritativeImporter = syncV2Services.localDataImportProvider,
-    )
+    runCatching { systemV3Services.localMediaAssetStore.cleanupOrphans() }
     val workspaceJoinPackageProvider = workspaceKeys.workspaceJoinPackageProvider()
-    val localV2KeyBoundStatePresent = {
-        SqlDelightSyncProtocolStoreV2(localRepository.database).hasKeyBoundLocalV2State()
-    }
     val workspaceJoiner = workspaceKeys.workspaceJoiner(
         deviceName = "Android device",
         platform = "android",
-        localV2KeyBoundStatePresent = localV2KeyBoundStatePresent,
-    )
-    val webDavPairingService = WebDavWorkspacePairingService(
-        settingsProvider = settingsRepository::load,
-        credentialStore = webDavCredentialStore,
-        transport = webDavTransport,
-        workspaceJoinPackageProvider = workspaceJoinPackageProvider,
-        workspaceJoiner = workspaceJoiner,
-        localV2KeyBoundStatePresent = localV2KeyBoundStatePresent,
-        authorityMutationCoordinator = syncV2Services.authorityMutationCoordinator,
+        adoptionPolicy = systemV3Services.workspaceAdoptionPolicy,
+        beforeWorkspaceReplacement = systemV3Services.discardEmptyDraftForWorkspaceAdoption,
+        afterWorkspaceReplacement = systemV3Services.bindAdoptedWorkspaceToCurrentSession,
     )
     val selfHostedPairingService = SelfHostedWorkspacePairingService(
         settingsProvider = settingsRepository::load,
         sessionStore = selfHostedSessionCredentialStore,
         transport = selfHostedTransport,
-        sessionExecutor = syncV2Services.selfHostedSessionExecutor,
+        sessionExecutor = systemV3Services.selfHostedSessionExecutor,
         workspaceJoinPackageProvider = workspaceJoinPackageProvider,
         workspaceJoiner = workspaceJoiner,
-        localV2KeyBoundStatePresent = localV2KeyBoundStatePresent,
-        authorityMutationCoordinator = syncV2Services.authorityMutationCoordinator,
-    )
-    val workspacePairingService = ModeRoutingWorkspacePairingService(
-        settingsProvider = settingsRepository::load,
-        webDavCreator = webDavPairingService,
-        webDavJoiner = webDavPairingService,
-        webDavCanceller = webDavPairingService,
-        selfHostedCreator = selfHostedPairingService,
-        selfHostedJoiner = selfHostedPairingService,
-        selfHostedCanceller = selfHostedPairingService,
+        adoptionPolicy = systemV3Services.workspaceAdoptionPolicy,
+        authorityMutationCoordinator = systemV3Services.authorityMutationCoordinator,
+        activeWorkspaceSessionGuard = systemV3Services.activeWorkspaceSessionGuard,
+        workspacePairingInviterReady = systemV3Services.workspacePairingInviterReady,
     )
     return AndroidClientRepositories(
-        notesRepository = syncV2Services.notesRepository,
-        settingsRepository = syncV2Services.settingsRepository,
-        webDavBackupService = webDavBackupService,
-        webDavCredentialStore = webDavCredentialStore,
+        notesRepository = systemV3Services.notesRepository,
+        settingsRepository = systemV3Services.settingsRepository,
         selfHostedSetupClient = SelfHostedSetupService(
             transport = selfHostedTransport,
             sessionStore = selfHostedSessionCredentialStore,
+            activeWorkspaceSessionGuard = systemV3Services.activeWorkspaceSessionGuard,
+            authorityMutationCoordinator = systemV3Services.authorityMutationCoordinator,
+            localDeviceIdProvider = { localRepository.localDeviceId },
         ),
-        selfHostedSessionCredentialStore = selfHostedSessionCredentialStore,
-        manualSyncRunner = syncV2Services.manualSyncRunner,
-        bindManualSyncProgressListener = syncV2Services.bindManualSyncProgressListener,
-        syncV2MaintenanceRunner = syncV2Services.maintenanceRunner,
-        workspacePairingInvitationCreator = workspacePairingService,
-        workspacePairingInvitationJoiner = workspacePairingService,
-        workspacePairingInvitationCanceller = workspacePairingService,
-        webDavDiscoveredDevicesRunner = syncV2Services.webDavDiscoveredDevicesRunner,
-        localRepository = localRepository,
+        selfHostedSessionCredentialStore = WorkspaceBoundSessionCredentialStore(
+            selfHostedSessionCredentialStore,
+            systemV3Services.activeWorkspaceSessionGuard,
+        ),
+        manualSyncRunner = systemV3Services.manualSyncRunner,
+        workspacePairingInvitationCreator = selfHostedPairingService,
+        workspacePairingInvitationJoiner = selfHostedPairingService,
+        workspacePairingInvitationCanceller = selfHostedPairingService,
+        localMediaAssetStore = systemV3Services.localMediaAssetStore,
+        mediaCoordinator = systemV3Services.mediaCoordinator,
         localDataExporter = LocalDataExporter(
-            localRepository,
-            authoritativeDocumentProvider = syncV2Services.localDataExportProvider,
+            authoritativeDocumentProvider = systemV3Services.localDataExportProvider,
         ),
-        localDataImportProvider = syncV2Services.localDataImportProvider,
+        localDataImportProvider = systemV3Services.localDataImportProvider,
         exportDirectory = File(context.filesDir, "exports"),
+        driver = localData.driver,
+        selfHostedTransport = selfHostedTransport,
     )
 }
 
 private fun createAndroidLocalDataRepository(
     context: Context,
     deviceId: String,
-): SqlDelightLocalDataRepository {
+): AndroidLocalData {
     val driver = AndroidSqliteDriver(
         schema = SomedayDatabase.Schema,
         context = context,
         name = "someday.db",
     )
-    val database = SomedayDatabase(driver)
-    return SqlDelightLocalDataRepository(
-        database = database,
-        deviceId = deviceId,
-    )
+    return runCatching {
+        AndroidLocalData(
+            repository = SqlDelightLocalDataRepository(
+                database = SomedayDatabase(driver),
+                deviceId = deviceId,
+            ),
+            driver = driver,
+        )
+    }.getOrElse { failure ->
+        driver.close()
+        throw failure
+    }
 }
+
+private data class AndroidLocalData(
+    val repository: SqlDelightLocalDataRepository,
+    val driver: AndroidSqliteDriver,
+)
 
 private fun resolveAndroidLocalDeviceId(context: Context): String {
     val preferences = context.getSharedPreferences(AndroidDevicePreferencesName, Context.MODE_PRIVATE)
@@ -321,4 +362,6 @@ private fun DayOneImportSummary.toSettingsImportSummary(): SettingsImportSummary
         richTextConverted = richTextConverted,
         mediaReferenced = photosReferenced + audiosReferenced + videosReferenced + pdfsReferenced,
         unsupportedItems = unsupportedEmbeddedObjects + tagsFound + starredFound + pinnedFound + weatherFound,
+        includesMediaBytes = false,
+        assetReferencesMayBeUnresolved = true,
     )

@@ -1,0 +1,481 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+GRADLEW="${GRADLEW:-$ROOT_DIR/gradlew}"
+POSTGRES_IMAGE="postgres@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73"
+MINIO_IMAGE="minio/minio@sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e"
+MINIO_MC_IMAGE="minio/mc@sha256:aead63c77f9db9107f1696fb08ecb0faeda23729cde94b0f663edf4fe09728e3"
+GATE_PROPERTY="-Psomeday.systemV3ReliabilityGate=true"
+
+mkdir -p "$ROOT_DIR/build"
+RUN_DIR="$(mktemp -d "$ROOT_DIR/build/system-v3-reliability-gate.XXXXXX")"
+FINAL_DIR="$ROOT_DIR/build/system-v3-reliability-gate"
+MEDIA_BLOB_DIR="$RUN_DIR/media-blobs"
+MEDIA_INTEGRATION_BLOB_DIR="$MEDIA_BLOB_DIR/integration"
+MINIO_CERT_DIR="$RUN_DIR/minio-certs"
+MINIO_TRUSTSTORE="$RUN_DIR/minio-truststore.p12"
+mkdir -p \
+    "$FINAL_DIR" \
+    "$MEDIA_BLOB_DIR" \
+    "$MEDIA_INTEGRATION_BLOB_DIR" \
+    "$MINIO_CERT_DIR"
+rm -f "$FINAL_DIR/report.json" "$FINAL_DIR/server-tail.log"
+
+SERVER_LOG="$RUN_DIR/server.log"
+ARCHITECTURE_LOG="$RUN_DIR/architecture.log"
+PHASES="$RUN_DIR/phases.tsv"
+REPORT="$RUN_DIR/report.json"
+RUN_SUFFIX="$(date +%s)-$$"
+POSTGRES_NAME="someday-v3-gate-postgres-$RUN_SUFFIX"
+MINIO_NAME="someday-v3-gate-minio-$RUN_SUFFIX"
+NETWORK_NAME="someday-v3-gate-$RUN_SUFFIX"
+POSTGRES_ADMIN_USER="someday_admin"
+POSTGRES_ADMIN_PASSWORD="gate-admin-only-password"
+POSTGRES_APP_USER="someday_app"
+POSTGRES_APP_PASSWORD="gate-app-only-password"
+MINIO_ROOT_USER="someday_minio_admin"
+MINIO_ROOT_PASSWORD="gate-minio-admin-only-password"
+MINIO_APP_USER="someday_s3_app"
+MINIO_APP_PASSWORD="gate-s3-app-only-password"
+MINIO_BUCKET="someday-media"
+SERVER_PID=""
+SERVER_JWT_SECRET=""
+JAVA_TRUST_OPTIONS=""
+GATE_STARTED_AT="$(date +%s)"
+
+die() {
+    printf 'system-v3 gate error: %s\n' "$*" >&2
+    exit 1
+}
+
+info() {
+    printf '[system-v3 gate] %s\n' "$*" >&2
+}
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+require_java_21() {
+    local java_bin feature_version
+    if [[ -n "${JAVA_HOME:-}" ]]; then
+        java_bin="$JAVA_HOME/bin/java"
+    else
+        java_bin="$(command -v java)"
+    fi
+    [[ -x "$java_bin" ]] || die "JAVA_HOME does not provide an executable Java runtime"
+    feature_version="$(
+        "$java_bin" -XshowSettings:properties -version 2>&1 |
+            sed -n 's/^[[:space:]]*java\.specification\.version = \([0-9][0-9]*\).*$/\1/p' |
+            head -1
+    )"
+    [[ "$feature_version" =~ ^[0-9]+$ ]] || die "could not determine the Java feature version"
+    ((feature_version >= 21)) || die "JDK 21 or newer is required"
+}
+
+cleanup() {
+    local status=$?
+    trap - EXIT INT TERM
+    if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" >/dev/null 2>&1; then
+        kill "$SERVER_PID" >/dev/null 2>&1 || true
+        wait "$SERVER_PID" >/dev/null 2>&1 || true
+    fi
+    if command -v docker >/dev/null 2>&1; then
+        docker rm -f "$POSTGRES_NAME" "$MINIO_NAME" >/dev/null 2>&1 || true
+        docker network rm "$NETWORK_NAME" >/dev/null 2>&1 || true
+    fi
+    [[ ! -f "$REPORT" ]] || cp "$REPORT" "$FINAL_DIR/report.json"
+    [[ ! -f "$SERVER_LOG" ]] || tail -n 300 "$SERVER_LOG" >"$FINAL_DIR/server-tail.log" || true
+    exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+phase() {
+    local name="$1"
+    shift
+    local started finished
+    started="$(date +%s)"
+    info "$name"
+    "$@"
+    finished="$(date +%s)"
+    printf '%s\t%s\n' "$name" "$((finished - started))" >>"$PHASES"
+}
+
+wait_for() {
+    local label="$1"
+    shift
+    local attempt
+    for attempt in $(seq 1 60); do
+        if "$@" >/dev/null 2>&1; then
+            return 0
+        fi
+        if [[ -n "$SERVER_PID" ]] && ! kill -0 "$SERVER_PID" >/dev/null 2>&1; then
+            tail -n 120 "$SERVER_LOG" >&2 || true
+            die "$label exited before becoming healthy"
+        fi
+        sleep 1
+    done
+    die "$label did not become healthy within 60 seconds"
+}
+
+container_port() {
+    docker port "$1" "$2/tcp" | sed -n '1s/.*://p' | tr -d '[:space:]'
+}
+
+free_port() {
+    python3 - <<'PY'
+import socket
+
+value = socket.socket()
+value.bind(("127.0.0.1", 0))
+print(value.getsockname()[1])
+value.close()
+PY
+}
+
+start_installed_server() {
+    local executable="$ROOT_DIR/server/build/install/server/bin/server"
+    [[ -x "$executable" ]] || die "installed server executable not found: $executable"
+    [[ -n "$SERVER_JWT_SECRET" ]] || die "production JWT secret was not initialized"
+    : >"$SERVER_LOG"
+    SOMEDAY_DEPLOYMENT_MODE=production \
+    SOMEDAY_HOST=127.0.0.1 \
+    SOMEDAY_PORT="$SERVER_PORT" \
+    SOMEDAY_PUBLIC_BASE_URL=https://someday-gate.invalid \
+    SOMEDAY_DB_URL="$DB_URL" \
+    SOMEDAY_DB_USER="$POSTGRES_APP_USER" \
+    SOMEDAY_DB_PASSWORD="$POSTGRES_APP_PASSWORD" \
+    SOMEDAY_DB_TLS_MODE=private \
+    SOMEDAY_MEDIA_BACKEND=s3 \
+    SOMEDAY_MEDIA_S3_BUCKET="$MINIO_BUCKET" \
+    SOMEDAY_MEDIA_S3_REGION=us-east-1 \
+    SOMEDAY_MEDIA_S3_ENDPOINT="$MINIO_ENDPOINT" \
+    SOMEDAY_MEDIA_S3_PATH_STYLE=true \
+    AWS_ACCESS_KEY_ID="$MINIO_APP_USER" \
+    AWS_SECRET_ACCESS_KEY="$MINIO_APP_PASSWORD" \
+    JAVA_TOOL_OPTIONS="$JAVA_TRUST_OPTIONS" \
+    SOMEDAY_JWT_SECRET="$SERVER_JWT_SECRET" \
+    SOMEDAY_REGISTRATION_ENABLED=true \
+        "$executable" >"$SERVER_LOG" 2>&1 &
+    SERVER_PID=$!
+    wait_for "Ktor server" curl -fsS "$SERVER_ENDPOINT/health"
+}
+
+validate_and_report() {
+    local finished_at="$1"
+    python3 - "$ROOT_DIR" "$PHASES" "$REPORT" "$ARCHITECTURE_LOG" \
+        "$GATE_STARTED_AT" "$finished_at" <<'PY'
+import json
+import pathlib
+import subprocess
+import sys
+import xml.etree.ElementTree as ET
+
+root = pathlib.Path(sys.argv[1])
+phase_path = pathlib.Path(sys.argv[2])
+report_path = pathlib.Path(sys.argv[3])
+architecture_path = pathlib.Path(sys.argv[4])
+started = int(sys.argv[5])
+finished = int(sys.argv[6])
+
+targets = {
+    "data-jvm": root / "shared/data/build/test-results/jvmTest",
+    "domain-jvm": root / "shared/domain/build/test-results/jvmTest",
+    "sync-jvm": root / "shared/sync/build/test-results/jvmTest",
+    "sync-android": root / "shared/sync/build/test-results/testDebugUnitTest",
+    "ui-jvm": root / "shared/ui/build/test-results/jvmTest",
+    "android-app": root / "app/android/build/test-results/testDebugUnitTest",
+    "desktop": root / "app/desktop/build/test-results/jvmTest",
+    "server-test": root / "server/build/test-results/test",
+    "server-integration": root / "server/build/test-results/integrationTest",
+    "server-s3-integration": root / "server/build/test-results/s3IntegrationTest",
+    "real-e2e": root / "integration-tests/build/test-results/realRemoteTest",
+    "server-recovery": root / "integration-tests/build/test-results/serverRecoveryTest",
+}
+minimum_tests = {
+    # First-release product scale: text convergence, conflict, media, pairing.
+    "real-e2e": 4,
+}
+
+suite_evidence = []
+for target, result_root in targets.items():
+    if not result_root.is_dir():
+        raise SystemExit(f"missing JUnit result root for {target}: {result_root}")
+    files = [
+        path for path in sorted(result_root.rglob("*.xml"))
+        if path.stat().st_mtime >= started - 1
+    ]
+    if not files:
+        raise SystemExit(f"no fresh JUnit XML for {target}")
+    tests = failures = errors = skipped = 0
+    for path in files:
+        tree = ET.parse(path)
+        cases = list(tree.getroot().iter("testcase"))
+        tests += len(cases)
+        for case in cases:
+            failures += case.find("failure") is not None
+            errors += case.find("error") is not None
+            skipped += case.find("skipped") is not None
+    if tests == 0:
+        raise SystemExit(f"no fresh test cases for {target}")
+    if tests < minimum_tests.get(target, 1):
+        raise SystemExit(
+            f"insufficient first-release evidence for {target}: "
+            f"tests={tests} required={minimum_tests[target]}"
+        )
+    if failures or errors or skipped:
+        raise SystemExit(
+            f"non-passing evidence for {target}: "
+            f"tests={tests} failures={failures} errors={errors} skipped={skipped}"
+        )
+    suite_evidence.append({
+        "target": target,
+        "result": "passed",
+        "tests": tests,
+        "resultFiles": [str(path.relative_to(root)) for path in files],
+    })
+
+architecture_evidence = []
+for line in architecture_path.read_text(encoding="utf-8").splitlines():
+    if line.startswith("EVIDENCE ") and line.endswith(" passed"):
+        architecture_evidence.append(line[len("EVIDENCE "):-len(" passed")])
+if not architecture_evidence:
+    raise SystemExit("architecture verifier emitted no evidence")
+
+phases = []
+for line in phase_path.read_text(encoding="utf-8").splitlines():
+    name, duration = line.split("\t", 1)
+    phases.append({"target": name, "durationSeconds": int(duration), "result": "passed"})
+
+commit = subprocess.run(
+    ["git", "rev-parse", "HEAD"], cwd=root, text=True,
+    capture_output=True, check=True,
+).stdout.strip()
+dirty = bool(subprocess.run(
+    ["git", "status", "--porcelain"], cwd=root, text=True,
+    capture_output=True, check=True,
+).stdout)
+
+report = {
+    "contractId": "someday-system-v3",
+    "commit": commit,
+    "dirtyWorktree": dirty,
+    "startedAtEpochSeconds": started,
+    "finishedAtEpochSeconds": finished,
+    "durationSeconds": finished - started,
+    "flakyRetries": 0,
+    "containerImages": {
+        "postgres": "postgres@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73",
+        "minio": "minio/minio@sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e",
+        "minioClient": "minio/mc@sha256:aead63c77f9db9107f1696fb08ecb0faeda23729cde94b0f663edf4fe09728e3",
+    },
+    "phases": phases,
+    "architectureEvidence": architecture_evidence,
+    "suiteEvidence": suite_evidence,
+    "result": "passed",
+}
+report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+PY
+}
+
+for command in curl docker git java keytool openssl python3 rg; do
+    require_command "$command"
+done
+require_java_21
+[[ -x "$GRADLEW" ]] || die "Gradle wrapper is not executable: $GRADLEW"
+docker info >/dev/null 2>&1 || die "Docker daemon is required for isolated PostgreSQL/S3 evidence"
+SERVER_JWT_SECRET="$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')"
+[[ ${#SERVER_JWT_SECRET} -ge 32 ]] || die "failed to create a production-strength JWT secret"
+openssl req \
+    -x509 \
+    -newkey rsa:2048 \
+    -sha256 \
+    -days 1 \
+    -nodes \
+    -subj "/CN=$MINIO_NAME" \
+    -addext "subjectAltName=DNS:$MINIO_NAME,DNS:localhost,IP:127.0.0.1" \
+    -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
+    -addext "extendedKeyUsage=serverAuth" \
+    -keyout "$MINIO_CERT_DIR/private.key" \
+    -out "$MINIO_CERT_DIR/public.crt" \
+    >/dev/null 2>&1
+keytool -importcert \
+    -noprompt \
+    -storetype PKCS12 \
+    -storepass changeit \
+    -keystore "$MINIO_TRUSTSTORE" \
+    -alias someday-minio-gate \
+    -file "$MINIO_CERT_DIR/public.crt" \
+    >/dev/null 2>&1
+JAVA_TRUST_OPTIONS="-Djavax.net.ssl.trustStore=$MINIO_TRUSTSTORE -Djavax.net.ssl.trustStorePassword=changeit"
+
+cd "$ROOT_DIR"
+: >"$PHASES"
+
+phase "architecture-and-privacy" \
+    bash "$ROOT_DIR/scripts/verify-system-v3-architecture" | tee "$ARCHITECTURE_LOG"
+
+phase "managed-storage-profile-preflight" \
+    bash "$ROOT_DIR/scripts/tests/managed-storage-profile-preflight-test.sh"
+
+phase "recovery-read-only-proxy-contract" \
+    bash "$ROOT_DIR/scripts/tests/recovery-read-only-proxy-test.sh"
+
+phase "gate-signal-status-contract" \
+    bash "$ROOT_DIR/scripts/tests/gate-signal-status-test.sh"
+
+if ! docker image inspect "$POSTGRES_IMAGE" >/dev/null 2>&1; then
+    info "pulling pinned PostgreSQL image"
+    docker pull "$POSTGRES_IMAGE" >/dev/null
+fi
+if ! docker image inspect "$MINIO_IMAGE" >/dev/null 2>&1; then
+    info "pulling pinned MinIO image"
+    docker pull "$MINIO_IMAGE" >/dev/null
+fi
+if ! docker image inspect "$MINIO_MC_IMAGE" >/dev/null 2>&1; then
+    info "pulling pinned MinIO client image"
+    docker pull "$MINIO_MC_IMAGE" >/dev/null
+fi
+docker network create "$NETWORK_NAME" >/dev/null
+docker run -d --rm \
+    --name "$POSTGRES_NAME" \
+    --network "$NETWORK_NAME" \
+    --tmpfs /var/lib/postgresql/data:rw,noexec,nosuid,size=512m \
+    -e POSTGRES_DB=someday \
+    -e POSTGRES_USER="$POSTGRES_ADMIN_USER" \
+    -e POSTGRES_PASSWORD="$POSTGRES_ADMIN_PASSWORD" \
+    -p 127.0.0.1::5432 \
+    "$POSTGRES_IMAGE" >/dev/null
+POSTGRES_PORT="$(container_port "$POSTGRES_NAME" 5432)"
+[[ "$POSTGRES_PORT" =~ ^[0-9]+$ ]] || die "could not resolve PostgreSQL port"
+DB_URL="jdbc:postgresql://127.0.0.1:$POSTGRES_PORT/someday"
+wait_for "PostgreSQL" docker exec "$POSTGRES_NAME" pg_isready -U "$POSTGRES_ADMIN_USER" -d someday
+
+docker run -d --rm \
+    --name "$MINIO_NAME" \
+    --network "$NETWORK_NAME" \
+    --tmpfs /data:rw,noexec,nosuid,size=512m \
+    -e MINIO_ROOT_USER="$MINIO_ROOT_USER" \
+    -e MINIO_ROOT_PASSWORD="$MINIO_ROOT_PASSWORD" \
+    --volume "$MINIO_CERT_DIR:/root/.minio/certs:ro" \
+    -p 127.0.0.1::9000 \
+    "$MINIO_IMAGE" server /data --console-address :9001 >/dev/null
+MINIO_PORT="$(container_port "$MINIO_NAME" 9000)"
+[[ "$MINIO_PORT" =~ ^[0-9]+$ ]] || die "could not resolve MinIO port"
+MINIO_ENDPOINT="https://127.0.0.1:$MINIO_PORT"
+wait_for "MinIO" curl --cacert "$MINIO_CERT_DIR/public.crt" -fsS "$MINIO_ENDPOINT/minio/health/live"
+
+docker run --rm \
+    --network "$NETWORK_NAME" \
+    --entrypoint /bin/sh \
+    --volume "$ROOT_DIR/scripts/fixtures/minio-media-policy.json:/policy.json:ro" \
+    --volume "$MINIO_CERT_DIR/public.crt:/root/.mc/certs/CAs/someday-gate.crt:ro" \
+    "$MINIO_MC_IMAGE" \
+    -c "mc alias set gate https://$MINIO_NAME:9000 '$MINIO_ROOT_USER' '$MINIO_ROOT_PASSWORD' >/dev/null && \
+        mc mb --ignore-existing gate/$MINIO_BUCKET >/dev/null && \
+        mc version enable gate/$MINIO_BUCKET >/dev/null && \
+        mc admin user add gate '$MINIO_APP_USER' '$MINIO_APP_PASSWORD' >/dev/null && \
+        mc admin policy create gate someday-media-app /policy.json >/dev/null && \
+        mc admin policy attach gate someday-media-app --user '$MINIO_APP_USER' >/dev/null"
+
+docker exec "$POSTGRES_NAME" psql \
+    --username "$POSTGRES_ADMIN_USER" \
+    --dbname someday \
+    --set ON_ERROR_STOP=1 \
+    --command "CREATE ROLE $POSTGRES_APP_USER LOGIN PASSWORD '$POSTGRES_APP_PASSWORD' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS" \
+    --command "GRANT CONNECT ON DATABASE someday TO $POSTGRES_APP_USER" \
+    --command "GRANT USAGE, CREATE ON SCHEMA public TO $POSTGRES_APP_USER" \
+    >/dev/null
+APP_ROLE_FLAGS="$(
+    docker exec \
+        --env PGPASSWORD="$POSTGRES_APP_PASSWORD" \
+        "$POSTGRES_NAME" \
+        psql \
+        --host 127.0.0.1 \
+        --username "$POSTGRES_APP_USER" \
+        --dbname someday \
+        --tuples-only \
+        --no-align \
+        --set ON_ERROR_STOP=1 \
+        --command "SELECT current_user || ':' || rolsuper::text || ':' || rolbypassrls::text FROM pg_roles WHERE rolname = current_user"
+)"
+[[ "$APP_ROLE_FLAGS" == "$POSTGRES_APP_USER:false:false" ]] || \
+    die "application database role must be LOGIN, NOSUPERUSER, and NOBYPASSRLS; observed: $APP_ROLE_FLAGS"
+
+SERVER_PORT="$(free_port)"
+SERVER_ENDPOINT="http://127.0.0.1:$SERVER_PORT"
+
+phase "linux-local-platform-and-protocol-tests" \
+    "$GRADLEW" \
+        :shared:data:verifySqlDelightMigration \
+        :shared:data:jvmTest \
+        :shared:domain:jvmTest \
+        :shared:sync:jvmTest \
+        :shared:sync:testDebugUnitTest \
+        :shared:ui:jvmTest \
+        :server:test \
+        :app:desktop:jvmTest \
+        :app:desktop:jvmMainClasses \
+        :app:android:testDebugUnitTest \
+        :app:android:compileDebugKotlin \
+        "$GATE_PROPERTY" \
+        --dependency-verification=strict \
+        --stacktrace
+
+phase "self-hosted-postgresql-integration" env \
+    SOMEDAY_DB_URL="$DB_URL" \
+    SOMEDAY_DB_USER="$POSTGRES_APP_USER" \
+    SOMEDAY_DB_PASSWORD="$POSTGRES_APP_PASSWORD" \
+    SOMEDAY_DB_TLS_MODE=private \
+    SOMEDAY_DB_ADMIN_URL="$DB_URL" \
+    SOMEDAY_DB_ADMIN_USER="$POSTGRES_ADMIN_USER" \
+    SOMEDAY_DB_ADMIN_PASSWORD="$POSTGRES_ADMIN_PASSWORD" \
+    SOMEDAY_MEDIA_BACKEND=filesystem \
+    SOMEDAY_MEDIA_BLOB_DIR="$MEDIA_INTEGRATION_BLOB_DIR" \
+    "$GRADLEW" \
+        :server:integrationTest \
+        :server:installDist \
+        "$GATE_PROPERTY" \
+        --dependency-verification=strict \
+        --stacktrace
+
+phase "self-hosted-s3-integration" env \
+    SOMEDAY_S3_TEST_ENDPOINT="$MINIO_ENDPOINT" \
+    SOMEDAY_S3_TEST_BUCKET="$MINIO_BUCKET" \
+    SOMEDAY_S3_TEST_REGION=us-east-1 \
+    AWS_ACCESS_KEY_ID="$MINIO_APP_USER" \
+    AWS_SECRET_ACCESS_KEY="$MINIO_APP_PASSWORD" \
+    JAVA_TOOL_OPTIONS="$JAVA_TRUST_OPTIONS" \
+    "$GRADLEW" \
+        :server:s3IntegrationTest \
+        "$GATE_PROPERTY" \
+        --dependency-verification=strict \
+        --stacktrace
+
+phase "self-hosted-server-startup" start_installed_server
+
+phase "real-self-hosted-journeys" env \
+    SOMEDAY_E2E_ENDPOINT="$SERVER_ENDPOINT" \
+    SOMEDAY_DB_URL="$DB_URL" \
+    SOMEDAY_DB_USER="$POSTGRES_APP_USER" \
+    SOMEDAY_DB_PASSWORD="$POSTGRES_APP_PASSWORD" \
+    "$GRADLEW" \
+        :integration-tests:realRemoteTest \
+        "$GATE_PROPERTY" \
+        --dependency-verification=strict \
+        --stacktrace
+
+phase "standalone-backup-and-isolated-restore" bash "$ROOT_DIR/scripts/server-recovery-gate"
+
+phase "server-container-packaging" bash "$ROOT_DIR/scripts/server-container-smoke"
+
+phase "diff-hygiene" git diff --check
+
+GATE_FINISHED_AT="$(date +%s)"
+validate_and_report "$GATE_FINISHED_AT"
+cp "$REPORT" "$FINAL_DIR/report.json"
+info "passed; report: $FINAL_DIR/report.json"

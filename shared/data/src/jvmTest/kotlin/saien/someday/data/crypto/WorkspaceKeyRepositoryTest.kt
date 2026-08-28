@@ -3,12 +3,11 @@
 
 package saien.someday.data.crypto
 
-import saien.someday.data.local.EntityType
-import saien.someday.data.local.LocalIdGenerator
-import saien.someday.data.local.LocationInput
 import saien.someday.data.local.SqlDelightLocalDataRepository
 import saien.someday.data.local.createSomedayJdbcDriver
 import saien.someday.data.local.db.SomedayDatabase
+import saien.someday.domain.settings.LocalWorkspaceAdoptionPolicy
+import saien.someday.domain.settings.WorkspacePairingReason
 import kotlin.time.Instant
 import java.nio.file.Files
 import kotlin.test.Test
@@ -29,6 +28,7 @@ class WorkspaceKeyRepositoryTest {
                 platform = "desktop",
             )
             val rawKey = checkNotNull(fixture.workspaceKeys.unlockedKeyOrNull())
+            assertEquals(setup.state.workspaceId, fixture.workspaceKeys.workspaceIdOrNull())
 
             val metadataJson = checkNotNull(
                 fixture.localRepository.getSetting(WorkspaceKeyRepository.WORKSPACE_KEY_METADATA_SETTING_KEY),
@@ -50,11 +50,7 @@ class WorkspaceKeyRepositoryTest {
             assertTrue(rawKey.toString().contains("redacted"))
             assertTrue(fixture.workspaceKeys.verifyRecoveryMaterial(setup.recoveryMaterial.revealForUserConfirmation()))
             assertFalse(fixture.workspaceKeys.verifyRecoveryMaterial("SOMEDAY-0000-0000-0000-0000"))
-            assertTrue(
-                fixture.localRepository
-                    .getSyncMetadata(WorkspaceKeyRepository.WORKSPACE_KEY_METADATA_SETTING_KEY, EntityType.SETTING)
-                    ?.dirty == true,
-            )
+            assertEquals(metadataJson, fixture.workspaceKeys.exportRecoveryMetadataJson())
         }
 
     @Test
@@ -149,6 +145,8 @@ class WorkspaceKeyRepositoryTest {
                     deviceName = "iPhone",
                     platform = "ios",
                     replaceExistingWorkspace = true,
+                    beforeMetadataReplacement = {},
+                    afterMetadataReplacement = { _, _ -> },
                 )
                 val joinedKey = checkNotNull(secondDevice.workspaceKeys.unlockedKeyOrNull())
 
@@ -159,90 +157,7 @@ class WorkspaceKeyRepositoryTest {
         }
 
     @Test
-    fun masterKeyRotationStagesOutOfBandPackageAndRetainsOldEpochKeyWithoutSyncingSecrets() =
-        withFixture { firstDevice ->
-            val initial = firstDevice.workspaceKeys.createFirstRunWorkspace("Mac", "desktop")
-            val oldKey = checkNotNull(firstDevice.workspaceKeys.unlockedKeyOrNull())
-            val sourceEpoch = "10000000-0000-4000-8000-000000000001"
-            val targetEpoch = "20000000-0000-4000-8000-000000000002"
-
-            val prepared = firstDevice.workspaceKeys.prepareWorkspaceKeyRotation(sourceEpoch)
-            val stagedNewKey = checkNotNull(
-                firstDevice.workspaceKeys.pendingWorkspaceKeyOrNull(prepared.token),
-            )
-
-            assertNotEquals(oldKey.fingerprint, stagedNewKey.fingerprint)
-            assertEquals(oldKey.fingerprint, firstDevice.workspaceKeys.unlockedKeyOrNull()?.fingerprint)
-            assertEquals(prepared.targetKeyFingerprint, stagedNewKey.fingerprint)
-            assertFalse(
-                checkNotNull(firstDevice.localRepository.getSetting(
-                    WorkspaceKeyRepository.WORKSPACE_KEY_ROTATION_SETTING_KEY,
-                )).dirty,
-            )
-            val stagedJson = checkNotNull(firstDevice.localRepository.getSetting(
-                WorkspaceKeyRepository.WORKSPACE_KEY_ROTATION_SETTING_KEY,
-            )).value
-            assertFalse(stagedJson.contains(prepared.recoveryMaterial.revealForUserConfirmation()))
-            assertFalse(stagedJson.contains(oldKey.rawKeyBase64ForTest()))
-            assertFalse(stagedJson.contains(stagedNewKey.rawKeyBase64ForTest()))
-            assertFalse(firstDevice.workspaceKeys.abortWorkspaceKeyRotation(prepared.token, false))
-
-            withFixture(deviceId = "device-b") { secondDevice ->
-                assertIs<WorkspaceRestoreResult.Restored>(
-                    secondDevice.workspaceKeys.restoreWorkspaceFromRecovery(
-                        initial.metadataJson,
-                        initial.recoveryMaterial.revealForUserConfirmation(),
-                        "iPhone",
-                        "ios",
-                    ),
-                )
-                val received = assertIs<WorkspaceKeyRotationStageResult.Staged>(
-                    secondDevice.workspaceKeys.stageWorkspaceKeyRotation(
-                        sourceEpoch,
-                        prepared.targetMetadataJson,
-                        prepared.recoveryMaterial.revealForUserConfirmation(),
-                    ),
-                )
-                assertEquals(prepared.targetKeyFingerprint, received.pending.targetKeyFingerprint)
-                assertEquals(oldKey.fingerprint, secondDevice.workspaceKeys.unlockedKeyOrNull()?.fingerprint)
-                assertIs<WorkspaceUnlockResult.Unlocked>(
-                    secondDevice.workspaceKeys.commitWorkspaceKeyRotation(received.pending.token, targetEpoch),
-                )
-                assertEquals(
-                    prepared.targetKeyFingerprint,
-                    secondDevice.workspaceKeys.unlockedKeyOrNull()?.fingerprint,
-                )
-                assertEquals(
-                    oldKey.fingerprint,
-                    secondDevice.workspaceKeys.workspaceKeyForEpochOrNull(sourceEpoch)?.fingerprint,
-                )
-                assertEquals(
-                    prepared.targetKeyFingerprint,
-                    secondDevice.workspaceKeys.workspaceKeyForEpochOrNull(targetEpoch)?.fingerprint,
-                )
-                assertNull(secondDevice.workspaceKeys.workspaceKeyForEpochOrNull("unknown-epoch"))
-            }
-
-            assertIs<WorkspaceUnlockResult.Unlocked>(
-                firstDevice.workspaceKeys.commitWorkspaceKeyRotation(prepared.token, targetEpoch),
-            )
-            assertEquals(prepared.targetKeyFingerprint, firstDevice.workspaceKeys.unlockedKeyOrNull()?.fingerprint)
-            assertEquals(oldKey.fingerprint, firstDevice.workspaceKeys.workspaceKeyForEpochOrNull(sourceEpoch)?.fingerprint)
-            assertEquals(
-                prepared.targetKeyFingerprint,
-                firstDevice.workspaceKeys.workspaceKeyForEpochOrNull(targetEpoch)?.fingerprint,
-            )
-            assertNull(firstDevice.workspaceKeys.pendingWorkspaceKeyRotation())
-            assertFalse(checkNotNull(firstDevice.localRepository.getSetting(
-                WorkspaceKeyRepository.WORKSPACE_KEY_ARCHIVES_SETTING_KEY,
-            )).dirty)
-            assertFalse(firstDevice.workspaceKeys.releaseWorkspaceKeyForEpoch(targetEpoch))
-            assertTrue(firstDevice.workspaceKeys.releaseWorkspaceKeyForEpoch(sourceEpoch))
-            assertNull(firstDevice.workspaceKeys.workspaceKeyForEpochOrNull(sourceEpoch))
-        }
-
-    @Test
-    fun wrongRecoveryMaterialFailsSafelyWithoutWorkspaceOrDirtyStateMutation() =
+    fun wrongRecoveryMaterialFailsWithoutMutatingDeviceLocalFoundationState() =
         withFixture { firstDevice ->
             val firstSetup = firstDevice.workspaceKeys.createFirstRunWorkspace(
                 deviceName = "Mac",
@@ -251,15 +166,7 @@ class WorkspaceKeyRepositoryTest {
             val metadataJson = checkNotNull(firstDevice.workspaceKeys.exportRecoveryMetadataJson())
 
             withFixture(deviceId = "device-b") { secondDevice ->
-                val notebook = secondDevice.localRepository.createNotebook("Offline")
-                val note = secondDevice.localRepository.createNote(
-                    notebookId = notebook.id,
-                    title = "Local dirty note",
-                    markdownBody = "This local plaintext must not be corrupted",
-                    createdAt = Instant.parse("2026-05-22T00:00:00Z"),
-                    location = LocationInput(placeText = "Local only"),
-                )
-                val syncBefore = checkNotNull(secondDevice.localRepository.getSyncMetadata(note.id, EntityType.NOTE))
+                secondDevice.localRepository.putLocalOnlySetting("sentinel", "must-survive")
 
                 val failed = secondDevice.workspaceKeys.restoreWorkspaceFromRecovery(
                     metadataJson = metadataJson,
@@ -267,59 +174,13 @@ class WorkspaceKeyRepositoryTest {
                     deviceName = "iPhone",
                     platform = "ios",
                 )
-                val protectedRepository = WorkspaceProtectedLocalDataRepository(
-                    localRepository = secondDevice.localRepository,
-                    workspaceKeys = secondDevice.workspaceKeys,
-                )
-
                 assertIs<WorkspaceRestoreResult.Failed>(failed)
                 assertEquals(WorkspaceUnlockFailure.AUTHENTICATION_FAILED, failed.reason)
                 assertNull(secondDevice.workspaceKeys.unlockedKeyOrNull())
                 assertNull(secondDevice.localRepository.getSetting(WorkspaceKeyRepository.WORKSPACE_KEY_METADATA_SETTING_KEY))
                 assertFalse(secondDevice.secureKeyStore.containsAny())
-                assertEquals("This local plaintext must not be corrupted", secondDevice.localRepository.getNote(note.id)?.markdownBody)
-                assertEquals(syncBefore, secondDevice.localRepository.getSyncMetadata(note.id, EntityType.NOTE))
-                assertIs<PlaintextAccessResult.Locked>(protectedRepository.getNote(note.id))
+                assertEquals("must-survive", secondDevice.localRepository.getSetting("sentinel")?.value)
             }
-        }
-
-    @Test
-    fun returningUserUnlocksBeforePlaintextNoteAppearsAfterRestart() =
-        withFixture { fixture ->
-            fixture.workspaceKeys.createFirstRunWorkspace(
-                deviceName = "Developer Mac",
-                platform = "desktop",
-            )
-            val notebook = fixture.localRepository.createNotebook("Diary")
-            val note = fixture.localRepository.createNote(
-                notebookId = notebook.id,
-                title = "Restart note",
-                markdownBody = "plaintext-after-unlock-only",
-                createdAt = Instant.parse("2026-05-22T00:00:00Z"),
-            )
-
-            val restartedKeys = WorkspaceKeyRepository(
-                localRepository = fixture.localRepository,
-                secureKeyStore = fixture.secureKeyStore,
-                crypto = fixture.crypto,
-                clock = { Instant.fromEpochMilliseconds(2_000) },
-                aliasGenerator = SequentialAliasGenerator("restart-alias"),
-            )
-            val protectedRepository = WorkspaceProtectedLocalDataRepository(
-                localRepository = fixture.localRepository,
-                workspaceKeys = restartedKeys,
-            )
-
-            assertIs<WorkspaceUnlockState.Locked>(restartedKeys.startupState())
-            assertIs<PlaintextAccessResult.Locked>(protectedRepository.getNote(note.id))
-            assertFalse(protectedRepository.getNote(note.id).toString().contains("plaintext-after-unlock-only"))
-
-            val unlocked = restartedKeys.unlockWithSecureStorage()
-
-            assertIs<WorkspaceUnlockResult.Unlocked>(unlocked)
-            val plaintextResult = protectedRepository.getNote(note.id)
-            val available = assertIs<PlaintextAccessResult.Available<*>>(plaintextResult)
-            assertEquals("plaintext-after-unlock-only", (available.value as saien.someday.data.local.Note).markdownBody)
         }
 
     @Test
@@ -334,7 +195,11 @@ class WorkspaceKeyRepositoryTest {
                 val joiner = secondDevice.workspaceKeys.workspaceJoiner(
                     deviceName = "iPhone",
                     platform = "ios",
-                    localV2KeyBoundStatePresent = { true },
+                    adoptionPolicy = LocalWorkspaceAdoptionPolicy {
+                        WorkspacePairingReason.LocalWorkspaceNotReplaceable
+                    },
+                    beforeWorkspaceReplacement = { true },
+                    afterWorkspaceReplacement = { _, _, _ -> true },
                 )
                 val blocked = joiner.join(
                     saien.someday.domain.settings.WorkspaceJoinPackage(
@@ -345,12 +210,44 @@ class WorkspaceKeyRepositoryTest {
                     ),
                 )
                 assertFalse(blocked.success)
-                assertTrue(blocked.message.contains("local Sync V2 history"))
+                assertEquals(WorkspacePairingReason.LocalWorkspaceNotReplaceable, blocked.reason)
                 // Key must remain the first-run identity, not the leader package.
                 assertNotEquals(
                     setup.state.keyFingerprint,
                     secondDevice.workspaceKeys.unlockedKeyOrNull()?.fingerprint,
                 )
+            }
+        }
+
+    @Test
+    fun failedTransactionalAdoptionBindingRollsBackWorkspaceMetadataAndUnlockedKey() =
+        withFixture { inviter ->
+            inviter.workspaceKeys.createFirstRunWorkspace("Inviter", "desktop")
+            val joinPackage = assertIs<WorkspaceJoinPackageResult.Created>(
+                inviter.workspaceKeys.createWorkspaceJoinPackage(),
+            )
+            val domainPackage = saien.someday.domain.settings.WorkspaceJoinPackage(
+                joinPackage.metadataJson,
+                joinPackage.recoveryMaterial.revealForUserConfirmation(),
+                joinPackage.workspaceId,
+                joinPackage.keyFingerprint,
+            )
+
+            withFixture(deviceId = "rollback-device") { joining ->
+                joining.workspaceKeys.createFirstRunWorkspace("Joining", "desktop")
+                val originalWorkspaceId = joining.workspaceKeys.workspaceIdOrNull()
+                val originalFingerprint = joining.workspaceKeys.unlockedKeyOrNull()?.fingerprint
+                val result = joining.workspaceKeys.workspaceJoiner(
+                    deviceName = "Joining",
+                    platform = "desktop",
+                    adoptionPolicy = LocalWorkspaceAdoptionPolicy { null },
+                    beforeWorkspaceReplacement = { true },
+                    afterWorkspaceReplacement = { _, _, _ -> false },
+                ).join(domainPackage)
+
+                assertFalse(result.success)
+                assertEquals(originalWorkspaceId, joining.workspaceKeys.workspaceIdOrNull())
+                assertEquals(originalFingerprint, joining.workspaceKeys.unlockedKeyOrNull()?.fingerprint)
             }
         }
 
@@ -366,7 +263,6 @@ class WorkspaceKeyRepositoryTest {
             database = database,
             deviceId = deviceId,
             clock = { Instant.fromEpochMilliseconds(1_000) },
-            idGenerator = SequentialTestIdGenerator(),
         )
         val secureKeyStore = InMemorySecureWorkspaceKeyStore()
         val crypto = SodiumWorkspaceCrypto(recoveryKdfPolicy = RecoveryKdfPolicy.forTests())
@@ -392,15 +288,6 @@ class WorkspaceKeyRepositoryTest {
         val crypto: SodiumWorkspaceCrypto,
         val workspaceKeys: WorkspaceKeyRepository,
     )
-
-    private class SequentialTestIdGenerator : LocalIdGenerator {
-        private var next = 0
-
-        override fun newId(prefix: String): String {
-            next += 1
-            return "$prefix-$next"
-        }
-    }
 
     private class SequentialAliasGenerator(
         private val prefix: String,

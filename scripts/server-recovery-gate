@@ -1,0 +1,487 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+GRADLEW="${GRADLEW:-$ROOT_DIR/gradlew}"
+POSTGRES_IMAGE="postgres@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73"
+GATE_PROPERTY="-Psomeday.systemV3ReliabilityGate=true"
+
+mkdir -p "$ROOT_DIR/build"
+RUN_DIR="$(mktemp -d "$ROOT_DIR/build/server-recovery-gate.XXXXXX")"
+FINAL_DIR="$ROOT_DIR/build/server-recovery-gate"
+SOURCE_MEDIA_DIR="$RUN_DIR/source-media"
+RESTORED_MEDIA_DIR="$RUN_DIR/restored-media"
+HANDSHAKE_DIR="$RUN_DIR/handshake"
+RECOVERY_SET_DIR="$RUN_DIR/recovery-set"
+mkdir -p \
+    "$FINAL_DIR" \
+    "$SOURCE_MEDIA_DIR" \
+    "$RESTORED_MEDIA_DIR" \
+    "$HANDSHAKE_DIR" \
+    "$RECOVERY_SET_DIR"
+
+RUN_SUFFIX="$(date +%s)-$$"
+POSTGRES_NAME="someday-recovery-postgres-$RUN_SUFFIX"
+POSTGRES_ADMIN_USER="someday_admin"
+POSTGRES_ADMIN_PASSWORD="recovery-admin-only-password"
+POSTGRES_APP_USER="someday_app"
+POSTGRES_APP_PASSWORD="recovery-app-only-password"
+SOURCE_DATABASE="someday_recovery_source"
+RESTORED_DATABASE="someday_recovery_restored"
+SERVER_PID=""
+TEST_PID=""
+PROXY_PID=""
+RESTORE_VOLUME_NAME=""
+SERVER_LOG="$RUN_DIR/source-server.log"
+TEST_LOG="$RUN_DIR/recovery-journey.log"
+JWT_SECRET=""
+
+die() {
+    printf 'server recovery gate error: %s\n' "$*" >&2
+    exit 1
+}
+
+info() {
+    printf '[server recovery gate] %s\n' "$*" >&2
+}
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+require_java_21() {
+    local java_bin feature_version
+    if [[ -n "${JAVA_HOME:-}" ]]; then
+        java_bin="$JAVA_HOME/bin/java"
+    else
+        java_bin="$(command -v java)"
+    fi
+    [[ -x "$java_bin" ]] || die "JAVA_HOME does not provide an executable Java runtime"
+    feature_version="$(
+        "$java_bin" -XshowSettings:properties -version 2>&1 |
+            sed -n 's/^[[:space:]]*java\.specification\.version = \([0-9][0-9]*\).*$/\1/p' |
+            head -1
+    )"
+    [[ "$feature_version" =~ ^[0-9]+$ ]] || die "could not determine the Java feature version"
+    ((feature_version >= 21)) || die "JDK 21 or newer is required"
+}
+
+cleanup() {
+    local status=$?
+    trap - EXIT INT TERM
+    for pid in "$TEST_PID" "$PROXY_PID" "$SERVER_PID"; do
+        if [[ -n "$pid" ]] && kill -0 "$pid" >/dev/null 2>&1; then
+            kill "$pid" >/dev/null 2>&1 || true
+            wait "$pid" >/dev/null 2>&1 || true
+        fi
+    done
+    docker rm -f "$POSTGRES_NAME" >/dev/null 2>&1 || true
+    if [[ -n "$RESTORE_VOLUME_NAME" ]]; then
+        docker volume rm "$RESTORE_VOLUME_NAME" >/dev/null 2>&1 || true
+    fi
+    [[ ! -f "$TEST_LOG" ]] || cp "$TEST_LOG" "$FINAL_DIR/recovery-journey.log"
+    [[ ! -f "$SERVER_LOG" ]] || tail -n 300 "$SERVER_LOG" >"$FINAL_DIR/server-tail.log" || true
+    exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+stop_server() {
+    if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" >/dev/null 2>&1; then
+        kill "$SERVER_PID" >/dev/null 2>&1 || true
+        wait "$SERVER_PID" >/dev/null 2>&1 || true
+    fi
+    SERVER_PID=""
+}
+
+free_port() {
+    python3 - <<'PY'
+import socket
+
+value = socket.socket()
+value.bind(("127.0.0.1", 0))
+print(value.getsockname()[1])
+value.close()
+PY
+}
+
+wait_for() {
+    local label="$1"
+    shift
+    local attempt
+    for attempt in $(seq 1 60); do
+        if "$@" >/dev/null 2>&1; then
+            return 0
+        fi
+        if [[ -n "$SERVER_PID" ]] && ! kill -0 "$SERVER_PID" >/dev/null 2>&1; then
+            tail -n 120 "$SERVER_LOG" >&2 || true
+            die "$label exited before becoming healthy"
+        fi
+        sleep 1
+    done
+    die "$label did not become healthy within 60 seconds"
+}
+
+start_server() {
+    local database_url="$1"
+    local port="$2"
+    local media_dir="$3"
+    local registration_enabled="$4"
+    local log_file="$5"
+    local executable="$ROOT_DIR/server/build/install/server/bin/server"
+    [[ -x "$executable" ]] || die "installed server executable not found: $executable"
+    SERVER_LOG="$log_file"
+    : >"$SERVER_LOG"
+    SOMEDAY_DEPLOYMENT_MODE=production \
+    SOMEDAY_HOST=127.0.0.1 \
+    SOMEDAY_PORT="$port" \
+    SOMEDAY_PUBLIC_BASE_URL=https://someday-recovery.invalid \
+    SOMEDAY_DB_URL="$database_url" \
+    SOMEDAY_DB_USER="$POSTGRES_APP_USER" \
+    SOMEDAY_DB_PASSWORD="$POSTGRES_APP_PASSWORD" \
+    SOMEDAY_DB_TLS_MODE=private \
+    SOMEDAY_MEDIA_BACKEND=filesystem \
+    SOMEDAY_MEDIA_BLOB_DIR="$media_dir" \
+    SOMEDAY_JWT_SECRET="$JWT_SECRET" \
+    SOMEDAY_REGISTRATION_ENABLED="$registration_enabled" \
+        "$executable" >"$SERVER_LOG" 2>&1 &
+    SERVER_PID=$!
+    wait_for "Ktor filesystem server" curl -fsS "http://127.0.0.1:$port/health"
+}
+
+database_row_manifest() {
+    local database="$1"
+    local output="$2"
+    local table count
+    : >"$output"
+    while IFS= read -r table; do
+        [[ -n "$table" ]] || continue
+        count="$(
+            docker exec "$POSTGRES_NAME" psql \
+                --username "$POSTGRES_ADMIN_USER" \
+                --dbname "$database" \
+                --tuples-only \
+                --no-align \
+                --set ON_ERROR_STOP=1 \
+                --command "SELECT count(*) FROM public.\"$table\"" |
+                tr -d '[:space:]'
+        )"
+        [[ "$count" =~ ^[0-9]+$ ]] || die "invalid row count for $database.$table"
+        printf '%s\t%s\n' "$table" "$count" >>"$output"
+    done < <(
+        docker exec "$POSTGRES_NAME" psql \
+            --username "$POSTGRES_ADMIN_USER" \
+            --dbname "$database" \
+            --tuples-only \
+            --no-align \
+            --set ON_ERROR_STOP=1 \
+            --command "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename"
+    )
+}
+
+database_ownership_manifest() {
+    local database="$1"
+    local output="$2"
+    docker exec "$POSTGRES_NAME" psql \
+        --username "$POSTGRES_ADMIN_USER" \
+        --dbname "$database" \
+        --tuples-only \
+        --no-align \
+        --field-separator $'\t' \
+        --set ON_ERROR_STOP=1 \
+        --command "
+            SELECT n.nspname || '.' || c.relname, pg_get_userbyid(c.relowner)
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p', 'S', 'v', 'm', 'f')
+            ORDER BY 1
+        " >"$output"
+}
+
+flyway_manifest() {
+    local database="$1"
+    local output="$2"
+    docker exec "$POSTGRES_NAME" psql \
+        --username "$POSTGRES_ADMIN_USER" \
+        --dbname "$database" \
+        --set ON_ERROR_STOP=1 \
+        --command "COPY (
+            SELECT installed_rank, version, description, type, script, checksum, success
+            FROM flyway_schema_history
+            ORDER BY installed_rank
+        ) TO STDOUT WITH CSV HEADER" >"$output"
+}
+
+media_manifest() {
+    local root="$1"
+    local output="$2"
+    python3 - "$root" "$output" <<'PY'
+import hashlib
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+output = pathlib.Path(sys.argv[2])
+lines = []
+for path in sorted(root.rglob("*")):
+    if path.is_symlink():
+        raise SystemExit(f"media recovery tree contains a symlink: {path}")
+    if path.is_file():
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        lines.append(f"{digest}\t{path.stat().st_size}\t{path.relative_to(root).as_posix()}")
+output.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+PY
+}
+
+verify_docker_restore_ownership() {
+    local backup_dir="$RUN_DIR/docker-ownership-backup"
+    mkdir -p "$backup_dir/user/workspace"
+    printf 'restored\n' >"$backup_dir/user/workspace/object.bin"
+    RESTORE_VOLUME_NAME="someday-recovery-ownership-$RUN_SUFFIX"
+    docker volume create "$RESTORE_VOLUME_NAME" >/dev/null
+    docker run --rm \
+        --user 0:0 \
+        --volume "$backup_dir:/backup:ro" \
+        --volume "$RESTORE_VOLUME_NAME:/media" \
+        --entrypoint /bin/sh \
+        "$POSTGRES_IMAGE" \
+        -ec 'cp -R /backup/. /media/ && chown -R 10001:10001 /media'
+    docker run --rm \
+        --user 10001:10001 \
+        --volume "$RESTORE_VOLUME_NAME:/media" \
+        --entrypoint /bin/sh \
+        "$POSTGRES_IMAGE" \
+        -ec 'test "$(cat /media/user/workspace/object.bin)" = restored && printf "new\n" > /media/user/workspace/new.bin && test -s /media/user/workspace/new.bin'
+}
+
+assert_manifest_equal() {
+    local label="$1"
+    local source="$2"
+    local restored="$3"
+    if ! cmp -s "$source" "$restored"; then
+        diff -u "$source" "$restored" >&2 || true
+        die "$label differs between source and isolated restore"
+    fi
+}
+
+assert_recovery_write_evidence() {
+    local audit_file="$1"
+    awk -F '\t' '$1 == "POST" && $2 ~ /\/entities\/push$/ { found = 1 } END { exit !found }' \
+        "$audit_file" || die "paired client did not reach the read-only proxy with an entity push"
+    awk -F '\t' '$1 == "PUT" && $2 ~ /\/media\/[^\/]+$/ { found = 1 } END { exit !found }' \
+        "$audit_file" || die "paired client did not reach the read-only proxy with a media upload"
+    cp "$audit_file" "$FINAL_DIR/recovery-write-rejections.tsv"
+}
+
+run_media_integrity() {
+    local database_url="$1"
+    local media_dir="$2"
+    SOMEDAY_DEPLOYMENT_MODE=production \
+    SOMEDAY_PUBLIC_BASE_URL=https://someday-recovery.invalid \
+    SOMEDAY_DB_URL="$database_url" \
+    SOMEDAY_DB_USER="$POSTGRES_APP_USER" \
+    SOMEDAY_DB_PASSWORD="$POSTGRES_APP_PASSWORD" \
+    SOMEDAY_DB_TLS_MODE=private \
+    SOMEDAY_MEDIA_BACKEND=filesystem \
+    SOMEDAY_MEDIA_BLOB_DIR="$media_dir" \
+    SOMEDAY_JWT_SECRET="$JWT_SECRET" \
+        "$ROOT_DIR/server/build/install/server/bin/verify-media-integrity"
+}
+
+restore_recovery_unit() {
+    local source_rows="$RECOVERY_SET_DIR/source-rows.tsv"
+    local restored_rows="$RECOVERY_SET_DIR/restored-rows.tsv"
+    local source_owners="$RECOVERY_SET_DIR/source-owners.tsv"
+    local restored_owners="$RECOVERY_SET_DIR/restored-owners.tsv"
+    local source_flyway="$RECOVERY_SET_DIR/source-flyway.csv"
+    local restored_flyway="$RECOVERY_SET_DIR/restored-flyway.csv"
+    local source_media="$RECOVERY_SET_DIR/source-media.tsv"
+    local restored_media="$RECOVERY_SET_DIR/restored-media.tsv"
+    local database_dump="$RECOVERY_SET_DIR/postgresql.dump"
+    local media_archive="$RECOVERY_SET_DIR/media.tar"
+    local database_owner media_rows object_count missing_file missing_status
+
+    database_row_manifest "$SOURCE_DATABASE" "$source_rows"
+    database_ownership_manifest "$SOURCE_DATABASE" "$source_owners"
+    flyway_manifest "$SOURCE_DATABASE" "$source_flyway"
+    media_manifest "$SOURCE_MEDIA_DIR" "$source_media"
+    media_rows="$(awk -F '\t' '$1 == "someday_media_v3_objects" { print $2 }' "$source_rows")"
+    object_count="$(wc -l <"$source_media" | tr -d '[:space:]')"
+    [[ "$media_rows" =~ ^[1-9][0-9]*$ ]] || die "recovery source has no PostgreSQL media rows"
+    [[ "$object_count" =~ ^[1-9][0-9]*$ ]] || die "recovery source has no filesystem media objects"
+
+    docker exec "$POSTGRES_NAME" pg_dump \
+        --username "$POSTGRES_ADMIN_USER" \
+        --dbname "$SOURCE_DATABASE" \
+        --format custom >"$database_dump"
+    tar -C "$SOURCE_MEDIA_DIR" -cf "$media_archive" .
+    [[ -s "$database_dump" && -s "$media_archive" ]] || die "recovery capture is empty"
+
+    docker exec "$POSTGRES_NAME" createdb \
+        --username "$POSTGRES_ADMIN_USER" \
+        --owner "$POSTGRES_APP_USER" \
+        "$RESTORED_DATABASE"
+    docker exec -i "$POSTGRES_NAME" pg_restore \
+        --username "$POSTGRES_ADMIN_USER" \
+        --dbname "$RESTORED_DATABASE" \
+        --no-acl \
+        --exit-on-error <"$database_dump"
+    tar -C "$RESTORED_MEDIA_DIR" -xf "$media_archive"
+
+    database_row_manifest "$RESTORED_DATABASE" "$restored_rows"
+    database_ownership_manifest "$RESTORED_DATABASE" "$restored_owners"
+    flyway_manifest "$RESTORED_DATABASE" "$restored_flyway"
+    media_manifest "$RESTORED_MEDIA_DIR" "$restored_media"
+    assert_manifest_equal "database row counts" "$source_rows" "$restored_rows"
+    assert_manifest_equal "database ownership" "$source_owners" "$restored_owners"
+    assert_manifest_equal "Flyway history" "$source_flyway" "$restored_flyway"
+    assert_manifest_equal "media count and byte digests" "$source_media" "$restored_media"
+    database_owner="$(
+        docker exec "$POSTGRES_NAME" psql \
+            --username "$POSTGRES_ADMIN_USER" \
+            --dbname "$RESTORED_DATABASE" \
+            --tuples-only \
+            --no-align \
+            --command "SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = '$RESTORED_DATABASE'" |
+            tr -d '[:space:]'
+    )"
+    [[ "$database_owner" == "$POSTGRES_APP_USER" ]] || die "restored database owner is $database_owner"
+    awk -F '\t' -v owner="$POSTGRES_APP_USER" '$2 != owner { exit 1 }' "$restored_owners" ||
+        die "restored public relations are not owned by $POSTGRES_APP_USER"
+    [[ "$(wc -l <"$restored_flyway" | tr -d '[:space:]')" -gt 1 ]] || die "restored Flyway history is empty"
+
+    RESTORED_DB_URL="jdbc:postgresql://127.0.0.1:$POSTGRES_PORT/$RESTORED_DATABASE"
+    run_media_integrity "$RESTORED_DB_URL" "$RESTORED_MEDIA_DIR"
+    missing_file="$(
+        docker exec "$POSTGRES_NAME" psql \
+            --username "$POSTGRES_ADMIN_USER" \
+            --dbname "$RESTORED_DATABASE" \
+            --tuples-only \
+            --no-align \
+            --set ON_ERROR_STOP=1 \
+            --command "
+                SELECT user_id || '/' || workspace_id || '/' ||
+                    substr(media_id, 1, 2) || '/' || substr(media_id, 3, 2) || '/' ||
+                    media_id || '/object.bin'
+                FROM someday_media_v3_objects
+                ORDER BY user_id, workspace_id, media_id
+                LIMIT 1
+            " |
+            tr -d '[:space:]'
+    )"
+    [[ -n "$missing_file" ]] || die "could not select a media object for negative recovery evidence"
+    mv "$RESTORED_MEDIA_DIR/$missing_file" "$RUN_DIR/temporarily-missing-media.bin"
+    set +e
+    run_media_integrity "$RESTORED_DB_URL" "$RESTORED_MEDIA_DIR"
+    missing_status=$?
+    set -e
+    [[ "$missing_status" -eq 2 ]] || die "missing media verifier returned $missing_status instead of 2"
+    mv "$RUN_DIR/temporarily-missing-media.bin" "$RESTORED_MEDIA_DIR/$missing_file"
+    run_media_integrity "$RESTORED_DB_URL" "$RESTORED_MEDIA_DIR"
+}
+
+for command in curl docker java python3 tar; do
+    require_command "$command"
+done
+require_java_21
+[[ -x "$GRADLEW" ]] || die "Gradle wrapper is not executable: $GRADLEW"
+docker info >/dev/null 2>&1 || die "Docker daemon is required"
+JWT_SECRET="$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')"
+
+if ! docker image inspect "$POSTGRES_IMAGE" >/dev/null 2>&1; then
+    info "pulling pinned PostgreSQL 17 image"
+    docker pull "$POSTGRES_IMAGE" >/dev/null
+fi
+info "checking restored Docker media ownership"
+verify_docker_restore_ownership
+docker run -d --rm \
+    --name "$POSTGRES_NAME" \
+    --tmpfs /var/lib/postgresql/data:rw,noexec,nosuid,size=512m \
+    -e POSTGRES_DB=postgres \
+    -e POSTGRES_USER="$POSTGRES_ADMIN_USER" \
+    -e POSTGRES_PASSWORD="$POSTGRES_ADMIN_PASSWORD" \
+    -p 127.0.0.1::5432 \
+    "$POSTGRES_IMAGE" >/dev/null
+POSTGRES_PORT="$(docker port "$POSTGRES_NAME" 5432/tcp | sed -n '1s/.*://p' | tr -d '[:space:]')"
+[[ "$POSTGRES_PORT" =~ ^[0-9]+$ ]] || die "could not resolve PostgreSQL port"
+wait_for "PostgreSQL" docker exec "$POSTGRES_NAME" pg_isready -U "$POSTGRES_ADMIN_USER" -d postgres
+docker exec "$POSTGRES_NAME" psql \
+    --username "$POSTGRES_ADMIN_USER" \
+    --dbname postgres \
+    --set ON_ERROR_STOP=1 \
+    --command "CREATE ROLE $POSTGRES_APP_USER LOGIN PASSWORD '$POSTGRES_APP_PASSWORD' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS" \
+    >/dev/null
+docker exec "$POSTGRES_NAME" createdb \
+    --username "$POSTGRES_ADMIN_USER" \
+    --owner "$POSTGRES_APP_USER" \
+    "$SOURCE_DATABASE"
+
+cd "$ROOT_DIR"
+info "building the server distribution"
+"$GRADLEW" :server:installDist "$GATE_PROPERTY" --dependency-verification=strict --stacktrace
+
+SERVER_PORT="$(free_port)"
+SERVER_ENDPOINT="http://127.0.0.1:$SERVER_PORT"
+SOURCE_DB_URL="jdbc:postgresql://127.0.0.1:$POSTGRES_PORT/$SOURCE_DATABASE"
+start_server "$SOURCE_DB_URL" "$SERVER_PORT" "$SOURCE_MEDIA_DIR" true "$RUN_DIR/source-server.log"
+
+info "seeding non-empty text and media with a paired content-empty verifier"
+SOMEDAY_E2E_ENDPOINT="$SERVER_ENDPOINT" \
+SOMEDAY_RECOVERY_GATE_DIR="$HANDSHAKE_DIR" \
+    "$GRADLEW" \
+        :integration-tests:serverRecoveryTest \
+        "$GATE_PROPERTY" \
+        --dependency-verification=strict \
+        --stacktrace >"$TEST_LOG" 2>&1 &
+TEST_PID=$!
+for attempt in $(seq 1 1200); do
+    [[ ! -f "$HANDSHAKE_DIR/ready" ]] || break
+    if ! kill -0 "$TEST_PID" >/dev/null 2>&1; then
+        tail -n 160 "$TEST_LOG" >&2 || true
+        die "recovery journey exited before its paired client became ready"
+    fi
+    sleep 0.1
+done
+[[ -f "$HANDSHAKE_DIR/ready" ]] || die "paired recovery client did not become ready"
+
+info "capturing and restoring the PostgreSQL and media recovery unit"
+stop_server
+restore_recovery_unit
+
+BACKEND_PORT="$(free_port)"
+start_server "$RESTORED_DB_URL" "$BACKEND_PORT" "$RESTORED_MEDIA_DIR" false "$RUN_DIR/restored-server.log"
+python3 "$ROOT_DIR/scripts/fixtures/recovery-read-only-proxy.py" \
+    --listen-port "$SERVER_PORT" \
+    --backend-port "$BACKEND_PORT" \
+    --audit-file "$RUN_DIR/recovery-write-rejections.tsv" \
+    >"$RUN_DIR/recovery-read-only-proxy.log" 2>&1 &
+PROXY_PID=$!
+wait_for "recovery read-only proxy" curl -fsS "$SERVER_ENDPOINT/health"
+: >"$HANDSHAKE_DIR/continue"
+
+if ! wait "$TEST_PID"; then
+    TEST_PID=""
+    tail -n 200 "$TEST_LOG" >&2 || true
+    die "paired-client recovery journey failed"
+fi
+TEST_PID=""
+assert_recovery_write_evidence "$RUN_DIR/recovery-write-rejections.tsv"
+database_row_manifest "$SOURCE_DATABASE" "$RECOVERY_SET_DIR/source-post-client-rows.tsv"
+database_row_manifest "$RESTORED_DATABASE" "$RECOVERY_SET_DIR/restored-post-client-rows.tsv"
+media_manifest "$RESTORED_MEDIA_DIR" "$RECOVERY_SET_DIR/restored-post-client-media.tsv"
+assert_manifest_equal "database row counts after read-only client verification" \
+    "$RECOVERY_SET_DIR/source-post-client-rows.tsv" \
+    "$RECOVERY_SET_DIR/restored-post-client-rows.tsv"
+assert_manifest_equal "media after read-only client verification" \
+    "$RECOVERY_SET_DIR/source-media.tsv" \
+    "$RECOVERY_SET_DIR/restored-post-client-media.tsv"
+
+cp "$RECOVERY_SET_DIR/source-rows.tsv" "$FINAL_DIR/source-rows.tsv"
+cp "$RECOVERY_SET_DIR/restored-rows.tsv" "$FINAL_DIR/restored-rows.tsv"
+cp "$RECOVERY_SET_DIR/source-flyway.csv" "$FINAL_DIR/source-flyway.csv"
+cp "$RECOVERY_SET_DIR/restored-flyway.csv" "$FINAL_DIR/restored-flyway.csv"
+cp "$RECOVERY_SET_DIR/source-media.tsv" "$FINAL_DIR/source-media.tsv"
+cp "$RECOVERY_SET_DIR/restored-media.tsv" "$FINAL_DIR/restored-media.tsv"
+info "passed; evidence: $FINAL_DIR"

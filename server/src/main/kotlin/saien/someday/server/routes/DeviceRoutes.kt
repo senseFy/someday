@@ -8,6 +8,8 @@ import saien.someday.server.api.DevicesResponse
 import saien.someday.server.api.StatusResponse
 import saien.someday.server.auth.scopesForDevice
 import saien.someday.server.persistence.DeviceRecord
+import saien.someday.server.persistence.DeviceIdAlreadyClaimedException
+import saien.someday.server.persistence.DeviceRevokedException
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.call
 import io.ktor.server.response.respond
@@ -27,22 +29,34 @@ fun Route.deviceRoutes(context: ServerContext) {
             val request = call.receiveJsonOrNull<DeviceRegistrationRequest>() ?: return@post
             val deviceName = request.name.trim()
             val platform = request.platform.trim().lowercase()
-            if (deviceName.isBlank() || platform.isBlank()) {
+            val requestedDeviceId = runCatching { UUID.fromString(request.deviceId) }.getOrNull()
+            if (deviceName.isBlank() || platform.isBlank() || requestedDeviceId == null ||
+                requestedDeviceId.toString() != request.deviceId.trim().lowercase() ||
+                requestedDeviceId.version() != 4 ||
+                requestedDeviceId.variant() != 2
+            ) {
                 call.respondError(HttpStatusCode.BadRequest, "invalid_request")
                 return@post
             }
 
             val refreshToken = context.tokenService.issueRefreshToken()
-            val deviceSession = context.repository.registerDevice(
-                userId = auth.userId,
-                currentSessionId = auth.sessionId,
-                currentDeviceId = auth.deviceId,
-                name = deviceName,
-                platform = platform,
-                refreshTokenHash = refreshToken.refreshTokenHash,
-                sessionExpiresAt = Instant.now().plus(context.config.refreshTokenTtl),
-                refreshExpiresAt = Instant.now().plus(context.config.refreshTokenTtl),
-            )
+            val deviceSession = try {
+                context.repository.registerDevice(
+                    userId = auth.userId,
+                    deviceId = requestedDeviceId,
+                    name = deviceName,
+                    platform = platform,
+                    refreshTokenHash = refreshToken.refreshTokenHash,
+                    sessionExpiresAt = Instant.now().plus(context.config.refreshTokenTtl),
+                    refreshExpiresAt = Instant.now().plus(context.config.refreshTokenTtl),
+                )
+            } catch (_: DeviceIdAlreadyClaimedException) {
+                call.respondError(HttpStatusCode.Conflict, "device_id_already_claimed")
+                return@post
+            } catch (_: DeviceRevokedException) {
+                call.respondError(HttpStatusCode.Conflict, "device_revoked")
+                return@post
+            }
             val tokens = context.tokenService.issueTokens(
                 userId = auth.userId,
                 sessionId = deviceSession.sessionId,

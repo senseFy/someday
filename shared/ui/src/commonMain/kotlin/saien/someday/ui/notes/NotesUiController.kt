@@ -5,57 +5,64 @@ package saien.someday.ui.notes
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import kotlinx.datetime.DatePeriod
+import kotlinx.datetime.LocalDate
+import kotlinx.datetime.TimeZone
+import kotlinx.datetime.atStartOfDayIn
+import kotlinx.datetime.minus
+import kotlinx.datetime.toLocalDateTime
 import saien.someday.domain.location.LocationCaptureAdapter
 import saien.someday.domain.location.LocationCaptureResult
 import saien.someday.domain.location.UnavailableLocationCaptureAdapter
-import saien.someday.domain.notes.ConflictDetails
-import saien.someday.domain.notes.ConflictResolutionAction
 import saien.someday.domain.notes.CausalEditToken
+import saien.someday.domain.notes.ConflictBranchResolutionResult
+import saien.someday.domain.notes.ConflictDetails
 import saien.someday.domain.notes.DeletedWorkspaceItem
 import saien.someday.domain.notes.DeletedWorkspaceItemType
-import saien.someday.domain.notes.NoteDetails
 import saien.someday.domain.notes.NoteBatchDeletion
 import saien.someday.domain.notes.NoteBatchUndelete
 import saien.someday.domain.notes.NoteBatchUpdate
+import saien.someday.domain.notes.NoteDetails
 import saien.someday.domain.notes.NoteInput
 import saien.someday.domain.notes.NoteSummary
 import saien.someday.domain.notes.NoteSyncBadge
 import saien.someday.domain.notes.NoteVersionSummary
-import saien.someday.domain.notes.NotebookSummary
 import saien.someday.domain.notes.NotebookConflictDetails
+import saien.someday.domain.notes.NotebookSummary
 import saien.someday.domain.notes.NotesLocationInput
 import saien.someday.domain.notes.NotesRepository
 import saien.someday.domain.notes.noteCalendarDate
 import saien.someday.domain.settings.EditorPreferences
 import saien.someday.ui.i18n.NotesUiStrings
 import saien.someday.ui.i18n.formatUiString
-import kotlinx.coroutines.CoroutineDispatcher
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
-import kotlinx.datetime.DatePeriod
-import kotlin.time.Instant
-import kotlinx.datetime.LocalDate
-import kotlinx.datetime.TimeZone
-import kotlinx.datetime.atStartOfDayIn
-import kotlinx.datetime.minus
-import kotlinx.datetime.toLocalDateTime
+import saien.someday.ui.media.MediaImportUiResult
 import kotlin.time.Clock
+import kotlin.time.Instant
 
 class NotesUiController(
     private val repository: NotesRepository,
-    private val strings: NotesUiStrings = NotesUiStrings(),
+    strings: NotesUiStrings = NotesUiStrings(),
     private val locationCaptureAdapter: LocationCaptureAdapter = UnavailableLocationCaptureAdapter,
     initialNotebookId: String? = null,
     private var editorPreferences: EditorPreferences = EditorPreferences(),
     private val currentDateProvider: () -> LocalDate = { currentLocalDate() },
     private val backgroundDispatcher: CoroutineDispatcher = Dispatchers.Default,
 ) {
+    private var strings = strings
     var state: NotesUiState by mutableStateOf(NotesUiState(selectedNotebookId = initialNotebookId))
         private set
     private var nextEditorSessionIdSeed: Long = 1L
 
     fun updateEditorPreferences(preferences: EditorPreferences) {
         editorPreferences = preferences
+    }
+
+    fun updateLocalizedStrings(updated: NotesUiStrings) {
+        strings = updated
     }
 
     suspend fun refresh(preferredNotebookId: String? = state.selectedNotebookId) {
@@ -901,6 +908,49 @@ class NotesUiController(
         )
     }
 
+    /**
+     * Applies a completed picker result only to the editor session that opened
+     * it. Cancel/failure provide feedback without changing Markdown.
+     */
+    fun applyMediaImportResult(
+        editorSessionId: Long,
+        result: MediaImportUiResult,
+    ): Boolean {
+        val editor = state.editor?.takeIf { it.sessionId == editorSessionId } ?: return false
+        return when (result) {
+            is MediaImportUiResult.Imported -> {
+                val edit = insertImportedMarkdownImage(
+                    source = editor.markdownBody,
+                    selectionStart = editor.markdownSelectionStart,
+                    selectionEnd = editor.markdownSelectionEnd,
+                    assetUri = result.uri,
+                    suggestedAltText = result.suggestedAltText,
+                )
+                state = state.copy(
+                    editor = editor.copy(
+                        markdownBody = edit.text,
+                        markdownSelectionStart = edit.selectionStart,
+                        markdownSelectionEnd = edit.selectionEnd,
+                        markdownPreviewVisible = false,
+                        validationMessage = null,
+                    ),
+                    feedbackMessage = strings.imageAdded,
+                )
+                true
+            }
+
+            MediaImportUiResult.Cancelled -> {
+                state = state.copy(feedbackMessage = strings.imageImportCancelled)
+                false
+            }
+
+            is MediaImportUiResult.Failed -> {
+                state = state.copy(feedbackMessage = strings.imageImportFailed)
+                false
+            }
+        }
+    }
+
     suspend fun saveEditor(): Boolean =
         saveEditor(clearEditor = true)
 
@@ -1125,21 +1175,6 @@ class NotesUiController(
         state = state.copy(versionHistory = history.copy(visible = false))
     }
 
-
-    private fun conflictActionLabel(action: ConflictResolutionAction): String =
-        when (action) {
-            ConflictResolutionAction.MergeIntoOriginal -> strings.conflictActionMerge
-            ConflictResolutionAction.KeepConflictCopy -> strings.conflictActionKeepCopy
-            ConflictResolutionAction.RestoreOriginalFromConflict -> strings.conflictActionRestoreOriginal
-            ConflictResolutionAction.DeleteConflictCopy -> strings.conflictActionDeleteCopy
-        }
-
-    suspend fun resolveConflict(action: ConflictResolutionAction): Boolean {
-        return resolveConflictWithFeedback(formatUiString(strings.conflictResolvedAction, conflictActionLabel(action))) { conflictNoteId ->
-            repository.resolveConflict(conflictNoteId, action)
-        }
-    }
-
     suspend fun resolveConflictBranch(versionId: String): Boolean {
         val expectedHeads = state.conflictDetails?.expectedHeadVersionIds.orEmpty()
         return resolveConflictWithFeedback(strings.conflictResolvedBranch) { conflictNoteId ->
@@ -1149,14 +1184,18 @@ class NotesUiController(
 
     private suspend fun resolveConflictWithFeedback(
         successMessage: String,
-        resolver: (String) -> NoteDetails?,
+        resolver: (String) -> ConflictBranchResolutionResult,
     ): Boolean {
         val conflictNoteId = state.conflictDetails?.conflictNoteId ?: state.editor?.noteId ?: return false
         val selectedNotebookId = state.selectedNotebookId
         val searchQuery = state.searchQuery
         return runCatching {
             withContext(backgroundDispatcher) {
-                val resolved = resolver(conflictNoteId)
+                val resolved = when (val result = resolver(conflictNoteId)) {
+                    is ConflictBranchResolutionResult.Content -> result.note
+                    ConflictBranchResolutionResult.Deletion -> null
+                    ConflictBranchResolutionResult.Rejected -> error(strings.unknownError)
+                }
                 ResolvedConflictData(
                     resolved = resolved,
                     repositoryData = loadRepositoryDataBlocking(
@@ -1193,6 +1232,7 @@ class NotesUiController(
                 true
             },
             onFailure = { failure ->
+                if (failure is CancellationException) throw failure
                 state = state.copy(feedbackMessage = formatUiString(strings.cannotResolveConflict, failure.message ?: strings.unknownError))
                 false
             },
@@ -1686,7 +1726,7 @@ class NotesUiController(
                     "Customer interview synthesis",
                     "Metrics review with support",
                     "Onboarding copy pass",
-                    "WebDAV restore edge cases",
+                    "Self-hosted sync recovery edge cases",
                     "Sprint planning constraints",
                     "Desktop sidebar polish",
                 ),
@@ -1699,7 +1739,7 @@ class NotesUiController(
                     "Support tickets clustered around sync setup, not editing; the settings screen should make that visible.",
                     "Shorter headings worked better, especially on mobile where every extra line pushed the form down.",
                     "Restore needs to handle missing folders, stale credentials, and a user switching devices mid-flow.",
-                    "The release window is tight because QA also needs Android install time and WebDAV account setup.",
+                    "The release window is tight because QA also needs Android install time and self-hosted server setup.",
                     "The drag target feels right at 8 dp, but the divider needs to stay quiet until hover or drag.",
                 ),
                 checklist = listOf(

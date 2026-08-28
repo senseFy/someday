@@ -10,13 +10,29 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.uikit.OnFocusBehavior
 import androidx.compose.ui.window.ComposeUIViewController
 import saien.someday.domain.settings.ClientSettings
 import saien.someday.domain.settings.WorkspacePreferencesConflictResolver
+import saien.someday.domain.media.MediaAssetId
+import saien.someday.domain.media.isSafeOriginalFileName
+import saien.someday.sync.AuthorityCoordinatedMediaAssetStore
+import saien.someday.data.media.MediaAssetImportRequest
+import saien.someday.data.media.MediaAssetLocalState
+import saien.someday.data.media.MediaAssetVerificationResult
 import saien.someday.ui.SomedayApp
 import saien.someday.ui.SomedayBootstrapScreen
+import saien.someday.ui.media.MAX_MEDIA_PREVIEW_BYTE_COUNT
+import saien.someday.ui.media.MediaImportRunner
+import saien.someday.ui.media.MediaImportUiResult
+import saien.someday.ui.media.MediaMaterializationRunner
+import saien.someday.ui.media.MediaMaterializationUiResult
+import saien.someday.ui.media.MediaPreviewLoader
+import saien.someday.ui.media.MediaPreviewUiResult
+import saien.someday.ui.media.MediaUiFailureReason
+import saien.someday.ui.media.MediaUiPorts
 import saien.someday.ui.settings.DayOneImportRunner
 import saien.someday.ui.settings.SettingsImportSummary
 import kotlinx.coroutines.CoroutineScope
@@ -39,6 +55,7 @@ import platform.UIKit.UIViewController
 import platform.UniformTypeIdentifiers.UTTypeArchive
 import platform.UniformTypeIdentifiers.UTTypeData
 import platform.UniformTypeIdentifiers.UTTypeZIP
+import platform.UniformTypeIdentifiers.UTTypeImage
 import platform.UserNotifications.UNNotification
 import platform.UserNotifications.UNNotificationPresentationOptionBanner
 import platform.UserNotifications.UNNotificationPresentationOptionList
@@ -48,6 +65,9 @@ import platform.UserNotifications.UNUserNotificationCenter
 import platform.UserNotifications.UNUserNotificationCenterDelegateProtocol
 import platform.darwin.NSObject
 import platform.posix.memcpy
+import okio.FileSystem
+import okio.Path.Companion.toPath
+import okio.buffer
 
 @OptIn(ExperimentalForeignApi::class)
 fun MainViewController(): UIViewController {
@@ -79,13 +99,18 @@ fun MainViewController(): UIViewController {
                     val clientRepositories = startupTrace.measure("clientRepositories") {
                         createIosClientRepositories()
                     }
-                    val initialSettings = startupTrace.measure("settings.load") {
-                        clientRepositories.settingsRepository.load()
+                    try {
+                        val initialSettings = startupTrace.measure("settings.load") {
+                            clientRepositories.settingsRepository.load()
+                        }
+                        IosAppBootstrap(
+                            repositories = clientRepositories,
+                            initialSettings = initialSettings,
+                        )
+                    } catch (failure: Throwable) {
+                        runCatching(clientRepositories::close)
+                        throw failure
                     }
-                    IosAppBootstrap(
-                        repositories = clientRepositories,
-                        initialSettings = initialSettings,
-                    )
                 }
             }.onFailure { failure ->
                 bootstrapError = failure.message ?: "unknown error"
@@ -100,6 +125,9 @@ fun MainViewController(): UIViewController {
         }
 
         val clientRepositories = loaded.repositories
+        DisposableEffect(clientRepositories) {
+            onDispose(clientRepositories::close)
+        }
         val initialSettings = loaded.initialSettings
         var foregroundSyncSignal by remember { mutableStateOf(0) }
         val onThisDayNotificationScheduler = remember(clientRepositories.notesRepository) {
@@ -113,6 +141,35 @@ fun MainViewController(): UIViewController {
         }
         val workspacePairingScanner = remember {
             IosWorkspacePairingScanner(rootControllerProvider = { rootController })
+        }
+        val mediaCoroutineScope = rememberCoroutineScope()
+        val mediaUiPorts = remember(clientRepositories) {
+            MediaUiPorts(
+                importRunner = IosMediaImportRunner(
+                    rootControllerProvider = { rootController },
+                    clientRepositories = clientRepositories,
+                ),
+                previewLoader = MediaPreviewLoader { assetId ->
+                    withContext(Dispatchers.Default) {
+                        clientRepositories.localMediaAssetStore.loadBoundedPreview(assetId)
+                    }
+                },
+                materializationRunner = MediaMaterializationRunner { assetId, onResult ->
+                    mediaCoroutineScope.launch {
+                        val result = withContext(Dispatchers.Default) {
+                            runCatching {
+                                clientRepositories.mediaCoordinator.materialize(assetId)
+                                MediaMaterializationUiResult.Materialized
+                            }.getOrElse {
+                                MediaMaterializationUiResult.Failed(
+                                    MediaUiFailureReason.MaterializationFailed,
+                                )
+                            }
+                        }
+                        onResult(result)
+                    }
+                },
+            )
         }
         DisposableEffect(notificationDelegate) {
             val observer = NSNotificationCenter.defaultCenter.addObserverForName(
@@ -129,8 +186,6 @@ fun MainViewController(): UIViewController {
         SomedayApp(
             platformName = IosShellEntrypoint.platformName,
             developerOptionsEnabled = IosBuildConfig.DEVELOPER_OPTIONS_ENABLED,
-            systemV2ActivationEnabled = IosBuildConfig.SOMEDAY_SYSTEM_V2_RELEASE_ENABLED ||
-                IosBuildConfig.SOMEDAY_SYSTEM_V2_DEVELOPMENT_ENABLED,
             initialSettings = initialSettings,
             notesRepository = clientRepositories.notesRepository,
             locationCaptureAdapter = IosLocationCaptureAdapter(),
@@ -143,21 +198,14 @@ fun MainViewController(): UIViewController {
                 clientRepositories.settingsRepository as? WorkspacePreferencesConflictResolver,
             onLocalExport = clientRepositories::exportLocalDataSummary,
             dayOneImportRunner = dayOneImportRunner,
-            webDavConnectionTester = clientRepositories.webDavBackupService,
-            webDavCredentialStore = clientRepositories.webDavCredentialStore,
-            webDavBackupRunner = clientRepositories.webDavBackupService,
-            webDavBackupCatalogRunner = clientRepositories.webDavBackupService,
-            webDavRestoreRunner = clientRepositories.webDavBackupService,
+            mediaUiPorts = mediaUiPorts,
             selfHostedSetupClient = clientRepositories.selfHostedSetupClient,
             selfHostedSessionCredentialStore = clientRepositories.selfHostedSessionCredentialStore,
             manualSyncRunner = clientRepositories.manualSyncRunner,
-            bindManualSyncProgressListener = clientRepositories.bindManualSyncProgressListener,
-            syncV2MaintenanceRunner = clientRepositories.syncV2MaintenanceRunner,
             workspacePairingInvitationCreator = clientRepositories.workspacePairingInvitationCreator,
             workspacePairingInvitationJoiner = clientRepositories.workspacePairingInvitationJoiner,
             workspacePairingInvitationCanceller = clientRepositories.workspacePairingInvitationCanceller,
             workspacePairingScanner = workspacePairingScanner,
-            webDavDiscoveredDevicesRunner = clientRepositories.webDavDiscoveredDevicesRunner,
             foregroundSyncSignal = foregroundSyncSignal,
             startupTrace = traceMark,
         )
@@ -198,6 +246,135 @@ private data class IosAppBootstrap(
     val repositories: IosClientRepositories,
     val initialSettings: ClientSettings,
 )
+
+@OptIn(ExperimentalForeignApi::class)
+private class IosMediaImportRunner(
+    private val rootControllerProvider: () -> UIViewController?,
+    private val clientRepositories: IosClientRepositories,
+) : MediaImportRunner {
+    private var activeDelegate: IosMediaDocumentPickerDelegate? = null
+
+    @Suppress("UNUSED_PARAMETER")
+    override fun start(
+        pickerTitle: String,
+        onResult: (MediaImportUiResult) -> Unit,
+    ) {
+        val rootController = rootControllerProvider()
+        if (rootController == null) {
+            onResult(MediaImportUiResult.Failed(MediaUiFailureReason.Unavailable))
+            return
+        }
+        val delegate = IosMediaDocumentPickerDelegate(clientRepositories) { result ->
+            activeDelegate = null
+            onResult(result)
+        }
+        activeDelegate = delegate
+        val picker = UIDocumentPickerViewController(
+            forOpeningContentTypes = listOf(UTTypeImage),
+            asCopy = true,
+        )
+        picker.setDelegate(delegate)
+        rootController.presentViewController(picker, animated = true, completion = null)
+    }
+}
+
+@OptIn(ExperimentalForeignApi::class)
+private class IosMediaDocumentPickerDelegate(
+    private val clientRepositories: IosClientRepositories,
+    private val onComplete: (MediaImportUiResult) -> Unit,
+) : NSObject(), UIDocumentPickerDelegateProtocol {
+    override fun documentPicker(
+        controller: UIDocumentPickerViewController,
+        didPickDocumentsAtURLs: List<*>,
+    ) {
+        val url = didPickDocumentsAtURLs.firstOrNull() as? NSURL
+        if (url == null) {
+            onComplete(MediaImportUiResult.Cancelled)
+            return
+        }
+        CoroutineScope(Dispatchers.Main).launch {
+            val result = withContext(Dispatchers.Default) {
+                runCatching {
+                    url.importInto(clientRepositories.localMediaAssetStore)
+                }.getOrElse {
+                    MediaImportUiResult.Failed(MediaUiFailureReason.ImportFailed)
+                }
+            }
+            onComplete(result)
+        }
+    }
+
+    override fun documentPickerWasCancelled(controller: UIDocumentPickerViewController) {
+        onComplete(MediaImportUiResult.Cancelled)
+    }
+}
+
+@OptIn(ExperimentalForeignApi::class)
+private fun NSURL.importInto(store: AuthorityCoordinatedMediaAssetStore): MediaImportUiResult {
+    val didAccess = startAccessingSecurityScopedResource()
+    try {
+        val localPath = path ?: error("The selected image has no local file path.")
+        val originalName = lastPathComponent?.takeIf(::isSafeOriginalFileName)
+        val source = FileSystem.SYSTEM.source(localPath.toPath())
+        val imported = try {
+            store.importAsset(
+                source = source,
+                request = MediaAssetImportRequest(
+                    originalFileName = originalName,
+                    maxBytes = MAX_MEDIA_PREVIEW_BYTE_COUNT.toLong(),
+                    maxDecodedPixelCount = MAX_MEDIA_PREVIEW_PIXEL_COUNT,
+                ),
+            )
+        } finally {
+            source.close()
+        }
+        return MediaImportUiResult.Imported(
+            imported.asset.metadata.id,
+            originalName?.substringBeforeLast('.')?.take(120).orEmpty(),
+        )
+    } finally {
+        if (didAccess) stopAccessingSecurityScopedResource()
+    }
+}
+
+private fun AuthorityCoordinatedMediaAssetStore.loadBoundedPreview(assetId: MediaAssetId): MediaPreviewUiResult {
+    val asset = getAsset(assetId) ?: return MediaPreviewUiResult.Missing
+    when (asset.localState) {
+        MediaAssetLocalState.Missing -> return MediaPreviewUiResult.Missing
+        MediaAssetLocalState.Corrupt -> return MediaPreviewUiResult.Missing
+        MediaAssetLocalState.Available -> Unit
+    }
+    if (asset.metadata.byteSize > MAX_MEDIA_PREVIEW_BYTE_COUNT ||
+        asset.metadata.decodedPixelCount > MAX_MEDIA_PREVIEW_PIXEL_COUNT
+    ) {
+        return MediaPreviewUiResult.Failed(MediaUiFailureReason.PreviewTooLarge)
+    }
+    when (runCatching { verifyAsset(assetId) }.getOrElse {
+        return MediaPreviewUiResult.Failed(MediaUiFailureReason.PreviewLoadFailed)
+    }) {
+        is MediaAssetVerificationResult.Verified -> Unit
+        is MediaAssetVerificationResult.Missing,
+        is MediaAssetVerificationResult.Corrupt,
+        -> return MediaPreviewUiResult.Missing
+    }
+    return runCatching {
+        val source = openSource(assetId).buffer()
+        val bytes = try {
+            source.readByteArray()
+        } finally {
+            source.close()
+        }
+        MediaPreviewUiResult.Loaded(bytes)
+    }.getOrElse {
+        if (getAsset(assetId)?.localState == MediaAssetLocalState.Available) {
+            MediaPreviewUiResult.Failed(MediaUiFailureReason.PreviewLoadFailed)
+        } else {
+            MediaPreviewUiResult.Missing
+        }
+    }
+}
+
+private const val MAX_MEDIA_PREVIEW_PIXEL_COUNT = 12_000_000L
 
 @OptIn(ExperimentalForeignApi::class)
 private class IosDayOneImportRunner(

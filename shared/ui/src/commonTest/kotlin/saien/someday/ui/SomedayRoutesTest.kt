@@ -30,6 +30,7 @@ class SomedayRoutesTest {
         for (page in SettingsPage.entries) {
             assertEquals(page, settingsPageFromRouteId(page.routeId))
         }
+        assertNull(settingsPageFromRouteId("self_hosted"))
         assertNull(settingsPageFromRouteId("privacy"))
         assertNull(settingsPageFromRouteId("missing"))
     }

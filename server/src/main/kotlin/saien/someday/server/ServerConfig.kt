@@ -1,13 +1,44 @@
 package saien.someday.server
 
 import java.net.URI
+import java.nio.file.Path
 import java.security.SecureRandom
 import java.time.Duration
 import java.util.Base64
+import java.util.Properties
+import org.postgresql.Driver
 
 enum class ServerDeploymentMode {
     LOCAL,
     PRODUCTION,
+}
+
+enum class DatabaseTlsMode {
+    PRIVATE,
+    VERIFY_FULL,
+}
+
+const val DEFAULT_DATABASE_MAX_POOL_SIZE: Int = 10
+const val MAX_DATABASE_MAX_POOL_SIZE: Int = 32
+
+sealed interface ServerMediaStorage {
+    data class FileSystem(val directory: Path) : ServerMediaStorage
+
+    data class S3(
+        val bucket: String,
+        val region: String,
+        val endpoint: URI?,
+        val pathStyle: Boolean,
+    ) : ServerMediaStorage {
+        init {
+            require(bucket.isNotBlank() && bucket.none { it.isWhitespace() || it.isISOControl() || it == '/' }) {
+                "SOMEDAY_MEDIA_S3_BUCKET must be a non-blank bucket name without whitespace or slashes."
+            }
+            require(region.isNotBlank() && region.none { it.isWhitespace() }) {
+                "SOMEDAY_MEDIA_S3_REGION must be a non-blank region without whitespace."
+            }
+        }
+    }
 }
 
 data class ServerConfig(
@@ -18,6 +49,10 @@ data class ServerConfig(
     val databaseUrl: String,
     val databaseUser: String,
     val databasePassword: String,
+    val databaseTlsMode: DatabaseTlsMode,
+    val databaseMaxPoolSize: Int,
+    val mediaStorage: ServerMediaStorage,
+    val mediaQuotaBytes: Long,
     val jwtIssuer: String,
     val jwtAudience: String,
     val jwtSecret: String,
@@ -28,7 +63,7 @@ data class ServerConfig(
     val rateLimitMaxAttempts: Int,
     val rateLimitWindow: Duration,
     val rateLimitMaxBuckets: Int,
-    val syncV2RateLimitMaxAttempts: Int,
+    val systemV3RateLimitMaxAttempts: Int,
     val argon2MaxConcurrent: Int,
 ) {
     val secureAdminCookies: Boolean
@@ -37,12 +72,21 @@ data class ServerConfig(
     val publicOrigin: String
         get() = normalizedOrigin(publicBaseUrl)
 
+    /** JDBC URL after applying the declared database network security mode. */
+    val databaseConnectionUrl: String
+        get() = databaseUrl.withDatabaseTlsMode(databaseTlsMode)
+
     init {
         require(bindHost.isNotBlank()) { "SOMEDAY_HOST must not be blank." }
         require(port in 1..65535) { "SOMEDAY_PORT must be between 1 and 65535." }
         require(databaseUrl.isNotBlank()) { "SOMEDAY_DB_URL must not be blank." }
         require(databaseUser.isNotBlank()) { "SOMEDAY_DB_USER must not be blank." }
         require(databasePassword.isNotBlank()) { "SOMEDAY_DB_PASSWORD must not be blank." }
+        databaseConnectionUrl
+        require(databaseMaxPoolSize in 1..MAX_DATABASE_MAX_POOL_SIZE) {
+            "SOMEDAY_DB_MAX_POOL_SIZE must be between 1 and $MAX_DATABASE_MAX_POOL_SIZE."
+        }
+        require(mediaQuotaBytes > 0L) { "SOMEDAY_MEDIA_QUOTA_BYTES must be positive." }
         require(jwtIssuer.isNotBlank()) { "SOMEDAY_JWT_ISSUER must not be blank." }
         require(jwtAudience.isNotBlank()) { "SOMEDAY_JWT_AUDIENCE must not be blank." }
         require(jwtSecret.encodeToByteArray().size >= MINIMUM_JWT_SECRET_BYTES) {
@@ -59,8 +103,8 @@ data class ServerConfig(
             "SOMEDAY_RATE_LIMIT_WINDOW_SECONDS must be positive."
         }
         require(rateLimitMaxBuckets > 0) { "SOMEDAY_RATE_LIMIT_MAX_BUCKETS must be positive." }
-        require(syncV2RateLimitMaxAttempts > 0) {
-            "SOMEDAY_SYNC_V2_RATE_LIMIT_MAX_ATTEMPTS must be positive."
+        require(systemV3RateLimitMaxAttempts > 0) {
+            "SOMEDAY_SYSTEM_V3_RATE_LIMIT_MAX_ATTEMPTS must be positive."
         }
         require(argon2MaxConcurrent > 0) { "SOMEDAY_ARGON2_MAX_CONCURRENT must be positive." }
 
@@ -71,6 +115,16 @@ data class ServerConfig(
             }
             require(jwtSecret != LOCAL_DEVELOPMENT_JWT_SECRET) {
                 "The local development JWT secret cannot be used in production mode."
+            }
+            require(mediaStorage !is ServerMediaStorage.FileSystem || mediaStorage.directory.isAbsolute) {
+                "SOMEDAY_MEDIA_BLOB_DIR must be an absolute path for filesystem storage in production mode."
+            }
+            require(
+                mediaStorage !is ServerMediaStorage.S3 ||
+                    mediaStorage.endpoint == null ||
+                    mediaStorage.endpoint.scheme.equals("https", ignoreCase = true),
+            ) {
+                "SOMEDAY_MEDIA_S3_ENDPOINT must use HTTPS in production mode."
             }
         }
     }
@@ -118,6 +172,16 @@ data class ServerConfig(
                     production = production,
                     localDefault = "someday",
                 ),
+                databaseTlsMode = environment.databaseTlsMode(production),
+                databaseMaxPoolSize = environment.intValue(
+                    "SOMEDAY_DB_MAX_POOL_SIZE",
+                    DEFAULT_DATABASE_MAX_POOL_SIZE,
+                ),
+                mediaStorage = environment.mediaStorage(production),
+                mediaQuotaBytes = environment.longValue(
+                    "SOMEDAY_MEDIA_QUOTA_BYTES",
+                    DEFAULT_MEDIA_QUOTA_BYTES,
+                ),
                 jwtIssuer = environment.nonBlank("SOMEDAY_JWT_ISSUER") ?: "someday-local",
                 jwtAudience = environment.nonBlank("SOMEDAY_JWT_AUDIENCE") ?: "someday-clients",
                 jwtSecret = environment.nonBlank("SOMEDAY_JWT_SECRET")
@@ -145,17 +209,35 @@ data class ServerConfig(
                     environment.longValue("SOMEDAY_RATE_LIMIT_WINDOW_SECONDS", 60),
                 ),
                 rateLimitMaxBuckets = environment.intValue("SOMEDAY_RATE_LIMIT_MAX_BUCKETS", 10_000),
-                // A single bounded V2 coordinator pass can issue two sets of up
+                // A single bounded System V3 coordinator pass can issue two sets of up
                 // to eight paged pulls, in addition to checkpoint/outbox work.
                 // Keep this budget independent from the deliberately tight
                 // authentication brute-force budget above.
-                syncV2RateLimitMaxAttempts =
-                    environment.intValue("SOMEDAY_SYNC_V2_RATE_LIMIT_MAX_ATTEMPTS", 256),
+                systemV3RateLimitMaxAttempts =
+                    environment.intValue("SOMEDAY_SYSTEM_V3_RATE_LIMIT_MAX_ATTEMPTS", 256),
                 argon2MaxConcurrent = environment.intValue("SOMEDAY_ARGON2_MAX_CONCURRENT", 2),
             )
         }
     }
 }
+
+private fun Map<String, String>.databaseTlsMode(production: Boolean): DatabaseTlsMode =
+    nonBlank("SOMEDAY_DB_TLS_MODE")
+        ?.lowercase()
+        ?.let { value ->
+            when (value) {
+                "private" -> DatabaseTlsMode.PRIVATE
+                "verify-full" -> DatabaseTlsMode.VERIFY_FULL
+                else -> error("SOMEDAY_DB_TLS_MODE must be private or verify-full.")
+            }
+        }
+        ?: if (containsKey("SOMEDAY_DB_TLS_MODE")) {
+            error("SOMEDAY_DB_TLS_MODE must not be blank.")
+        } else if (production) {
+            error("SOMEDAY_DB_TLS_MODE is required in production mode.")
+        } else {
+            DatabaseTlsMode.PRIVATE
+        }
 
 private fun Map<String, String>.nonBlank(name: String): String? =
     get(name)?.trim()?.takeIf { it.isNotEmpty() }
@@ -170,6 +252,86 @@ private fun Map<String, String>.productionValue(
     } else {
         localDefault
     }
+
+private fun Map<String, String>.mediaStorage(production: Boolean): ServerMediaStorage {
+    val backend = nonBlank("SOMEDAY_MEDIA_BACKEND")
+        ?: if (containsKey("SOMEDAY_MEDIA_BACKEND")) {
+            error("SOMEDAY_MEDIA_BACKEND must not be blank.")
+        } else if (production) {
+            error("SOMEDAY_MEDIA_BACKEND is required in production mode.")
+        } else {
+            "filesystem"
+        }
+    return when (backend.lowercase()) {
+        "filesystem" -> ServerMediaStorage.FileSystem(
+            Path.of(
+                productionValue(
+                    name = "SOMEDAY_MEDIA_BLOB_DIR",
+                    production = production,
+                    localDefault = "build/local-media-blobs",
+                ),
+            ),
+        )
+        "s3" -> ServerMediaStorage.S3(
+            bucket = requiredValue("SOMEDAY_MEDIA_S3_BUCKET"),
+            region = requiredValue("SOMEDAY_MEDIA_S3_REGION"),
+            endpoint = nonBlank("SOMEDAY_MEDIA_S3_ENDPOINT")?.let(::validatedS3Endpoint),
+            pathStyle = booleanValue("SOMEDAY_MEDIA_S3_PATH_STYLE", default = false),
+        )
+        else -> error("SOMEDAY_MEDIA_BACKEND must be filesystem or s3.")
+    }
+}
+
+private fun Map<String, String>.requiredValue(name: String): String =
+    nonBlank(name) ?: error("$name is required for the selected media backend.")
+
+private fun validatedS3Endpoint(value: String): URI {
+    val uri = runCatching { URI(value) }.getOrElse {
+        throw IllegalArgumentException("SOMEDAY_MEDIA_S3_ENDPOINT must be a valid URL.", it)
+    }
+    require(uri.scheme.equals("http", ignoreCase = true) || uri.scheme.equals("https", ignoreCase = true)) {
+        "SOMEDAY_MEDIA_S3_ENDPOINT must use HTTP or HTTPS."
+    }
+    require(
+        !uri.host.isNullOrBlank() && uri.userInfo == null && uri.query == null && uri.fragment == null &&
+            (uri.path.isNullOrEmpty() || uri.path == "/"),
+    ) {
+        "SOMEDAY_MEDIA_S3_ENDPOINT must be an origin without credentials, path, query, or fragment."
+    }
+    return uri
+}
+
+private fun String.withDatabaseTlsMode(mode: DatabaseTlsMode): String {
+    val properties = Driver.parseURL(this, Properties())
+        ?: error("SOMEDAY_DB_URL must be a valid PostgreSQL JDBC URL.")
+    if (mode != DatabaseTlsMode.VERIFY_FULL) return this
+
+    require(properties.getProperty("ssl") == null) {
+        "SOMEDAY_DB_URL must not combine ssl with SOMEDAY_DB_TLS_MODE=verify-full; use sslmode=verify-full."
+    }
+    require(properties.getProperty("sslfactory") == null && properties.getProperty("sslhostnameverifier") == null) {
+        "SOMEDAY_DB_URL must not override PostgreSQL certificate or hostname verification."
+    }
+    properties.getProperty("sslmode")?.let { sslMode ->
+        require(sslMode.equals("verify-full", ignoreCase = true)) {
+            "SOMEDAY_DB_URL sslmode conflicts with SOMEDAY_DB_TLS_MODE=verify-full."
+        }
+    }
+    val rootCertificate = properties.getProperty("sslrootcert")
+    require(rootCertificate == null || rootCertificate.isNotBlank()) {
+        "SOMEDAY_DB_URL sslrootcert must not be blank."
+    }
+
+    val enforcedParameters = buildList {
+        if (properties.getProperty("sslmode") == null) add("sslmode=verify-full")
+        if (rootCertificate == null) add("sslfactory=$DEFAULT_JAVA_SSL_FACTORY")
+    }
+    if (enforcedParameters.isEmpty()) return this
+    val separator = if ('?' in this) '&' else '?'
+    return "$this$separator${enforcedParameters.joinToString("&")}"
+}
+
+private const val DEFAULT_JAVA_SSL_FACTORY = "org.postgresql.ssl.DefaultJavaSSLFactory"
 
 private fun Map<String, String>.booleanValue(name: String, default: Boolean): Boolean =
     nonBlank(name)?.toBooleanStrictOrNull()
@@ -236,3 +398,4 @@ private fun randomLocalJwtSecret(): String {
 
 private const val MINIMUM_JWT_SECRET_BYTES = 32
 private const val LOCAL_DEVELOPMENT_JWT_SECRET = "someday-local-development-secret-change-before-production"
+private const val DEFAULT_MEDIA_QUOTA_BYTES = 5L * 1024L * 1024L * 1024L

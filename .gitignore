@@ -50,8 +50,11 @@ ExportOptions*.plist
 .env.*
 !.env.example
 !.env.*.example
+.wrangler/
 artifacts/
 *.log
+__pycache__/
+*.py[cod]
 
 # Local AI / operator skills and private release runbooks
 .factory/

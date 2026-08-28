@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+CONTROLLER="$ROOT_DIR/scripts/server-release"
+VERSION="${SERVER_RELEASE_VERSION:-}"
+VERSION_OPTION_SEEN=false
+
+usage() {
+    cat <<'EOF'
+Open the interactive Someday server release assistant.
+
+Usage:
+  scripts/server-release-tui [--version X.Y.Z]
+
+The assistant only forwards plan, status, and rehearse to the server release
+controller. It cannot create or push tags, publish artifacts, change GitHub
+settings, or run managed-storage gates.
+
+Use the non-interactive controller directly in automation:
+  scripts/server-release <plan|status|rehearse> X.Y.Z
+EOF
+}
+
+die() {
+    printf 'server release assistant error: %s\n' "$*" >&2
+    exit 2
+}
+
+valid_version() {
+    local candidate="$1"
+    local component='(0|[1-9][0-9]*)'
+
+    [[ "$candidate" =~ ^${component}\.${component}\.${component}$ ]] &&
+        ((${#candidate} <= 64))
+}
+
+prompt_version() {
+    local candidate=""
+
+    while true; do
+        printf 'Server version (X.Y.Z; blank exits): '
+        if ! IFS= read -r candidate; then
+            return 1
+        fi
+        if [[ -z "$candidate" ]]; then
+            return 1
+        fi
+        if valid_version "$candidate"; then
+            VERSION="$candidate"
+            return 0
+        fi
+        printf 'Invalid version. Use canonical X.Y.Z without a v prefix.\n' >&2
+    done
+}
+
+pause_for_menu() {
+    local ignored=""
+
+    printf '\nPress Enter to return to the menu.'
+    IFS= read -r ignored
+}
+
+run_controller() {
+    local action="$1"
+    local result=0
+    local command=("$CONTROLLER" "$action" "$VERSION")
+
+    printf '\nRunning: scripts/server-release %s %s\n\n' "$action" "$VERSION"
+    set +e
+    "${command[@]}"
+    result=$?
+    set -e
+
+    if ((result >= 128)); then
+        exit "$result"
+    fi
+    if ((result != 0)); then
+        printf '\nCommand exited with status %s. Review its output above.\n' "$result" >&2
+    fi
+    pause_for_menu
+}
+
+confirm_rehearsal() {
+    local confirmation=""
+
+    printf '\nThe rehearsal runs the full local checks and both Docker topologies.\n'
+    printf 'Type REHEARSE %s to continue: ' "$VERSION"
+    if ! IFS= read -r confirmation; then
+        return 1
+    fi
+    if [[ "$confirmation" != "REHEARSE $VERSION" ]]; then
+        printf 'Rehearsal cancelled.\n'
+        return 0
+    fi
+    run_controller rehearse
+}
+
+render_menu() {
+    printf '\nSomeday Server Release\n'
+    printf 'Version: %s\n' "$VERSION"
+    printf 'Runbook: docs/server-release.md\n'
+    printf 'This assistant cannot tag, push, or publish.\n\n'
+    printf '  1. Check status\n'
+    printf '  2. View plan\n'
+    printf '  3. Run local rehearsal\n'
+    printf '  4. Change version\n'
+    printf '  5. Exit\n\n'
+    printf 'Choose [1]: '
+}
+
+while (($# > 0)); do
+    case "$1" in
+        --version)
+            (($# >= 2)) || die '--version requires X.Y.Z'
+            [[ "$VERSION_OPTION_SEEN" == false ]] ||
+                die '--version was provided more than once'
+            VERSION="$2"
+            VERSION_OPTION_SEEN=true
+            shift 2
+            ;;
+        -h|--help)
+            (($# == 1)) || die '--help does not accept other arguments'
+            usage
+            exit 0
+            ;;
+        *)
+            die "unknown argument: $1"
+            ;;
+    esac
+done
+
+[[ -x "$CONTROLLER" ]] || die "controller is not executable: $CONTROLLER"
+if [[ -n "$VERSION" ]] && ! valid_version "$VERSION"; then
+    die "version must be canonical X.Y.Z without a v prefix: $VERSION"
+fi
+[[ -t 0 && -t 1 ]] ||
+    die 'an interactive terminal is required; use a server-release-* Make target in automation'
+
+if [[ -z "$VERSION" ]] && ! prompt_version; then
+    exit 0
+fi
+
+while true; do
+    choice=""
+    render_menu
+    if ! IFS= read -r choice; then
+        exit 0
+    fi
+    case "${choice:-1}" in
+        1|status)
+            run_controller status || exit 0
+            ;;
+        2|plan)
+            run_controller plan || exit 0
+            ;;
+        3|rehearse)
+            confirm_rehearsal || exit 0
+            ;;
+        4|version)
+            prompt_version || exit 0
+            ;;
+        5|q|quit|exit)
+            exit 0
+            ;;
+        *)
+            printf 'Unknown choice: %s\n' "$choice" >&2
+            ;;
+    esac
+done

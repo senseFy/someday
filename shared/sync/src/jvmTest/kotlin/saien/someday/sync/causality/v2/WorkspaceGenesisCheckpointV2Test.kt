@@ -3,7 +3,6 @@
 package saien.someday.sync.causality.v2
 
 import saien.someday.data.crypto.SodiumWorkspaceCrypto
-import saien.someday.data.local.LocationInput
 import saien.someday.data.local.SqlDelightLocalDataRepository
 import saien.someday.data.local.createSomedayJdbcDriver
 import saien.someday.data.local.db.SomedayDatabase
@@ -14,27 +13,11 @@ import saien.someday.domain.settings.EditorPreferences
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertIs
-import kotlin.test.assertNotNull
-import kotlin.test.assertTrue
 import kotlin.time.Instant
 
 class WorkspaceGenesisCheckpointV2Test {
     @Test
-    fun genesisCapturesCompleteProductStateAndTypedPreferences() = withFixture { local, settings ->
-        val notebook = local.createNotebook("Journal", id = NOTEBOOK_ID)
-        local.createNote(
-            notebookId = notebook.id,
-            title = "Shanghai",
-            markdownBody = "A complete local snapshot.",
-            createdAt = CREATED_AT,
-            location = LocationInput(
-                latitude = 31.2304,
-                longitude = 121.4737,
-                placeText = "Shanghai",
-            ),
-            timeZoneId = "Asia/Shanghai",
-            id = NOTE_ID,
-        )
+    fun genesisCreatesOnlyTypedWorkspacePreferences() = withFixture { local, settings ->
         settings.save(
             ClientSettings(
                 theme = ClientTheme.Dark,
@@ -49,13 +32,6 @@ class WorkspaceGenesisCheckpointV2Test {
 
         val service = service(local, settings)
         val inventory = service.inventory()
-        val noteSource = inventory.sourceHeads.single {
-            it.entityType == WorkspaceEntityTypeV2.NOTE && it.entityId == NOTE_ID
-        }
-        val note = assertIs<NoteContentV2>(noteSource.content)
-        assertEquals("Shanghai", assertNotNull(note.location).placeText)
-        assertEquals("Asia/Shanghai", note.timeZoneId)
-
         val preferences = inventory.sourceHeads.single {
             it.entityType == WorkspaceEntityTypeV2.WORKSPACE_PREFERENCES
         }
@@ -70,42 +46,17 @@ class WorkspaceGenesisCheckpointV2Test {
         )
 
         val prepared = assertIs<WorkspaceGenesisCheckpointResultV2.Prepared>(service.prepare())
-        assertTrue(prepared.checkpoint.entities.any {
-            it.version.entityType == WorkspaceEntityTypeV2.NOTE &&
-                it.version.entityId == NOTE_ID &&
-                it.version.parentVersionIds.isEmpty()
-        })
-    }
-
-    @Test
-    fun invalidOversizedProductStateFailsBeforeAnEpochCanBePublished() = withFixture { local, settings ->
-        val notebook = local.createNotebook("Journal", id = NOTEBOOK_ID)
-        val oversizedBody = "x".repeat(MAX_NOTE_MARKDOWN_BYTES_V2 + 1)
-        local.createNote(
-            notebookId = notebook.id,
-            title = "Oversized",
-            markdownBody = oversizedBody,
-            createdAt = CREATED_AT,
-            id = NOTE_ID,
-        )
-
-        val blocked = assertIs<WorkspaceGenesisCheckpointResultV2.Blocked>(
-            service(local, settings).prepare(),
-        )
-
-        assertEquals("genesis_checkpoint_invalid", blocked.safeErrorCode)
-        assertEquals(oversizedBody, local.getNote(NOTE_ID)?.markdownBody)
+        assertEquals(listOf(WorkspaceEntityTypeV2.WORKSPACE_PREFERENCES), prepared.checkpoint.entities.map { it.version.entityType })
     }
 
     private fun service(
         local: SqlDelightLocalDataRepository,
         settings: ClientSettingsRepository,
     ) = WorkspaceGenesisCheckpointServiceV2(
-        localRepository = local,
         settingsRepository = settings,
         workspaceKey = WORKSPACE_KEY,
         writerDeviceId = WRITER,
-        remoteProfile = SyncRemoteProfileV2.WEB_DAV.wireValue,
+        remoteProfile = SyncRemoteProfileV2.SELF_HOSTED.wireValue,
         idGenerator = SequentialIds(),
         clock = { SNAPSHOT_AT },
     )
@@ -148,8 +99,6 @@ class WorkspaceGenesisCheckpointV2Test {
     private companion object {
         const val WRITER = "10000000-0000-4000-8000-000000000001"
         const val NOTEBOOK_ID = "20000000-0000-4000-8000-000000000001"
-        const val NOTE_ID = "30000000-0000-4000-8000-000000000001"
-        val CREATED_AT = Instant.parse("2026-07-19T00:00:00Z")
         val SNAPSHOT_AT = Instant.parse("2026-07-19T01:00:00Z")
         val WORKSPACE_KEY =
             SodiumWorkspaceCrypto().workspaceKeyFromBytes(ByteArray(32) { (it + 19).toByte() })

@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+RUN_SUFFIX="$(date +%s)-$$"
+PROJECT_NAME="someday-container-smoke-$RUN_SUFFIX"
+IMAGE_NAME="someday-server:container-smoke-$RUN_SUFFIX"
+STANDALONE_FILE="$ROOT_DIR/deploy/standalone/compose.yaml"
+STANDALONE_SOURCE_FILE="$ROOT_DIR/deploy/standalone/compose.source.yaml"
+EXTERNAL_FILE="$ROOT_DIR/deploy/external/compose.yaml"
+EXTERNAL_SOURCE_FILE="$ROOT_DIR/deploy/external/compose.source.yaml"
+
+export SOMEDAY_IMAGE="$IMAGE_NAME"
+export SOMEDAY_SOURCE_IMAGE="$IMAGE_NAME"
+export SOMEDAY_HTTP_PORT=0
+export SOMEDAY_PUBLIC_BASE_URL=https://container-smoke.invalid
+export SOMEDAY_DB_NAME=someday
+export SOMEDAY_DB_URL=jdbc:postgresql://database.invalid:5432/someday
+export SOMEDAY_DB_USER=someday
+export SOMEDAY_DB_PASSWORD=container-smoke-app-password
+export SOMEDAY_DB_MAX_POOL_SIZE=4
+export SOMEDAY_POSTGRES_ADMIN_PASSWORD=container-smoke-admin-password
+export SOMEDAY_JWT_SECRET=0123456789abcdef0123456789abcdef
+export SOMEDAY_MEDIA_QUOTA_BYTES=10485760
+export SOMEDAY_MEDIA_S3_BUCKET=container-smoke
+export SOMEDAY_MEDIA_S3_REGION=us-east-1
+export SOMEDAY_MEDIA_S3_ENDPOINT=https://objects.invalid
+export SOMEDAY_MEDIA_S3_PATH_STYLE=false
+
+STANDALONE_COMPOSE=(
+    docker compose
+    --project-name "$PROJECT_NAME"
+    --file "$STANDALONE_FILE"
+)
+EXTERNAL_COMPOSE=(
+    docker compose
+    --project-name "$PROJECT_NAME-external"
+    --file "$EXTERNAL_FILE"
+)
+
+die() {
+    printf 'server container smoke error: %s\n' "$*" >&2
+    exit 1
+}
+
+info() {
+    printf '[server container smoke] %s\n' "$*" >&2
+}
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+cleanup() {
+    local status=$?
+    trap - EXIT INT TERM
+    if ((status != 0)); then
+        "${STANDALONE_COMPOSE[@]}" logs --no-color --tail 200 >&2 || true
+    fi
+    "${STANDALONE_COMPOSE[@]}" down --volumes --remove-orphans >/dev/null 2>&1 || true
+    docker image rm "$IMAGE_NAME" >/dev/null 2>&1 || true
+    exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+require_command curl
+require_command docker
+docker info >/dev/null 2>&1 || die "Docker daemon is unavailable"
+compose_version="$(docker compose version --short 2>/dev/null)" ||
+    die "Docker Compose is unavailable"
+compose_version="${compose_version#v}"
+IFS=. read -r compose_major compose_minor _ <<<"$compose_version"
+[[ "$compose_major" =~ ^[0-9]+$ && "$compose_minor" =~ ^[0-9]+$ ]] ||
+    die "could not parse Docker Compose version: $compose_version"
+((compose_major > 2 || (compose_major == 2 && compose_minor >= 20))) ||
+    die "Docker Compose 2.20 or newer is required; found $compose_version"
+
+info "validating both Compose topologies"
+"${STANDALONE_COMPOSE[@]}" config --quiet
+"${STANDALONE_COMPOSE[@]}" --file "$STANDALONE_SOURCE_FILE" config --quiet
+external_config="$("${EXTERNAL_COMPOSE[@]}" config --format json)"
+"${EXTERNAL_COMPOSE[@]}" --file "$EXTERNAL_SOURCE_FILE" config --quiet
+external_compact="${external_config//[[:space:]]/}"
+[[ "$external_compact" == *'"read_only":true'* ]] ||
+    die "external server must use a read-only root filesystem"
+[[ "$external_compact" == *'"SOMEDAY_MEDIA_BACKEND":"s3"'* ]] ||
+    die "external server must select the S3 media backend"
+[[ "$external_compact" == *'"SOMEDAY_DB_MAX_POOL_SIZE":"4"'* ]] ||
+    die "external server did not receive the configured database pool size"
+[[ "$external_compact" == *'"SOMEDAY_DB_TLS_MODE":"verify-full"'* ]] ||
+    die "external server did not enable verified database TLS"
+[[ "$external_compact" == *'"SOMEDAY_MEDIA_QUOTA_BYTES":"10485760"'* ]] ||
+    die "external server did not receive the configured media quota"
+[[ "$external_compact" != *'"volumes":'* ]] ||
+    die "external topology must not mount durable application volumes"
+[[ "$external_compact" != *'SOMEDAY_POSTGRES_ADMIN_PASSWORD'* ]] ||
+    die "external server received the standalone PostgreSQL administrator secret"
+
+info "building $IMAGE_NAME through the source override"
+"${STANDALONE_COMPOSE[@]}" \
+    --file "$STANDALONE_SOURCE_FILE" \
+    --progress plain \
+    build \
+    server
+
+info "starting the standalone production image"
+"${STANDALONE_COMPOSE[@]}" up --detach --no-build --wait
+server_id="$("${STANDALONE_COMPOSE[@]}" ps --quiet server)"
+[[ -n "$server_id" ]] || die "Compose did not return the server container"
+
+published_address="$("${STANDALONE_COMPOSE[@]}" port server 3180)"
+published_port="${published_address##*:}"
+[[ "$published_port" =~ ^[0-9]+$ ]] || die "could not resolve the published server port"
+curl --fail --silent --show-error "http://127.0.0.1:$published_port/health" |
+    grep --fixed-strings '"status":"ok"' >/dev/null || die "server health endpoint failed"
+
+[[ "$(docker inspect --format '{{.Config.User}}' "$server_id")" == "10001:10001" ]] ||
+    die "server image did not run with the fixed unprivileged identity"
+[[ "$(docker inspect --format '{{.HostConfig.ReadonlyRootfs}}' "$server_id")" == "true" ]] ||
+    die "server container root filesystem was writable"
+docker inspect --format '{{json .HostConfig.CapDrop}}' "$server_id" |
+    grep --fixed-strings '"ALL"' >/dev/null || die "server container retained Linux capabilities"
+if docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$server_id" |
+    grep --quiet '^SOMEDAY_POSTGRES_ADMIN_PASSWORD='; then
+    die "server container received the PostgreSQL administrator secret"
+fi
+
+info "running the media integrity operator command"
+"${STANDALONE_COMPOSE[@]}" run --rm --no-deps server verify-media-integrity |
+    grep --fixed-strings 'Media integrity verification passed' >/dev/null ||
+    die "media integrity command did not complete"
+
+info "running the administrator bootstrap operator command"
+"${STANDALONE_COMPOSE[@]}" run \
+    --rm \
+    --no-deps \
+    --env SOMEDAY_ADMIN_EMAIL=admin@example.com \
+    --env SOMEDAY_ADMIN_PASSWORD=container-smoke-bootstrap-password \
+    server bootstrap-admin |
+    grep --fixed-strings 'Created Someday admin' >/dev/null ||
+    die "administrator bootstrap command did not complete"
+
+info "passed"

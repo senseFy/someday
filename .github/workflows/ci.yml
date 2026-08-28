@@ -24,6 +24,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Set up JDK
@@ -44,6 +45,9 @@ jobs:
           sudo apt-get install --no-install-recommends --yes ripgrep
           rg --version
 
+      - name: Verify public history
+        run: ./scripts/verify-public-history
+
       - name: Install Android SDK packages
         shell: bash
         run: |
@@ -63,8 +67,42 @@ jobs:
       - name: Run hermetic checks
         run: ./gradlew check --dependency-verification=strict --max-workers=2 --stacktrace
 
-      - name: Run Sync V2 release gate
-        run: ./scripts/sync-v2-reliability-gate
+      - name: Run System V3 release gate
+        run: ./scripts/sync-v3-reliability-gate
+
+      - name: Check patch whitespace
+        run: git diff --check
+
+  apple:
+    name: iOS simulator evidence
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Set up JDK
+        uses: actions/setup-java@c1e323688fd81a25caa38c78aa6df2d33d3e20d9 # v4.8.0
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@3f131e8634966bd73d06cc69884922b02e6faf92 # v6.2.0
+        with:
+          cache-provider: basic
+          add-job-summary: on-failure
+
+      - name: Verify Xcode 26 toolchain
+        run: xcodebuild -version
+
+      - name: Run System V3 Apple gate
+        run: ./scripts/sync-v3-apple-gate
 
       - name: Check patch whitespace
         run: git diff --check

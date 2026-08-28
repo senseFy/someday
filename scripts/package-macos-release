@@ -50,8 +50,6 @@ cd "$ROOT_DIR"
 info "Building macOS release DMG with developer options disabled."
 "$GRADLEW" :app:desktop:packageReleaseDmg \
     -Psomeday.desktop.developerOptions=false \
-    -Psomeday.systemV2ReleaseEnabled=true \
-    -Psomeday.systemV2DevelopmentEnabled=false \
     --dependency-verification=strict \
     --stacktrace
 

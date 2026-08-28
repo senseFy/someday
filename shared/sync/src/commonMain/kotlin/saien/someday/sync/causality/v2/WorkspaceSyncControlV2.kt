@@ -47,37 +47,6 @@ data class WorkspaceCheckpointChunkV2(
     val objects: List<EncryptedWorkspaceObjectV2>,
 )
 
-data class WorkspaceWebDavSegmentRefV2(
-    val ordinal: Long,
-    val segmentId: String,
-    val segmentDigest: String,
-    val previousSegmentDigest: String?,
-    val entryCount: Int,
-    val plaintextBytes: Int,
-    val createdAt: Instant,
-)
-
-data class WorkspaceWebDavWriterManifestV2(
-    val schemaVersion: Int = 1,
-    val contractId: String = SYNC_V2_CONTRACT_ID,
-    val syncEpochId: String,
-    val writerDeviceId: String,
-    val previousManifestDigest: String?,
-    val segments: List<WorkspaceWebDavSegmentRefV2>,
-)
-
-data class WorkspaceWebDavLogSegmentV2(
-    val schemaVersion: Int = 1,
-    val contractId: String = SYNC_V2_CONTRACT_ID,
-    val syncEpochId: String,
-    val writerDeviceId: String,
-    val ordinal: Long,
-    val segmentId: String,
-    val previousSegmentDigest: String?,
-    val createdAt: Instant,
-    val objects: List<EncryptedWorkspaceObjectV2>,
-)
-
 enum class WorkspaceControlErrorCodeV2(val wireValue: String) {
     WRONG_OBJECT_TYPE("wrong_object_type"),
     AUTHENTICATION_FAILED("authentication_failed"),
@@ -105,16 +74,6 @@ class WorkspaceSyncControlCodecV2(
     fun checkpointChunkPlaintextBytes(chunk: WorkspaceCheckpointChunkV2): Int {
         validateChunk(chunk)
         return DeterministicCborV2.encode(chunk.toCborV2()).size
-    }
-
-    fun writerManifestPlaintextBytes(manifest: WorkspaceWebDavWriterManifestV2): Int {
-        validateWriterManifest(manifest)
-        return DeterministicCborV2.encode(manifest.toCborV2()).size
-    }
-
-    fun logSegmentPlaintextBytes(segment: WorkspaceWebDavLogSegmentV2): Int {
-        validateSegment(segment)
-        return DeterministicCborV2.encode(segment.toCborV2()).size
     }
 
     fun encodeEpochPointer(
@@ -211,65 +170,6 @@ class WorkspaceSyncControlCodecV2(
             }
         }
 
-    fun encodeWriterManifest(
-        manifest: WorkspaceWebDavWriterManifestV2,
-        writerDeviceId: String,
-    ): EncryptedWorkspaceObjectV2 {
-        validateWriterManifest(manifest)
-        require(writerDeviceId == manifest.writerDeviceId)
-        return encrypt(
-            manifest.syncEpochId,
-            "webdav_writer_manifest_v2",
-            "writer-manifest:${manifest.writerDeviceId}",
-            writerDeviceId,
-            manifest.toCborV2(),
-            MAX_CHECKPOINT_CHUNK_PLAINTEXT_SYSTEM_V2,
-        )
-    }
-
-    fun decodeWriterManifest(outer: EncryptedWorkspaceObjectV2): WorkspaceControlDecodeResultV2<WorkspaceWebDavWriterManifestV2> =
-        decode(
-            outer,
-            "webdav_writer_manifest_v2",
-            outer.objectId,
-            MAX_CHECKPOINT_CHUNK_PLAINTEXT_SYSTEM_V2,
-        ) { value ->
-            value.toWriterManifestV2().also { manifest ->
-                validateWriterManifest(manifest)
-                require(outer.objectId == "writer-manifest:${manifest.writerDeviceId}")
-                require(outer.writerDeviceId == manifest.writerDeviceId)
-            }
-        }
-
-    fun encodeLogSegment(
-        segment: WorkspaceWebDavLogSegmentV2,
-        writerDeviceId: String,
-    ): EncryptedWorkspaceObjectV2 {
-        validateSegment(segment)
-        require(writerDeviceId == segment.writerDeviceId)
-        return encrypt(
-            segment.syncEpochId,
-            "webdav_log_segment_v2",
-            segment.segmentId,
-            writerDeviceId,
-            segment.toCborV2(),
-            MAX_CHECKPOINT_CHUNK_PLAINTEXT_SYSTEM_V2,
-        )
-    }
-
-    fun decodeLogSegment(outer: EncryptedWorkspaceObjectV2): WorkspaceControlDecodeResultV2<WorkspaceWebDavLogSegmentV2> =
-        decode(
-            outer,
-            "webdav_log_segment_v2",
-            outer.objectId,
-            MAX_CHECKPOINT_CHUNK_PLAINTEXT_SYSTEM_V2,
-        ) { value ->
-            value.toLogSegmentV2().also { segment ->
-                validateSegment(segment)
-                require(segment.segmentId == outer.objectId && segment.writerDeviceId == outer.writerDeviceId)
-            }
-        }
-
     private fun encrypt(
         epochId: String,
         type: String,
@@ -354,33 +254,6 @@ class WorkspaceSyncControlCodecV2(
         require(value.objects.map { it.objectId }.distinct().size == value.objects.size)
     }
 
-    private fun validateWriterManifest(value: WorkspaceWebDavWriterManifestV2) {
-        require(value.schemaVersion == 1 && value.contractId == SYNC_V2_CONTRACT_ID)
-        require(UUID_V4_PATTERN_SYSTEM_V2.matches(value.syncEpochId) && UUID_V4_PATTERN_SYSTEM_V2.matches(value.writerDeviceId))
-        require(value.previousManifestDigest == null || CONTROL_DIGEST_PATTERN_SYSTEM_V2.matches(value.previousManifestDigest))
-        value.segments.forEachIndexed { index, ref ->
-            require(ref.ordinal == index + 1L)
-            require(UUID_V4_PATTERN_SYSTEM_V2.matches(ref.segmentId))
-            require(CONTROL_DIGEST_PATTERN_SYSTEM_V2.matches(ref.segmentDigest))
-            require(ref.previousSegmentDigest == value.segments.getOrNull(index - 1)?.segmentDigest)
-            require(ref.entryCount in 1..64 && ref.plaintextBytes in 1..MAX_CHECKPOINT_CHUNK_PLAINTEXT_SYSTEM_V2)
-        }
-    }
-
-    private fun validateSegment(value: WorkspaceWebDavLogSegmentV2) {
-        require(value.schemaVersion == 1 && value.contractId == SYNC_V2_CONTRACT_ID)
-        require(UUID_V4_PATTERN_SYSTEM_V2.matches(value.syncEpochId))
-        require(UUID_V4_PATTERN_SYSTEM_V2.matches(value.writerDeviceId) && UUID_V4_PATTERN_SYSTEM_V2.matches(value.segmentId))
-        require(value.ordinal >= 1 && value.objects.size in 1..64)
-        require((value.ordinal == 1L) == (value.previousSegmentDigest == null))
-        require(value.previousSegmentDigest == null || CONTROL_DIGEST_PATTERN_SYSTEM_V2.matches(value.previousSegmentDigest))
-        require(value.objects.all {
-            it.objectType == WORKSPACE_ENTITY_VERSION_OBJECT_TYPE_V2 &&
-                it.syncEpochId == value.syncEpochId && it.writerDeviceId == value.writerDeviceId
-        })
-        require(value.objects.map { it.mutationId }.distinct().size == value.objects.size)
-    }
-
     private fun <T> rejected(code: WorkspaceControlErrorCodeV2, message: String): WorkspaceControlDecodeResultV2<T> =
         WorkspaceControlDecodeResultV2.Rejected(WorkspaceControlErrorV2(code, message))
 }
@@ -444,37 +317,6 @@ private fun WorkspaceCheckpointChunkV2.toCborV2() = cborMap(
     "checkpointId" to cborText(checkpointId),
     "chunkIndex" to cborInt(chunkIndex.toLong()),
     "chunkId" to cborText(chunkId),
-    "objects" to cborArray(objects.map { it.toCborV2() }),
-)
-
-private fun WorkspaceWebDavWriterManifestV2.toCborV2() = cborMap(
-    "schemaVersion" to cborInt(schemaVersion.toLong()),
-    "contractId" to cborText(contractId),
-    "syncEpochId" to cborText(syncEpochId),
-    "writerDeviceId" to cborText(writerDeviceId),
-    "previousManifestDigest" to cborNullableText(previousManifestDigest),
-    "segments" to cborArray(segments.map { it.toCborV2() }),
-)
-
-private fun WorkspaceWebDavSegmentRefV2.toCborV2() = cborMap(
-    "ordinal" to cborInt(ordinal),
-    "segmentId" to cborText(segmentId),
-    "segmentDigest" to cborText(segmentDigest),
-    "previousSegmentDigest" to cborNullableText(previousSegmentDigest),
-    "entryCount" to cborInt(entryCount.toLong()),
-    "plaintextBytes" to cborInt(plaintextBytes.toLong()),
-    "createdAt" to controlInstantV2(createdAt),
-)
-
-private fun WorkspaceWebDavLogSegmentV2.toCborV2() = cborMap(
-    "schemaVersion" to cborInt(schemaVersion.toLong()),
-    "contractId" to cborText(contractId),
-    "syncEpochId" to cborText(syncEpochId),
-    "writerDeviceId" to cborText(writerDeviceId),
-    "ordinal" to cborInt(ordinal),
-    "segmentId" to cborText(segmentId),
-    "previousSegmentDigest" to cborNullableText(previousSegmentDigest),
-    "createdAt" to controlInstantV2(createdAt),
     "objects" to cborArray(objects.map { it.toCborV2() }),
 )
 
@@ -584,41 +426,6 @@ private fun CborValueV2.toCheckpointChunkV2(): WorkspaceCheckpointChunkV2 {
         map.textV2("checkpointId"),
         map.intV2("chunkIndex").toIntExactV2(),
         map.textV2("chunkId"),
-        map.arrayV2("objects").map { it.toEncryptedOuterV2() },
-    )
-}
-
-private fun CborValueV2.toWriterManifestV2(): WorkspaceWebDavWriterManifestV2 {
-    val map = exactControlMapV2(setOf(
-        "schemaVersion", "contractId", "syncEpochId", "writerDeviceId", "previousManifestDigest", "segments",
-    ))
-    return WorkspaceWebDavWriterManifestV2(
-        map.intV2("schemaVersion").toIntExactV2(), map.textV2("contractId"), map.textV2("syncEpochId"),
-        map.textV2("writerDeviceId"), map.nullableTextV2("previousManifestDigest"),
-        map.arrayV2("segments").map { it.toSegmentRefV2() },
-    )
-}
-
-private fun CborValueV2.toSegmentRefV2(): WorkspaceWebDavSegmentRefV2 {
-    val map = exactControlMapV2(setOf(
-        "ordinal", "segmentId", "segmentDigest", "previousSegmentDigest", "entryCount", "plaintextBytes", "createdAt",
-    ))
-    return WorkspaceWebDavSegmentRefV2(
-        map.intV2("ordinal"), map.textV2("segmentId"), map.textV2("segmentDigest"),
-        map.nullableTextV2("previousSegmentDigest"), map.intV2("entryCount").toIntExactV2(),
-        map.intV2("plaintextBytes").toIntExactV2(), map.getValue("createdAt").instantV2(),
-    )
-}
-
-private fun CborValueV2.toLogSegmentV2(): WorkspaceWebDavLogSegmentV2 {
-    val map = exactControlMapV2(setOf(
-        "schemaVersion", "contractId", "syncEpochId", "writerDeviceId", "ordinal", "segmentId",
-        "previousSegmentDigest", "createdAt", "objects",
-    ))
-    return WorkspaceWebDavLogSegmentV2(
-        map.intV2("schemaVersion").toIntExactV2(), map.textV2("contractId"), map.textV2("syncEpochId"),
-        map.textV2("writerDeviceId"), map.intV2("ordinal"), map.textV2("segmentId"),
-        map.nullableTextV2("previousSegmentDigest"), map.getValue("createdAt").instantV2(),
         map.arrayV2("objects").map { it.toEncryptedOuterV2() },
     )
 }

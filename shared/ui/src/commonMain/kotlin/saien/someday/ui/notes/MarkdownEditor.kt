@@ -1,5 +1,7 @@
 package saien.someday.ui.notes
 
+import saien.someday.domain.media.SomedayAssetUri
+
 enum class MarkdownToolbarAction(
     val label: String,
     val syntaxName: String,
@@ -11,6 +13,7 @@ enum class MarkdownToolbarAction(
     Quote(label = "Quote", syntaxName = "quote"),
     CodeBlock(label = "Code block", syntaxName = "code-block"),
     Link(label = "Link", syntaxName = "link"),
+    Image(label = "Image", syntaxName = "image"),
 }
 
 val markdownToolbarActions: List<MarkdownToolbarAction> = listOf(
@@ -21,6 +24,7 @@ val markdownToolbarActions: List<MarkdownToolbarAction> = listOf(
     MarkdownToolbarAction.Quote,
     MarkdownToolbarAction.CodeBlock,
     MarkdownToolbarAction.Link,
+    MarkdownToolbarAction.Image,
 )
 
 data class MarkdownEditResult(
@@ -51,13 +55,47 @@ fun applyMarkdownToolbarAction(
         MarkdownToolbarAction.Quote -> prefixSelection(source, selection, "> ", "Quoted text")
         MarkdownToolbarAction.CodeBlock -> wrapSelection(source, selection, "```\n", "\n```", "code")
         MarkdownToolbarAction.Link -> linkSelection(source, selection)
+        // Image insertion needs a durable imported identity and is handled by
+        // insertImportedMarkdownImage after MediaImportRunner succeeds.
+        MarkdownToolbarAction.Image -> MarkdownEditResult(
+            text = source,
+            selectionStart = selection.start,
+            selectionEnd = selection.end,
+        )
     }
+}
+
+/** Inserts a durable app-owned image reference as a standalone Markdown block. */
+fun insertImportedMarkdownImage(
+    source: String,
+    selectionStart: Int,
+    selectionEnd: Int,
+    assetUri: SomedayAssetUri,
+    suggestedAltText: String = "",
+): MarkdownEditResult {
+    val selection = MarkdownTextSelection(selectionStart, selectionEnd).coerceTo(source.length)
+    val selectedAltText = source.substring(selection.start, selection.end)
+    val altText = escapeMarkdownImageAltText(
+        selectedAltText.takeIf { it.isNotBlank() } ?: suggestedAltText,
+    )
+    val markdown = "![$altText]($assetUri)"
+    val prefix = if (selection.start > 0 && source[selection.start - 1] != '\n') "\n" else ""
+    val suffix = if (selection.end < source.length && source[selection.end] != '\n') "\n" else ""
+    val replacement = prefix + markdown + suffix
+    val text = source.replaceRange(selection.start, selection.end, replacement)
+    val cursor = selection.start + replacement.length
+    return MarkdownEditResult(
+        text = text,
+        selectionStart = cursor,
+        selectionEnd = cursor,
+    )
 }
 
 fun markdownEditorCapabilityLog(): String =
     "markdown-source=plain-text preview=toggle " +
         "toolbar=${markdownToolbarActions.joinToString("|") { it.syntaxName }} " +
-        "wysiwyg-assist=live-edit-preview+selection-aware-toolbar+preview-feedback attachments=absent"
+        "wysiwyg-assist=live-edit-preview+selection-aware-toolbar+preview-feedback " +
+        "images=app-owned-assets+local-preview+user-requested-materialization"
 
 enum class MarkdownInlineKind {
     Text,
@@ -104,6 +142,20 @@ sealed interface MarkdownPreviewBlock {
         val code: String,
     ) : MarkdownPreviewBlock {
         override val plainText: String = code
+    }
+
+    /**
+     * A standalone Markdown image. The destination remains opaque at this
+     * layer: product code resolves `someday-asset://` references, while remote
+     * URLs can be rejected or rendered as an unavailable placeholder without
+     * making the parser perform IO.
+     */
+    data class Image(
+        val altText: String,
+        val destination: String,
+    ) : MarkdownPreviewBlock {
+        override val plainText: String = altText
+        val localAssetUri: SomedayAssetUri? = SomedayAssetUri.parseOrNull(destination)
     }
 }
 
@@ -223,6 +275,11 @@ fun renderMarkdownPreview(source: String): List<MarkdownPreviewBlock> {
                 blocks += MarkdownPreviewBlock.CodeBlock(codeLines.joinToString("\n"))
             }
 
+            parseStandaloneMarkdownImage(trimmed) != null -> {
+                blocks += checkNotNull(parseStandaloneMarkdownImage(trimmed))
+                index += 1
+            }
+
             headingLevelFor(trimmed) != null -> {
                 val level = checkNotNull(headingLevelFor(trimmed))
                 val headingText = trimmed.drop(level + 1)
@@ -255,6 +312,52 @@ fun renderMarkdownPreview(source: String): List<MarkdownPreviewBlock> {
     }
 
     return blocks
+}
+
+private fun parseStandaloneMarkdownImage(line: String): MarkdownPreviewBlock.Image? {
+    if (!line.startsWith("![")) return null
+    val labelEnd = line.indexOfUnescaped(']', startIndex = 2)
+    if (labelEnd < 2 || line.getOrNull(labelEnd + 1) != '(' || !line.endsWith(')')) return null
+    val destination = line.substring(labelEnd + 2, line.lastIndex).trim()
+    if (destination.isEmpty() || destination.any { it == '\n' || it == '\r' }) return null
+    return MarkdownPreviewBlock.Image(
+        altText = unescapeMarkdownImageAltText(line.substring(2, labelEnd)),
+        destination = destination,
+    )
+}
+
+private fun escapeMarkdownImageAltText(value: String): String =
+    value
+        .replace(Regex("\\s+"), " ")
+        .trim()
+        .replace("\\", "\\\\")
+        .replace("]", "\\]")
+
+private fun unescapeMarkdownImageAltText(value: String): String = buildString(value.length) {
+    var index = 0
+    while (index < value.length) {
+        if (value[index] == '\\' && index + 1 < value.length && value[index + 1] in charArrayOf('\\', ']')) {
+            append(value[index + 1])
+            index += 2
+        } else {
+            append(value[index])
+            index += 1
+        }
+    }
+}
+
+private fun String.indexOfUnescaped(
+    character: Char,
+    startIndex: Int,
+): Int {
+    var escaped = false
+    for (index in startIndex until length) {
+        val current = this[index]
+        if (!escaped && current == character) return index
+        escaped = !escaped && current == '\\'
+        if (current != '\\') escaped = false
+    }
+    return -1
 }
 
 fun parseMarkdownInlines(text: String): List<MarkdownPreviewInline> {
@@ -538,6 +641,7 @@ private fun headingLevelFor(trimmedLine: String): Int? {
 private fun isMarkdownBlockStart(line: String): Boolean {
     val trimmed = line.trimStart()
     return trimmed.startsWith("```") ||
+        parseStandaloneMarkdownImage(trimmed) != null ||
         headingLevelFor(trimmed) != null ||
         trimmed.startsWith("- ") ||
         trimmed.startsWith("> ")

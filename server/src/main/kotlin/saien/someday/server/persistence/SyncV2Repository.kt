@@ -3,7 +3,6 @@ package saien.someday.server.persistence
 import saien.someday.server.ServerConfig
 import java.security.MessageDigest
 import java.sql.Connection
-import java.sql.DriverManager
 import java.sql.ResultSet
 import java.time.OffsetDateTime
 import java.time.ZoneOffset
@@ -74,6 +73,20 @@ data class SyncV2CheckpointCleanupInput(
     val chunks: List<SyncV2CheckpointChunkRefRecord>,
 )
 
+private data class StoredSyncV2CheckpointChunk(
+    val checkpointId: String,
+    val ref: SyncV2CheckpointChunkRefRecord,
+    val encryptedObjectJson: String,
+)
+
+private data class StoredSyncV2CheckpointManifestIdentity(
+    val checkpointDigest: String,
+    val chunkCount: Int,
+    val totalObjectCount: Int,
+    val chunkRefsFingerprint: String,
+    val encryptedObjectJson: String,
+)
+
 data class SyncV2MutationAckRecord(
     val mutationId: String,
     val objectId: String,
@@ -91,7 +104,6 @@ data class SyncV2ChangeRecord(val cursor: Long, val encodedObjectJson: String)
 data class SyncV2PullRepositoryResult(
     val changes: List<SyncV2ChangeRecord>,
     val complete: Boolean,
-    val rebootstrapRequired: Boolean = false,
     val error: String? = null,
 )
 
@@ -119,82 +131,77 @@ sealed interface SyncV2CheckpointCleanupRepositoryResult {
     data class Retained(val error: String) : SyncV2CheckpointCleanupRepositoryResult
 }
 
-class SyncV2Repository(private val config: ServerConfig) {
-    fun loadEpoch(userId: UUID): SyncV2EpochRecord? = connection().use { connection ->
-        loadActiveEpoch(connection, userId, false)
-    }
-
-    fun loadRetainedEpoch(userId: UUID, epochId: String): SyncV2EpochRecord? = connection().use { connection ->
-        loadEpochById(connection, userId, epochId)
+class SyncV2Repository(
+    config: ServerConfig,
+    private val connections: DatabaseConnectionProvider = directDatabaseConnectionProvider(config),
+) {
+    fun loadEpoch(userId: UUID, workspaceId: String): SyncV2EpochRecord? =
+        scopedConnection(userId, workspaceId).use { connection ->
+        loadActiveEpoch(connection, userId, workspaceId, false)
     }
 
     fun putCheckpointChunk(
         userId: UUID,
+        workspaceId: String,
         input: SyncV2CheckpointChunkInput,
-    ): SyncV2ImmutablePutRepositoryResult = transaction { connection ->
-        lockWorkspace(connection, userId)
+    ): SyncV2ImmutablePutRepositoryResult = transaction(userId, workspaceId) { connection ->
+        lockWorkspace(connection, userId, workspaceId)
         val ref = input.ref
         val existing = connection.prepareStatement(
             """
-            SELECT chunk_index, chunk_id, chunk_digest, object_count, plaintext_bytes
+            SELECT checkpoint_id, chunk_index, chunk_id, chunk_digest, object_count, plaintext_bytes,
+                   encrypted_object_json
             FROM someday_sync_v2_checkpoint_chunks
-            WHERE user_id = ? AND epoch_id = ? AND checkpoint_id = ?
-              AND (chunk_index = ? OR chunk_id = ?)
+            WHERE user_id = ? AND workspace_id = ? AND epoch_id = ?
+              AND ((checkpoint_id = ? AND chunk_index = ?) OR chunk_id = ?)
             FOR UPDATE
             """.trimIndent(),
         ).use { statement ->
             statement.setObject(1, userId)
-            statement.setString(2, input.epochId)
-            statement.setString(3, input.checkpointId)
-            statement.setInt(4, ref.chunkIndex)
-            statement.setString(5, ref.chunkId)
+            statement.setString(2, workspaceId)
+            statement.setString(3, input.epochId)
+            statement.setString(4, input.checkpointId)
+            statement.setInt(5, ref.chunkIndex)
+            statement.setString(6, ref.chunkId)
             statement.executeQuery().use { result ->
-                if (!result.next()) null else SyncV2CheckpointChunkRefRecord(
-                    result.getInt("chunk_index"),
-                    result.getString("chunk_id"),
-                    result.getString("chunk_digest"),
-                    result.getInt("object_count"),
-                    result.getInt("plaintext_bytes"),
+                if (!result.next()) null else StoredSyncV2CheckpointChunk(
+                    checkpointId = result.getString("checkpoint_id"),
+                    ref = SyncV2CheckpointChunkRefRecord(
+                        result.getInt("chunk_index"),
+                        result.getString("chunk_id"),
+                        result.getString("chunk_digest"),
+                        result.getInt("object_count"),
+                        result.getInt("plaintext_bytes"),
+                    ),
+                    encryptedObjectJson = result.getString("encrypted_object_json"),
                 )
             }
         }
         when {
-            existing != null && existing != ref -> SyncV2ImmutablePutRepositoryResult.Rejected("immutable_object_mismatch")
-            existing != null -> {
-                connection.prepareStatement(
-                    """
-                    UPDATE someday_sync_v2_checkpoint_chunks
-                    SET encrypted_object_json = ?, updated_at = NOW()
-                    WHERE user_id = ? AND epoch_id = ? AND checkpoint_id = ? AND chunk_index = ?
-                    """.trimIndent(),
-                ).use { statement ->
-                    statement.setString(1, input.encryptedObjectJson)
-                    statement.setObject(2, userId)
-                    statement.setString(3, input.epochId)
-                    statement.setString(4, input.checkpointId)
-                    statement.setInt(5, ref.chunkIndex)
-                    statement.executeUpdate()
-                }
-                SyncV2ImmutablePutRepositoryResult.Stored(true)
-            }
+            existing != null &&
+                (existing.checkpointId != input.checkpointId || existing.ref != ref ||
+                    existing.encryptedObjectJson != input.encryptedObjectJson) ->
+                SyncV2ImmutablePutRepositoryResult.Rejected("immutable_object_mismatch")
+            existing != null -> SyncV2ImmutablePutRepositoryResult.Stored(true)
             else -> {
                 connection.prepareStatement(
                     """
                     INSERT INTO someday_sync_v2_checkpoint_chunks(
-                        user_id, epoch_id, checkpoint_id, chunk_index, chunk_id,
+                        user_id, workspace_id, epoch_id, checkpoint_id, chunk_index, chunk_id,
                         chunk_digest, object_count, plaintext_bytes, encrypted_object_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """.trimIndent(),
                 ).use { statement ->
                     statement.setObject(1, userId)
-                    statement.setString(2, input.epochId)
-                    statement.setString(3, input.checkpointId)
-                    statement.setInt(4, ref.chunkIndex)
-                    statement.setString(5, ref.chunkId)
-                    statement.setString(6, ref.chunkDigest)
-                    statement.setInt(7, ref.objectCount)
-                    statement.setInt(8, ref.plaintextBytes)
-                    statement.setString(9, input.encryptedObjectJson)
+                    statement.setString(2, workspaceId)
+                    statement.setString(3, input.epochId)
+                    statement.setString(4, input.checkpointId)
+                    statement.setInt(5, ref.chunkIndex)
+                    statement.setString(6, ref.chunkId)
+                    statement.setString(7, ref.chunkDigest)
+                    statement.setInt(8, ref.objectCount)
+                    statement.setInt(9, ref.plaintextBytes)
+                    statement.setString(10, input.encryptedObjectJson)
                     statement.executeUpdate()
                 }
                 SyncV2ImmutablePutRepositoryResult.Stored(false)
@@ -204,71 +211,62 @@ class SyncV2Repository(private val config: ServerConfig) {
 
     fun putCheckpointManifest(
         userId: UUID,
+        workspaceId: String,
         input: SyncV2CheckpointManifestInput,
-    ): SyncV2ImmutablePutRepositoryResult = transaction { connection ->
-        lockWorkspace(connection, userId)
+    ): SyncV2ImmutablePutRepositoryResult = transaction(userId, workspaceId) { connection ->
+        lockWorkspace(connection, userId, workspaceId)
         val fingerprint = chunkRefsFingerprint(input.chunks)
         val existing = connection.prepareStatement(
             """
-            SELECT checkpoint_digest, chunk_count, total_object_count, chunk_refs_fingerprint
+            SELECT checkpoint_digest, chunk_count, total_object_count, chunk_refs_fingerprint,
+                   encrypted_object_json
             FROM someday_sync_v2_checkpoint_manifests
-            WHERE user_id = ? AND epoch_id = ? AND checkpoint_id = ?
+            WHERE user_id = ? AND workspace_id = ? AND epoch_id = ? AND checkpoint_id = ?
             FOR UPDATE
             """.trimIndent(),
         ).use { statement ->
             statement.setObject(1, userId)
-            statement.setString(2, input.epochId)
-            statement.setString(3, input.checkpointId)
+            statement.setString(2, workspaceId)
+            statement.setString(3, input.epochId)
+            statement.setString(4, input.checkpointId)
             statement.executeQuery().use { result ->
-                if (!result.next()) null else listOf(
-                    result.getString("checkpoint_digest"),
-                    result.getInt("chunk_count").toString(),
-                    result.getInt("total_object_count").toString(),
-                    result.getString("chunk_refs_fingerprint"),
+                if (!result.next()) null else StoredSyncV2CheckpointManifestIdentity(
+                    checkpointDigest = result.getString("checkpoint_digest"),
+                    chunkCount = result.getInt("chunk_count"),
+                    totalObjectCount = result.getInt("total_object_count"),
+                    chunkRefsFingerprint = result.getString("chunk_refs_fingerprint"),
+                    encryptedObjectJson = result.getString("encrypted_object_json"),
                 )
             }
         }
-        val incoming = listOf(
-            input.checkpointDigest,
-            input.chunks.size.toString(),
-            input.totalObjectCount.toString(),
-            fingerprint,
+        val incoming = StoredSyncV2CheckpointManifestIdentity(
+            checkpointDigest = input.checkpointDigest,
+            chunkCount = input.chunks.size,
+            totalObjectCount = input.totalObjectCount,
+            chunkRefsFingerprint = fingerprint,
+            encryptedObjectJson = input.encryptedObjectJson,
         )
         when {
             existing != null && existing != incoming -> SyncV2ImmutablePutRepositoryResult.Rejected("immutable_object_mismatch")
-            existing != null -> {
-                connection.prepareStatement(
-                    """
-                    UPDATE someday_sync_v2_checkpoint_manifests
-                    SET encrypted_object_json = ?, updated_at = NOW()
-                    WHERE user_id = ? AND epoch_id = ? AND checkpoint_id = ?
-                    """.trimIndent(),
-                ).use { statement ->
-                    statement.setString(1, input.encryptedObjectJson)
-                    statement.setObject(2, userId)
-                    statement.setString(3, input.epochId)
-                    statement.setString(4, input.checkpointId)
-                    statement.executeUpdate()
-                }
-                SyncV2ImmutablePutRepositoryResult.Stored(true)
-            }
+            existing != null -> SyncV2ImmutablePutRepositoryResult.Stored(true)
             else -> {
                 connection.prepareStatement(
                     """
                     INSERT INTO someday_sync_v2_checkpoint_manifests(
-                        user_id, epoch_id, checkpoint_id, checkpoint_digest,
+                        user_id, workspace_id, epoch_id, checkpoint_id, checkpoint_digest,
                         chunk_count, total_object_count, chunk_refs_fingerprint, encrypted_object_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """.trimIndent(),
                 ).use { statement ->
                     statement.setObject(1, userId)
-                    statement.setString(2, input.epochId)
-                    statement.setString(3, input.checkpointId)
-                    statement.setString(4, input.checkpointDigest)
-                    statement.setInt(5, input.chunks.size)
-                    statement.setInt(6, input.totalObjectCount)
-                    statement.setString(7, fingerprint)
-                    statement.setString(8, input.encryptedObjectJson)
+                    statement.setString(2, workspaceId)
+                    statement.setString(3, input.epochId)
+                    statement.setString(4, input.checkpointId)
+                    statement.setString(5, input.checkpointDigest)
+                    statement.setInt(6, input.chunks.size)
+                    statement.setInt(7, input.totalObjectCount)
+                    statement.setString(8, fingerprint)
+                    statement.setString(9, input.encryptedObjectJson)
                     statement.executeUpdate()
                 }
                 SyncV2ImmutablePutRepositoryResult.Stored(false)
@@ -278,10 +276,11 @@ class SyncV2Repository(private val config: ServerConfig) {
 
     fun cleanupCheckpointDraft(
         userId: UUID,
+        workspaceId: String,
         input: SyncV2CheckpointCleanupInput,
-    ): SyncV2CheckpointCleanupRepositoryResult = transaction { connection ->
-        lockWorkspace(connection, userId)
-        val current = loadActiveEpoch(connection, userId, true)
+    ): SyncV2CheckpointCleanupRepositoryResult = transaction(userId, workspaceId) { connection ->
+        lockWorkspace(connection, userId, workspaceId)
+        val current = loadActiveEpoch(connection, userId, workspaceId, true)
             ?: return@transaction SyncV2CheckpointCleanupRepositoryResult.Retained(
                 "checkpoint_still_publishable",
             )
@@ -290,7 +289,7 @@ class SyncV2Repository(private val config: ServerConfig) {
                 "checkpoint_still_publishable",
             )
         }
-        if (loadEpochById(connection, userId, input.epochId) != null) {
+        if (loadEpochById(connection, userId, workspaceId, input.epochId) != null) {
             return@transaction SyncV2CheckpointCleanupRepositoryResult.Retained(
                 "checkpoint_referenced",
             )
@@ -301,13 +300,14 @@ class SyncV2Repository(private val config: ServerConfig) {
             """
             SELECT checkpoint_digest, chunk_count, chunk_refs_fingerprint
             FROM someday_sync_v2_checkpoint_manifests
-            WHERE user_id = ? AND epoch_id = ? AND checkpoint_id = ?
+            WHERE user_id = ? AND workspace_id = ? AND epoch_id = ? AND checkpoint_id = ?
             FOR UPDATE
             """.trimIndent(),
         ).use { statement ->
             statement.setObject(1, userId)
-            statement.setString(2, input.epochId)
-            statement.setString(3, input.checkpointId)
+            statement.setString(2, workspaceId)
+            statement.setString(3, input.epochId)
+            statement.setString(4, input.checkpointId)
             statement.executeQuery().use { result ->
                 if (!result.next()) null else Triple(
                     result.getString(1),
@@ -332,14 +332,15 @@ class SyncV2Repository(private val config: ServerConfig) {
             """
             SELECT chunk_index, chunk_id, chunk_digest, object_count, plaintext_bytes
             FROM someday_sync_v2_checkpoint_chunks
-            WHERE user_id = ? AND epoch_id = ? AND checkpoint_id = ?
+            WHERE user_id = ? AND workspace_id = ? AND epoch_id = ? AND checkpoint_id = ?
             ORDER BY chunk_index
             FOR UPDATE
             """.trimIndent(),
         ).use { statement ->
             statement.setObject(1, userId)
-            statement.setString(2, input.epochId)
-            statement.setString(3, input.checkpointId)
+            statement.setString(2, workspaceId)
+            statement.setString(3, input.epochId)
+            statement.setString(4, input.checkpointId)
             statement.executeQuery().use { result ->
                 buildList {
                     while (result.next()) {
@@ -367,23 +368,25 @@ class SyncV2Repository(private val config: ServerConfig) {
         connection.prepareStatement(
             """
             DELETE FROM someday_sync_v2_checkpoint_manifests
-            WHERE user_id = ? AND epoch_id = ? AND checkpoint_id = ?
+            WHERE user_id = ? AND workspace_id = ? AND epoch_id = ? AND checkpoint_id = ?
             """.trimIndent(),
         ).use { statement ->
             statement.setObject(1, userId)
-            statement.setString(2, input.epochId)
-            statement.setString(3, input.checkpointId)
+            statement.setString(2, workspaceId)
+            statement.setString(3, input.epochId)
+            statement.setString(4, input.checkpointId)
             statement.executeUpdate()
         }
         connection.prepareStatement(
             """
             DELETE FROM someday_sync_v2_checkpoint_chunks
-            WHERE user_id = ? AND epoch_id = ? AND checkpoint_id = ?
+            WHERE user_id = ? AND workspace_id = ? AND epoch_id = ? AND checkpoint_id = ?
             """.trimIndent(),
         ).use { statement ->
             statement.setObject(1, userId)
-            statement.setString(2, input.epochId)
-            statement.setString(3, input.checkpointId)
+            statement.setString(2, workspaceId)
+            statement.setString(3, input.epochId)
+            statement.setString(4, input.checkpointId)
             statement.executeUpdate()
         }
         SyncV2CheckpointCleanupRepositoryResult.Deleted(alreadyAbsent)
@@ -391,91 +394,53 @@ class SyncV2Repository(private val config: ServerConfig) {
 
     fun compareAndSetEpoch(
         userId: UUID,
+        workspaceId: String,
         expectedCurrentDigest: String?,
         metadata: SyncV2EpochMetadataRecord,
         pointerObjectJson: String,
-    ): SyncV2PointerPublishRepositoryResult = transaction { connection ->
-        lockWorkspace(connection, userId)
-        val current = loadActiveEpoch(connection, userId, true)
-        if (current?.metadata == metadata) {
-            connection.prepareStatement(
-                """
-                UPDATE someday_sync_v2_epochs SET pointer_object_json = ?, updated_at = NOW()
-                WHERE user_id = ? AND epoch_id = ? AND active
-                """.trimIndent(),
-            ).use { statement ->
-                statement.setString(1, pointerObjectJson)
-                statement.setObject(2, userId)
-                statement.setString(3, metadata.epochId)
-                statement.executeUpdate()
-            }
+    ): SyncV2PointerPublishRepositoryResult = transaction(userId, workspaceId) { connection ->
+        lockWorkspace(connection, userId, workspaceId)
+        val current = loadActiveEpoch(connection, userId, workspaceId, true)
+        if (current?.metadata == metadata && current.pointerObjectJson == pointerObjectJson) {
             return@transaction SyncV2PointerPublishRepositoryResult.Published(true)
         }
-        if (current?.metadata?.pointerDigest != expectedCurrentDigest) {
+        if (current != null) {
             return@transaction SyncV2PointerPublishRepositoryResult.CompareAndSetFailed(current)
         }
-        if (current == null && expectedCurrentDigest != null) {
+        if (expectedCurrentDigest != null ||
+            metadata.previousEpochId != null || metadata.previousEpochPointerDigest != null
+        ) {
             return@transaction SyncV2PointerPublishRepositoryResult.Rejected("previous_epoch_mismatch")
         }
-        // On an already initialized authority this field is the exact local
-        // predecessor.  On an empty target it may name an authenticated epoch
-        // from another authority as migration provenance; the target cannot
-        // and must not pretend that external epoch existed in its own rows.
-        if (current != null && metadata.previousEpochId != current.metadata.epochId) {
-            return@transaction SyncV2PointerPublishRepositoryResult.Rejected("previous_epoch_mismatch")
-        }
-        if (current != null && metadata.previousEpochPointerDigest != current.metadata.pointerDigest) {
-            return@transaction SyncV2PointerPublishRepositoryResult.Rejected("previous_epoch_pointer_mismatch")
-        }
-        if (loadEpochById(connection, userId, metadata.epochId) != null) {
-            return@transaction SyncV2PointerPublishRepositoryResult.Rejected("epoch_id_reuse")
-        }
-        if (!checkpointIsComplete(connection, userId, metadata)) {
+        if (!checkpointIsComplete(connection, userId, workspaceId, metadata)) {
             return@transaction SyncV2PointerPublishRepositoryResult.Rejected("checkpoint_incomplete")
-        }
-        if (current != null) {
-            connection.prepareStatement(
-                """
-                UPDATE someday_sync_v2_epochs
-                SET active = FALSE, read_only_at = NOW(),
-                    retain_until = NOW() + (supported_offline_window_seconds * INTERVAL '1 second'),
-                    updated_at = NOW()
-                WHERE user_id = ? AND epoch_id = ? AND active
-                """.trimIndent(),
-            ).use { statement ->
-                statement.setObject(1, userId)
-                statement.setString(2, current.metadata.epochId)
-                statement.executeUpdate()
-            }
         }
         connection.prepareStatement(
             """
             INSERT INTO someday_sync_v2_epochs(
-                user_id, epoch_id, pointer_digest, pointer_object_json,
+                user_id, workspace_id, epoch_id, pointer_digest, pointer_object_json,
                 contract_id, schema_set_version, semantic_protocol_version,
                 minimum_writer_protocol_version, key_set_version, remote_profile,
                 metadata_privacy_mode, supported_offline_window_seconds,
-                checkpoint_id, checkpoint_digest, previous_epoch_id,
-                previous_epoch_pointer_digest, active
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE)
+                checkpoint_id, checkpoint_digest
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """.trimIndent(),
         ).use { statement ->
             statement.setObject(1, userId)
-            statement.setString(2, metadata.epochId)
-            statement.setString(3, metadata.pointerDigest)
-            statement.setString(4, pointerObjectJson)
-            statement.setString(5, metadata.contractId)
-            statement.setString(6, metadata.schemaSetVersion)
-            statement.setInt(7, metadata.semanticProtocolVersion)
-            statement.setInt(8, metadata.minimumWriterProtocolVersion)
-            statement.setString(9, metadata.keySetVersion)
-            statement.setString(10, metadata.remoteProfile)
-            statement.setString(11, metadata.metadataPrivacyMode)
-            statement.setLong(12, metadata.supportedOfflineWindowSeconds)
-            statement.setString(13, metadata.checkpointId)
-            statement.setString(14, metadata.checkpointDigest)
-            statement.setString(15, metadata.previousEpochId)
-            statement.setString(16, metadata.previousEpochPointerDigest)
+            statement.setString(2, workspaceId)
+            statement.setString(3, metadata.epochId)
+            statement.setString(4, metadata.pointerDigest)
+            statement.setString(5, pointerObjectJson)
+            statement.setString(6, metadata.contractId)
+            statement.setString(7, metadata.schemaSetVersion)
+            statement.setInt(8, metadata.semanticProtocolVersion)
+            statement.setInt(9, metadata.minimumWriterProtocolVersion)
+            statement.setString(10, metadata.keySetVersion)
+            statement.setString(11, metadata.remoteProfile)
+            statement.setString(12, metadata.metadataPrivacyMode)
+            statement.setLong(13, metadata.supportedOfflineWindowSeconds)
+            statement.setString(14, metadata.checkpointId)
+            statement.setString(15, metadata.checkpointDigest)
             statement.executeUpdate()
         }
         SyncV2PointerPublishRepositoryResult.Published(false)
@@ -483,51 +448,56 @@ class SyncV2Repository(private val config: ServerConfig) {
 
     fun loadCheckpointManifest(
         userId: UUID,
+        workspaceId: String,
         epochId: String,
         checkpointId: String,
-    ): String? = connection().use { connection ->
+    ): String? = scopedConnection(userId, workspaceId).use { connection ->
         connection.prepareStatement(
             """
             SELECT encrypted_object_json FROM someday_sync_v2_checkpoint_manifests
-            WHERE user_id = ? AND epoch_id = ? AND checkpoint_id = ?
+            WHERE user_id = ? AND workspace_id = ? AND epoch_id = ? AND checkpoint_id = ?
             """.trimIndent(),
         ).use { statement ->
             statement.setObject(1, userId)
-            statement.setString(2, epochId)
-            statement.setString(3, checkpointId)
+            statement.setString(2, workspaceId)
+            statement.setString(3, epochId)
+            statement.setString(4, checkpointId)
             statement.executeQuery().use { result -> if (result.next()) result.getString(1) else null }
         }
     }
 
     fun loadCheckpointChunk(
         userId: UUID,
+        workspaceId: String,
         epochId: String,
         checkpointId: String,
         chunkIndex: Int,
-    ): String? = connection().use { connection ->
+    ): String? = scopedConnection(userId, workspaceId).use { connection ->
         connection.prepareStatement(
             """
             SELECT encrypted_object_json FROM someday_sync_v2_checkpoint_chunks
-            WHERE user_id = ? AND epoch_id = ? AND checkpoint_id = ? AND chunk_index = ?
+            WHERE user_id = ? AND workspace_id = ? AND epoch_id = ? AND checkpoint_id = ? AND chunk_index = ?
             """.trimIndent(),
         ).use { statement ->
             statement.setObject(1, userId)
-            statement.setString(2, epochId)
-            statement.setString(3, checkpointId)
-            statement.setInt(4, chunkIndex)
+            statement.setString(2, workspaceId)
+            statement.setString(3, epochId)
+            statement.setString(4, checkpointId)
+            statement.setInt(5, chunkIndex)
             statement.executeQuery().use { result -> if (result.next()) result.getString(1) else null }
         }
     }
 
     fun push(
         userId: UUID,
+        workspaceId: String,
         deviceId: UUID,
         epochId: String,
         writerProtocolVersion: Int,
         objects: List<SyncV2ObjectInput>,
-    ): SyncV2PushRepositoryResult = transaction { connection ->
-        lockWorkspace(connection, userId)
-        val epoch = loadActiveEpoch(connection, userId, true)
+    ): SyncV2PushRepositoryResult = transaction(userId, workspaceId) { connection ->
+        lockWorkspace(connection, userId, workspaceId)
+        val epoch = loadActiveEpoch(connection, userId, workspaceId, true)
             ?: return@transaction SyncV2PushRepositoryResult.Rejected("v2_epoch_not_initialized")
         if (epoch.metadata.epochId != epochId) {
             return@transaction SyncV2PushRepositoryResult.Rejected("incompatible_epoch")
@@ -541,24 +511,17 @@ class SyncV2Repository(private val config: ServerConfig) {
 
         val prepared = mutableListOf<PreparedMutation>()
         for (input in objects) {
-            val mutation = findMutation(connection, userId, epochId, input.mutationId)
+            val mutation = findMutation(connection, userId, workspaceId, epochId, input.mutationId)
             if (mutation != null && (mutation.objectId != input.objectId || mutation.objectDigest != input.objectDigest)) {
                 return@transaction SyncV2PushRepositoryResult.Rejected("mutation_reuse_mismatch")
             }
-            val objectValue = findObject(connection, userId, epochId, input.objectId, true)
-            if (objectValue != null && (
-                    objectValue.objectDigest != input.objectDigest ||
-                        objectValue.objectType != input.objectType ||
-                        objectValue.mutationId != input.mutationId
-                    )
+            val objectValue = findObject(connection, userId, workspaceId, epochId, input.objectId, true)
+            if (objectValue != null && !objectValue.exactlyMatches(input)
             ) {
                 return@transaction SyncV2PushRepositoryResult.Rejected("immutable_object_mismatch")
             }
             if ((mutation == null) != (objectValue == null)) {
                 return@transaction SyncV2PushRepositoryResult.Rejected("stored_object_invalid")
-            }
-            if (objectValue != null && !replicaCapacityAvailable(connection, userId, epochId, input)) {
-                return@transaction SyncV2PushRepositoryResult.Rejected("repair_replica_set_invalid")
             }
             prepared += PreparedMutation(input, mutation)
         }
@@ -566,66 +529,71 @@ class SyncV2Repository(private val config: ServerConfig) {
         val acknowledgements = prepared.map { value ->
             val input = value.input
             if (value.existingMutation != null) {
-                upsertReplica(connection, userId, input, repair = false)
                 SyncV2MutationAckRecord(input.mutationId, input.objectId, input.objectDigest, true)
             } else {
                 connection.prepareStatement(
                     """
                     INSERT INTO someday_sync_v2_objects(
-                        user_id, epoch_id, object_id, object_type, object_digest,
-                        mutation_id, first_writer_device_id, cursor
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+                        user_id, workspace_id, epoch_id, object_id, object_type, object_digest,
+                        mutation_id, first_writer_device_id, ciphertext_digest,
+                        encrypted_object_json, cursor
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
                     """.trimIndent(),
                 ).use { statement ->
                     statement.setObject(1, userId)
-                    statement.setString(2, epochId)
-                    statement.setString(3, input.objectId)
-                    statement.setString(4, input.objectType)
-                    statement.setString(5, input.objectDigest)
-                    statement.setString(6, input.mutationId)
-                    statement.setObject(7, input.writerDeviceId)
+                    statement.setString(2, workspaceId)
+                    statement.setString(3, epochId)
+                    statement.setString(4, input.objectId)
+                    statement.setString(5, input.objectType)
+                    statement.setString(6, input.objectDigest)
+                    statement.setString(7, input.mutationId)
+                    statement.setObject(8, input.writerDeviceId)
+                    statement.setString(9, input.ciphertextDigest)
+                    statement.setString(10, input.encodedObjectJson)
                     statement.executeUpdate()
                 }
-                upsertReplica(connection, userId, input, repair = false)
                 val cursor = connection.prepareStatement(
                     """
                     INSERT INTO someday_sync_v2_changes(
-                        user_id, epoch_id, object_id, object_digest, mutation_id
-                    ) VALUES (?, ?, ?, ?, ?) RETURNING cursor
+                        user_id, workspace_id, epoch_id, object_id, object_digest, mutation_id
+                    ) VALUES (?, ?, ?, ?, ?, ?) RETURNING cursor
                     """.trimIndent(),
                 ).use { statement ->
                     statement.setObject(1, userId)
-                    statement.setString(2, epochId)
-                    statement.setString(3, input.objectId)
-                    statement.setString(4, input.objectDigest)
-                    statement.setString(5, input.mutationId)
+                    statement.setString(2, workspaceId)
+                    statement.setString(3, epochId)
+                    statement.setString(4, input.objectId)
+                    statement.setString(5, input.objectDigest)
+                    statement.setString(6, input.mutationId)
                     statement.executeQuery().use { result -> result.next(); result.getLong(1) }
                 }
                 connection.prepareStatement(
                     """
                     UPDATE someday_sync_v2_objects SET cursor = ?
-                    WHERE user_id = ? AND epoch_id = ? AND object_id = ?
+                    WHERE user_id = ? AND workspace_id = ? AND epoch_id = ? AND object_id = ?
                     """.trimIndent(),
                 ).use { statement ->
                     statement.setLong(1, cursor)
                     statement.setObject(2, userId)
-                    statement.setString(3, epochId)
-                    statement.setString(4, input.objectId)
+                    statement.setString(3, workspaceId)
+                    statement.setString(4, epochId)
+                    statement.setString(5, input.objectId)
                     statement.executeUpdate()
                 }
                 connection.prepareStatement(
                     """
                     INSERT INTO someday_sync_v2_mutations(
-                        user_id, epoch_id, mutation_id, object_id, object_digest, cursor
-                    ) VALUES (?, ?, ?, ?, ?, ?)
+                        user_id, workspace_id, epoch_id, mutation_id, object_id, object_digest, cursor
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
                     """.trimIndent(),
                 ).use { statement ->
                     statement.setObject(1, userId)
-                    statement.setString(2, epochId)
-                    statement.setString(3, input.mutationId)
-                    statement.setString(4, input.objectId)
-                    statement.setString(5, input.objectDigest)
-                    statement.setLong(6, cursor)
+                    statement.setString(2, workspaceId)
+                    statement.setString(3, epochId)
+                    statement.setString(4, input.mutationId)
+                    statement.setString(5, input.objectId)
+                    statement.setString(6, input.objectDigest)
+                    statement.setLong(7, cursor)
                     statement.executeUpdate()
                 }
                 SyncV2MutationAckRecord(input.mutationId, input.objectId, input.objectDigest, false)
@@ -636,18 +604,19 @@ class SyncV2Repository(private val config: ServerConfig) {
 
     fun pull(
         userId: UUID,
+        workspaceId: String,
         epochId: String,
         afterCursor: Long,
         limit: Int,
-    ): SyncV2PullRepositoryResult = connection().use { connection ->
-        if (loadEpochById(connection, userId, epochId) == null) {
-            return@use SyncV2PullRepositoryResult(emptyList(), true, rebootstrapRequired = true)
+    ): SyncV2PullRepositoryResult = scopedConnection(userId, workspaceId).use { connection ->
+        if (loadEpochById(connection, userId, workspaceId, epochId) == null) {
+            return@use SyncV2PullRepositoryResult(emptyList(), true, error = "epoch_not_found")
         }
-        val maximum = maximumCursor(connection, userId, epochId)
+        val maximum = maximumCursor(connection, userId, workspaceId, epochId)
         if (afterCursor > maximum) {
-            // A cursor ahead of this retained epoch is rollback evidence, not
-            // an offline-horizon event.  Rebootstrap may be offered only when
-            // the requested read-only epoch has actually been collected.
+            // An authenticated client cursor ahead of the server is rollback
+            // evidence. The first-release protocol never discards history and
+            // therefore has no rebootstrap/horizon escape hatch.
             return@use SyncV2PullRepositoryResult(
                 emptyList(),
                 complete = true,
@@ -656,24 +625,21 @@ class SyncV2Repository(private val config: ServerConfig) {
         }
         val values = connection.prepareStatement(
             """
-            SELECT c.cursor, r.encrypted_object_json
+            SELECT c.cursor, o.encrypted_object_json
             FROM someday_sync_v2_changes c
-            LEFT JOIN LATERAL (
-                SELECT encrypted_object_json
-                FROM someday_sync_v2_object_replicas r
-                WHERE r.user_id = c.user_id AND r.epoch_id = c.epoch_id AND r.object_id = c.object_id
-                ORDER BY r.repair_replica ASC, r.updated_at DESC, r.writer_device_id ASC
-                LIMIT 1
-            ) r ON TRUE
-            WHERE c.user_id = ? AND c.epoch_id = ? AND c.cursor > ?
+            LEFT JOIN someday_sync_v2_objects o
+              ON o.user_id = c.user_id AND o.workspace_id = c.workspace_id
+             AND o.epoch_id = c.epoch_id AND o.object_id = c.object_id
+            WHERE c.user_id = ? AND c.workspace_id = ? AND c.epoch_id = ? AND c.cursor > ?
             ORDER BY c.cursor
             LIMIT ?
             """.trimIndent(),
         ).use { statement ->
             statement.setObject(1, userId)
-            statement.setString(2, epochId)
-            statement.setLong(3, afterCursor)
-            statement.setInt(4, limit + 1)
+            statement.setString(2, workspaceId)
+            statement.setString(3, epochId)
+            statement.setLong(4, afterCursor)
+            statement.setInt(5, limit + 1)
             statement.executeQuery().use { result ->
                 buildList {
                     while (result.next()) add(result.getLong(1) to result.getString(2))
@@ -688,7 +654,6 @@ class SyncV2Repository(private val config: ServerConfig) {
             return@use SyncV2PullRepositoryResult(
                 changes = emptyList(),
                 complete = false,
-                rebootstrapRequired = true,
                 error = "missing_remote_object",
             )
         }
@@ -700,103 +665,67 @@ class SyncV2Repository(private val config: ServerConfig) {
         )
     }
 
-    fun frontier(userId: UUID, epochId: String): SyncV2EpochFrontierRecord? = connection().use { connection ->
-        if (loadEpochById(connection, userId, epochId) == null) return@use null
-        val cursor = maximumCursor(connection, userId, epochId)
-        val digest = connection.prepareStatement(
-            """
-            SELECT object_digest FROM someday_sync_v2_changes
-            WHERE user_id = ? AND epoch_id = ? ORDER BY cursor DESC LIMIT 1
-            """.trimIndent(),
-        ).use { statement ->
-            statement.setObject(1, userId)
-            statement.setString(2, epochId)
-            statement.executeQuery().use { result ->
-                if (result.next()) "self-hosted:$cursor:${result.getString(1)}" else "self-hosted:0:empty"
+    fun frontier(userId: UUID, workspaceId: String, epochId: String): SyncV2EpochFrontierRecord? =
+        scopedConnection(userId, workspaceId).use { connection ->
+            if (loadEpochById(connection, userId, workspaceId, epochId) == null) return@use null
+            connection.prepareStatement(
+                """
+                SELECT cursor, object_digest FROM someday_sync_v2_changes
+                WHERE user_id = ? AND workspace_id = ? AND epoch_id = ? ORDER BY cursor DESC LIMIT 1
+                """.trimIndent(),
+            ).use { statement ->
+                statement.setObject(1, userId)
+                statement.setString(2, workspaceId)
+                statement.setString(3, epochId)
+                statement.executeQuery().use { result ->
+                    if (!result.next()) {
+                        SyncV2EpochFrontierRecord(0, "self-hosted:0:empty")
+                    } else {
+                        val cursor = result.getLong(1)
+                        SyncV2EpochFrontierRecord(cursor, "self-hosted:$cursor:${result.getString(2)}")
+                    }
+                }
             }
         }
-        SyncV2EpochFrontierRecord(cursor, digest)
-    }
 
-    fun fetchReplicas(
-        userId: UUID,
-        epochId: String,
-        objectId: String,
-        expectedObjectDigest: String,
-    ): List<String> = connection().use { connection ->
-        connection.prepareStatement(
-            """
-            SELECT r.encrypted_object_json
-            FROM someday_sync_v2_object_replicas r
-            JOIN someday_sync_v2_objects o
-              ON o.user_id = r.user_id AND o.epoch_id = r.epoch_id AND o.object_id = r.object_id
-            WHERE r.user_id = ? AND r.epoch_id = ? AND r.object_id = ? AND o.object_digest = ?
-            ORDER BY r.writer_device_id
-            LIMIT 5
-            """.trimIndent(),
-        ).use { statement ->
-            statement.setObject(1, userId)
-            statement.setString(2, epochId)
-            statement.setString(3, objectId)
-            statement.setString(4, expectedObjectDigest)
-            statement.executeQuery().use { result -> buildList { while (result.next()) add(result.getString(1)) } }
+    fun status(userId: UUID, workspaceId: String): SyncV2StatusSnapshot =
+        scopedConnection(userId, workspaceId).use { connection ->
+            val epoch = loadActiveEpoch(connection, userId, workspaceId, false)
+                ?: return@use SyncV2StatusSnapshot(null, 0, 0)
+            val cursor = maximumCursor(connection, userId, workspaceId, epoch.metadata.epochId)
+            val count = connection.prepareStatement(
+                "SELECT COUNT(*) FROM someday_sync_v2_objects " +
+                    "WHERE user_id = ? AND workspace_id = ? AND epoch_id = ?",
+            ).use { statement ->
+                statement.setObject(1, userId)
+                statement.setString(2, workspaceId)
+                statement.setString(3, epoch.metadata.epochId)
+                statement.executeQuery().use { result ->
+                    result.next()
+                    result.getLong(1)
+                }
+            }
+            SyncV2StatusSnapshot(epoch.metadata.epochId, cursor, count)
         }
-    }
-
-    fun publishRepairReplica(
-        userId: UUID,
-        deviceId: UUID,
-        input: SyncV2ObjectInput,
-    ): SyncV2ImmutablePutRepositoryResult = transaction { connection ->
-        lockWorkspace(connection, userId)
-        if (input.writerDeviceId != deviceId || loadEpochById(connection, userId, input.epochId) == null) {
-            return@transaction SyncV2ImmutablePutRepositoryResult.Rejected("device_or_epoch_mismatch")
-        }
-        val stored = findObject(connection, userId, input.epochId, input.objectId, true)
-            ?: return@transaction SyncV2ImmutablePutRepositoryResult.Rejected("missing_remote_object")
-        if (stored.objectDigest != input.objectDigest || stored.objectType != input.objectType ||
-            stored.mutationId != input.mutationId
-        ) {
-            return@transaction SyncV2ImmutablePutRepositoryResult.Rejected("repair_object_mismatch")
-        }
-        if (!replicaCapacityAvailable(connection, userId, input.epochId, input)) {
-            return@transaction SyncV2ImmutablePutRepositoryResult.Rejected("repair_replica_set_invalid")
-        }
-        val replay = replicaExists(connection, userId, input)
-        upsertReplica(connection, userId, input, repair = true)
-        SyncV2ImmutablePutRepositoryResult.Stored(replay)
-    }
-
-    fun status(userId: UUID): SyncV2StatusSnapshot = connection().use { connection ->
-        val epoch = loadActiveEpoch(connection, userId, false)
-            ?: return@use SyncV2StatusSnapshot(null, 0, 0)
-        val cursor = maximumCursor(connection, userId, epoch.metadata.epochId)
-        val count = connection.prepareStatement(
-            "SELECT COUNT(*) FROM someday_sync_v2_objects WHERE user_id = ? AND epoch_id = ?",
-        ).use { statement ->
-            statement.setObject(1, userId)
-            statement.setString(2, epoch.metadata.epochId)
-            statement.executeQuery().use { result -> result.next(); result.getLong(1) }
-        }
-        SyncV2StatusSnapshot(epoch.metadata.epochId, cursor, count)
-    }
 
     private fun checkpointIsComplete(
         connection: Connection,
         userId: UUID,
+        workspaceId: String,
         metadata: SyncV2EpochMetadataRecord,
     ): Boolean {
         val manifest = connection.prepareStatement(
             """
             SELECT chunk_count, total_object_count, chunk_refs_fingerprint
             FROM someday_sync_v2_checkpoint_manifests
-            WHERE user_id = ? AND epoch_id = ? AND checkpoint_id = ? AND checkpoint_digest = ?
+            WHERE user_id = ? AND workspace_id = ? AND epoch_id = ? AND checkpoint_id = ? AND checkpoint_digest = ?
             """.trimIndent(),
         ).use { statement ->
             statement.setObject(1, userId)
-            statement.setString(2, metadata.epochId)
-            statement.setString(3, metadata.checkpointId)
-            statement.setString(4, metadata.checkpointDigest)
+            statement.setString(2, workspaceId)
+            statement.setString(3, metadata.epochId)
+            statement.setString(4, metadata.checkpointId)
+            statement.setString(5, metadata.checkpointDigest)
             statement.executeQuery().use { result ->
                 if (!result.next()) null else Triple(result.getInt(1), result.getInt(2), result.getString(3))
             }
@@ -805,12 +734,13 @@ class SyncV2Repository(private val config: ServerConfig) {
             """
             SELECT chunk_index, chunk_id, chunk_digest, object_count, plaintext_bytes
             FROM someday_sync_v2_checkpoint_chunks
-            WHERE user_id = ? AND epoch_id = ? AND checkpoint_id = ? ORDER BY chunk_index
+            WHERE user_id = ? AND workspace_id = ? AND epoch_id = ? AND checkpoint_id = ? ORDER BY chunk_index
             """.trimIndent(),
         ).use { statement ->
             statement.setObject(1, userId)
-            statement.setString(2, metadata.epochId)
-            statement.setString(3, metadata.checkpointId)
+            statement.setString(2, workspaceId)
+            statement.setString(3, metadata.epochId)
+            statement.setString(4, metadata.checkpointId)
             statement.executeQuery().use { result ->
                 buildList {
                     while (result.next()) add(SyncV2CheckpointChunkRefRecord(
@@ -825,23 +755,31 @@ class SyncV2Repository(private val config: ServerConfig) {
             chunkRefsFingerprint(refs) == manifest.third
     }
 
-    private fun loadActiveEpoch(connection: Connection, userId: UUID, forUpdate: Boolean): SyncV2EpochRecord? =
-        loadEpoch(connection, userId, null, activeOnly = true, forUpdate = forUpdate)
+    private fun loadActiveEpoch(
+        connection: Connection,
+        userId: UUID,
+        workspaceId: String,
+        forUpdate: Boolean,
+    ): SyncV2EpochRecord? = loadEpoch(connection, userId, workspaceId, null, forUpdate = forUpdate)
 
-    private fun loadEpochById(connection: Connection, userId: UUID, epochId: String): SyncV2EpochRecord? =
-        loadEpoch(connection, userId, epochId, activeOnly = false, forUpdate = false)
+    private fun loadEpochById(
+        connection: Connection,
+        userId: UUID,
+        workspaceId: String,
+        epochId: String,
+    ): SyncV2EpochRecord? = loadEpoch(connection, userId, workspaceId, epochId, forUpdate = false)
 
     private fun loadEpoch(
         connection: Connection,
         userId: UUID,
+        workspaceId: String,
         epochId: String?,
-        activeOnly: Boolean,
         forUpdate: Boolean,
     ): SyncV2EpochRecord? {
         val conditions = buildList {
             add("user_id = ?")
+            add("workspace_id = ?")
             if (epochId != null) add("epoch_id = ?")
-            if (activeOnly) add("active")
         }.joinToString(" AND ")
         val lock = if (forUpdate) " FOR UPDATE" else ""
         return connection.prepareStatement(
@@ -849,12 +787,13 @@ class SyncV2Repository(private val config: ServerConfig) {
             SELECT contract_id, schema_set_version, epoch_id, pointer_digest, pointer_object_json,
                    semantic_protocol_version, minimum_writer_protocol_version, key_set_version,
                    remote_profile, metadata_privacy_mode, supported_offline_window_seconds,
-                   checkpoint_id, checkpoint_digest, previous_epoch_id, previous_epoch_pointer_digest
+                   checkpoint_id, checkpoint_digest
             FROM someday_sync_v2_epochs WHERE $conditions$lock
             """.trimIndent(),
         ).use { statement ->
             statement.setObject(1, userId)
-            if (epochId != null) statement.setString(2, epochId)
+            statement.setString(2, workspaceId)
+            if (epochId != null) statement.setString(3, epochId)
             statement.executeQuery().use { result ->
                 if (!result.next()) null else SyncV2EpochRecord(
                     SyncV2EpochMetadataRecord(
@@ -870,8 +809,8 @@ class SyncV2Repository(private val config: ServerConfig) {
                         result.getLong("supported_offline_window_seconds"),
                         result.getString("checkpoint_id"),
                         result.getString("checkpoint_digest"),
-                        result.getString("previous_epoch_id"),
-                        result.getString("previous_epoch_pointer_digest"),
+                        null,
+                        null,
                     ),
                     result.getString("pointer_object_json"),
                 )
@@ -882,17 +821,19 @@ class SyncV2Repository(private val config: ServerConfig) {
     private fun findMutation(
         connection: Connection,
         userId: UUID,
+        workspaceId: String,
         epochId: String,
         mutationId: String,
     ): ExistingMutation? = connection.prepareStatement(
         """
         SELECT object_id, object_digest, cursor FROM someday_sync_v2_mutations
-        WHERE user_id = ? AND epoch_id = ? AND mutation_id = ? FOR UPDATE
+        WHERE user_id = ? AND workspace_id = ? AND epoch_id = ? AND mutation_id = ? FOR UPDATE
         """.trimIndent(),
     ).use { statement ->
         statement.setObject(1, userId)
-        statement.setString(2, epochId)
-        statement.setString(3, mutationId)
+        statement.setString(2, workspaceId)
+        statement.setString(3, epochId)
+        statement.setString(4, mutationId)
         statement.executeQuery().use { result ->
             if (!result.next()) null else ExistingMutation(result.getString(1), result.getString(2), result.getLong(3))
         }
@@ -901,6 +842,7 @@ class SyncV2Repository(private val config: ServerConfig) {
     private fun findObject(
         connection: Connection,
         userId: UUID,
+        workspaceId: String,
         epochId: String,
         objectId: String,
         forUpdate: Boolean,
@@ -908,97 +850,38 @@ class SyncV2Repository(private val config: ServerConfig) {
         val lock = if (forUpdate) " FOR UPDATE" else ""
         return connection.prepareStatement(
             """
-            SELECT object_type, object_digest, mutation_id, cursor
+            SELECT object_type, object_digest, mutation_id, first_writer_device_id,
+                   ciphertext_digest, encrypted_object_json, cursor
             FROM someday_sync_v2_objects
-            WHERE user_id = ? AND epoch_id = ? AND object_id = ?$lock
+            WHERE user_id = ? AND workspace_id = ? AND epoch_id = ? AND object_id = ?$lock
             """.trimIndent(),
         ).use { statement ->
             statement.setObject(1, userId)
-            statement.setString(2, epochId)
-            statement.setString(3, objectId)
+            statement.setString(2, workspaceId)
+            statement.setString(3, epochId)
+            statement.setString(4, objectId)
             statement.executeQuery().use { result ->
                 if (!result.next()) null else ExistingObject(
-                    result.getString(1), result.getString(2), result.getString(3), result.getLong(4),
+                    result.getString(1), result.getString(2), result.getString(3),
+                    result.getObject(4, UUID::class.java), result.getString(5), result.getString(6), result.getLong(7),
                 )
             }
         }
     }
 
-    private fun replicaCapacityAvailable(
-        connection: Connection,
-        userId: UUID,
-        epochId: String,
-        input: SyncV2ObjectInput,
-    ): Boolean = connection.prepareStatement(
-        """
-        SELECT COUNT(*) < 4 OR BOOL_OR(writer_device_id = ?)
-        FROM someday_sync_v2_object_replicas
-        WHERE user_id = ? AND epoch_id = ? AND object_id = ?
-        """.trimIndent(),
-    ).use { statement ->
-        statement.setObject(1, input.writerDeviceId)
-        statement.setObject(2, userId)
-        statement.setString(3, epochId)
-        statement.setString(4, input.objectId)
-        statement.executeQuery().use { result -> result.next(); result.getBoolean(1) }
-    }
-
-    private fun replicaExists(connection: Connection, userId: UUID, input: SyncV2ObjectInput): Boolean =
+    private fun maximumCursor(connection: Connection, userId: UUID, workspaceId: String, epochId: String): Long =
         connection.prepareStatement(
-            """
-            SELECT ciphertext_digest = ? FROM someday_sync_v2_object_replicas
-            WHERE user_id = ? AND epoch_id = ? AND object_id = ? AND writer_device_id = ?
-            """.trimIndent(),
-        ).use { statement ->
-            statement.setString(1, input.ciphertextDigest)
-            statement.setObject(2, userId)
-            statement.setString(3, input.epochId)
-            statement.setString(4, input.objectId)
-            statement.setObject(5, input.writerDeviceId)
-            statement.executeQuery().use { result -> result.next() && result.getBoolean(1) }
-        }
-
-    private fun upsertReplica(connection: Connection, userId: UUID, input: SyncV2ObjectInput, repair: Boolean) {
-        connection.prepareStatement(
-            """
-            INSERT INTO someday_sync_v2_object_replicas(
-                user_id, epoch_id, object_id, object_digest, mutation_id,
-                writer_device_id, ciphertext_digest, encrypted_object_json, repair_replica
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT (user_id, epoch_id, object_id, writer_device_id) DO UPDATE SET
-                object_digest = EXCLUDED.object_digest,
-                mutation_id = EXCLUDED.mutation_id,
-                ciphertext_digest = EXCLUDED.ciphertext_digest,
-                encrypted_object_json = EXCLUDED.encrypted_object_json,
-                repair_replica = someday_sync_v2_object_replicas.repair_replica AND EXCLUDED.repair_replica,
-                updated_at = NOW()
-            """.trimIndent(),
+            "SELECT COALESCE(MAX(cursor), 0) FROM someday_sync_v2_changes WHERE user_id = ? AND workspace_id = ? AND epoch_id = ?",
         ).use { statement ->
             statement.setObject(1, userId)
-            statement.setString(2, input.epochId)
-            statement.setString(3, input.objectId)
-            statement.setString(4, input.objectDigest)
-            statement.setString(5, input.mutationId)
-            statement.setObject(6, input.writerDeviceId)
-            statement.setString(7, input.ciphertextDigest)
-            statement.setString(8, input.encodedObjectJson)
-            statement.setBoolean(9, repair)
-            statement.executeUpdate()
-        }
-    }
-
-    private fun maximumCursor(connection: Connection, userId: UUID, epochId: String): Long =
-        connection.prepareStatement(
-            "SELECT COALESCE(MAX(cursor), 0) FROM someday_sync_v2_changes WHERE user_id = ? AND epoch_id = ?",
-        ).use { statement ->
-            statement.setObject(1, userId)
-            statement.setString(2, epochId)
+            statement.setString(2, workspaceId)
+            statement.setString(3, epochId)
             statement.executeQuery().use { result -> result.next(); result.getLong(1) }
         }
 
-    private fun lockWorkspace(connection: Connection, userId: UUID) {
+    private fun lockWorkspace(connection: Connection, userId: UUID, workspaceId: String) {
         connection.prepareStatement("SELECT pg_advisory_xact_lock(hashtext(?))").use { statement ->
-            statement.setString(1, userId.toString())
+            statement.setString(1, "$userId\u001f$workspaceId")
             statement.executeQuery().close()
         }
     }
@@ -1010,9 +893,14 @@ class SyncV2Repository(private val config: ServerConfig) {
         return MessageDigest.getInstance("SHA-256").digest(bytes).hex()
     }
 
-    private fun <T> transaction(block: (Connection) -> T): T = connection().use { connection ->
+    private fun <T> transaction(
+        userId: UUID,
+        workspaceId: String,
+        block: (Connection) -> T,
+    ): T = connection().use { connection ->
         connection.autoCommit = false
         try {
+            selectWorkspaceScope(connection, userId, workspaceId, local = true, ensureWorkspace = true)
             block(connection).also { connection.commit() }
         } catch (failure: Throwable) {
             connection.rollback()
@@ -1021,16 +909,73 @@ class SyncV2Repository(private val config: ServerConfig) {
     }
 
     private fun connection(): Connection =
-        DriverManager.getConnection(config.databaseUrl, config.databaseUser, config.databasePassword)
+        connections.connection()
+
+    private fun scopedConnection(userId: UUID, workspaceId: String): Connection {
+        val connection = connection()
+        try {
+            connection.autoCommit = false
+            selectWorkspaceScope(connection, userId, workspaceId, local = false, ensureWorkspace = false)
+            connection.commit()
+            connection.autoCommit = true
+            return connection
+        } catch (failure: Throwable) {
+            runCatching { connection.rollback() }
+            runCatching { connection.close() }
+            throw failure
+        }
+    }
+
+    /** Selects one fail-closed RLS namespace; only write transactions create its registry row. */
+    private fun selectWorkspaceScope(
+        connection: Connection,
+        userId: UUID,
+        workspaceId: String,
+        local: Boolean,
+        ensureWorkspace: Boolean,
+    ) {
+        require(WORKSPACE_ID.matches(workspaceId)) { "Invalid workspace scope." }
+        connection.prepareStatement("SELECT set_config('someday.user_id', ?, ?)").use { statement ->
+            statement.setString(1, userId.toString())
+            statement.setBoolean(2, local)
+            statement.executeQuery().close()
+        }
+        connection.prepareStatement("SELECT set_config('someday.workspace_id', ?, ?)").use { statement ->
+            statement.setString(1, workspaceId)
+            statement.setBoolean(2, local)
+            statement.executeQuery().close()
+        }
+        if (ensureWorkspace) {
+            connection.prepareStatement(
+                "INSERT INTO someday_entity_workspaces(user_id, workspace_id) VALUES (?, ?) ON CONFLICT DO NOTHING",
+            ).use { statement ->
+                statement.setObject(1, userId)
+                statement.setString(2, workspaceId)
+                statement.executeUpdate()
+            }
+        }
+    }
 
     private data class ExistingMutation(val objectId: String, val objectDigest: String, val cursor: Long)
     private data class ExistingObject(
         val objectType: String,
         val objectDigest: String,
         val mutationId: String,
+        val writerDeviceId: UUID,
+        val ciphertextDigest: String,
+        val encodedObjectJson: String,
         val cursor: Long,
-    )
+    ) {
+        fun exactlyMatches(input: SyncV2ObjectInput): Boolean =
+            objectType == input.objectType && objectDigest == input.objectDigest &&
+                mutationId == input.mutationId && writerDeviceId == input.writerDeviceId &&
+                ciphertextDigest == input.ciphertextDigest && encodedObjectJson == input.encodedObjectJson
+    }
     private data class PreparedMutation(val input: SyncV2ObjectInput, val existingMutation: ExistingMutation?)
+
+    private companion object {
+        val WORKSPACE_ID = Regex("^workspace-[0-9a-f]{32}$")
+    }
 }
 
 private fun ByteArray.hex(): String = joinToString("") { byte -> "%02x".format(byte) }

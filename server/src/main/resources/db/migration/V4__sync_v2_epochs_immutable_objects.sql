@@ -1,5 +1,13 @@
-CREATE TABLE someday_sync_v2_epochs (
+CREATE TABLE someday_entity_workspaces (
     user_id UUID NOT NULL REFERENCES someday_users (id) ON DELETE CASCADE,
+    workspace_id TEXT NOT NULL CHECK (workspace_id ~ '^workspace-[0-9a-f]{32}$'),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (user_id, workspace_id)
+);
+
+CREATE TABLE someday_sync_v2_epochs (
+    user_id UUID NOT NULL,
+    workspace_id TEXT NOT NULL,
     epoch_id TEXT NOT NULL,
     pointer_digest TEXT NOT NULL,
     pointer_object_json TEXT NOT NULL,
@@ -13,22 +21,16 @@ CREATE TABLE someday_sync_v2_epochs (
     supported_offline_window_seconds BIGINT NOT NULL CHECK (supported_offline_window_seconds = 15552000),
     checkpoint_id TEXT NOT NULL,
     checkpoint_digest TEXT NOT NULL,
-    previous_epoch_id TEXT,
-    active BOOLEAN NOT NULL,
     activated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    read_only_at TIMESTAMPTZ,
-    retain_until TIMESTAMPTZ,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (user_id, epoch_id),
-    CHECK ((active AND read_only_at IS NULL) OR (NOT active AND read_only_at IS NOT NULL))
+    PRIMARY KEY (user_id, workspace_id, epoch_id),
+    UNIQUE (user_id, workspace_id),
+    FOREIGN KEY (user_id, workspace_id) REFERENCES someday_entity_workspaces (user_id, workspace_id) ON DELETE CASCADE
 );
 
-CREATE UNIQUE INDEX someday_sync_v2_one_active_epoch
-    ON someday_sync_v2_epochs (user_id)
-    WHERE active;
-
 CREATE TABLE someday_sync_v2_checkpoint_chunks (
-    user_id UUID NOT NULL REFERENCES someday_users (id) ON DELETE CASCADE,
+    user_id UUID NOT NULL,
+    workspace_id TEXT NOT NULL,
     epoch_id TEXT NOT NULL,
     checkpoint_id TEXT NOT NULL,
     chunk_index INTEGER NOT NULL CHECK (chunk_index >= 0),
@@ -39,12 +41,14 @@ CREATE TABLE someday_sync_v2_checkpoint_chunks (
     encrypted_object_json TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (user_id, epoch_id, checkpoint_id, chunk_index),
-    UNIQUE (user_id, epoch_id, chunk_id)
+    PRIMARY KEY (user_id, workspace_id, epoch_id, checkpoint_id, chunk_index),
+    UNIQUE (user_id, workspace_id, epoch_id, chunk_id),
+    FOREIGN KEY (user_id, workspace_id) REFERENCES someday_entity_workspaces (user_id, workspace_id) ON DELETE CASCADE
 );
 
 CREATE TABLE someday_sync_v2_checkpoint_manifests (
-    user_id UUID NOT NULL REFERENCES someday_users (id) ON DELETE CASCADE,
+    user_id UUID NOT NULL,
+    workspace_id TEXT NOT NULL,
     epoch_id TEXT NOT NULL,
     checkpoint_id TEXT NOT NULL,
     checkpoint_digest TEXT NOT NULL,
@@ -54,40 +58,27 @@ CREATE TABLE someday_sync_v2_checkpoint_manifests (
     encrypted_object_json TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (user_id, epoch_id, checkpoint_id)
+    PRIMARY KEY (user_id, workspace_id, epoch_id, checkpoint_id),
+    FOREIGN KEY (user_id, workspace_id) REFERENCES someday_entity_workspaces (user_id, workspace_id) ON DELETE CASCADE
 );
 
 CREATE TABLE someday_sync_v2_objects (
-    user_id UUID NOT NULL REFERENCES someday_users (id) ON DELETE CASCADE,
+    user_id UUID NOT NULL,
+    workspace_id TEXT NOT NULL,
     epoch_id TEXT NOT NULL,
     object_id TEXT NOT NULL,
     object_type TEXT NOT NULL CHECK (object_type = 'workspace_entity_version_v2'),
     object_digest TEXT NOT NULL,
     mutation_id TEXT NOT NULL,
     first_writer_device_id UUID NOT NULL REFERENCES someday_devices (id) ON DELETE RESTRICT,
-    cursor BIGINT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (user_id, epoch_id, object_id),
-    UNIQUE (user_id, epoch_id, mutation_id),
-    UNIQUE (user_id, epoch_id, cursor)
-);
-
-CREATE TABLE someday_sync_v2_object_replicas (
-    user_id UUID NOT NULL,
-    epoch_id TEXT NOT NULL,
-    object_id TEXT NOT NULL,
-    object_digest TEXT NOT NULL,
-    mutation_id TEXT NOT NULL,
-    writer_device_id UUID NOT NULL REFERENCES someday_devices (id) ON DELETE RESTRICT,
     ciphertext_digest TEXT NOT NULL,
     encrypted_object_json TEXT NOT NULL,
-    repair_replica BOOLEAN NOT NULL DEFAULT FALSE,
+    cursor BIGINT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (user_id, epoch_id, object_id, writer_device_id),
-    UNIQUE (user_id, epoch_id, object_id, ciphertext_digest),
-    FOREIGN KEY (user_id, epoch_id, object_id)
-        REFERENCES someday_sync_v2_objects (user_id, epoch_id, object_id) ON DELETE CASCADE
+    PRIMARY KEY (user_id, workspace_id, epoch_id, object_id),
+    UNIQUE (user_id, workspace_id, epoch_id, mutation_id),
+    UNIQUE (user_id, workspace_id, epoch_id, cursor),
+    FOREIGN KEY (user_id, workspace_id) REFERENCES someday_entity_workspaces (user_id, workspace_id) ON DELETE CASCADE
 );
 
 CREATE SEQUENCE someday_sync_v2_global_cursor;
@@ -95,29 +86,73 @@ CREATE SEQUENCE someday_sync_v2_global_cursor;
 CREATE TABLE someday_sync_v2_changes (
     cursor BIGINT PRIMARY KEY DEFAULT nextval('someday_sync_v2_global_cursor'),
     user_id UUID NOT NULL,
+    workspace_id TEXT NOT NULL,
     epoch_id TEXT NOT NULL,
     object_id TEXT NOT NULL,
     object_digest TEXT NOT NULL,
     mutation_id TEXT NOT NULL,
     changed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (user_id, epoch_id, object_id),
-    UNIQUE (user_id, epoch_id, mutation_id),
-    FOREIGN KEY (user_id, epoch_id, object_id)
-        REFERENCES someday_sync_v2_objects (user_id, epoch_id, object_id) ON DELETE RESTRICT
+    UNIQUE (user_id, workspace_id, epoch_id, object_id),
+    UNIQUE (user_id, workspace_id, epoch_id, mutation_id),
+    FOREIGN KEY (user_id, workspace_id, epoch_id, object_id)
+        REFERENCES someday_sync_v2_objects (user_id, workspace_id, epoch_id, object_id) ON DELETE RESTRICT
 );
 
 CREATE INDEX someday_sync_v2_changes_epoch_cursor
-    ON someday_sync_v2_changes (user_id, epoch_id, cursor);
+    ON someday_sync_v2_changes (user_id, workspace_id, epoch_id, cursor);
 
 CREATE TABLE someday_sync_v2_mutations (
     user_id UUID NOT NULL,
+    workspace_id TEXT NOT NULL,
     epoch_id TEXT NOT NULL,
     mutation_id TEXT NOT NULL,
     object_id TEXT NOT NULL,
     object_digest TEXT NOT NULL,
     cursor BIGINT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (user_id, epoch_id, mutation_id),
-    FOREIGN KEY (user_id, epoch_id, object_id)
-        REFERENCES someday_sync_v2_objects (user_id, epoch_id, object_id) ON DELETE RESTRICT
+    PRIMARY KEY (user_id, workspace_id, epoch_id, mutation_id),
+    FOREIGN KEY (user_id, workspace_id, epoch_id, object_id)
+        REFERENCES someday_sync_v2_objects (user_id, workspace_id, epoch_id, object_id) ON DELETE RESTRICT
 );
+
+-- Entity repository connections select one account + workspace scope before
+-- accessing these tables. FORCE RLS makes either omitted SQL predicate fail closed.
+DO $$
+DECLARE
+    target regclass;
+BEGIN
+    FOREACH target IN ARRAY ARRAY[
+        'someday_entity_workspaces'::regclass,
+        'someday_sync_v2_epochs'::regclass,
+        'someday_sync_v2_checkpoint_chunks'::regclass,
+        'someday_sync_v2_checkpoint_manifests'::regclass,
+        'someday_sync_v2_objects'::regclass,
+        'someday_sync_v2_changes'::regclass,
+        'someday_sync_v2_mutations'::regclass
+    ] LOOP
+        EXECUTE format('ALTER TABLE %s ENABLE ROW LEVEL SECURITY', target);
+        EXECUTE format('ALTER TABLE %s FORCE ROW LEVEL SECURITY', target);
+        EXECUTE format(
+            $policy$
+            CREATE POLICY entity_account_workspace_scope ON %s
+            USING (
+                (current_setting('someday.user_id', true) = '*'
+                    OR user_id::text = current_setting('someday.user_id', true))
+                AND (current_setting('someday.workspace_id', true) = '*'
+                    OR workspace_id = current_setting('someday.workspace_id', true))
+            )
+            WITH CHECK (
+                (current_setting('someday.user_id', true) = '*'
+                    OR user_id::text = current_setting('someday.user_id', true))
+                AND (current_setting('someday.workspace_id', true) = '*'
+                    OR workspace_id = current_setting('someday.workspace_id', true))
+            )
+            $policy$,
+            target
+        );
+        EXECUTE format(
+            'ALTER TABLE %s ALTER COLUMN workspace_id SET DEFAULT current_setting(''someday.workspace_id'', true)',
+            target
+        );
+    END LOOP;
+END $$;

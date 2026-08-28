@@ -43,6 +43,7 @@ class PairingApiIntegrationTest {
     private val dbUrl = System.getenv("SOMEDAY_DB_URL") ?: "jdbc:postgresql://127.0.0.1:54329/someday"
     private val dbUser = System.getenv("SOMEDAY_DB_USER") ?: "someday"
     private val dbPassword = System.getenv("SOMEDAY_DB_PASSWORD") ?: "someday"
+    private val dbConnectionUrl = productionTestDatabaseConnectionUrl(dbUrl)
 
     @BeforeTest fun setUp() = clearServerTables()
     @AfterTest fun tearDown() = clearServerTables()
@@ -213,7 +214,7 @@ class PairingApiIntegrationTest {
         val response = client.post("/devices/register") {
             bearerAuth(accessToken)
             contentType(ContentType.Application.Json)
-            setBody(json.encodeToString(DeviceRegistrationRequest(name, platform)))
+            setBody(json.encodeToString(DeviceRegistrationRequest(java.util.UUID.randomUUID().toString(), name, platform)))
         }
         assertEquals(HttpStatusCode.OK, response.status, response.bodyAsText())
         return json.decodeFromString(response.bodyAsText())
@@ -272,7 +273,7 @@ class PairingApiIntegrationTest {
         inviteId: String,
         read: (java.sql.ResultSet) -> T,
     ): T? =
-        DriverManager.getConnection(dbUrl, dbUser, dbPassword).use { connection ->
+        DriverManager.getConnection(dbConnectionUrl, dbUser, dbPassword).use { connection ->
             connection.prepareStatement(
                 "SELECT state, envelope_json FROM workspace_pairing_invites WHERE user_id = ?::uuid AND invite_id = ?",
             ).use { statement ->
@@ -285,7 +286,7 @@ class PairingApiIntegrationTest {
         }
 
     private fun expireInvite(userId: String, inviteId: String) {
-        DriverManager.getConnection(dbUrl, dbUser, dbPassword).use { connection ->
+        DriverManager.getConnection(dbConnectionUrl, dbUser, dbPassword).use { connection ->
             connection.prepareStatement(
                 "UPDATE workspace_pairing_invites SET expires_at = NOW() - INTERVAL '1 second' " +
                     "WHERE user_id = ?::uuid AND invite_id = ?",
@@ -299,7 +300,7 @@ class PairingApiIntegrationTest {
 
     private fun clearServerTables() {
         runCatching {
-            DriverManager.getConnection(dbUrl, dbUser, dbPassword).use { connection ->
+            DriverManager.getConnection(dbConnectionUrl, dbUser, dbPassword).use { connection ->
                 connection.createStatement().use { statement ->
                     statement.execute(
                         """

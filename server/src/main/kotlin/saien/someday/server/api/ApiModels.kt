@@ -20,6 +20,7 @@ data class LogoutRequest(
 
 @Serializable
 data class DeviceRegistrationRequest(
+    val deviceId: String,
     val name: String,
     val platform: String,
 )
@@ -171,9 +172,6 @@ data class SyncV2EpochResponse(
 )
 
 @Serializable
-data class SyncV2EpochHistoryRequest(val epochId: String)
-
-@Serializable
 data class SyncV2EpochCompareAndSetRequest(
     val expectedCurrentDigest: String? = null,
     val metadata: SyncV2EpochMetadata,
@@ -295,7 +293,6 @@ data class SyncV2CursorUnitResponse(
 data class SyncV2PullResponse(
     val units: List<SyncV2CursorUnitResponse>,
     val complete: Boolean,
-    val rebootstrapRequired: Boolean = false,
     val error: String? = null,
 )
 
@@ -311,23 +308,6 @@ data class SyncV2StreamFrontier(
 
 @Serializable
 data class SyncV2FrontierResponse(val frontiers: List<SyncV2StreamFrontier>)
-
-@Serializable
-data class SyncV2RepairObjectRequest(
-    val epochId: String,
-    val objectId: String,
-    val expectedObjectDigest: String,
-)
-
-@Serializable
-data class SyncV2RepairObjectResponse(
-    val replicas: List<SyncV2ObjectPayload> = emptyList(),
-)
-
-@Serializable
-data class SyncV2RepairReplicaRequest(
-    val objectValue: SyncV2ObjectPayload,
-)
 
 @Serializable
 data class SyncV2StatusResponse(

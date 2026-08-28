@@ -1,0 +1,77 @@
+name: someday-standalone
+
+services:
+  server:
+    image: ${SOMEDAY_IMAGE:?Set SOMEDAY_IMAGE to an exact server release}
+    restart: unless-stopped
+    init: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+        restart: true
+    environment:
+      SOMEDAY_DEPLOYMENT_MODE: production
+      SOMEDAY_HOST: 0.0.0.0
+      SOMEDAY_PORT: 3180
+      SOMEDAY_PUBLIC_BASE_URL: ${SOMEDAY_PUBLIC_BASE_URL:?Set SOMEDAY_PUBLIC_BASE_URL in .env}
+      SOMEDAY_DB_URL: jdbc:postgresql://postgres:5432/${SOMEDAY_DB_NAME:-someday}
+      SOMEDAY_DB_USER: ${SOMEDAY_DB_USER:-someday}
+      SOMEDAY_DB_PASSWORD: ${SOMEDAY_DB_PASSWORD:?Set SOMEDAY_DB_PASSWORD in .env}
+      SOMEDAY_DB_MAX_POOL_SIZE: ${SOMEDAY_DB_MAX_POOL_SIZE:-10}
+      SOMEDAY_DB_TLS_MODE: private
+      SOMEDAY_JWT_SECRET: ${SOMEDAY_JWT_SECRET:?Set SOMEDAY_JWT_SECRET in .env}
+      SOMEDAY_MEDIA_BACKEND: filesystem
+      SOMEDAY_MEDIA_BLOB_DIR: /var/lib/someday/media
+      SOMEDAY_MEDIA_QUOTA_BYTES: ${SOMEDAY_MEDIA_QUOTA_BYTES:-5368709120}
+      SOMEDAY_REGISTRATION_ENABLED: ${SOMEDAY_REGISTRATION_ENABLED:-false}
+      SOMEDAY_TRUST_PROXY_HEADERS: ${SOMEDAY_TRUST_PROXY_HEADERS:-false}
+    ports:
+      - ${SOMEDAY_HTTP_BIND_ADDRESS:-127.0.0.1}:${SOMEDAY_HTTP_PORT:-3180}:3180
+    volumes:
+      - media-data:/var/lib/someday/media
+    read_only: true
+    tmpfs:
+      # Argon2's JNA binding extracts a native library here and must map it.
+      - /tmp:rw,exec,nosuid,nodev,size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  postgres:
+    image: postgres:17-alpine@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${SOMEDAY_DB_NAME:-someday}
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${SOMEDAY_POSTGRES_ADMIN_PASSWORD:?Set SOMEDAY_POSTGRES_ADMIN_PASSWORD in .env}
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+      SOMEDAY_DB_USER: ${SOMEDAY_DB_USER:-someday}
+      SOMEDAY_DB_PASSWORD: ${SOMEDAY_DB_PASSWORD:?Set SOMEDAY_DB_PASSWORD in .env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./initdb/10-create-app-role.sh:/docker-entrypoint-initdb.d/10-create-app-role.sh:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - PGPASSWORD="$${SOMEDAY_DB_PASSWORD}" psql --host=127.0.0.1 --username="$${SOMEDAY_DB_USER}" --dbname="$${POSTGRES_DB}" --no-password --tuples-only --command='SELECT 1' | grep -q 1
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    stop_grace_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+volumes:
+  media-data:
+  postgres-data:

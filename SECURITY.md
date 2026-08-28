@@ -10,7 +10,7 @@ Security reports are welcome for:
 - Client apps (Android, iOS, Desktop)
 - The self-hosted Ktor server
 - Encryption, key storage, recovery material handling
-- Sync transports (WebDAV Sync V2, self-hosted sync) and conflict handling
+- Self-hosted sync transport and conflict handling
 - Authentication, session, and device management on the server
 
 ## Reporting a vulnerability
@@ -43,9 +43,10 @@ reasonable window for assessment and fix before any public disclosure.
 
 ## Scope notes
 
-- The self-hosted server is designed so note bodies can remain client-encrypted;
-  server bugs that break auth, tenancy, or transport integrity are still in
-  scope.
+- The self-hosted server stores note and image payloads as client ciphertext;
+  server bugs that break auth, account/workspace isolation, quota enforcement,
+  or transport integrity are still in scope. Media quota is a per-account total
+  across all workspaces.
 - `compose.yaml` and the server's `local` mode are development surfaces. A
   public deployment must use the fail-closed `production` contract, HTTPS, and
   private database networking documented in
@@ -56,8 +57,8 @@ reasonable window for assessment and fix before any public disclosure.
   accepts it across authorities, or permits a second claim. The protocol and
   threat model are documented in
   [`docs/workspace-pairing-protocol.md`](docs/workspace-pairing-protocol.md).
-- Cleartext WebDAV disaster-recovery backup limitations are documented product
-  gaps; report issues that go beyond those documented constraints.
-- Social engineering of individual users, physical device access, and issues in
-  third-party WebDAV providers are generally out of scope unless Someday
-  mishandles them.
+- Portable export/restore does not contain app-private image bytes. Operators
+  must protect and consistently back up both PostgreSQL and the configured media
+  store; disclosing either can expose sensitive metadata or ciphertext.
+- Social engineering of individual users and physical device access are
+  generally out of scope unless Someday mishandles them.

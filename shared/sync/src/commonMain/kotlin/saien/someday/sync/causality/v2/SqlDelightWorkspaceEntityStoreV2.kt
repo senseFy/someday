@@ -441,6 +441,36 @@ class SqlDelightWorkspaceEntityStoreV2(
                 }
             }
             if (result != null) return@transaction
+            val remotelyAcknowledgedPending = mutableListOf<RemoteWorkspaceMutationV2>()
+            fresh.forEach { mutation ->
+                val byMutation = queries.selectPendingMutationSystemV2(
+                    unit.remoteProfile,
+                    syncEpochId,
+                    mutation.mutationId,
+                ).executeAsOneOrNull()
+                val byObject = queries.selectPendingMutationByObjectSystemV2(
+                    unit.remoteProfile,
+                    syncEpochId,
+                    mutation.objectId,
+                ).executeAsOneOrNull()
+                val pending = byMutation ?: byObject
+                if (pending != null) {
+                    if (pending.mutation_id != mutation.mutationId ||
+                        pending.object_id != mutation.objectId ||
+                        pending.object_digest != mutation.objectDigest
+                    ) {
+                        result = WorkspaceRemoteUnitApplyResultV2.Rejected(
+                            WorkspaceStoreErrorV2(
+                                WorkspaceStoreErrorCodeV2.OUTBOX_IDENTITY_MISMATCH,
+                                "A remote mutation conflicts with a durable V2 outbox identity.",
+                            ),
+                        )
+                        return@transaction
+                    }
+                    remotelyAcknowledgedPending += mutation
+                }
+            }
+            if (result != null) return@transaction
             val prepared = when (val value = prepareEntityPlans(fresh.map { it.version })) {
                 is PrepareEntityPlansResultV2.Prepared -> value.values
                 is PrepareEntityPlansResultV2.Rejected -> {
@@ -466,6 +496,17 @@ class SqlDelightWorkspaceEntityStoreV2(
                     mutation.writerDeviceId,
                     committedAt,
                 )
+            }
+            remotelyAcknowledgedPending.forEach { mutation ->
+                check(
+                    removePendingPublication(
+                        unit.remoteProfile,
+                        mutation.mutationId,
+                        mutation.objectId,
+                        mutation.objectDigest,
+                        committedAt,
+                    ),
+                ) { "An exact remote mutation did not acknowledge its durable V2 outbox tuple." }
             }
             persistGeneratedOutbox(unit.remoteProfile, generatedOutbox, unit.appliedAt)
             rebuildAffectedProjections(prepared.keys, unit.appliedAt)
@@ -495,44 +536,61 @@ class SqlDelightWorkspaceEntityStoreV2(
     ): Boolean {
         var removed = false
         database.transaction {
-            val row = queries.selectPendingMutationSystemV2(remoteProfile, syncEpochId, mutationId)
-                .executeAsOneOrNull() ?: return@transaction
-            require(row.object_id == objectId && row.object_digest == objectDigest) {
-                "V2 acknowledgement must match mutation, object id, and object digest exactly."
-            }
-            removed = queries.deletePendingMutationSystemV2(
+            removed = removePendingPublication(
                 remoteProfile,
-                syncEpochId,
                 mutationId,
                 objectId,
                 objectDigest,
-            ).value == 1L
-            if (removed) {
-                queries.selectSourceImportByMutationSystemV2(remoteProfile, syncEpochId, mutationId)
-                    .executeAsOneOrNull()
-                    ?.let { imported ->
-                        queries.updateSourceImportStateSystemV2(
-                            "published",
-                            kotlin.time.Clock.System.now().toEpochMilliseconds(),
+                kotlin.time.Clock.System.now().toEpochMilliseconds(),
+            )
+        }
+        return removed
+    }
+
+    private fun removePendingPublication(
+        remoteProfile: String,
+        mutationId: String,
+        objectId: String,
+        objectDigest: String,
+        publishedAtEpochMilliseconds: Long,
+    ): Boolean {
+        val row = queries.selectPendingMutationSystemV2(remoteProfile, syncEpochId, mutationId)
+            .executeAsOneOrNull() ?: return false
+        require(row.object_id == objectId && row.object_digest == objectDigest) {
+            "V2 acknowledgement must match mutation, object id, and object digest exactly."
+        }
+        val removed = queries.deletePendingMutationSystemV2(
+            remoteProfile,
+            syncEpochId,
+            mutationId,
+            objectId,
+            objectDigest,
+        ).value == 1L
+        if (removed) {
+            queries.selectSourceImportByMutationSystemV2(remoteProfile, syncEpochId, mutationId)
+                .executeAsOneOrNull()
+                ?.let { imported ->
+                    queries.updateSourceImportStateSystemV2(
+                        "published",
+                        publishedAtEpochMilliseconds,
+                        remoteProfile,
+                        syncEpochId,
+                        imported.source_profile,
+                        imported.source_object_id,
+                        imported.source_digest,
+                    )
+                    val sourceEpoch = imported.source_epoch
+                    val sourceMutationId = imported.source_mutation_id
+                    if (sourceEpoch != null && sourceMutationId != null) {
+                        queries.deletePendingMutationSystemV2(
                             remoteProfile,
-                            syncEpochId,
-                            imported.source_profile,
+                            sourceEpoch,
+                            sourceMutationId,
                             imported.source_object_id,
                             imported.source_digest,
                         )
-                        val sourceEpoch = imported.source_epoch
-                        val sourceMutationId = imported.source_mutation_id
-                        if (sourceEpoch != null && sourceMutationId != null) {
-                            queries.deletePendingMutationSystemV2(
-                                remoteProfile,
-                                sourceEpoch,
-                                sourceMutationId,
-                                imported.source_object_id,
-                                imported.source_digest,
-                            )
-                        }
                     }
-            }
+                }
         }
         return removed
     }
