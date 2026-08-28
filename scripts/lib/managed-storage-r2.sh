@@ -23,6 +23,27 @@ run_r2_integrity() {
         AWS_SECRET_ACCESS_KEY="$secret_key"
 }
 
+r2_wrangler_read() {
+    local output_file="$1"
+    local wrangler_cwd="$2"
+    shift 2
+    local attempt status
+
+    for attempt in 1 2 3; do
+        if NO_COLOR=1 wrangler --cwd "$wrangler_cwd" "$@" >"$output_file"; then
+            return 0
+        else
+            status=$?
+        fi
+        rm -f "$output_file"
+        if ((attempt == 3)); then
+            return "$status"
+        fi
+        info "Cloudflare control-plane read failed; retrying ($attempt/3)"
+        sleep "$attempt"
+    done
+}
+
 r2_bucket_evidence() {
     local bucket="$1"
     local label="$2"
@@ -32,11 +53,16 @@ r2_bucket_evidence() {
     local domain_output="$FINAL_DIR/$label-domains.txt"
     local wrangler_cwd="$RUN_DIR/wrangler"
     mkdir -p "$wrangler_cwd"
-    NO_COLOR=1 wrangler --cwd "$wrangler_cwd" r2 bucket info "$bucket" --json >"$FINAL_DIR/$label-info.json"
-    NO_COLOR=1 wrangler --cwd "$wrangler_cwd" r2 bucket lock list "$bucket" >"$lock_output"
-    NO_COLOR=1 wrangler --cwd "$wrangler_cwd" r2 bucket lifecycle list "$bucket" >"$lifecycle_output"
-    NO_COLOR=1 wrangler --cwd "$wrangler_cwd" r2 bucket dev-url get "$bucket" >"$dev_url_output"
-    NO_COLOR=1 wrangler --cwd "$wrangler_cwd" r2 bucket domain list "$bucket" >"$domain_output"
+    r2_wrangler_read "$FINAL_DIR/$label-info.json" "$wrangler_cwd" \
+        r2 bucket info "$bucket" --json
+    r2_wrangler_read "$lock_output" "$wrangler_cwd" \
+        r2 bucket lock list "$bucket"
+    r2_wrangler_read "$lifecycle_output" "$wrangler_cwd" \
+        r2 bucket lifecycle list "$bucket"
+    r2_wrangler_read "$dev_url_output" "$wrangler_cwd" \
+        r2 bucket dev-url get "$bucket"
+    r2_wrangler_read "$domain_output" "$wrangler_cwd" \
+        r2 bucket domain list "$bucket"
     python3 - "$lock_output" <<'PY' || die "$label bucket has no enabled indefinite media/v1 lock rule"
 import pathlib
 import sys
