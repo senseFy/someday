@@ -119,6 +119,17 @@ checks run inside that workflow; `status` does not query the registry itself.
 
 - Before pushing the tag, fix the issue, commit it, refresh commit-bound managed
   evidence, and rehearse again.
+- If validation fails before an image exists because the release workflow itself
+  is defective, fix the canonical workflow on `main`, wait for main CI on that
+  workflow-fix commit, then resume the unchanged protected tag:
+
+  ```bash
+  gh workflow run server-release.yml --ref main -f tag=server-vX.Y.Z
+  ```
+
+  Recovery still checks the remote annotated tag, its original commit, main
+  ancestry, the unused image version, and the absence of a GitHub Release. It
+  builds and tests the tagged source, not the newer workflow-control commit.
 - If the image job passed and a later job failed transiently, rerun failed jobs
   only. Make the package public first when `public-image` requests it.
 - If the image job failed, inspect the workflow and GHCR before retrying. An

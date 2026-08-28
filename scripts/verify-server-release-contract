@@ -184,8 +184,15 @@ if grep -Fqx -- "      - '**'" "$ROOT_DIR/.github/workflows/android.yml"; then
     die "Android workflow still accepts server release tags"
 fi
 server_workflow="$ROOT_DIR/.github/workflows/server-release.yml"
+grep -Fqx -- 'run-name: Server release ${{ inputs.tag || github.ref_name }}' \
+    "$server_workflow" ||
+    die "server workflow runs must identify their release tag"
 grep -Fqx -- "      - 'server-v*.*.*'" "$server_workflow" ||
     die "server workflow must use independent server-vX.Y.Z tags"
+grep -Fqx -- '  workflow_dispatch:' "$server_workflow" ||
+    die "server workflow must support resuming an existing protected tag"
+grep -Fqx -- '      tag:' "$server_workflow" ||
+    die "server workflow recovery must require a release tag input"
 grep -Eq '^  group: server-release$' "$server_workflow" ||
     die "server release runs must use one global concurrency group"
 grep -Eq '^  cancel-in-progress: false$' "$server_workflow" ||
@@ -211,10 +218,23 @@ validate_section="$(workflow_job "$server_workflow" validate)" ||
 require_strict_job "$validate_section" 'server release validation'
 grep -Fqx '          fetch-depth: 0' <<<"$validate_section" ||
     die "server release validation must fetch complete Git history"
+grep -Fqx \
+    "          ref: \${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.ref }}" \
+    <<<"$validate_section" ||
+    die "server release validation must checkout the requested tag"
+grep -Fqx '      commit: ${{ steps.identity.outputs.commit }}' <<<"$validate_section" ||
+    die "server release validation must expose the immutable commit"
 identity_run="$(workflow_step_run "$validate_section" 'Validate tag and image identity')" ||
     die "server release validation must define the identity step"
-require_run_line "$identity_run" '[[ "$(git cat-file -t "$tag")" == tag ]] || {' \
-    "server release validation must actively require an annotated tag"
+require_run_line "$identity_run" \
+    'release_commit="$(git rev-parse "refs/tags/$tag^{commit}")"' \
+    "server release validation must resolve the requested tag commit"
+require_run_line "$identity_run" \
+    '[[ "$(git rev-parse HEAD)" == "$release_commit" ]]' \
+    "server release validation must checkout the requested tag commit"
+require_run_line "$identity_run" \
+    'if [[ "$GITHUB_EVENT_NAME" != workflow_dispatch &&' \
+    "tag pushes must match the immutable release commit"
 require_run_line "$identity_run" 'git fetch --no-tags origin \' \
     "server release validation must refresh origin/main"
 require_run_line "$identity_run" "'+refs/heads/main:refs/remotes/origin/main'" \
@@ -223,11 +243,24 @@ require_run_line "$identity_run" \
     "main_commit=\"\$(git rev-parse 'refs/remotes/origin/main^{commit}')\"" \
     "server release validation must resolve origin/main to a commit"
 require_run_line "$identity_run" \
-    'if ! git merge-base --is-ancestor "$GITHUB_SHA" "$main_commit"; then' \
-    "server release validation must actively require GITHUB_SHA in origin/main history"
+    '("$GITHUB_REF_NAME" != "$DEFAULT_BRANCH" ||' \
+    "server release recovery must run from the current default branch"
+require_run_line "$identity_run" 'gh run list \' \
+    "server release recovery must inspect control-commit CI"
+require_run_line "$identity_run" '--commit "$GITHUB_SHA" \' \
+    "server release recovery must bind CI to its control commit"
 require_run_line "$identity_run" \
-    './scripts/verify-server-release-tag "$tag" "$GITHUB_SHA"' \
+    'if [[ "$ci_status" != completed || "$ci_conclusion" != success ||' \
+    "server release recovery must require passing control-commit CI"
+require_run_line "$identity_run" \
+    'if ! git merge-base --is-ancestor "$release_commit" "$main_commit"; then' \
+    "server release validation must require the release commit in origin/main history"
+require_run_line "$identity_run" \
+    './scripts/verify-server-release-tag "$tag" "$release_commit"' \
     "server release validation must verify the protected remote tag identity"
+require_run_line "$identity_run" \
+    "printf 'commit=%s\\n' \"\$release_commit\"" \
+    "server release validation must publish the immutable commit output"
 release_absence_run="$(workflow_step_run "$validate_section" 'Refuse an existing GitHub Release')" ||
     die "server release validation must check GitHub Release absence"
 require_run_line "$release_absence_run" 'if gh api \' \
@@ -245,6 +278,12 @@ quality_section="$(workflow_job "$server_workflow" quality)" ||
 require_strict_job "$quality_section" 'server release quality gates'
 grep -Fqx '          fetch-depth: 0' <<<"$quality_section" ||
     die "server release quality gates must fetch complete Git history"
+grep -Fqx '          ref: ${{ needs.validate.outputs.commit }}' <<<"$quality_section" ||
+    die "server release quality gates must checkout the validated commit"
+require_run_line \
+    "$(workflow_step_run "$quality_section" 'Check release commit whitespace')" \
+    'git show --check --format= --no-ext-diff "$RELEASE_COMMIT" >/dev/null' \
+    "server release whitespace checks must use the validated commit"
 quality_history_run="$(workflow_step_run "$quality_section" 'Verify public history')" ||
     die "server release quality gates must define the public-history step"
 require_run_line "$quality_history_run" './scripts/verify-public-history' \
@@ -254,11 +293,21 @@ for strict_job in public-image runtime-smoke engine-24-smoke; do
     strict_section="$(workflow_job "$server_workflow" "$strict_job")" ||
         die "server release workflow must define the $strict_job job"
     require_strict_job "$strict_section" "$strict_job"
+    grep -Fqx '          ref: ${{ needs.validate.outputs.commit }}' \
+        <<<"$strict_section" ||
+        die "$strict_job must checkout the validated commit"
 done
 
 publish_image_section="$(workflow_job "$server_workflow" publish-image)" ||
     die "server release workflow must define the image publication job"
 require_strict_job "$publish_image_section" 'image publication'
+grep -Fqx '          ref: ${{ needs.validate.outputs.commit }}' \
+    <<<"$publish_image_section" ||
+    die "image publication must checkout the validated commit"
+[[ "$(grep -Fc \
+    'org.opencontainers.image.revision=${{ needs.validate.outputs.commit }}' \
+    <<<"$publish_image_section")" -eq 2 ]] ||
+    die "image publication provenance must use the validated commit"
 grep -Fqx '      - validate' <<<"$publish_image_section" ||
     die "image publication must depend on identity validation"
 grep -Fqx '      - quality' <<<"$publish_image_section" ||
@@ -268,7 +317,7 @@ pre_publish_tag_run="$(
         'Reconfirm the protected release tag before publishing'
 )" || die "image publication must reconfirm the protected tag"
 require_run_line "$pre_publish_tag_run" \
-    './scripts/verify-server-release-tag "$RELEASE_TAG" "$GITHUB_SHA"' \
+    './scripts/verify-server-release-tag "$RELEASE_TAG" "$RELEASE_COMMIT"' \
     "image publication must actively reconfirm the protected tag"
 require_step_order "$publish_image_section" \
     'Reconfirm the protected release tag before publishing' \
@@ -278,6 +327,9 @@ require_step_order "$publish_image_section" \
 github_release_section="$(workflow_job "$server_workflow" github-release)" ||
     die "server release workflow must define the GitHub Release job"
 require_strict_job "$github_release_section" 'GitHub Release publication'
+grep -Fqx '          ref: ${{ needs.validate.outputs.commit }}' \
+    <<<"$github_release_section" ||
+    die "GitHub Release must checkout the validated commit"
 for dependency in validate publish-image public-image runtime-smoke engine-24-smoke; do
     grep -Fqx "      - $dependency" <<<"$github_release_section" ||
         die "GitHub Release must depend on $dependency"
@@ -287,7 +339,7 @@ final_tag_run="$(
         'Reconfirm that the tag still identifies the tested commit'
 )" || die "GitHub Release must reconfirm the protected tag"
 require_run_line "$final_tag_run" \
-    './scripts/verify-server-release-tag "$RELEASE_TAG" "$GITHUB_SHA"' \
+    './scripts/verify-server-release-tag "$RELEASE_TAG" "$RELEASE_COMMIT"' \
     "GitHub Release must actively reconfirm the protected tag"
 require_step_order "$github_release_section" \
     'Reconfirm that the tag still identifies the tested commit' \
@@ -301,7 +353,7 @@ for argument_line in \
     '--version "$VERSION" \' \
     '--image "$RELEASE_IMAGE" \' \
     '--digest "$DIGEST" \' \
-    '--commit "$GITHUB_SHA" \' \
+    '--commit "$RELEASE_COMMIT" \' \
     '--output-dir release'; do
     require_run_line "$bundle_run" "$argument_line" \
         "bundle builder invocation is missing: $argument_line"
