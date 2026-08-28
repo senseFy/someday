@@ -77,6 +77,8 @@ jobs:
     name: iOS simulator evidence
     runs-on: macos-15
     timeout-minutes: 60
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
 
     steps:
       - name: Checkout
@@ -95,6 +97,9 @@ jobs:
         with:
           cache-provider: basic
           add-job-summary: on-failure
+
+      - name: Verify Xcode 26 toolchain
+        run: xcodebuild -version
 
       - name: Run System V3 Apple gate
         run: ./scripts/sync-v3-apple-gate
