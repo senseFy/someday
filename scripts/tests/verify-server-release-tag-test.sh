@@ -75,7 +75,7 @@ run_verify() {
     FAKE_TAG_MODE="${FAKE_TAG_MODE:-valid}" \
     GITHUB_REPOSITORY=senseFy/someday \
     GITHUB_REF_NAME="$tag" \
-    GITHUB_REF_PROTECTED="${GITHUB_REF_PROTECTED:-true}" \
+    GITHUB_REF_PROTECTED="${FAKE_REF_PROTECTED:-true}" \
     GH_TOKEN=test-token \
         "$VERIFY_SCRIPT" "$tag" "$commit"
 }
@@ -89,7 +89,8 @@ expect_failure() {
 }
 
 [[ -x "$VERIFY_SCRIPT" ]] || fail 'tag verifier is not executable'
-run_verify >"$TEST_ROOT/valid.out"
+# Pull-request jobs expose this as false; the fixture must replace ambient CI state.
+GITHUB_REF_PROTECTED=false run_verify >"$TEST_ROOT/valid.out"
 grep -Fq 'protected annotated tag confirmed' "$TEST_ROOT/valid.out" ||
     fail 'valid protected tag was not confirmed'
 
@@ -101,7 +102,7 @@ for mode in missing-policy weak-policy; do
     grep -Fq 'no active ruleset prevents creation, update, and deletion' \
         "$TEST_ROOT/$mode.out" || fail "$mode failed for the wrong reason"
 done
-GITHUB_REF_PROTECTED=false expect_failure unprotected run_verify
+FAKE_REF_PROTECTED=false expect_failure unprotected run_verify
 expect_failure leading-zero run_verify server-v01.2.3 "$COMMIT"
 
 [[ "$(wc -l <"$CALL_LOG" | tr -d ' ')" -eq 22 ]] ||
