@@ -146,28 +146,28 @@ grep -Fq 'server release quality gates must actively verify public history' \
 main_ancestry_case="$(new_case main-ancestry-commented)"
 mutate_once \
     "$main_ancestry_case/.github/workflows/server-release.yml" \
-    '          if ! git merge-base --is-ancestor "$GITHUB_SHA" "$main_commit"; then' \
-    '          # if ! git merge-base --is-ancestor "$GITHUB_SHA" "$main_commit"; then'
+    '          if ! git merge-base --is-ancestor "$release_commit" "$main_commit"; then' \
+    '          # if ! git merge-base --is-ancestor "$release_commit" "$main_commit"; then'
 expect_failure main-ancestry-commented run_contract "$main_ancestry_case" 1.2.3
-grep -Fq 'must actively require GITHUB_SHA in origin/main history' \
+grep -Fq 'must require the release commit in origin/main history' \
     "$TEST_ROOT/main-ancestry-commented.out" ||
     fail 'commented main-ancestry gate failed for the wrong reason'
 
 annotated_tag_case="$(new_case annotated-tag-commented)"
 mutate_once \
     "$annotated_tag_case/.github/workflows/server-release.yml" \
-    '          [[ "$(git cat-file -t "$tag")" == tag ]] || {' \
-    '          # [[ "$(git cat-file -t "$tag")" == tag ]] || {'
+    '            ./scripts/verify-server-release-tag "$tag" "$release_commit"' \
+    '            # ./scripts/verify-server-release-tag "$tag" "$release_commit"'
 expect_failure annotated-tag-commented run_contract "$annotated_tag_case" 1.2.3
-grep -Fq 'must actively require an annotated tag' \
+grep -Fq 'must verify the protected remote tag identity' \
     "$TEST_ROOT/annotated-tag-commented.out" ||
     fail 'commented annotated-tag gate failed for the wrong reason'
 
 pre_publish_tag_case="$(new_case pre-publish-tag-commented)"
 mutate_once \
     "$pre_publish_tag_case/.github/workflows/server-release.yml" \
-    $'      - name: Reconfirm the protected release tag before publishing\n        env:\n          GH_TOKEN: ${{ github.token }}\n          RELEASE_TAG: ${{ needs.validate.outputs.tag }}\n        run: ./scripts/verify-server-release-tag "$RELEASE_TAG" "$GITHUB_SHA"' \
-    $'      - name: Reconfirm the protected release tag before publishing\n        env:\n          GH_TOKEN: ${{ github.token }}\n          RELEASE_TAG: ${{ needs.validate.outputs.tag }}\n        run: "# tag verification removed"'
+    $'      - name: Reconfirm the protected release tag before publishing\n        env:\n          GH_TOKEN: ${{ github.token }}\n          RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}\n          RELEASE_TAG: ${{ needs.validate.outputs.tag }}\n        run: |\n          GITHUB_REF_NAME="$RELEASE_TAG" GITHUB_REF_PROTECTED=true \\\n            ./scripts/verify-server-release-tag "$RELEASE_TAG" "$RELEASE_COMMIT"' \
+    $'      - name: Reconfirm the protected release tag before publishing\n        env:\n          GH_TOKEN: ${{ github.token }}\n          RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}\n          RELEASE_TAG: ${{ needs.validate.outputs.tag }}\n        run: "# tag verification removed"'
 expect_failure pre-publish-tag-commented \
     run_contract "$pre_publish_tag_case" 1.2.3
 grep -Fq 'image publication must actively reconfirm the protected tag' \

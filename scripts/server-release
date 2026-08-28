@@ -285,7 +285,7 @@ github_ci_detail() {
             --commit "$commit" \
             --limit 1 \
             --json status,conclusion,headBranch,headSha,url \
-            --jq '.[] | [.status, (.conclusion // ""), .headBranch, .headSha, .url] | @tsv' \
+            --jq '.[] | [.status, (if (.conclusion // "") == "" then "-" else .conclusion end), .headBranch, .headSha, .url] | @tsv' \
             2>/dev/null || true
     )"
     [[ -n "$run" ]] || {
@@ -310,7 +310,8 @@ github_ci_detail() {
 
 github_publish_detail() {
     local commit="$1"
-    local identity repository run release
+    local control_tip="$2"
+    local control_ci identity repository run release
     identity="$(repository_identity)"
     [[ -n "$identity" ]] || {
         printf 'GitHub state unavailable; install/authenticate gh\n'
@@ -321,20 +322,38 @@ github_publish_detail() {
         gh run list \
             --repo "$repository" \
             --workflow server-release.yml \
-            --commit "$commit" \
-            --limit 1 \
-            --json status,conclusion,headBranch,headSha,url \
-            --jq '.[] | [.status, (.conclusion // ""), .headBranch, .headSha, .url] | @tsv' \
+            --limit 100 \
+            --json status,conclusion,displayTitle,event,headBranch,headSha,url \
+            --jq "[.[] | select(\
+                (.event == \"push\" and .headBranch == \"$TAG\" and .headSha == \"$commit\") or \
+                (.event == \"workflow_dispatch\" and .headBranch == \"main\" and \
+                    .displayTitle == \"Server release $TAG\")\
+            )] | sort_by(.conclusion != \"success\") | .[] | \
+                [.status, (if (.conclusion // \"\") == \"\" then \"-\" else .conclusion end), .event, .headBranch, .headSha, .url] | @tsv" \
             2>/dev/null || true
     )"
+    run="$(head -n 1 <<<"$run")"
     [[ -n "$run" ]] || {
         printf 'tag exists; no Server Release workflow run found\n'
         return 2
     }
-    IFS=$'\t' read -r run_status conclusion run_ref run_sha run_url <<<"$run"
-    if [[ "$run_ref" != "$TAG" || "$run_sha" != "$commit" ]]; then
+    IFS=$'\t' read -r run_status conclusion run_event run_ref run_sha run_url <<<"$run"
+    if [[ "$run_event" == push &&
+        ("$run_ref" != "$TAG" || "$run_sha" != "$commit") ]]; then
         printf 'workflow run targets another commit: %s\n' "$run_url"
         return 1
+    fi
+    if [[ "$run_event" == workflow_dispatch ]]; then
+        if [[ "$run_ref" != main ]] ||
+            ! git -C "$ROOT_DIR" merge-base --is-ancestor \
+                "$run_sha" "$control_tip" 2>/dev/null; then
+            printf 'recovery workflow is not in current main history: %s\n' "$run_url"
+            return 1
+        fi
+        if ! control_ci="$(github_ci_detail "$repository" "$run_sha")"; then
+            printf 'recovery workflow control CI is not passing: %s\n' "$control_ci"
+            return 1
+        fi
     fi
     if [[ "$run_status" != completed ]]; then
         printf '%s: %s\n' "$run_status" "$run_url"
@@ -362,7 +381,7 @@ github_publish_detail() {
 }
 
 run_status() {
-    local commit short branch tree_clean=true identity identity_detail history_ready=true
+    local commit head_commit short branch tree_clean=true identity identity_detail history_ready=true
     local local_tag_state=absent remote_tag_state=absent remote_main="" remote_tag=""
     local identity_ready=true policy_ready=true ci_ready=true rehearsal_ready=true providers_ready=true
     local publish_state publish_detail policy_detail ci_detail repository
@@ -371,49 +390,58 @@ run_status() {
 
     require_command git
     require_command python3
-    commit="$(head_sha)"
-    short="$(short_sha)"
+    head_commit="$(head_sha)"
+    commit="$head_commit"
     branch="$(git -C "$ROOT_DIR" branch --show-current)"
     [[ -z "$(git -C "$ROOT_DIR" status --porcelain --untracked-files=all)" ]] || tree_clean=false
+
+    if detail="$(local_tag_commit)"; then
+        local_tag_state="$detail"
+    fi
+    if remote_tag="$(remote_tag_commit)"; then
+        remote_tag_state="$remote_tag"
+        commit="$remote_tag"
+    else
+        code=$?
+        [[ "$code" -eq 2 ]] || identity_ready=false
+    fi
+    short="${commit:0:12}"
 
     identity_detail="branch=$branch; tree=$([[ "$tree_clean" == true ]] && printf clean || printf dirty)"
     [[ "$branch" == main && "$tree_clean" == true ]] || identity_ready=false
 
     if remote_main="$(remote_main_sha)"; then
-        if [[ "$remote_main" == "$commit" ]]; then
+        if [[ "$remote_main" == "$head_commit" ]]; then
             identity_detail+="; $REMOTE/main matches"
         else
             identity_detail+="; $REMOTE/main differs"
             identity_ready=false
+        fi
+        if [[ "$remote_tag_state" != absent ]]; then
+            if git -C "$ROOT_DIR" merge-base --is-ancestor "$commit" "$remote_main"; then
+                identity_detail+="; tag commit is in main history"
+            else
+                identity_detail+="; tag commit is outside main history"
+                identity_ready=false
+            fi
         fi
     else
         identity_detail+="; $REMOTE/main unavailable"
         identity_ready=false
     fi
 
-    if detail="$(local_tag_commit)"; then
-        local_tag_state="$detail"
-        if [[ "$detail" != "$commit" ]]; then
-            identity_detail+="; local $TAG points elsewhere"
-            identity_ready=false
-        fi
+    if [[ "$local_tag_state" != absent && "$local_tag_state" != "$commit" ]]; then
+        identity_detail+="; local $TAG points elsewhere"
+        identity_ready=false
     fi
-    if remote_tag="$(remote_tag_commit)"; then
-        remote_tag_state="$remote_tag"
-        if [[ "$remote_tag" == "$commit" ]]; then
-            identity_detail+="; tag published"
-        else
-            identity_detail+="; remote $TAG points elsewhere"
-            identity_ready=false
-        fi
-    else
-        code=$?
+    if [[ "$remote_tag_state" == absent ]]; then
         if [[ "$code" -eq 2 ]]; then
             identity_detail+="; tag unused"
         else
             identity_detail+="; remote tag state unavailable"
-            identity_ready=false
         fi
+    else
+        identity_detail+="; tag published"
     fi
     if [[ "$local_tag_state" != absent && "$remote_tag_state" == absent ]]; then
         identity_detail+="; local tag not pushed"
@@ -504,7 +532,7 @@ run_status() {
         status_line CI publish "explicit $TAG push starts the immutable GitHub workflow"
     else
         set +e
-        publish_detail="$(github_publish_detail "$commit")"
+        publish_detail="$(github_publish_detail "$commit" "$remote_main")"
         code=$?
         set -e
         case "$code" in

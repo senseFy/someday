@@ -53,6 +53,10 @@ case "${1:-}" in
     status)
         [[ "${FAKE_DIRTY:-false}" != true ]] || printf ' M README.md\n'
         ;;
+    merge-base)
+        [[ "${2:-}" == --is-ancestor ]] || exit 2
+        [[ "${FAKE_TAG_IN_MAIN:-true}" == true ]]
+        ;;
     ls-remote)
         case " $* " in
             *' --heads '*)
@@ -119,22 +123,34 @@ fi
 if [[ "${1:-}" == run && "${2:-}" == list ]]; then
     workflow=''
     previous=''
+    requested_commit=''
     for argument in "$@"; do
         if [[ "$previous" == --workflow ]]; then
             workflow="$argument"
         fi
+        if [[ "$previous" == --commit ]]; then
+            requested_commit="$argument"
+        fi
         previous="$argument"
     done
     if [[ "$workflow" == ci.yml ]]; then
+        conclusion="${FAKE_CI_CONCLUSION:-success}"
+        [[ -n "$conclusion" ]] || conclusion=-
         printf '%s\t%s\tmain\t%s\thttps://example.test/ci\n' \
             "${FAKE_CI_STATUS:-completed}" \
-            "${FAKE_CI_CONCLUSION:-success}" \
-            "$FAKE_SHA"
+            "$conclusion" \
+            "${requested_commit:-$FAKE_SHA}"
         exit 0
     fi
     if [[ "$workflow" == server-release.yml ]] &&
         [[ "${FAKE_PUBLISHED:-false}" == true ]]; then
-        printf 'completed\tsuccess\tserver-v1.2.3\t%s\thttps://example.test/run\n' "$FAKE_SHA"
+        if [[ "${FAKE_RELEASE_EVENT:-push}" == workflow_dispatch ]]; then
+            printf 'completed\tsuccess\tworkflow_dispatch\t%s\t%s\thttps://example.test/run\n' \
+                "${FAKE_RELEASE_BRANCH:-main}" "$FAKE_SHA"
+        else
+            printf 'completed\tsuccess\tpush\tserver-v1.2.3\t%s\thttps://example.test/run\n' \
+                "${FAKE_REMOTE_TAG_COMMIT:-$FAKE_SHA}"
+        fi
         exit 0
     fi
 fi
@@ -210,12 +226,15 @@ probe_ci="$(
 run_release() {
     PATH="$STUB_BIN:$PATH" \
     FAKE_CALL_LOG="$CALL_LOG" \
-    FAKE_SHA="$SHA" \
+    FAKE_SHA="${FAKE_SHA:-$SHA}" \
     FAKE_BRANCH="${FAKE_BRANCH:-main}" \
     FAKE_DIRTY="${FAKE_DIRTY:-false}" \
     FAKE_REMOTE_MAIN="${FAKE_REMOTE_MAIN:-$SHA}" \
     FAKE_LOCAL_TAG_COMMIT="${FAKE_LOCAL_TAG_COMMIT:-}" \
     FAKE_REMOTE_TAG_COMMIT="${FAKE_REMOTE_TAG_COMMIT:-}" \
+    FAKE_RELEASE_EVENT="${FAKE_RELEASE_EVENT:-push}" \
+    FAKE_RELEASE_BRANCH="${FAKE_RELEASE_BRANCH:-main}" \
+    FAKE_TAG_IN_MAIN="${FAKE_TAG_IN_MAIN:-true}" \
     FAKE_PUBLISHED="${FAKE_PUBLISHED:-false}" \
     FAKE_REPOSITORY="${FAKE_REPOSITORY:-senseFy/someday}" \
     FAKE_VISIBILITY="${FAKE_VISIBILITY:-PUBLIC}" \
@@ -406,6 +425,32 @@ FAKE_REMOTE_TAG_COMMIT="$SHA" FAKE_PUBLISHED=true \
     run_release status "$VERSION" >"$TEST_ROOT/status-published.out"
 grep -Fq 'RELEASE COMPLETE' "$TEST_ROOT/status-published.out" ||
     fail 'a passing published workflow did not produce RELEASE COMPLETE'
+
+CONTROL_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+FAKE_SHA="$CONTROL_SHA" FAKE_REMOTE_MAIN="$CONTROL_SHA" \
+    FAKE_REMOTE_TAG_COMMIT="$SHA" FAKE_RELEASE_EVENT=workflow_dispatch \
+    FAKE_PUBLISHED=true \
+    run_release status "$VERSION" >"$TEST_ROOT/status-recovered.out"
+grep -Fq "commit ${SHA:0:12}" "$TEST_ROOT/status-recovered.out" ||
+    fail 'recovered status did not use the immutable tag commit'
+grep -Fq 'tag commit is in main history' "$TEST_ROOT/status-recovered.out" ||
+    fail 'recovered status did not validate tag ancestry'
+grep -Fq 'RELEASE COMPLETE' "$TEST_ROOT/status-recovered.out" ||
+    fail 'a passing recovered workflow did not produce RELEASE COMPLETE'
+
+FAKE_SHA="$CONTROL_SHA" FAKE_REMOTE_MAIN="$CONTROL_SHA" \
+    FAKE_REMOTE_TAG_COMMIT="$SHA" FAKE_RELEASE_EVENT=workflow_dispatch \
+    FAKE_RELEASE_BRANCH=feature FAKE_PUBLISHED=true \
+    expect_failure status-recovery-branch run_release status "$VERSION"
+grep -Fq 'recovery workflow is not in current main history' \
+    "$TEST_ROOT/status-recovery-branch.out" ||
+    fail 'status accepted recovery from a non-main branch'
+
+FAKE_REMOTE_TAG_COMMIT="$SHA" FAKE_TAG_IN_MAIN=false \
+    expect_failure status-tag-outside-main run_release status "$VERSION"
+grep -Fq 'tag commit is outside main history' \
+    "$TEST_ROOT/status-tag-outside-main.out" ||
+    fail 'status accepted a tag outside main history'
 grep -Fq 'docker build' "$CALL_LOG" || fail 'rehearsal did not build an image'
 grep -Fq 'system-gate' "$CALL_LOG" || fail 'rehearsal did not run System V3'
 
