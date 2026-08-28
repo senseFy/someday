@@ -102,6 +102,44 @@ if rg -q -- '(--env|-e)[[:space:]]+(ACCESS_KEY|SECRET_KEY)=' \
     printf 'R2 credential value is exposed in a docker command argument\n' >&2
     exit 1
 fi
+
+retry_output="$TEST_ROOT/wrangler-output.txt"
+retry_attempts=0
+retry_sleeps=0
+wrangler() {
+    retry_attempts=$((retry_attempts + 1))
+    if ((retry_attempts < 3)); then
+        printf 'partial output\n'
+        return 28
+    fi
+    printf 'complete output\n'
+}
+sleep() {
+    retry_sleeps=$((retry_sleeps + 1))
+}
+r2_wrangler_read "$retry_output" "$TEST_ROOT/wrangler" r2 bucket info test --json 2>/dev/null
+[[ "$retry_attempts" == 3 ]]
+[[ "$retry_sleeps" == 2 ]]
+[[ "$(cat "$retry_output")" == 'complete output' ]]
+
+retry_attempts=0
+wrangler() {
+    retry_attempts=$((retry_attempts + 1))
+    printf 'partial output\n'
+    return 42
+}
+if r2_wrangler_read "$retry_output" "$TEST_ROOT/wrangler" \
+    r2 bucket info test --json 2>/dev/null; then
+    printf 'exhausted Wrangler reads passed validation\n' >&2
+    exit 1
+else
+    retry_status=$?
+fi
+[[ "$retry_status" == 42 ]]
+[[ "$retry_attempts" == 3 ]]
+[[ ! -e "$retry_output" ]]
+unset -f wrangler sleep
+
 r2_copy="$TEST_ROOT/r2-copy"
 r2_expected="$TEST_ROOT/r2-expected.tsv"
 r2_current="$TEST_ROOT/r2-current.tsv"

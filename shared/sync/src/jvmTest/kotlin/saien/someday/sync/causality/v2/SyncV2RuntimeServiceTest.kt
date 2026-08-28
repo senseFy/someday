@@ -22,6 +22,7 @@ import saien.someday.domain.settings.SyncConfiguration
 import saien.someday.domain.settings.SyncMode
 import saien.someday.domain.notes.NoteInput
 import saien.someday.sync.WorkspaceAuthorityMutationCoordinator
+import java.nio.file.Files
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -188,7 +189,7 @@ class SyncV2RuntimeServiceTest {
     @Test
     fun productMutationAtPointerCommitWaitsAndRoutesToActivatedV2() {
         val remote = InMemoryWorkspaceSyncRemoteV2(SyncRemoteProfileV2.SELF_HOSTED.wireValue)
-        withRuntimeFixture(remote) { fixture ->
+        withFileBackedRuntimeFixture(remote) { fixture ->
             val casEntered = CountDownLatch(1)
             val releaseCas = CountDownLatch(1)
             val mutationStarted = CountDownLatch(1)
@@ -360,12 +361,31 @@ class SyncV2RuntimeServiceTest {
         }
     }
 
-    private fun withRuntimeFixture(
+    private fun withFileBackedRuntimeFixture(
         remote: InMemoryWorkspaceSyncRemoteV2,
         writerDeviceId: String = WRITER_A,
         block: (RuntimeFixture) -> Unit,
     ) {
-        val driver = createSomedayJdbcDriver("jdbc:sqlite::memory:")
+        val directory = Files.createTempDirectory("someday-sync-v2-runtime-")
+        try {
+            withRuntimeFixture(
+                remote = remote,
+                writerDeviceId = writerDeviceId,
+                jdbcUrl = "jdbc:sqlite:${directory.resolve("someday.db").toAbsolutePath()}",
+                block = block,
+            )
+        } finally {
+            directory.toFile().deleteRecursively()
+        }
+    }
+
+    private fun withRuntimeFixture(
+        remote: InMemoryWorkspaceSyncRemoteV2,
+        writerDeviceId: String = WRITER_A,
+        jdbcUrl: String = "jdbc:sqlite::memory:",
+        block: (RuntimeFixture) -> Unit,
+    ) {
+        val driver = createSomedayJdbcDriver(jdbcUrl)
         val database = SomedayDatabase(driver)
         val localRepository = SqlDelightLocalDataRepository(
             database = database,
