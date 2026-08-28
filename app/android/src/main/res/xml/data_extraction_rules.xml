@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <data-extraction-rules>
     <!--
-      Cloud backup and device-to-device transfer stay disabled until Someday
-      has an authenticated, key-preserving workspace adoption transaction.
+      Cloud backup and device-to-device transfer stay disabled because the
+      local database cannot be restored without its matching secure key.
     -->
     <cloud-backup>
         <exclude domain="root" path="." />

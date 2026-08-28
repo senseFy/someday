@@ -17,7 +17,7 @@ import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 
 /**
- * Credential writes use synchronous commit because authority adoption must not
+ * Credential writes use synchronous commit because authority replacement must not
  * report success before its encrypted credential is durable.
  */
 @SuppressLint("ApplySharedPref", "UseKtx")

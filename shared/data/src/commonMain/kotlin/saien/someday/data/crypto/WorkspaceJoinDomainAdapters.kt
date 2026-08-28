@@ -4,7 +4,6 @@ import saien.someday.domain.settings.WorkspaceJoinPackage
 import saien.someday.domain.settings.WorkspaceJoinPackageProvider
 import saien.someday.domain.settings.WorkspaceJoinResult
 import saien.someday.domain.settings.WorkspaceJoiner
-import saien.someday.domain.settings.LocalWorkspaceAdoptionPolicy
 import saien.someday.domain.settings.WorkspacePairingReason
 
 fun WorkspaceKeyRepository.workspaceJoinPackageProvider(): WorkspaceJoinPackageProvider =
@@ -26,29 +25,42 @@ fun WorkspaceKeyRepository.workspaceJoinPackageProvider(): WorkspaceJoinPackageP
 fun WorkspaceKeyRepository.workspaceJoiner(
     deviceName: String,
     platform: String,
-    adoptionPolicy: LocalWorkspaceAdoptionPolicy,
     beforeWorkspaceReplacement: () -> Boolean,
     afterWorkspaceReplacement: (WorkspaceJoinPackage, WorkspaceMasterKey, String) -> Boolean,
+    afterWorkspaceReplacementCommitted: () -> Unit,
 ): WorkspaceJoiner =
-    WorkspaceJoiner { packageData ->
-        adoptionPolicy.refusalReason()?.let { return@WorkspaceJoiner WorkspaceJoinResult.failure(it) }
-        runCatching { joinWorkspaceFromDomain(
-            packageData = packageData,
-            deviceName = deviceName,
-            platform = platform,
-            beforeWorkspaceReplacement = {
-                check(beforeWorkspaceReplacement()) {
-                    "The empty local workspace draft changed while joining."
-                }
-            },
-            afterWorkspaceReplacement = { key, workspaceId ->
-                check(afterWorkspaceReplacement(packageData, key, workspaceId)) {
-                    "The joined workspace could not be bound to the authenticated account."
-                }
-            },
-        ) }.getOrElse {
-            WorkspaceJoinResult.failure(WorkspacePairingReason.AdoptionFailed)
+    WorkspaceJoiner { packageData, replaceExistingWorkspace ->
+        if (!replaceExistingWorkspace) {
+            return@WorkspaceJoiner WorkspaceJoinResult.failure(
+                WorkspacePairingReason.ReplacementConfirmationRequired,
+            )
         }
+        val result = runCatching {
+            joinWorkspaceFromDomain(
+                packageData = packageData,
+                deviceName = deviceName,
+                platform = platform,
+                beforeWorkspaceReplacement = {
+                    check(beforeWorkspaceReplacement()) {
+                        "The current local workspace changed while joining."
+                    }
+                },
+                afterWorkspaceReplacement = { key, workspaceId ->
+                    check(afterWorkspaceReplacement(packageData, key, workspaceId)) {
+                        "The joined workspace could not be bound to the authenticated account."
+                    }
+                },
+            )
+        }.getOrElse {
+            return@WorkspaceJoiner WorkspaceJoinResult.failure(WorkspacePairingReason.ReplacementFailed)
+        }
+        if (result.success) {
+            // Database and secure-key replacement have committed. Filesystem
+            // cleanup is best-effort and must never turn that commit into a
+            // user-visible pairing failure.
+            runCatching(afterWorkspaceReplacementCommitted)
+        }
+        result
     }
 
 private fun WorkspaceKeyRepository.joinWorkspaceFromDomain(
@@ -82,7 +94,7 @@ private fun WorkspaceUnlockFailure.workspacePairingReason(): WorkspacePairingRea
         WorkspaceUnlockFailure.NO_WORKSPACE ->
             WorkspacePairingReason.WorkspaceLocked
         WorkspaceUnlockFailure.WORKSPACE_ALREADY_EXISTS ->
-            WorkspacePairingReason.LocalWorkspaceNotReplaceable
+            WorkspacePairingReason.ReplacementConfirmationRequired
         WorkspaceUnlockFailure.SECURE_STORAGE_UNAVAILABLE ->
             WorkspacePairingReason.WorkspaceLocked
         WorkspaceUnlockFailure.AUTHENTICATION_FAILED ->

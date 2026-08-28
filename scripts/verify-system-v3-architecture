@@ -193,8 +193,10 @@ pass ARCH-APPEND-ONLY-MEDIA
 
 rg -q 'beforeEntityPublication = \{ versions ->' "$SERVICE_FILE" ||
     fail "the product composition does not install the media publication gate"
-rg -q 'mediaCoordinator\.ensurePublished\(mediaIds\)' "$SERVICE_FILE" ||
+rg -q 'mediaCoordinator\.ensurePublishedWithinWorkspaceLifecycle\(mediaIds\)' "$SERVICE_FILE" ||
     fail "referenced media is not proven before entity publication"
+rg -q 'workspaceLifecycleCoordinator\.exclusive' "$SYNC_CORE/SyncV2RuntimeService.kt" ||
+    fail "entity synchronization does not hold the shared workspace-lifecycle lock"
 if rg -n 'beforeEntityPublication:.*=[[:space:]]*\{[[:space:]]*\}' \
     "$SYNC_CORE/WorkspaceSyncCoordinatorV2.kt" "$SYNC_CORE/WorkspaceCheckpointLifecycleV2.kt" >/dev/null; then
     fail "an entity publication path can silently bypass media reachability"
@@ -211,10 +213,26 @@ fi
 pass ARCH-PORTABLE-NO-MEDIA
 
 pairing="$SYNC_MAIN/saien/someday/sync/selfhosted/SelfHostedWorkspacePairingService.kt"
-draft="$SYNC_CORE/WorkspaceLocalDraftV2.kt"
+replacement="$SYNC_CORE/WorkspaceLocalReplacementV2.kt"
+cleanup="$SYNC_CORE/WorkspaceCheckpointCleanupV2.kt"
+join_adapter="$DATA_MAIN/kotlin/saien/someday/data/crypto/WorkspaceJoinDomainAdapters.kt"
 rg -q 'workspacePairingInviterReady' "$pairing" || fail "pairing does not require a published inviter"
-rg -q 'localWorkspaceAdoptionRefusalReasonV2' "$draft" || fail "semantic-empty adoption policy is missing"
-rg -q 'discardEmptyLocalWorkspaceDraftForAdoptionV2' "$draft" || fail "empty-draft adoption cleanup is missing"
+rg -q 'replaceExistingWorkspace: Boolean' "$pairing" ||
+    fail "pairing does not carry explicit per-attempt replacement consent"
+rg -q 'if \(!replaceExistingWorkspace\)' "$pairing" ||
+    fail "pairing does not refuse before claim without explicit replacement consent"
+rg -q 'if \(!replaceExistingWorkspace\)' "$join_adapter" ||
+    fail "the local workspace join boundary does not enforce replacement consent"
+if rg -n 'LocalWorkspaceAdoptionPolicy|workspaceAdoptionPolicy|adoptionPolicy' \
+    "$DOMAIN_MAIN" "$DATA_MAIN" "$SYNC_MAIN" app integration-tests >/dev/null; then
+    fail "the removed semantic-adoption policy layer remains"
+fi
+rg -q 'discardLocalWorkspaceForReplacementV2' "$replacement" ||
+    fail "atomic local workspace replacement cleanup is missing"
+rg -q 'discardAllForWorkspaceReplacement' "$cleanup" ||
+    fail "workspace replacement does not clear every local protocol generation"
+rg -q 'afterWorkspaceReplacementCommitted' "$join_adapter" ||
+    fail "post-commit media cleanup is not wired after workspace replacement"
 rg -Fq 'requestedDeviceId.version() != 4' \
     "$SERVER_MAIN/kotlin/saien/someday/server/routes/DeviceRoutes.kt" ||
     fail "server device registration does not require UUIDv4"

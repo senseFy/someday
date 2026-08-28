@@ -9,7 +9,7 @@ import saien.someday.domain.settings.ManualSyncReason
 import saien.someday.domain.settings.ManualSyncResult
 import saien.someday.domain.settings.ManualSyncRunner
 import saien.someday.domain.settings.SyncMode
-import saien.someday.sync.WorkspaceAuthorityMutationCoordinator
+import saien.someday.sync.WorkspaceLifecycleCoordinator
 import kotlin.time.Clock
 import kotlin.time.Instant
 
@@ -29,16 +29,21 @@ class SyncV2RuntimeService(
     private val workspaceKeyProvider: () -> WorkspaceMasterKey?,
     private val writerDeviceIdProvider: () -> String,
     private val transportFactory: SyncRemoteTransportFactoryV2,
-    private val authorityMutationCoordinator: WorkspaceAuthorityMutationCoordinator,
+    private val workspaceLifecycleCoordinator: WorkspaceLifecycleCoordinator,
     private val clock: () -> Instant = { Clock.System.now() },
     private val onPublishProgress: (WorkspaceCheckpointPublishProgressV2) -> Unit = {},
     /** Required product boundary; System V3 supplies its media reachability gate. */
     private val beforeEntityPublication: (List<WorkspaceEntityVersionV2>) -> Unit,
 ) : ManualSyncRunner {
     private val protocolStore = SqlDelightSyncProtocolStoreV2(localRepository.database)
-    private val checkpointDraftCleanup = WorkspaceCheckpointDraftCleanupServiceV2(localRepository, protocolStore)
+    private val checkpointCleanup = WorkspaceCheckpointCleanupServiceV2(localRepository, protocolStore)
 
-    override fun run(): ManualSyncResult {
+    override fun run(): ManualSyncResult =
+        workspaceLifecycleCoordinator.exclusive {
+            runWithWorkspaceLifecycleLock()
+        }
+
+    private fun runWithWorkspaceLifecycleLock(): ManualSyncResult {
         val configured = settingsRepository.load().syncConfiguration
         if (configured.mode != mode) {
             return ManualSyncResult.failure(mode, ManualSyncReason.ProviderChanged)
@@ -51,19 +56,7 @@ class SyncV2RuntimeService(
             )
         }
         if (authority == null) {
-            return authorityMutationCoordinator.exclusive {
-                val authorityAfterLock = protocolStore.loadAuthoritativeEpoch()
-                if (authorityAfterLock == null) {
-                    initializeWorkspace()
-                } else if (authorityAfterLock.remoteProfile != mode.remoteProfileV2()) {
-                    ManualSyncResult.failure(
-                        mode = mode,
-                        reason = ManualSyncReason.AuthorityMismatch,
-                    )
-                } else {
-                    runV2()
-                }
-            }
+            return initializeWorkspace()
         }
         return runV2()
     }
@@ -160,7 +153,7 @@ class SyncV2RuntimeService(
                     )
                 }
                 // First epoch: checkpoint from local product state (or rebuild after stale prepare).
-                // Still inside authorityMutationCoordinator.exclusive from run().
+                // Still inside workspaceLifecycleCoordinator.exclusive from run().
                 when (
                     val attempt = prepareAndPublishGenesis(
                         remote = remote,
@@ -406,7 +399,7 @@ class SyncV2RuntimeService(
             remote = remote,
             protocolStore = protocolStore,
             clock = clock,
-            authorityMutationCoordinator = authorityMutationCoordinator,
+            workspaceLifecycleCoordinator = workspaceLifecycleCoordinator,
             beforeEntityPublication = beforeEntityPublication,
         )
     }
@@ -508,7 +501,7 @@ class SyncV2RuntimeService(
             beforeEntityPublication = beforeEntityPublication,
             localSnapshotStillMatches = snapshotValidator,
             commitPointerBarrier = { commit ->
-                authorityMutationCoordinator.productAccess(commit)
+                workspaceLifecycleCoordinator.productAccess(commit)
             },
         )
     }
@@ -708,7 +701,7 @@ class SyncV2RuntimeService(
                 if (runCatching { remote.cleanupCheckpointDraft(draft) }.getOrNull()
                     is WorkspaceCheckpointDraftCleanupResultV2.Deleted
                 ) {
-                    checkpointDraftCleanup.collect(remote.remoteProfile, epoch.descriptor.syncEpochId)
+                    checkpointCleanup.collect(remote.remoteProfile, epoch.descriptor.syncEpochId)
                 }
             }
     }

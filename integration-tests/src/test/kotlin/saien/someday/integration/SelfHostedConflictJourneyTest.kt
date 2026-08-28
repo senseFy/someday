@@ -9,7 +9,7 @@ import kotlin.time.Instant
 import saien.someday.domain.notes.NoteDetails
 import saien.someday.domain.notes.NoteInput
 import saien.someday.integration.testkit.RealSelfHostedFixture
-import saien.someday.integration.testkit.adoptWorkspaceFrom
+import saien.someday.integration.testkit.replaceWorkspaceFrom
 import saien.someday.integration.testkit.assertSuccessfulSync
 
 class SelfHostedConflictJourneyTest {
@@ -32,7 +32,7 @@ class SelfHostedConflictJourneyTest {
                 ),
             )
             leader.assertSuccessfulSync()
-            follower.adoptWorkspaceFrom(leader)
+            follower.replaceWorkspaceFrom(leader)
             follower.assertSuccessfulSync()
 
             val leaderBase = assertNotNull(leader.services.notesRepository.getNoteDetails(note.id))

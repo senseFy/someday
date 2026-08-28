@@ -14,7 +14,7 @@ import saien.someday.domain.notes.NotebookOrderEdit
 import saien.someday.domain.notes.NotesLocationInput
 import saien.someday.domain.settings.ClientTheme
 import saien.someday.integration.testkit.RealSelfHostedFixture
-import saien.someday.integration.testkit.adoptWorkspaceFrom
+import saien.someday.integration.testkit.replaceWorkspaceFrom
 import saien.someday.integration.testkit.assertSuccessfulSync
 
 class SelfHostedTextConvergenceJourneyTest {
@@ -39,7 +39,7 @@ class SelfHostedTextConvergenceJourneyTest {
             )
             leader.assertSuccessfulSync()
 
-            follower.adoptWorkspaceFrom(leader)
+            follower.replaceWorkspaceFrom(leader)
             follower.assertSuccessfulSync()
             assertEquals(NOTE_BODY_SENTINEL, follower.services.notesRepository.getNoteDetails(note.id)?.markdownBody)
 

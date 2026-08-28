@@ -37,6 +37,9 @@ import saien.someday.domain.settings.WorkspacePairingInvitationCreator
 import saien.someday.domain.settings.WorkspacePairingInvitationJoiner
 import saien.someday.domain.settings.WorkspacePairingInvitationResult
 import saien.someday.domain.settings.WorkspacePairingReason
+import saien.someday.domain.settings.WorkspacePreferencesSnapshot
+import saien.someday.domain.settings.WorkspacePreferencesSyncState
+import saien.someday.domain.settings.resetWorkspaceStateForReplacement
 import saien.someday.ui.i18n.SettingsUiStrings
 import saien.someday.ui.i18n.formatUiString
 
@@ -59,6 +62,7 @@ enum class SettingsFeedbackSeverity {
 class SettingsUiController(
     initialSettings: ClientSettings = ClientSettings(),
     private val notebooksProvider: () -> List<NotebookSummary> = { emptyList() },
+    private val loadSettings: () -> ClientSettings,
     private val persistSettings: (ClientSettings) -> ClientSettings = { it },
     private val workspacePreferencesConflictResolver: WorkspacePreferencesConflictResolver? = null,
     private val exportProvider: () -> SettingsExportSummary = { SettingsExportSummary.unavailable() },
@@ -79,12 +83,13 @@ class SettingsUiController(
             reason = ManualSyncReason.Unavailable,
         )
     },
+    private val automaticSyncEligible: () -> Boolean = { false },
     private val workspacePairingInvitationCreator: WorkspacePairingInvitationCreator =
         WorkspacePairingInvitationCreator {
             WorkspacePairingInvitationResult.failure(WorkspacePairingReason.Unavailable)
         },
     private val workspacePairingInvitationJoiner: WorkspacePairingInvitationJoiner =
-        WorkspacePairingInvitationJoiner {
+        WorkspacePairingInvitationJoiner { _, _ ->
             WorkspaceJoinResult.failure(WorkspacePairingReason.Unavailable)
         },
     private val workspacePairingInvitationCanceller: WorkspacePairingInvitationCanceller =
@@ -712,6 +717,7 @@ class SettingsUiController(
 
     private suspend fun runSyncLocked(userInitiated: Boolean): SyncCompletion {
         if (!userInitiated && !canStartSync()) return SyncCompletion()
+        if (!userInitiated && !preflightAutomaticSync()) return SyncCompletion()
         if (!beginSync(showFeedback = userInitiated)) return SyncCompletion()
         return try {
             val result = executeSyncRunner()
@@ -730,6 +736,14 @@ class SettingsUiController(
             }
         }
     }
+
+    private suspend fun preflightAutomaticSync(): Boolean =
+        runCatching {
+            withContext(backgroundDispatcher) { automaticSyncEligible() }
+        }.getOrElse { failure ->
+            failure.rethrowCancellation()
+            false
+        }
 
     private suspend fun executeSyncRunner(): ManualSyncResult {
         val mode = state.settings.syncConfiguration.mode
@@ -907,9 +921,12 @@ class SettingsUiController(
         )
     }
 
-    suspend fun joinWorkspaceWithToken(tokenInput: String): Boolean {
+    suspend fun joinWorkspaceWithToken(
+        tokenInput: String,
+        replaceExistingWorkspace: Boolean,
+    ): Boolean {
         val completion = runExclusiveSyncLifecycle(WorkspaceJoinCompletion()) {
-            joinWorkspaceWithTokenLocked(tokenInput)
+            joinWorkspaceWithTokenLocked(tokenInput, replaceExistingWorkspace)
         }
         if (completion.refreshProductData) {
             onDataRestored()
@@ -917,7 +934,10 @@ class SettingsUiController(
         return completion.joined
     }
 
-    private suspend fun joinWorkspaceWithTokenLocked(tokenInput: String): WorkspaceJoinCompletion {
+    private suspend fun joinWorkspaceWithTokenLocked(
+        tokenInput: String,
+        replaceExistingWorkspace: Boolean,
+    ): WorkspaceJoinCompletion {
         if (tokenInput.isBlank()) {
             state = buildState(
                 settings = state.settings,
@@ -934,7 +954,10 @@ class SettingsUiController(
         return try {
             val result = try {
                 withContext(backgroundDispatcher) {
-                    workspacePairingInvitationJoiner.joinWithToken(tokenInput)
+                    workspacePairingInvitationJoiner.joinWithToken(
+                        tokenInput = tokenInput,
+                        replaceExistingWorkspace = replaceExistingWorkspace,
+                    )
                 }
             } catch (cancelled: CancellationException) {
                 throw cancelled
@@ -944,21 +967,24 @@ class SettingsUiController(
             if (result.success) {
                 currentWorkspacePairingInvitation = null
                 currentSyncIssue = null
-                // Prior sync failures (wrong first-run key against a remote epoch)
-                // are stale after a successful join package restore.
-                val cleared = state.settings.copy(
-                    syncConfiguration = state.settings.syncConfiguration.copy(
-                        lastError = null,
-                    ),
-                )
-                val persisted = runCatching {
-                    withContext(backgroundDispatcher) { persistSettings(cleared) }
+                val replacementSettings = runCatching {
+                    withContext(backgroundDispatcher) { loadSettings() }
                 }.getOrElse { failure ->
                     failure.rethrowCancellation()
-                    cleared
+                    currentSyncIssue = SyncIssueUi(SyncIssueReason.WorkspaceSettingsReloadRequired)
+                    state = buildState(
+                        settings = state.settings.safeWorkspaceReplacementFallback(),
+                        exportSummary = state.exportSummary,
+                        feedbackMessage = uiStrings.pairingSettingsReloadFailed,
+                        feedbackSeverity = SettingsFeedbackSeverity.Error,
+                    )
+                    return WorkspaceJoinCompletion(
+                        joined = true,
+                        refreshProductData = true,
+                    )
                 }
                 state = buildState(
-                    settings = persisted,
+                    settings = replacementSettings,
                     exportSummary = state.exportSummary,
                     feedbackMessage = workspacePairingMessage(result.reason),
                     feedbackSeverity = SettingsFeedbackSeverity.Success,
@@ -969,7 +995,7 @@ class SettingsUiController(
                 completeSync(syncResult, showFeedback = !syncResult.success)
                 WorkspaceJoinCompletion(
                     joined = true,
-                    refreshProductData = syncResult.success || syncResult.hasVisibleSyncChanges,
+                    refreshProductData = true,
                 )
             } else {
                 state = buildState(
@@ -1069,6 +1095,7 @@ class SettingsUiController(
             SyncIssueReason.RetryRequired -> uiStrings.syncRetryRequired
             SyncIssueReason.Blocked -> uiStrings.syncBlocked
             SyncIssueReason.SyncFailed -> uiStrings.syncFailed
+            SyncIssueReason.WorkspaceSettingsReloadRequired -> uiStrings.pairingSettingsReloadFailed
         }
 
     private fun workspacePairingMessage(
@@ -1090,11 +1117,12 @@ class SettingsUiController(
             WorkspacePairingReason.InvitationAlreadyUsed,
             -> uiStrings.pairingInvitationUnavailable
             WorkspacePairingReason.WorkspaceLocked -> uiStrings.pairingWorkspaceLocked
-            WorkspacePairingReason.LocalWorkspaceNotReplaceable -> uiStrings.pairingLocalWorkspaceNotReplaceable
-            WorkspacePairingReason.LocalContentPresent -> uiStrings.pairingLocalContentPresent
-            WorkspacePairingReason.VerificationFailed,
-            WorkspacePairingReason.AuthorityMismatch,
-            WorkspacePairingReason.AdoptionFailed,
+            WorkspacePairingReason.ReplacementConfirmationRequired ->
+                uiStrings.pairingReplacementConfirmationRequired
+            WorkspacePairingReason.ReplacementFailed -> uiStrings.pairingReplacementFailed
+            WorkspacePairingReason.ServerRequestFailed -> uiStrings.pairingServerRequestFailed
+            WorkspacePairingReason.VerificationFailed -> uiStrings.pairingVerificationFailed
+            WorkspacePairingReason.AuthorityMismatch -> uiStrings.syncAuthorityMismatch
             WorkspacePairingReason.Unavailable,
             WorkspacePairingReason.Failed,
             -> if (invitationOperation) uiStrings.pairingInvitationFailed else uiStrings.pairingFailed
@@ -1231,6 +1259,25 @@ private data class WorkspaceJoinCompletion(
     val joined: Boolean = false,
     val refreshProductData: Boolean = false,
 )
+
+/**
+ * Prevents a retry from interpreting fallback values as edits to the joined
+ * workspace. Real edits still fail closed because this snapshot has no causal
+ * token; a successful Sync projects the target workspace before persistence.
+ */
+private fun ClientSettings.safeWorkspaceReplacementFallback(): ClientSettings {
+    val reset = resetWorkspaceStateForReplacement()
+    return reset.copy(
+        workspacePreferencesState = WorkspacePreferencesSyncState(
+            displayedSnapshot = WorkspacePreferencesSnapshot(
+                theme = reset.theme,
+                previewByDefault = reset.editorPreferences.previewByDefault,
+                markdownToolbarVisible = reset.editorPreferences.markdownToolbarVisible,
+                defaultNotebookId = reset.defaultNotebookId,
+            ),
+        ),
+    )
+}
 
 private val ManualSyncResult.hasVisibleSyncChanges: Boolean
     get() = pushedObjects > 0 || pulledObjects > 0 || conflicts > 0

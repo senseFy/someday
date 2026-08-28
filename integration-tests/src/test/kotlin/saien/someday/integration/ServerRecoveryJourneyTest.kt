@@ -56,7 +56,10 @@ class ServerRecoveryJourneyTest {
 
             val invitation = source.pairing.createInvitation()
             assertTrue(invitation.success, invitation.diagnosticMessage ?: invitation.reason.name)
-            val joined = verifier.pairing.joinWithToken(assertNotNull(invitation.invitation).revealManualToken())
+            val joined = verifier.pairing.joinWithToken(
+                assertNotNull(invitation.invitation).revealManualToken(),
+                replaceExistingWorkspace = true,
+            )
             assertTrue(joined.success, joined.diagnosticMessage ?: joined.reason.name)
             assertNull(verifier.services.notesRepository.getNoteDetails(note.id))
             assertTrue(verifier.database.somedayQueries.selectAllMediaAssets().executeAsList().isEmpty())

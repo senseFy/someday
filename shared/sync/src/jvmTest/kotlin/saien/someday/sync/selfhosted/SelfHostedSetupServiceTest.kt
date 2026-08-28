@@ -7,7 +7,7 @@ import kotlin.test.assertTrue
 import saien.someday.domain.settings.SelfHostedSetupInput
 import saien.someday.domain.settings.SelfHostedSessionCredentials
 import saien.someday.domain.settings.authorityBindingId
-import saien.someday.sync.WorkspaceAuthorityMutationCoordinator
+import saien.someday.sync.WorkspaceLifecycleCoordinator
 
 class SelfHostedSetupServiceTest {
     @Test
@@ -125,7 +125,7 @@ class SelfHostedSetupServiceTest {
         transport = transport,
         sessionStore = store,
         activeWorkspaceSessionGuard = ActiveWorkspaceSessionGuard { requirement },
-        authorityMutationCoordinator = WorkspaceAuthorityMutationCoordinator(),
+        workspaceLifecycleCoordinator = WorkspaceLifecycleCoordinator(),
         localDeviceIdProvider = { LOCAL_DEVICE_ID },
     )
 

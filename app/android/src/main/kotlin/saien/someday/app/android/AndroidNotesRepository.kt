@@ -50,6 +50,7 @@ class AndroidClientRepositories(
     val selfHostedSetupClient: SelfHostedSetupClient,
     val selfHostedSessionCredentialStore: SelfHostedSessionCredentialStore,
     val manualSyncRunner: ManualSyncRunner,
+    val automaticSyncEligible: () -> Boolean,
     val workspacePairingInvitationCreator: WorkspacePairingInvitationCreator,
     val workspacePairingInvitationJoiner: WorkspacePairingInvitationJoiner,
     val workspacePairingInvitationCanceller: WorkspacePairingInvitationCanceller,
@@ -204,14 +205,14 @@ private fun assembleAndroidClientRepositories(
         selfHostedMediaTransportV3 = selfHostedTransport,
         selfHostedSessionStore = selfHostedSessionCredentialStore,
     )
-    runCatching { systemV3Services.localMediaAssetStore.cleanupOrphans() }
+    runCatching { localMediaAssetStore.purgeUnreferencedFilesWithoutGracePeriod() }
     val workspaceJoinPackageProvider = workspaceKeys.workspaceJoinPackageProvider()
     val workspaceJoiner = workspaceKeys.workspaceJoiner(
         deviceName = "Android device",
         platform = "android",
-        adoptionPolicy = systemV3Services.workspaceAdoptionPolicy,
-        beforeWorkspaceReplacement = systemV3Services.discardEmptyDraftForWorkspaceAdoption,
-        afterWorkspaceReplacement = systemV3Services.bindAdoptedWorkspaceToCurrentSession,
+        beforeWorkspaceReplacement = systemV3Services.discardLocalWorkspaceForReplacement,
+        afterWorkspaceReplacement = systemV3Services.bindReplacementWorkspaceToCurrentSession,
+        afterWorkspaceReplacementCommitted = systemV3Services.finalizeLocalWorkspaceReplacement,
     )
     val selfHostedPairingService = SelfHostedWorkspacePairingService(
         settingsProvider = settingsRepository::load,
@@ -220,8 +221,7 @@ private fun assembleAndroidClientRepositories(
         sessionExecutor = systemV3Services.selfHostedSessionExecutor,
         workspaceJoinPackageProvider = workspaceJoinPackageProvider,
         workspaceJoiner = workspaceJoiner,
-        adoptionPolicy = systemV3Services.workspaceAdoptionPolicy,
-        authorityMutationCoordinator = systemV3Services.authorityMutationCoordinator,
+        workspaceLifecycleCoordinator = systemV3Services.workspaceLifecycleCoordinator,
         activeWorkspaceSessionGuard = systemV3Services.activeWorkspaceSessionGuard,
         workspacePairingInviterReady = systemV3Services.workspacePairingInviterReady,
     )
@@ -232,7 +232,7 @@ private fun assembleAndroidClientRepositories(
             transport = selfHostedTransport,
             sessionStore = selfHostedSessionCredentialStore,
             activeWorkspaceSessionGuard = systemV3Services.activeWorkspaceSessionGuard,
-            authorityMutationCoordinator = systemV3Services.authorityMutationCoordinator,
+            workspaceLifecycleCoordinator = systemV3Services.workspaceLifecycleCoordinator,
             localDeviceIdProvider = { localRepository.localDeviceId },
         ),
         selfHostedSessionCredentialStore = WorkspaceBoundSessionCredentialStore(
@@ -240,6 +240,7 @@ private fun assembleAndroidClientRepositories(
             systemV3Services.activeWorkspaceSessionGuard,
         ),
         manualSyncRunner = systemV3Services.manualSyncRunner,
+        automaticSyncEligible = systemV3Services.automaticSyncEligible,
         workspacePairingInvitationCreator = selfHostedPairingService,
         workspacePairingInvitationJoiner = selfHostedPairingService,
         workspacePairingInvitationCanceller = selfHostedPairingService,

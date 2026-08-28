@@ -2,6 +2,10 @@
 
 package saien.someday.sync.selfhosted
 
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.time.Instant
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -19,9 +23,8 @@ import saien.someday.domain.settings.WorkspaceJoinPackage
 import saien.someday.domain.settings.WorkspaceJoinPackageProvider
 import saien.someday.domain.settings.WorkspaceJoinResult
 import saien.someday.domain.settings.WorkspaceJoiner
-import saien.someday.domain.settings.LocalWorkspaceAdoptionPolicy
 import saien.someday.domain.settings.WorkspacePairingReason
-import saien.someday.sync.WorkspaceAuthorityMutationCoordinator
+import saien.someday.sync.WorkspaceLifecycleCoordinator
 
 class SelfHostedWorkspacePairingServiceJvmTest {
     @Test
@@ -30,14 +33,16 @@ class SelfHostedWorkspacePairingServiceJvmTest {
         val store = MemorySessionStore(testCredentials())
         val packageData = testSelfHostedPackage()
         var joinedPackage: WorkspaceJoinPackage? = null
+        var replacementAuthorized: Boolean? = null
         var joinCount = 0
         val service = pairingService(
             transport = transport,
             store = store,
             packageData = packageData,
-            joiner = WorkspaceJoiner {
+            joiner = WorkspaceJoiner { receivedPackage, replaceExistingWorkspace ->
                 joinCount += 1
-                joinedPackage = it
+                joinedPackage = receivedPackage
+                replacementAuthorized = replaceExistingWorkspace
                 WorkspaceJoinResult.success(WorkspacePairingReason.Joined)
             },
         )
@@ -46,16 +51,24 @@ class SelfHostedWorkspacePairingServiceJvmTest {
         assertFalse(transport.envelopesText().contains(packageData.recoveryCode))
         assertFalse(transport.envelopesText().contains(packageData.metadataJson))
 
-        val joined = service.joinWithToken(invitation.revealQrPayload())
+        val joined = service.joinWithToken(
+            tokenInput = invitation.revealQrPayload(),
+            replaceExistingWorkspace = true,
+        )
 
         assertTrue(joined.success, joined.diagnosticMessage)
         assertEquals(WorkspacePairingReason.Joined, joined.reason)
         assertEquals(packageData, joinedPackage)
+        assertEquals(true, replacementAuthorized)
         assertEquals(1, joinCount)
+        assertEquals(1, transport.claimCount)
         assertEquals(1, transport.completeCount)
         assertTrue(transport.allCompleted())
 
-        val replay = service.joinWithToken(invitation.revealManualToken())
+        val replay = service.joinWithToken(
+            tokenInput = invitation.revealManualToken(),
+            replaceExistingWorkspace = true,
+        )
         assertFalse(replay.success)
         assertEquals(
             WorkspacePairingReason.InvitationAlreadyUsed,
@@ -66,24 +79,117 @@ class SelfHostedWorkspacePairingServiceJvmTest {
     }
 
     @Test
-    fun localHistoryBlocksBeforeClaim() {
+    fun replacementWithoutExplicitConfirmationIsRejectedBeforeClaim() {
         val transport = MemorySelfHostedPairingTransport()
         val store = MemorySessionStore(testCredentials())
         val invitation = assertNotNull(pairingService(transport, store).createInvitation().invitation)
+        var joinCount = 0
 
         val blocked = pairingService(
             transport = transport,
             store = store,
-            localV2KeyBoundStatePresent = { true },
-        ).joinWithToken(invitation.revealManualToken())
+            joiner = WorkspaceJoiner { _, _ ->
+                joinCount += 1
+                WorkspaceJoinResult.success(WorkspacePairingReason.Joined)
+            },
+        ).joinWithToken(
+            tokenInput = invitation.revealManualToken(),
+            replaceExistingWorkspace = false,
+        )
 
         assertFalse(blocked.success)
         assertEquals(0, transport.claimCount)
+        assertEquals(0, transport.completeCount)
+        assertEquals(0, joinCount)
         assertEquals(
-            WorkspacePairingReason.LocalWorkspaceNotReplaceable,
+            WorkspacePairingReason.ReplacementConfirmationRequired,
             blocked.reason,
             blocked.diagnosticMessage,
         )
+    }
+
+    @Test
+    fun claimTransportFailureIsClassifiedWithoutConsumingTheInvitation() {
+        val transport = MemorySelfHostedPairingTransport()
+        val store = MemorySessionStore(testCredentials())
+        var joinCount = 0
+        val service = pairingService(
+            transport = transport,
+            store = store,
+            joiner = WorkspaceJoiner { _, _ ->
+                joinCount += 1
+                WorkspaceJoinResult.success(WorkspacePairingReason.Joined)
+            },
+        )
+        val invitation = assertNotNull(service.createInvitation().invitation)
+        transport.failNextClaim = IllegalStateException("token=must-not-leak connection refused")
+
+        val result = service.joinWithToken(
+            tokenInput = invitation.revealManualToken(),
+            replaceExistingWorkspace = true,
+        )
+
+        assertFalse(result.success)
+        assertEquals(WorkspacePairingReason.ServerRequestFailed, result.reason)
+        assertFalse(result.diagnosticMessage.orEmpty().contains("must-not-leak"))
+        assertEquals(0, joinCount)
+        assertEquals(0, transport.completeCount)
+        assertTrue(transport.allAvailable())
+    }
+
+    @Test
+    fun confirmedReplacementWaitsForActiveWorkspaceLifecycleBeforeClaimOrCommit() {
+        val transport = MemorySelfHostedPairingTransport()
+        val store = MemorySessionStore(testCredentials())
+        val workspaceLifecycleCoordinator = WorkspaceLifecycleCoordinator()
+        val replacementAttempting = CountDownLatch(1)
+        val replacementCommits = AtomicInteger()
+        val service = pairingService(
+            transport = transport,
+            store = store,
+            workspaceLifecycleCoordinator = workspaceLifecycleCoordinator,
+            joiner = WorkspaceJoiner { _, _ ->
+                replacementCommits.incrementAndGet()
+                WorkspaceJoinResult.success(WorkspacePairingReason.Joined)
+            },
+        )
+        val invitation = assertNotNull(service.createInvitation().invitation)
+        val lifecycleEntered = CountDownLatch(1)
+        val releaseLifecycle = CountDownLatch(1)
+        val executor = Executors.newFixedThreadPool(2)
+
+        try {
+            val activeOperation = executor.submit {
+                workspaceLifecycleCoordinator.exclusive {
+                    lifecycleEntered.countDown()
+                    assertTrue(releaseLifecycle.await(5, TimeUnit.SECONDS))
+                }
+            }
+            assertTrue(lifecycleEntered.await(5, TimeUnit.SECONDS))
+
+            val replacement = executor.submit(java.util.concurrent.Callable {
+                replacementAttempting.countDown()
+                service.joinWithToken(
+                    tokenInput = invitation.revealManualToken(),
+                    replaceExistingWorkspace = true,
+                )
+            })
+            assertTrue(replacementAttempting.await(5, TimeUnit.SECONDS))
+            assertEquals(0, transport.claimCount)
+            assertEquals(0, transport.completeCount)
+            assertEquals(0, replacementCommits.get())
+
+            releaseLifecycle.countDown()
+            activeOperation.get(5, TimeUnit.SECONDS)
+            val result = replacement.get(5, TimeUnit.SECONDS)
+            assertTrue(result.success, result.diagnosticMessage)
+            assertEquals(1, transport.claimCount)
+            assertEquals(1, transport.completeCount)
+            assertEquals(1, replacementCommits.get())
+        } finally {
+            releaseLifecycle.countDown()
+            executor.shutdownNow()
+        }
     }
 
     @Test
@@ -94,7 +200,7 @@ class SelfHostedWorkspacePairingServiceJvmTest {
         val service = pairingService(
             transport = transport,
             store = store,
-            joiner = WorkspaceJoiner {
+            joiner = WorkspaceJoiner { _, _ ->
                 joinCalled = true
                 WorkspaceJoinResult.success(WorkspacePairingReason.Joined)
             },
@@ -102,7 +208,10 @@ class SelfHostedWorkspacePairingServiceJvmTest {
         val invitation = assertNotNull(service.createInvitation().invitation)
         transport.tamperNextClaimDigest = true
 
-        val result = service.joinWithToken(invitation.revealManualToken())
+        val result = service.joinWithToken(
+            tokenInput = invitation.revealManualToken(),
+            replaceExistingWorkspace = true,
+        )
 
         assertFalse(result.success)
         assertEquals(
@@ -125,7 +234,10 @@ class SelfHostedWorkspacePairingServiceJvmTest {
         val cancelled = service.cancelInvitation(invitation)
         assertTrue(cancelled.success, cancelled.diagnosticMessage)
         assertEquals(WorkspacePairingReason.InvitationCancelled, cancelled.reason)
-        val rejectedJoin = service.joinWithToken(invitation.revealManualToken())
+        val rejectedJoin = service.joinWithToken(
+            tokenInput = invitation.revealManualToken(),
+            replaceExistingWorkspace = true,
+        )
         assertFalse(rejectedJoin.success)
         assertEquals(
             WorkspacePairingReason.InvitationAlreadyUsed,
@@ -230,13 +342,14 @@ private fun pairingService(
     transport: MemorySelfHostedPairingTransport,
     store: MemorySessionStore,
     packageData: WorkspaceJoinPackage = testSelfHostedPackage(),
-    joiner: WorkspaceJoiner = WorkspaceJoiner {
+    joiner: WorkspaceJoiner = WorkspaceJoiner { _, _ ->
         WorkspaceJoinResult.success(WorkspacePairingReason.Joined)
     },
-    localV2KeyBoundStatePresent: () -> Boolean = { false },
     activeWorkspaceSessionGuard: ActiveWorkspaceSessionGuard = ActiveWorkspaceSessionGuard { null },
     workspacePairingInviterReady: () -> Boolean = { true },
     onPackageRequest: () -> Unit = {},
+    workspaceLifecycleCoordinator: WorkspaceLifecycleCoordinator =
+        WorkspaceLifecycleCoordinator(),
 ): SelfHostedWorkspacePairingService =
     SelfHostedWorkspacePairingService(
         settingsProvider = {
@@ -260,14 +373,7 @@ private fun pairingService(
             )
         },
         workspaceJoiner = joiner,
-        adoptionPolicy = LocalWorkspaceAdoptionPolicy {
-            if (localV2KeyBoundStatePresent()) {
-                WorkspacePairingReason.LocalWorkspaceNotReplaceable
-            } else {
-                null
-            }
-        },
-        authorityMutationCoordinator = WorkspaceAuthorityMutationCoordinator(),
+        workspaceLifecycleCoordinator = workspaceLifecycleCoordinator,
         activeWorkspaceSessionGuard = activeWorkspaceSessionGuard,
         workspacePairingInviterReady = workspacePairingInviterReady,
         clock = { Instant.fromEpochMilliseconds(1_000) },
@@ -312,6 +418,7 @@ internal class MemorySelfHostedPairingTransport : SelfHostedSyncTransport {
 
     var rejectFirstCreateToken: String? = null
     var tamperNextClaimDigest: Boolean = false
+    var failNextClaim: Throwable? = null
     var refreshCount: Int = 0
         private set
     var refreshUserId: String = "user-a"
@@ -368,6 +475,10 @@ internal class MemorySelfHostedPairingTransport : SelfHostedSyncTransport {
         inviteId: String,
         request: SelfHostedPairingInviteClaimRequest,
     ): SelfHostedPairingInviteClaimResponse {
+        failNextClaim?.let { failure ->
+            failNextClaim = null
+            throw failure
+        }
         claimCount += 1
         val invite = invitations[inviteId] ?: throw SelfHostedSyncHttpException(404, "missing")
         if (invite.state != "available") throw SelfHostedSyncHttpException(409, "claimed")
@@ -410,6 +521,8 @@ internal class MemorySelfHostedPairingTransport : SelfHostedSyncTransport {
     fun envelopesText(): String = invitations.values.joinToString("\n") { it.request.envelopeJson }
 
     fun allCompleted(): Boolean = invitations.values.all { it.state == "completed" }
+
+    fun allAvailable(): Boolean = invitations.values.all { it.state == "available" }
 
     private data class Invite(
         val request: SelfHostedPairingInviteCreateRequest,

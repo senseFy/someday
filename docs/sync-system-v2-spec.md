@@ -102,16 +102,18 @@ entities or classifies semantic conflicts.
 
 One authenticated pointer selects the workspace's single generation. A fresh
 installation keeps its locally prepared checkpoint and offline mutations. On
-first connection:
+ordinary first connection:
 
 - an empty remote workspace accepts that same generation by one
   compare-and-set; or
-- an existing remote pointer can replace only a semantically empty local
-  draft.
+- an existing remote pointer is accepted only when the local draft has no
+  semantic changes.
 
-A non-empty local workspace is refused rather than silently merged. Stable
-installation UUIDv4 is used as the local DAG writer and is claimed exactly by
-device registration before first publication.
+A normal sync never replaces or merges a contentful local workspace. Joining
+another workspace is a separate Pair operation with explicit destructive
+confirmation, described in section 8. Stable installation UUIDv4 is used as
+the local DAG writer and is claimed exactly by device registration before
+first publication.
 
 A checkpoint manifest references immutable bounded chunks containing the
 complete entity graph needed to bootstrap another device, including live and
@@ -169,7 +171,7 @@ decoded, and size bounded. Device/session revocation is checked before access.
 There is no epoch-history, object-repair, remote-migration, rotation, or
 retained-generation API.
 
-## 8. Keys, pairing, and adoption
+## 8. Keys and pairing
 
 The workspace master key is generated on-device and stays in platform secure
 storage. Subkeys bind purpose, generation identity, and the frozen key-set
@@ -177,13 +179,19 @@ version. Pairing transfers recovery material through the end-to-end encrypted,
 single-use capability in
 [`workspace-pairing-protocol.md`](workspace-pairing-protocol.md).
 
-An inviter needs an active published pointer. A joining installation may
-replace its normal default `PREPARING` draft only when that draft is
-semantically empty. The emptiness check runs before remote claim and again
-inside the same authority lock that guards product writes and first
-publication; empty-draft removal and key adoption are atomic. Any local note,
-notebook, deletion history, pending semantic mutation, conflict, or image
-causes refusal.
+An inviter needs an active published pointer. Joining requires explicit,
+per-attempt confirmation that the current local workspace will be discarded
+without merging. Without confirmation the client refuses before claiming the
+invitation. With confirmation, Pair may replace a contentful, published,
+blocked, or locked local workspace.
+
+Pair holds the shared workspace-lifecycle lock. One database transaction
+removes every local generation, DAG, projection, protocol row, and media row;
+installs the authenticated workspace metadata; and binds the new authority.
+The stable installation identity and authenticated session remain local. A
+failure before commit preserves the old workspace. After commit, unreferenced
+media files are removed on a best-effort basis. The old workspace and its
+media remain on its server.
 
 Master-key rotation and cryptographic device revocation are not first-release
 features. Server device/session token revocation remains supported. Adding key
@@ -199,7 +207,7 @@ host-specific product acceptance gates. Together they verify:
 - local and remote transaction rollback behavior;
 - first-offline-edit, first publication, bootstrap, restart, and conflict
   convergence;
-- empty-workspace adoption and non-empty refusal;
+- explicit destructive pairing from contentful and unpublished workspaces;
 - stable device identity and real multi-workspace isolation;
 - media-before-entity ordering and immutable media replay;
 - strict TLS, opaque-server, and route-scope boundaries;

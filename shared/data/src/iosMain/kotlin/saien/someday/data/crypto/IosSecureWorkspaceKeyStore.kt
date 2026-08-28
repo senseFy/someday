@@ -108,8 +108,11 @@ class IosSecureWorkspaceKeyStore(
         }.getOrNull()
 
     override fun remove(alias: String) {
-        withBaseQuery(alias) { query ->
+        val status = withBaseQuery(alias) { query ->
             SecItemDelete(query)
+        }
+        require(status == errSecSuccess || status == errSecItemNotFound) {
+            keychainError("delete", status)
         }
     }
 

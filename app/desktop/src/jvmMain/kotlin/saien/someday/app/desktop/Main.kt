@@ -157,6 +157,7 @@ fun main() = application {
             developerOptionsEnabled = DesktopBuildConfig.DEVELOPER_OPTIONS_ENABLED,
             initialSettings = loaded.initialSettings,
             notesRepository = clientRepositories.notesRepository,
+            loadSettings = clientRepositories.settingsRepository::load,
             onSettingsChanged = clientRepositories.settingsRepository::save,
             workspacePreferencesConflictResolver =
                 clientRepositories.settingsRepository as? WorkspacePreferencesConflictResolver,
@@ -189,6 +190,7 @@ fun main() = application {
             selfHostedSetupClient = clientRepositories.selfHostedSetupClient,
             selfHostedSessionCredentialStore = clientRepositories.selfHostedSessionCredentialStore,
             manualSyncRunner = clientRepositories.manualSyncRunner,
+            automaticSyncEligible = clientRepositories.automaticSyncEligible,
             workspacePairingInvitationCreator = clientRepositories.workspacePairingInvitationCreator,
             workspacePairingInvitationJoiner = clientRepositories.workspacePairingInvitationJoiner,
             workspacePairingInvitationCanceller = clientRepositories.workspacePairingInvitationCanceller,

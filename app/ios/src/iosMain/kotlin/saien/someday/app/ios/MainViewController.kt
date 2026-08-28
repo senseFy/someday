@@ -193,6 +193,7 @@ fun MainViewController(): UIViewController {
             onThisDayNotificationTimeFormatter = onThisDayNotificationTimeFormatter,
             pendingOpenMemories = pendingOpenMemories,
             onPendingOpenMemoriesConsumed = { pendingOpenMemories = false },
+            loadSettings = clientRepositories.settingsRepository::load,
             onSettingsChanged = clientRepositories.settingsRepository::save,
             workspacePreferencesConflictResolver =
                 clientRepositories.settingsRepository as? WorkspacePreferencesConflictResolver,
@@ -202,6 +203,7 @@ fun MainViewController(): UIViewController {
             selfHostedSetupClient = clientRepositories.selfHostedSetupClient,
             selfHostedSessionCredentialStore = clientRepositories.selfHostedSessionCredentialStore,
             manualSyncRunner = clientRepositories.manualSyncRunner,
+            automaticSyncEligible = clientRepositories.automaticSyncEligible,
             workspacePairingInvitationCreator = clientRepositories.workspacePairingInvitationCreator,
             workspacePairingInvitationJoiner = clientRepositories.workspacePairingInvitationJoiner,
             workspacePairingInvitationCanceller = clientRepositories.workspacePairingInvitationCanceller,

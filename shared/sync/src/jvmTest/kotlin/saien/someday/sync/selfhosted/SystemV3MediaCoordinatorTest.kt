@@ -34,7 +34,7 @@ import saien.someday.domain.settings.SelfHostedSessionCredentialStore
 import saien.someday.domain.settings.SelfHostedSessionCredentials
 import saien.someday.domain.settings.authorityBindingId
 import saien.someday.sync.AuthorityCoordinatedMediaAssetStore
-import saien.someday.sync.WorkspaceAuthorityMutationCoordinator
+import saien.someday.sync.WorkspaceLifecycleCoordinator
 
 class SystemV3MediaCoordinatorTest {
     @Test
@@ -91,7 +91,7 @@ class SystemV3MediaCoordinatorTest {
     }
 
     @Test
-    fun materializationKeepsNetworkOutsideProductLockAndRejectsStaleWorkspaceCommit() = withStore { source ->
+    fun workspaceReplacementWaitsForBlockedMaterializationBeforeCommitting() = withStore { source ->
         val imported = source.import(IMAGE_BYTES)
         val remote = InMemoryMediaTransportV3()
         source.coordinator(remote).publishPending()
@@ -111,15 +111,18 @@ class SystemV3MediaCoordinatorTest {
                     return remote.getMediaObject(endpoint, accessToken, workspaceId, mediaId)
                 }
             }
-            val mutationCoordinator = WorkspaceAuthorityMutationCoordinator()
+            val workspaceLifecycleCoordinator = WorkspaceLifecycleCoordinator()
             var activeWorkspaceId = WORKSPACE
             val coordinator = SystemV3MediaCoordinator(
-                localStore = AuthorityCoordinatedMediaAssetStore(target.store, mutationCoordinator),
+                localStore = AuthorityCoordinatedMediaAssetStore(target.store, workspaceLifecycleCoordinator),
                 transport = blockingTransport,
                 sessionStore = FixedSessionStore(),
                 workspaceKeyProvider = { WORKSPACE_KEY },
                 workspaceIdProvider = { activeWorkspaceId },
+                workspaceLifecycleCoordinator = workspaceLifecycleCoordinator,
             )
+            val replacementAttempting = CountDownLatch(1)
+            val replacementEntered = CountDownLatch(1)
             val executor = Executors.newFixedThreadPool(2)
 
             try {
@@ -128,19 +131,32 @@ class SystemV3MediaCoordinatorTest {
                 })
                 assertTrue(fetchEntered.await(5, TimeUnit.SECONDS))
 
-                // This is the short pairing/adoption commit window. It must not
-                // wait for the remote download, which is still deliberately blocked.
                 val workspaceReplacement = executor.submit {
-                    mutationCoordinator.productAccess {
-                        activeWorkspaceId = OTHER_WORKSPACE
+                    replacementAttempting.countDown()
+                    workspaceLifecycleCoordinator.exclusive {
+                        replacementEntered.countDown()
+                        workspaceLifecycleCoordinator.productAccess {
+                            assertEquals(WORKSPACE, activeWorkspaceId)
+                            assertEquals(
+                                listOf(imported.metadata.id),
+                                target.store.listAssets().map { it.metadata.id },
+                            )
+                            activeWorkspaceId = OTHER_WORKSPACE
+                        }
                     }
                 }
-                workspaceReplacement.get(2, TimeUnit.SECONDS)
+                assertTrue(replacementAttempting.await(5, TimeUnit.SECONDS))
+                assertEquals(1L, replacementEntered.count)
+                assertEquals(WORKSPACE, activeWorkspaceId)
+                assertTrue(target.store.listAssets().isEmpty())
 
                 releaseFetch.countDown()
                 val result = materializing.get(5, TimeUnit.SECONDS)
-                assertTrue(result.isFailure)
-                assertTrue(target.store.listAssets().isEmpty())
+                assertTrue(result.getOrThrow().downloaded)
+                workspaceReplacement.get(5, TimeUnit.SECONDS)
+                assertEquals(0L, replacementEntered.count)
+                assertEquals(OTHER_WORKSPACE, activeWorkspaceId)
+                assertEquals(listOf(imported.metadata.id), target.store.listAssets().map { it.metadata.id })
             } finally {
                 releaseFetch.countDown()
                 executor.shutdownNow()
@@ -247,15 +263,16 @@ class SystemV3MediaCoordinatorTest {
             transport: SelfHostedMediaTransportV3,
             workspaceId: String = WORKSPACE,
             requirement: ActiveWorkspaceSessionRequirement? = null,
-            authorityMutationCoordinator: WorkspaceAuthorityMutationCoordinator =
-                WorkspaceAuthorityMutationCoordinator(),
+            workspaceLifecycleCoordinator: WorkspaceLifecycleCoordinator =
+                WorkspaceLifecycleCoordinator(),
         ) = SystemV3MediaCoordinator(
-            AuthorityCoordinatedMediaAssetStore(store, authorityMutationCoordinator),
+            AuthorityCoordinatedMediaAssetStore(store, workspaceLifecycleCoordinator),
             transport,
             FixedSessionStore(),
             workspaceKeyProvider = { WORKSPACE_KEY },
             workspaceIdProvider = { workspaceId },
             activeWorkspaceSessionGuard = ActiveWorkspaceSessionGuard { requirement },
+            workspaceLifecycleCoordinator = workspaceLifecycleCoordinator,
         )
     }
 

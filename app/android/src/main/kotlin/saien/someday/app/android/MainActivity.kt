@@ -260,6 +260,7 @@ class MainActivity : ComponentActivity() {
                 onThisDayNotificationTimeFormatter = onThisDayNotificationTimeFormatter,
                 pendingOpenMemories = pendingOpenMemories,
                 onPendingOpenMemoriesConsumed = { pendingOpenMemories = false },
+                loadSettings = loaded.repositories.settingsRepository::load,
                 onSettingsChanged = loaded.repositories.settingsRepository::save,
                 workspacePreferencesConflictResolver =
                     loaded.repositories.settingsRepository as? WorkspacePreferencesConflictResolver,
@@ -308,6 +309,7 @@ class MainActivity : ComponentActivity() {
                 selfHostedSetupClient = loaded.repositories.selfHostedSetupClient,
                 selfHostedSessionCredentialStore = loaded.repositories.selfHostedSessionCredentialStore,
                 manualSyncRunner = loaded.repositories.manualSyncRunner,
+                automaticSyncEligible = loaded.repositories.automaticSyncEligible,
                 workspacePairingInvitationCreator = loaded.repositories.workspacePairingInvitationCreator,
                 workspacePairingInvitationJoiner = loaded.repositories.workspacePairingInvitationJoiner,
                 workspacePairingInvitationCanceller = loaded.repositories.workspacePairingInvitationCanceller,

@@ -10,6 +10,7 @@ interface SecureWorkspaceKeyStore {
 
     fun get(alias: String): WorkspaceMasterKey?
 
+    /** Idempotently removes [alias], or throws when the backend cannot commit the deletion. */
     fun remove(alias: String)
 
     fun contains(alias: String): Boolean = get(alias) != null

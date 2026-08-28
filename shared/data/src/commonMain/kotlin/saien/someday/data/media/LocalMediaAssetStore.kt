@@ -484,6 +484,40 @@ class LocalMediaAssetStore(
         )
     }
 
+    /**
+     * Removes all store-owned files that no longer have metadata. The caller
+     * must guarantee that no media import is in flight, as startup and the
+     * workspace lifecycle replacement lock do.
+     */
+    fun purgeUnreferencedFilesWithoutGracePeriod(): MediaAssetCleanupResult {
+        var temporaryFilesRemoved = 0
+        var orphanObjectFilesRemoved = 0
+        fileSystem.listOrNull(stagingRoot).orEmpty().forEach { path ->
+            if (fileSystem.metadataOrNull(path)?.isRegularFile == true) {
+                fileSystem.delete(path, mustExist = false)
+                temporaryFilesRemoved++
+            }
+        }
+
+        val referencedDigests = listAssets().mapTo(mutableSetOf(), LocalMediaAsset::contentSha256)
+        fileSystem.listRecursivelyOrEmpty(objectsRoot).forEach { path ->
+            val metadata = fileSystem.metadataOrNull(path) ?: return@forEach
+            if (!metadata.isRegularFile) return@forEach
+            val digest = path.name.removeSuffix(OBJECT_FILE_SUFFIX)
+                .takeIf { it.isCanonicalSha256() }
+            if (digest == null || digest !in referencedDigests || path != objectPath(digest)) {
+                fileSystem.delete(path, mustExist = false)
+                orphanObjectFilesRemoved++
+            }
+        }
+        return MediaAssetCleanupResult(
+            temporaryFilesRemoved = temporaryFilesRemoved,
+            orphanObjectFilesRemoved = orphanObjectFilesRemoved,
+            assetsMarkedMissing = 0,
+            assetsMarkedCorrupt = 0,
+        )
+    }
+
     private fun ensureStorageDirectories() {
         fileSystem.createDirectories(objectsRoot)
         fileSystem.createDirectories(stagingRoot)

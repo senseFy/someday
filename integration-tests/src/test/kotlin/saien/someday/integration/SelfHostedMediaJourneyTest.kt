@@ -15,7 +15,7 @@ import okio.buffer
 import saien.someday.data.media.MediaAssetImportRequest
 import saien.someday.domain.notes.NoteInput
 import saien.someday.integration.testkit.RealSelfHostedFixture
-import saien.someday.integration.testkit.adoptWorkspaceFrom
+import saien.someday.integration.testkit.replaceWorkspaceFrom
 import saien.someday.integration.testkit.assertSuccessfulSync
 
 class SelfHostedMediaJourneyTest {
@@ -68,7 +68,7 @@ class SelfHostedMediaJourneyTest {
             }
             assertTrue(entityPublicationBoundariesObserved > 0, "The journey must cross a real entity publication boundary.")
 
-            follower.adoptWorkspaceFrom(leader)
+            follower.replaceWorkspaceFrom(leader)
             follower.assertSuccessfulSync()
             val received = assertNotNull(follower.services.notesRepository.getNoteDetails(note.id))
             assertTrue(received.markdownBody.contains("someday-asset://${assetId.value}"))

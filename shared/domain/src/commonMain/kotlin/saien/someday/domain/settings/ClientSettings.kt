@@ -27,6 +27,20 @@ data class ClientSettings(
 }
 
 /**
+ * Drops values derived from the current workspace while retaining settings
+ * owned by this installation and its authenticated self-hosted session.
+ */
+fun ClientSettings.resetWorkspaceStateForReplacement(): ClientSettings =
+    copy(
+        theme = ClientTheme.System,
+        editorPreferences = EditorPreferences(),
+        defaultNotebookId = null,
+        lastSelectedNotebookId = null,
+        syncConfiguration = syncConfiguration.copy(lastError = null),
+        workspacePreferencesState = WorkspacePreferencesSyncState(),
+    )
+
+/**
  * In-app UI language override for compose string resources.
  *
  * [System] uses the platform locale. Explicit values force a language tag
@@ -609,15 +623,10 @@ fun interface WorkspaceJoinPackageProvider {
 }
 
 fun interface WorkspaceJoiner {
-    fun join(packageData: WorkspaceJoinPackage): WorkspaceJoinResult
-}
-
-/**
- * Decides whether this installation may adopt another workspace identity.
- * Null means replacement is safe; a non-null value is a stable refusal reason.
- */
-fun interface LocalWorkspaceAdoptionPolicy {
-    fun refusalReason(): WorkspacePairingReason?
+    fun join(
+        packageData: WorkspaceJoinPackage,
+        replaceExistingWorkspace: Boolean,
+    ): WorkspaceJoinResult
 }
 
 class WorkspacePairingInvitation private constructor(
@@ -690,9 +699,9 @@ enum class WorkspacePairingReason {
     VerificationFailed,
     AuthorityMismatch,
     WorkspaceLocked,
-    LocalWorkspaceNotReplaceable,
-    LocalContentPresent,
-    AdoptionFailed,
+    ReplacementConfirmationRequired,
+    ReplacementFailed,
+    ServerRequestFailed,
     Unavailable,
     Failed,
 }
@@ -702,7 +711,10 @@ fun interface WorkspacePairingInvitationCreator {
 }
 
 fun interface WorkspacePairingInvitationJoiner {
-    fun joinWithToken(tokenInput: String): WorkspaceJoinResult
+    fun joinWithToken(
+        tokenInput: String,
+        replaceExistingWorkspace: Boolean,
+    ): WorkspaceJoinResult
 }
 
 fun interface WorkspacePairingInvitationCanceller {

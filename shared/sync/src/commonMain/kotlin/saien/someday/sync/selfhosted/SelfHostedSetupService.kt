@@ -8,19 +8,19 @@ import saien.someday.domain.settings.SelfHostedSetupResult
 import saien.someday.domain.settings.SelfHostedSetupStatus
 import saien.someday.domain.settings.authorityBindingId
 import saien.someday.domain.settings.parseSelfHostedAuthorityBindingId
-import saien.someday.sync.WorkspaceAuthorityMutationCoordinator
+import saien.someday.sync.WorkspaceLifecycleCoordinator
 
 class SelfHostedSetupService(
     private val transport: SelfHostedSyncTransport,
     private val sessionStore: SelfHostedSessionCredentialStore,
     private val activeWorkspaceSessionGuard: ActiveWorkspaceSessionGuard,
-    private val authorityMutationCoordinator: WorkspaceAuthorityMutationCoordinator,
+    private val workspaceLifecycleCoordinator: WorkspaceLifecycleCoordinator,
     private val localDeviceIdProvider: () -> String,
 ) : SelfHostedSetupClient {
     override fun setup(input: SelfHostedSetupInput): SelfHostedSetupResult =
         runCatching {
             val sanitized = input.sanitized()
-            authorityMutationCoordinator.exclusive {
+            workspaceLifecycleCoordinator.exclusive {
                 val requirement = activeWorkspaceSessionGuard.currentRequirement()
                 if (requirement != null) {
                     if (sanitized.createAccount) {

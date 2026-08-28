@@ -13,7 +13,7 @@ import saien.someday.domain.notes.NotesRepository
 /** Holds the product-access barrier for the complete repository operation, including context resolution. */
 internal class AuthorityCoordinatedNotesRepository(
     private val delegate: NotesRepository,
-    private val coordinator: WorkspaceAuthorityMutationCoordinator,
+    private val coordinator: WorkspaceLifecycleCoordinator,
 ) : NotesRepository {
     private fun <T> access(block: NotesRepository.() -> T): T = coordinator.productAccess { delegate.block() }
 
