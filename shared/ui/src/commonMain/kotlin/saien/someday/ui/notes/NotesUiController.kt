@@ -40,6 +40,7 @@ import saien.someday.domain.settings.EditorPreferences
 import saien.someday.ui.i18n.NotesUiStrings
 import saien.someday.ui.i18n.formatUiString
 import saien.someday.ui.media.MediaImportUiResult
+import saien.someday.ui.media.MediaUiFailureReason
 import kotlin.time.Clock
 import kotlin.time.Instant
 
@@ -909,8 +910,9 @@ class NotesUiController(
     }
 
     /**
-     * Applies a completed picker result only to the editor session that opened
-     * it. Cancel/failure provide feedback without changing Markdown.
+     * Applies a completed picker result only to the editor session that opened it.
+     * Success is visible in the editor, cancellation is silent, and failures
+     * surface one actionable message without changing Markdown.
      */
     fun applyMediaImportResult(
         editorSessionId: Long,
@@ -934,22 +936,40 @@ class NotesUiController(
                         markdownPreviewVisible = false,
                         validationMessage = null,
                     ),
-                    feedbackMessage = strings.imageAdded,
+                    feedbackMessage = null,
                 )
                 true
             }
 
             MediaImportUiResult.Cancelled -> {
-                state = state.copy(feedbackMessage = strings.imageImportCancelled)
+                state = state.copy(feedbackMessage = null)
                 false
             }
 
             is MediaImportUiResult.Failed -> {
-                state = state.copy(feedbackMessage = strings.imageImportFailed)
+                state = state.copy(feedbackMessage = mediaImportFailureMessage(result.reason))
                 false
             }
         }
     }
+
+    private fun mediaImportFailureMessage(reason: MediaUiFailureReason): String =
+        when (reason) {
+            MediaUiFailureReason.SourceTooLarge -> strings.imageImportSourceTooLarge
+            MediaUiFailureReason.SourcePixelLimitExceeded -> strings.imageImportSourcePixelLimitExceeded
+            MediaUiFailureReason.UnsupportedFormat -> strings.imageImportUnsupportedFormat
+            MediaUiFailureReason.AnimatedImage -> strings.imageImportAnimatedImage
+            MediaUiFailureReason.InvalidEncoding -> strings.imageImportInvalidEncoding
+            MediaUiFailureReason.NormalizationFailed -> strings.imageImportNormalizationFailed
+            MediaUiFailureReason.NormalizationWouldViolateQualityBounds -> strings.imageImportNormalizationQualityLimit
+            MediaUiFailureReason.Unavailable,
+            MediaUiFailureReason.ImportFailed,
+            MediaUiFailureReason.PreviewTooLarge,
+            MediaUiFailureReason.PreviewDecodeFailed,
+            MediaUiFailureReason.PreviewLoadFailed,
+            MediaUiFailureReason.MaterializationFailed,
+            -> strings.imageImportFailed
+        }
 
     suspend fun saveEditor(): Boolean =
         saveEditor(clearEditor = true)

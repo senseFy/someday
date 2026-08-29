@@ -30,9 +30,10 @@ class StaticImageMediaInspectorTest {
         assertFailsWith<MediaAssetInspectionException> {
             inspect(PNG_1X1, "image/jpeg")
         }
-        assertFailsWith<MediaAssetInspectionException> {
+        val unsupported = assertFailsWith<MediaAssetInspectionException> {
             inspect("<svg xmlns=\"http://www.w3.org/2000/svg\"/>".encodeToByteArray(), "image/svg+xml")
         }
+        assertEquals(MediaAssetInspectionFailureReason.UnsupportedFormat, unsupported.reason)
     }
 
     @Test
@@ -51,23 +52,45 @@ class StaticImageMediaInspectorTest {
 
     @Test
     fun rejectsAnimatedPngAndWebP() {
-        assertFailsWith<MediaAssetInspectionException> {
+        val pngFailure = assertFailsWith<MediaAssetInspectionException> {
             inspect(pngHeader(width = 1, height = 1, animated = true), "image/png")
         }
-        assertFailsWith<MediaAssetInspectionException> {
+        val webpFailure = assertFailsWith<MediaAssetInspectionException> {
             inspect(animatedWebpHeader(), "image/webp")
         }
+        assertEquals(MediaAssetInspectionFailureReason.AnimatedImage, pngFailure.reason)
+        assertEquals(MediaAssetInspectionFailureReason.AnimatedImage, webpFailure.reason)
     }
 
     @Test
     fun rejectsDecodedPixelBombBeforePromotion() {
-        assertFailsWith<MediaAssetInspectionException> {
+        val failure = assertFailsWith<MediaAssetInspectionException> {
             inspect(
                 bytes = pngHeader(width = 10_000, height = 10_000),
                 mediaType = "image/png",
                 maxDecodedPixelCount = 12_000_000L,
             )
         }
+        assertEquals(MediaAssetInspectionFailureReason.PixelLimitExceeded, failure.reason)
+    }
+
+    @Test
+    fun selectedSourcePixelBoundIsInclusive() {
+        val exact = inspect(
+            bytes = pngHeader(width = 20_000, height = 10_000),
+            mediaType = "image/png",
+            maxDecodedPixelCount = MAX_SELECTED_IMAGE_PIXEL_COUNT,
+        )
+        assertEquals(MAX_SELECTED_IMAGE_PIXEL_COUNT, exact.decodedPixelCount)
+
+        val above = assertFailsWith<MediaAssetInspectionException> {
+            inspect(
+                bytes = pngHeader(width = 200_000_001, height = 1),
+                mediaType = "image/png",
+                maxDecodedPixelCount = MAX_SELECTED_IMAGE_PIXEL_COUNT,
+            )
+        }
+        assertEquals(MediaAssetInspectionFailureReason.PixelLimitExceeded, above.reason)
     }
 
     private fun assertInspection(

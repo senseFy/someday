@@ -1,15 +1,23 @@
 package saien.someday.ui.media
 
+import androidx.compose.ui.graphics.ImageBitmap
 import saien.someday.domain.media.MediaAssetId
+import saien.someday.domain.media.MAX_MEDIA_ASSET_PIXEL_COUNT
 import saien.someday.domain.media.SomedayAssetUri
-
-const val MAX_MEDIA_PREVIEW_BYTE_COUNT: Int = 4 * 1024 * 1024
 
 /** Presentation-neutral failures produced by platform media adapters. */
 enum class MediaUiFailureReason {
     Unavailable,
     ImportFailed,
+    SourceTooLarge,
+    SourcePixelLimitExceeded,
+    UnsupportedFormat,
+    AnimatedImage,
+    InvalidEncoding,
+    NormalizationFailed,
+    NormalizationWouldViolateQualityBounds,
     PreviewTooLarge,
+    PreviewDecodeFailed,
     PreviewLoadFailed,
     MaterializationFailed,
 }
@@ -43,32 +51,24 @@ fun interface MediaImportRunner {
 }
 
 /**
- * Resolves bounded preview bytes for an app-owned asset. Implementations may
- * return a generated thumbnail; [MediaPreviewUiResult.Missing] means the asset
- * is not materialized locally. This port performs no network IO.
+ * Resolves a bounded, correctly oriented preview for an app-owned asset.
+ * [MediaPreviewUiResult.Missing] means the asset is not materialized locally.
+ * This port performs no network IO.
  */
 fun interface MediaPreviewLoader {
     suspend fun loadPreview(assetId: MediaAssetId): MediaPreviewUiResult
 }
 
 sealed interface MediaPreviewUiResult {
-    class Loaded(bytes: ByteArray) : MediaPreviewUiResult {
-        private val content: ByteArray = bytes.copyOf()
-        val byteCount: Int get() = content.size
-
+    data class Loaded(val bitmap: ImageBitmap) : MediaPreviewUiResult {
         init {
-            require(bytes.isNotEmpty()) { "Preview bytes must not be empty." }
-            require(bytes.size <= MAX_MEDIA_PREVIEW_BYTE_COUNT) {
-                "Preview bytes exceed the UI decode limit."
+            require(bitmap.width > 0 && bitmap.height > 0) {
+                "Preview dimensions must be positive."
+            }
+            require(bitmap.width.toLong() * bitmap.height <= MAX_MEDIA_ASSET_PIXEL_COUNT) {
+                "Preview dimensions exceed the UI decode limit."
             }
         }
-
-        fun copyBytes(): ByteArray = content.copyOf()
-
-        override fun equals(other: Any?): Boolean =
-            other is Loaded && content.contentEquals(other.content)
-
-        override fun hashCode(): Int = content.contentHashCode()
     }
 
     data object Missing : MediaPreviewUiResult

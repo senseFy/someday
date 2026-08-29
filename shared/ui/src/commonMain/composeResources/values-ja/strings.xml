@@ -231,9 +231,14 @@
     <string name="notes_fb_location_added">位置を追加しました。</string>
     <string name="notes_fb_location_permission_denied">位置情報の許可が拒否されました。場所は手入力できます。</string>
     <string name="notes_fb_location_unavailable">位置情報を利用できません。場所は手入力できます。</string>
-    <string name="notes_fb_image_added">画像を追加しました。</string>
-    <string name="notes_fb_image_import_cancelled">画像の読み込みをキャンセルしました。</string>
     <string name="image_import_failed">選択した画像を読み込めません。</string>
+    <string name="image_import_source_too_large">32 MB 以下の画像を選択してください。</string>
+    <string name="image_import_source_pixel_limit_exceeded">選択した画像のサイズが大きすぎます。</string>
+    <string name="image_import_unsupported_format">JPEG、PNG、または WebP 画像を選択してください。</string>
+    <string name="image_import_animated_image">アニメーション画像には対応していません。</string>
+    <string name="image_import_invalid_encoding">選択した画像が破損しているか、形式が無効です。</string>
+    <string name="image_import_normalization_failed">選択した画像を処理できません。</string>
+    <string name="image_import_normalization_quality_limit">画質を大きく損なわずに画像を 4 MB まで縮小できません。</string>
     <string name="image_picker_title">画像を挿入</string>
     <string name="image_toolbar_action">画像を挿入</string>
     <string name="image_preview_default_alt">画像</string>

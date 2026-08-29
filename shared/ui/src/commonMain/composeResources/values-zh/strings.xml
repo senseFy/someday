@@ -231,9 +231,14 @@
     <string name="notes_fb_location_added">已添加位置。</string>
     <string name="notes_fb_location_permission_denied">位置权限被拒绝。你仍可手动输入地点。</string>
     <string name="notes_fb_location_unavailable">无法获取位置。你仍可手动输入地点。</string>
-    <string name="notes_fb_image_added">已添加图片。</string>
-    <string name="notes_fb_image_import_cancelled">已取消导入图片。</string>
     <string name="image_import_failed">无法导入所选图片。</string>
+    <string name="image_import_source_too_large">请选择不超过 32 MB 的图片。</string>
+    <string name="image_import_source_pixel_limit_exceeded">所选图片的尺寸过大。</string>
+    <string name="image_import_unsupported_format">请选择 JPEG、PNG 或 WebP 图片。</string>
+    <string name="image_import_animated_image">暂不支持动态图片。</string>
+    <string name="image_import_invalid_encoding">所选图片已损坏或编码无效。</string>
+    <string name="image_import_normalization_failed">无法处理所选图片。</string>
+    <string name="image_import_normalization_quality_limit">无法在不过度损失画质的情况下将图片压缩至 4 MB。</string>
     <string name="image_picker_title">插入图片</string>
     <string name="image_toolbar_action">插入图片</string>
     <string name="image_preview_default_alt">图片</string>

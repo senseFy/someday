@@ -4,6 +4,7 @@ import kotlin.jvm.JvmInline
 import kotlin.time.Instant
 
 const val SOMEDAY_ASSET_URI_SCHEME: String = "someday-asset"
+const val MAX_MEDIA_ASSET_ENCODED_BYTE_COUNT: Long = 4L * 1_024L * 1_024L
 const val MAX_MEDIA_ASSET_PIXEL_COUNT: Long = 12_000_000L
 
 private const val MEDIA_ASSET_ID_HEX_LENGTH: Int = 64
@@ -62,7 +63,9 @@ data class MediaAssetMetadata(
     val decodedPixelCount: Long = pixelWidth.toLong() * pixelHeight
 
     init {
-        require(byteSize > 0L) { "A media asset must contain at least one byte." }
+        require(byteSize in 1L..MAX_MEDIA_ASSET_ENCODED_BYTE_COUNT) {
+            "A media asset must contain between 1 and $MAX_MEDIA_ASSET_ENCODED_BYTE_COUNT bytes."
+        }
         require(canonicalMediaTypeOrNull(mediaType) == mediaType) {
             "A media asset type must be a canonical lowercase type/subtype without parameters."
         }

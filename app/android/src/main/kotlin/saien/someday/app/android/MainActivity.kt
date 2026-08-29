@@ -10,14 +10,14 @@ import android.os.Build
 import android.os.Bundle
 import android.os.LocaleList
 import android.os.SystemClock
-import android.provider.OpenableColumns
 import android.util.Log
 import android.view.View
 import android.view.Window
 import android.view.WindowInsetsController
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
@@ -30,22 +30,14 @@ import saien.someday.domain.settings.AppLanguage
 import saien.someday.domain.settings.ClientSettings
 import saien.someday.domain.settings.ClientTheme
 import saien.someday.domain.settings.WorkspacePreferencesConflictResolver
-import saien.someday.domain.media.MediaAssetId
-import saien.someday.domain.media.isSafeOriginalFileName
-import saien.someday.data.media.MediaAssetImportRequest
-import saien.someday.data.media.MediaAssetLocalState
-import saien.someday.data.media.MediaAssetVerificationResult
-import saien.someday.sync.AuthorityCoordinatedMediaAssetStore
 import saien.someday.ui.SomedayApp
 import saien.someday.ui.SomedayBootstrapScreen
 import saien.someday.ui.i18n.applyAppLanguageTag
-import saien.someday.ui.media.MAX_MEDIA_PREVIEW_BYTE_COUNT
 import saien.someday.ui.media.MediaImportRunner
 import saien.someday.ui.media.MediaImportUiResult
 import saien.someday.ui.media.MediaMaterializationRunner
 import saien.someday.ui.media.MediaMaterializationUiResult
 import saien.someday.ui.media.MediaPreviewLoader
-import saien.someday.ui.media.MediaPreviewUiResult
 import saien.someday.ui.media.MediaUiFailureReason
 import saien.someday.ui.media.MediaUiPorts
 import saien.someday.ui.settings.DayOneImportRunner
@@ -54,7 +46,6 @@ import saien.someday.ui.settings.WorkspacePairingScanner
 import java.util.Locale
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import okio.buffer
 import okio.source
 
 class MainActivity : ComponentActivity() {
@@ -140,7 +131,7 @@ class MainActivity : ComponentActivity() {
             runOnUiThread { callback(summary) }
         }.start()
     }
-    private val mediaImportLauncher = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+    private val mediaImportLauncher = registerForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
         val callback = pendingMediaImportCallback ?: return@registerForActivityResult
         pendingMediaImportCallback = null
         if (uri == null) {
@@ -148,31 +139,7 @@ class MainActivity : ComponentActivity() {
             return@registerForActivityResult
         }
         Thread {
-            val result = runCatching {
-                val fileName = contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
-                    ?.use { cursor ->
-                        if (cursor.moveToFirst()) cursor.getString(0) else null
-                    }
-                    ?.takeIf(::isSafeOriginalFileName)
-                val imported = contentResolver.openInputStream(uri)?.use { input ->
-                    input.source().use { source ->
-                        clientRepositories.localMediaAssetStore.importAsset(
-                            source = source,
-                            request = MediaAssetImportRequest(
-                                originalFileName = fileName,
-                                maxBytes = MAX_MEDIA_PREVIEW_BYTE_COUNT.toLong(),
-                                maxDecodedPixelCount = MAX_MEDIA_PREVIEW_PIXEL_COUNT,
-                            ),
-                        )
-                    }
-                } ?: error("The selected image could not be read.")
-                MediaImportUiResult.Imported(
-                    assetId = imported.asset.metadata.id,
-                    suggestedAltText = fileName?.substringBeforeLast('.')?.take(120).orEmpty(),
-                )
-            }.getOrElse {
-                MediaImportUiResult.Failed(MediaUiFailureReason.ImportFailed)
-            }
+            val result = contentResolver.importSelectedImage(uri, clientRepositories.localMediaAssetStore)
             runOnUiThread { callback(result) }
         }.start()
     }
@@ -284,11 +251,13 @@ class MainActivity : ComponentActivity() {
                     MediaUiPorts(
                         importRunner = MediaImportRunner { _, onResult ->
                             pendingMediaImportCallback = onResult
-                            mediaImportLauncher.launch(arrayOf("image/jpeg", "image/png", "image/webp"))
+                            mediaImportLauncher.launch(
+                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),
+                            )
                         },
                         previewLoader = MediaPreviewLoader { assetId ->
                             withContext(Dispatchers.IO) {
-                                loaded.repositories.localMediaAssetStore.loadBoundedPreview(assetId)
+                                loaded.repositories.localMediaAssetStore.loadMediaPreview(assetId)
                             }
                         },
                         materializationRunner = MediaMaterializationRunner { assetId, onResult ->
@@ -348,38 +317,6 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private fun AuthorityCoordinatedMediaAssetStore.loadBoundedPreview(assetId: MediaAssetId): MediaPreviewUiResult {
-    val asset = getAsset(assetId) ?: return MediaPreviewUiResult.Missing
-    when (asset.localState) {
-        MediaAssetLocalState.Missing -> return MediaPreviewUiResult.Missing
-        MediaAssetLocalState.Corrupt -> return MediaPreviewUiResult.Missing
-        MediaAssetLocalState.Available -> Unit
-    }
-    if (asset.metadata.byteSize > MAX_MEDIA_PREVIEW_BYTE_COUNT ||
-        asset.metadata.decodedPixelCount > MAX_MEDIA_PREVIEW_PIXEL_COUNT
-    ) {
-        return MediaPreviewUiResult.Failed(MediaUiFailureReason.PreviewTooLarge)
-    }
-    when (runCatching { verifyAsset(assetId) }.getOrElse {
-        return MediaPreviewUiResult.Failed(MediaUiFailureReason.PreviewLoadFailed)
-    }) {
-        is MediaAssetVerificationResult.Verified -> Unit
-        is MediaAssetVerificationResult.Missing,
-        is MediaAssetVerificationResult.Corrupt,
-        -> return MediaPreviewUiResult.Missing
-    }
-    return runCatching {
-        val bytes = openSource(assetId).buffer().use { it.readByteArray() }
-        MediaPreviewUiResult.Loaded(bytes)
-    }.getOrElse {
-        if (getAsset(assetId)?.localState == MediaAssetLocalState.Available) {
-            MediaPreviewUiResult.Failed(MediaUiFailureReason.PreviewLoadFailed)
-        } else {
-            MediaPreviewUiResult.Missing
-        }
-    }
-}
-
 private fun Intent.consumeOpenMemoriesRequest(): Boolean =
     getBooleanExtra(OnThisDayNotificationContract.ExtraOpenMemories, false).also { requested ->
         if (requested) {
@@ -394,7 +331,6 @@ private data class AndroidAppBootstrap(
 
 private const val SomedayLightSystemBarColor = 0xFFFAFBFC.toInt()
 private const val SomedayDarkSystemBarColor = 0xFF111315.toInt()
-private const val MAX_MEDIA_PREVIEW_PIXEL_COUNT = 12_000_000L
 private const val StatePendingOpenMemories = "saien.someday.app.state.PENDING_OPEN_MEMORIES"
 
 private fun ClientTheme.isDarkTheme(systemDark: Boolean): Boolean =

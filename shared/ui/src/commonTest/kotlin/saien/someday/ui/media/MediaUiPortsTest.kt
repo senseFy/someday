@@ -1,11 +1,13 @@
 package saien.someday.ui.media
 
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.ImageBitmapConfig
+import androidx.compose.ui.graphics.colorspace.ColorSpace
+import androidx.compose.ui.graphics.colorspace.ColorSpaces
 import saien.someday.domain.media.MediaAssetId
 import kotlinx.coroutines.runBlocking
 import kotlin.test.Test
-import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
-import kotlin.test.assertFailsWith
 
 class MediaUiPortsTest {
     @Test
@@ -18,16 +20,11 @@ class MediaUiPortsTest {
     }
 
     @Test
-    fun previewResultOwnsAndBoundsBytes() {
-        val source = byteArrayOf(1, 2, 3)
-        val loaded = MediaPreviewUiResult.Loaded(source)
-        source[0] = 9
+    fun previewResultCarriesDecodedPlatformImage() {
+        val loaded = MediaPreviewUiResult.Loaded(FakeImageBitmap(width = 3, height = 2))
 
-        assertContentEquals(byteArrayOf(1, 2, 3), loaded.copyBytes())
-        assertEquals(3, loaded.byteCount)
-        assertFailsWith<IllegalArgumentException> {
-            MediaPreviewUiResult.Loaded(ByteArray(MAX_MEDIA_PREVIEW_BYTE_COUNT + 1))
-        }
+        assertEquals(3, loaded.bitmap.width)
+        assertEquals(2, loaded.bitmap.height)
     }
 
     @Test
@@ -82,5 +79,26 @@ class MediaUiPortsTest {
             MediaUiFailureReason.MaterializationFailed,
             MediaMaterializationUiResult.Failed(MediaUiFailureReason.MaterializationFailed).reason,
         )
+    }
+
+    private class FakeImageBitmap(
+        override val width: Int,
+        override val height: Int,
+    ) : ImageBitmap {
+        override val config: ImageBitmapConfig = ImageBitmapConfig.Argb8888
+        override val hasAlpha: Boolean = true
+        override val colorSpace: ColorSpace = ColorSpaces.Srgb
+
+        override fun prepareToDraw() = Unit
+
+        override fun readPixels(
+            buffer: IntArray,
+            startX: Int,
+            startY: Int,
+            width: Int,
+            height: Int,
+            bufferOffset: Int,
+            stride: Int,
+        ) = Unit
     }
 }

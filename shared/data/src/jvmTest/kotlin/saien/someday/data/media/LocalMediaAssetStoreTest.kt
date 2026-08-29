@@ -15,6 +15,7 @@ import okio.ForwardingSource
 import okio.Path
 import okio.Path.Companion.toPath
 import okio.Source
+import okio.Timeout
 import okio.buffer
 import saien.someday.data.local.createSomedayJdbcDriver
 import saien.someday.data.local.db.SomedayDatabase
@@ -31,6 +32,139 @@ import kotlin.test.assertTrue
 import kotlin.time.Instant
 
 class LocalMediaAssetStoreTest {
+    @Test
+    fun selectedSourceByteBoundIsInclusive() {
+        val sourceInspector = MediaAssetInspector { source, encodedByteSize, declaredMediaType, maxPixelCount ->
+            if (maxPixelCount > MAX_DECODED_PIXEL_COUNT_BOUND) {
+                MediaAssetInspection("image/png", 4_000, 4_000)
+            } else {
+                StaticImageMediaAssetInspector.inspect(
+                    source = source,
+                    encodedByteSize = encodedByteSize,
+                    declaredMediaType = declaredMediaType,
+                    maxDecodedPixelCount = maxPixelCount,
+                )
+            }
+        }
+        withFixture(inspector = sourceInspector) { fixture ->
+            val imported = fixture.store.importSelectedImage(
+                source = FixedByteCountSource(MAX_SELECTED_IMAGE_BYTE_COUNT),
+                request = SelectedImageImportRequest(),
+                normalizer = MediaImageNormalizer { _, _ -> PNG_1X1.copyOf() },
+            )
+
+            assertEquals(1, fixture.store.listAssets().size)
+            assertEquals(PNG_1X1.size.toLong(), imported.asset.metadata.byteSize)
+            assertTrue(FileSystem.SYSTEM.listOrNull(stagingRoot(fixture.root)).orEmpty().isEmpty())
+        }
+        withFixture(inspector = sourceInspector) { fixture ->
+            val failure = assertFailsWith<SelectedImageImportException> {
+                fixture.store.importSelectedImage(
+                    source = FixedByteCountSource(MAX_SELECTED_IMAGE_BYTE_COUNT + 1L),
+                    request = SelectedImageImportRequest(),
+                    normalizer = MediaImageNormalizer { _, _ -> error("must not run") },
+                )
+            }
+
+            assertEquals(SelectedImageImportFailureReason.SourceTooLarge, failure.reason)
+            assertTrue(fixture.store.listAssets().isEmpty())
+            assertTrue(FileSystem.SYSTEM.listOrNull(stagingRoot(fixture.root)).orEmpty().isEmpty())
+        }
+    }
+
+    @Test
+    fun selectedImageWithinFinalBoundsPreservesExactBytes() = withFixture { fixture ->
+        var normalizerCalled = false
+
+        val imported = fixture.store.importSelectedImage(
+            source = Buffer().write(PNG_1X1),
+            request = SelectedImageImportRequest(originalFileName = "pixel.png"),
+            normalizer = MediaImageNormalizer { _, _ ->
+                normalizerCalled = true
+                error("In-bound images must not be normalized.")
+            },
+        )
+
+        assertFalse(normalizerCalled)
+        assertContentEquals(
+            PNG_1X1,
+            fixture.store.openSource(imported.asset.metadata.id).buffer().use { it.readByteArray() },
+        )
+        assertTrue(FileSystem.SYSTEM.listOrNull(stagingRoot(fixture.root)).orEmpty().isEmpty())
+    }
+
+    @Test
+    fun selectedImageOutsideFinalPixelBoundUsesNormalizerThenVerifiedImport() = withFixture(
+        inspector = MediaAssetInspector { source, encodedByteSize, declaredMediaType, maxDecodedPixelCount ->
+            if (maxDecodedPixelCount > MAX_DECODED_PIXEL_COUNT_BOUND) {
+                MediaAssetInspection("image/png", 4_000, 4_000)
+            } else {
+                StaticImageMediaAssetInspector.inspect(
+                    source = source,
+                    encodedByteSize = encodedByteSize,
+                    declaredMediaType = declaredMediaType,
+                    maxDecodedPixelCount = maxDecodedPixelCount,
+                )
+            }
+        },
+    ) { fixture ->
+        var receivedInspection: MediaAssetInspection? = null
+
+        val imported = fixture.store.importSelectedImage(
+            source = Buffer().write(PNG_1X1),
+            request = SelectedImageImportRequest(originalFileName = "large.png"),
+            normalizer = MediaImageNormalizer { _, request ->
+                receivedInspection = request.sourceInspection
+                PNG_1X1.copyOf()
+            },
+        )
+
+        assertEquals(4_000, receivedInspection?.pixelWidth)
+        assertEquals(4_000, receivedInspection?.pixelHeight)
+        assertEquals(1, imported.asset.metadata.pixelWidth)
+        assertEquals(1, imported.asset.metadata.pixelHeight)
+        assertContentEquals(
+            PNG_1X1,
+            fixture.store.openSource(imported.asset.metadata.id).buffer().use { it.readByteArray() },
+        )
+        assertTrue(FileSystem.SYSTEM.listOrNull(stagingRoot(fixture.root)).orEmpty().isEmpty())
+    }
+
+    @Test
+    fun selectedImageFailuresAreTypedAndLeaveNoDurableState() = withFixture(
+        inspector = MediaAssetInspector { _, _, _, _ -> MediaAssetInspection("image/png", 4_000, 4_000) },
+        decodeValidator = MediaAssetDecodeValidator { DecodedMediaAsset(4_000, 4_000) },
+    ) { fixture ->
+        val tooLarge = assertFailsWith<SelectedImageImportException> {
+            fixture.store.importSelectedImage(
+                source = Buffer().write(PNG_1X1),
+                request = SelectedImageImportRequest(maxSourceBytes = 16),
+                normalizer = MediaImageNormalizer { _, _ -> error("must not run") },
+            )
+        }
+        assertEquals(SelectedImageImportFailureReason.SourceTooLarge, tooLarge.reason)
+
+        val qualityLimit = assertFailsWith<SelectedImageImportException> {
+            fixture.store.importSelectedImage(
+                source = Buffer().write(PNG_1X1),
+                request = SelectedImageImportRequest(),
+                normalizer = MediaImageNormalizer { _, _ ->
+                    throw MediaImageNormalizationException(
+                        violatesQualityBounds = true,
+                        message = "injected quality floor",
+                    )
+                },
+            )
+        }
+        assertEquals(
+            SelectedImageImportFailureReason.NormalizationWouldViolateQualityBounds,
+            qualityLimit.reason,
+        )
+        assertTrue(fixture.store.listAssets().isEmpty())
+        assertTrue(FileSystem.SYSTEM.listOrNull(stagingRoot(fixture.root)).orEmpty().isEmpty())
+        assertTrue(FileSystem.SYSTEM.listRecursivelyOrEmpty(objectsRoot(fixture.root)).none())
+    }
+
     @Test
     fun localImageImportDetectsCanonicalMediaTypeFromBytes() = withFixture { fixture ->
         val imported = fixture.store.importAsset(
@@ -401,6 +535,7 @@ class LocalMediaAssetStoreTest {
     private fun withFixture(
         fileSystem: FileSystem = FileSystem.SYSTEM,
         decodeValidator: MediaAssetDecodeValidator = JVM_TEST_DECODE_VALIDATOR,
+        inspector: MediaAssetInspector = StaticImageMediaAssetInspector,
         block: (Fixture) -> Unit,
     ) {
         val directory = Files.createTempDirectory("someday-media-store-")
@@ -411,7 +546,7 @@ class LocalMediaAssetStoreTest {
         val fixture = Fixture(
             root = root,
             database = database,
-            store = testStore(database, root, fileSystem, decodeValidator),
+            store = testStore(database, root, fileSystem, decodeValidator, inspector),
         )
         try {
             block(fixture)
@@ -446,6 +581,23 @@ class LocalMediaAssetStoreTest {
         }
     }
 
+    private class FixedByteCountSource(
+        private var remainingBytes: Long,
+    ) : Source {
+        override fun read(sink: Buffer, byteCount: Long): Long {
+            if (byteCount == 0L) return 0L
+            if (remainingBytes == 0L) return -1L
+            val count = minOf(remainingBytes, byteCount, 8_192L).toInt()
+            sink.write(ByteArray(count))
+            remainingBytes -= count
+            return count.toLong()
+        }
+
+        override fun timeout(): Timeout = Timeout.NONE
+
+        override fun close() = Unit
+    }
+
     companion object {
         private const val AUTHORITY_A = "self-hosted|22:https://sync.example|6:user-a"
         private const val AUTHORITY_B = "self-hosted|22:https://sync.example|6:user-b"
@@ -466,12 +618,14 @@ class LocalMediaAssetStoreTest {
             root: Path,
             fileSystem: FileSystem = FileSystem.SYSTEM,
             decodeValidator: MediaAssetDecodeValidator = JVM_TEST_DECODE_VALIDATOR,
+            inspector: MediaAssetInspector = StaticImageMediaAssetInspector,
         ): LocalMediaAssetStore = LocalMediaAssetStore(
             database = database,
             appPrivateRoot = root,
             fileSystem = fileSystem,
             addressingStrategy = MediaAssetAddressingStrategy(MediaAssetId::fromCanonicalValue),
             decodeValidator = decodeValidator,
+            inspector = inspector,
             clock = { TEST_CLOCK },
         )
 

@@ -37,7 +37,17 @@ fun interface MediaAssetInspector {
     ): MediaAssetInspection
 }
 
-class MediaAssetInspectionException(message: String) : LocalMediaAssetStoreException(message)
+enum class MediaAssetInspectionFailureReason {
+    UnsupportedFormat,
+    AnimatedImage,
+    PixelLimitExceeded,
+    InvalidEncoding,
+}
+
+class MediaAssetInspectionException(
+    message: String,
+    val reason: MediaAssetInspectionFailureReason = MediaAssetInspectionFailureReason.InvalidEncoding,
+) : LocalMediaAssetStoreException(message)
 
 /** Fail-closed metadata inspector for the supported static raster formats. */
 object StaticImageMediaAssetInspector : MediaAssetInspector {
@@ -48,13 +58,14 @@ object StaticImageMediaAssetInspector : MediaAssetInspector {
         maxDecodedPixelCount: Long,
     ): MediaAssetInspection {
         require(encodedByteSize > 0L) { "Encoded byte size must be positive." }
-        require(maxDecodedPixelCount in 1L..MAX_DECODED_PIXEL_COUNT_BOUND) {
+        require(maxDecodedPixelCount in 1L..MAX_SELECTED_IMAGE_PIXEL_COUNT) {
             "Decoded pixel bound is outside the supported range."
         }
         val detectedMediaType = detectStaticImageMediaType(
             source.peek().readByteArray(minOf(encodedByteSize, STATIC_IMAGE_SIGNATURE_BYTES)),
         ) ?: throw MediaAssetInspectionException(
-            "Unsupported media type. Only static JPEG, PNG, and WebP images are accepted.",
+            reason = MediaAssetInspectionFailureReason.UnsupportedFormat,
+            message = "Unsupported media type. Only static JPEG, PNG, and WebP images are accepted.",
         )
         if (declaredMediaType != null && declaredMediaType != detectedMediaType) {
             throw MediaAssetInspectionException("Declared media type does not match the encoded image signature.")
@@ -68,7 +79,8 @@ object StaticImageMediaAssetInspector : MediaAssetInspector {
         val pixelCount = dimensions.width.toLong() * dimensions.height
         if (pixelCount > maxDecodedPixelCount) {
             throw MediaAssetInspectionException(
-                "Decoded image size $pixelCount exceeds the configured $maxDecodedPixelCount-pixel limit.",
+                reason = MediaAssetInspectionFailureReason.PixelLimitExceeded,
+                message = "Decoded image size $pixelCount exceeds the configured $maxDecodedPixelCount-pixel limit.",
             )
         }
         return MediaAssetInspection(
@@ -114,7 +126,10 @@ object StaticImageMediaAssetInspector : MediaAssetInspector {
                     }
                     dimensions = Dimensions(width, height)
                 }
-                PNG_ACTL -> throw MediaAssetInspectionException("Animated PNG images are not supported.")
+                PNG_ACTL -> throw MediaAssetInspectionException(
+                    message = "Animated PNG images are not supported.",
+                    reason = MediaAssetInspectionFailureReason.AnimatedImage,
+                )
                 PNG_IDAT -> {
                     if (dimensions == null) throw MediaAssetInspectionException("PNG image data precedes IHDR.")
                     imageDataBytes += length
@@ -222,7 +237,10 @@ object StaticImageMediaAssetInspector : MediaAssetInspector {
                     }
                     val bytes = source.readByteArray(length)
                     if ((bytes[0].toInt() and WEBP_ANIMATION_FLAG) != 0) {
-                        throw MediaAssetInspectionException("Animated WebP images are not supported.")
+                        throw MediaAssetInspectionException(
+                            message = "Animated WebP images are not supported.",
+                            reason = MediaAssetInspectionFailureReason.AnimatedImage,
+                        )
                     }
                     canvas = Dimensions(
                         width = bytes.readUnsigned24LittleEndian(4) + 1,
@@ -264,7 +282,10 @@ object StaticImageMediaAssetInspector : MediaAssetInspector {
                     source.skip(length - 5L)
                 }
                 WEBP_ANIM, WEBP_ANMF ->
-                    throw MediaAssetInspectionException("Animated WebP images are not supported.")
+                    throw MediaAssetInspectionException(
+                        message = "Animated WebP images are not supported.",
+                        reason = MediaAssetInspectionFailureReason.AnimatedImage,
+                    )
                 else -> source.skip(length)
             }
             if (length and 1L != 0L) source.skip(1L)

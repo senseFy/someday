@@ -8,6 +8,7 @@ import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 import okio.Buffer
 import saien.someday.data.crypto.SodiumWorkspaceCrypto
+import saien.someday.domain.media.MAX_MEDIA_ASSET_ENCODED_BYTE_COUNT
 import saien.someday.domain.media.MediaAssetId
 
 class SelfHostedMediaV3Test {
@@ -15,6 +16,11 @@ class SelfHostedMediaV3Test {
     private val key = crypto.workspaceKeyFromBytes(ByteArray(32) { it.toByte() })
     private val cipher = SelfHostedMediaCipherV3(key, crypto)
     private val mediaId = MediaAssetId.fromCanonicalValue("0123456789abcdef".repeat(4))
+
+    @Test
+    fun frozenWireBoundMatchesTheClientAssetBound() {
+        assertEquals(MAX_MEDIA_ASSET_ENCODED_BYTE_COUNT, SYSTEM_V3_MEDIA_MAX_PLAINTEXT_BYTES.toLong())
+    }
 
     @Test
     fun singleObjectIsDeterministicAuthenticatedAndWorkspaceScoped() {

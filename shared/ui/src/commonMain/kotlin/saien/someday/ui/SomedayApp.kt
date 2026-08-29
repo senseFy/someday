@@ -309,7 +309,6 @@ import kotlinx.datetime.TimeZone
 import kotlinx.datetime.LocalDate
 import kotlinx.datetime.toLocalDateTime
 import org.jetbrains.compose.resources.StringResource
-import org.jetbrains.compose.resources.decodeToImageBitmap
 import org.jetbrains.compose.resources.stringResource
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -6833,11 +6832,14 @@ private sealed interface LocalImagePreviewState {
     data object Loading : LocalImagePreviewState
     data class Ready(val bitmap: ImageBitmap) : LocalImagePreviewState
     data object Missing : LocalImagePreviewState
-    data class Failed(val safeMessage: String) : LocalImagePreviewState
+    data class Failed(
+        val safeMessage: String,
+        val retryable: Boolean,
+    ) : LocalImagePreviewState
 }
 
 @Composable
-private fun MarkdownImagePreviewBlock(
+internal fun MarkdownImagePreviewBlock(
     block: MarkdownPreviewBlock.Image,
     mediaUiPorts: MediaUiPorts,
 ) {
@@ -6874,34 +6876,37 @@ private fun MarkdownImagePreviewBlock(
         previewState = try {
             when (val result = mediaUiPorts.previewLoader.loadPreview(assetId)) {
                 is MediaPreviewUiResult.Loaded -> {
-                    try {
-                        val bitmap = withContext(Dispatchers.Default) {
-                            result.copyBytes().decodeToImageBitmap()
-                        }
-                        LocalImagePreviewState.Ready(bitmap)
-                    } catch (cancelled: CancellationException) {
-                        throw cancelled
-                    } catch (_: Exception) {
-                        LocalImagePreviewState.Failed(previewDecodeFailedMessage)
-                    }
+                    LocalImagePreviewState.Ready(result.bitmap)
                 }
 
                 MediaPreviewUiResult.Missing -> LocalImagePreviewState.Missing
                 is MediaPreviewUiResult.Failed -> LocalImagePreviewState.Failed(
-                    when (result.reason) {
+                    safeMessage = when (result.reason) {
                         MediaUiFailureReason.PreviewTooLarge -> previewTooLargeMessage
                         MediaUiFailureReason.Unavailable,
                         MediaUiFailureReason.ImportFailed,
+                        MediaUiFailureReason.SourceTooLarge,
+                        MediaUiFailureReason.SourcePixelLimitExceeded,
+                        MediaUiFailureReason.UnsupportedFormat,
+                        MediaUiFailureReason.AnimatedImage,
+                        MediaUiFailureReason.InvalidEncoding,
+                        MediaUiFailureReason.NormalizationFailed,
+                        MediaUiFailureReason.NormalizationWouldViolateQualityBounds,
                         MediaUiFailureReason.PreviewLoadFailed,
                         MediaUiFailureReason.MaterializationFailed,
                         -> previewLoadFailedMessage
+                        MediaUiFailureReason.PreviewDecodeFailed -> previewDecodeFailedMessage
                     },
+                    retryable = result.reason != MediaUiFailureReason.PreviewTooLarge,
                 )
             }
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (_: Exception) {
-            LocalImagePreviewState.Failed(previewLoadFailedMessage)
+            LocalImagePreviewState.Failed(
+                safeMessage = previewLoadFailedMessage,
+                retryable = true,
+            )
         }
     }
 
@@ -6979,11 +6984,18 @@ private fun MarkdownImagePreviewBlock(
                 }
             }
 
-            is LocalImagePreviewState.Failed -> Text(
-                text = current.safeMessage,
-                color = MaterialTheme.colorScheme.error,
-                style = MaterialTheme.typography.bodySmall,
-            )
+            is LocalImagePreviewState.Failed -> {
+                Text(
+                    text = current.safeMessage,
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                if (current.retryable) {
+                    TextButton(onClick = { loadGeneration += 1 }) {
+                        Text(stringResource(Res.string.sync_retry))
+                    }
+                }
+            }
         }
     }
 }

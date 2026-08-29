@@ -64,8 +64,19 @@ class MediaAssetsTest {
             createdAt = Instant.fromEpochMilliseconds(1_000),
         )
         assertEquals(12L, metadata.decodedPixelCount)
+        assertEquals(
+            MAX_MEDIA_ASSET_ENCODED_BYTE_COUNT,
+            metadata.copy(byteSize = MAX_MEDIA_ASSET_ENCODED_BYTE_COUNT).byteSize,
+        )
+        assertEquals(
+            MAX_MEDIA_ASSET_PIXEL_COUNT,
+            metadata.copy(pixelWidth = 4_000, pixelHeight = 3_000).decodedPixelCount,
+        )
         assertFailsWith<IllegalArgumentException> {
-            metadata.copy(pixelWidth = 10_001, pixelHeight = 10_000)
+            metadata.copy(byteSize = MAX_MEDIA_ASSET_ENCODED_BYTE_COUNT + 1)
+        }
+        assertFailsWith<IllegalArgumentException> {
+            metadata.copy(pixelWidth = MAX_MEDIA_ASSET_PIXEL_COUNT.toInt() + 1, pixelHeight = 1)
         }
     }
 }

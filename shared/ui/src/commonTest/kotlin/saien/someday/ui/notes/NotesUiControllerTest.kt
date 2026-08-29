@@ -715,12 +715,12 @@ class NotesUiControllerTest {
             "A \n![sunset](someday-asset://${"ab".repeat(32)})\n memory",
             controller.state.editor?.markdownBody,
         )
-        assertEquals("Image added.", controller.state.feedbackMessage)
+        assertNull(controller.state.feedbackMessage)
 
         val bodyAfterImport = assertNotNull(controller.state.editor?.markdownBody)
         assertFalse(controller.applyMediaImportResult(sessionId, MediaImportUiResult.Cancelled))
         assertEquals(bodyAfterImport, controller.state.editor?.markdownBody)
-        assertEquals("Image import cancelled.", controller.state.feedbackMessage)
+        assertNull(controller.state.feedbackMessage)
 
         assertFalse(
             controller.applyMediaImportResult(
@@ -730,6 +730,17 @@ class NotesUiControllerTest {
         )
         assertEquals(bodyAfterImport, controller.state.editor?.markdownBody)
         assertEquals("Unable to import the selected image.", controller.state.feedbackMessage)
+
+        assertFalse(
+            controller.applyMediaImportResult(
+                sessionId,
+                MediaImportUiResult.Failed(MediaUiFailureReason.NormalizationWouldViolateQualityBounds),
+            ),
+        )
+        assertEquals(
+            "This image cannot be reduced to 4 MB without excessive quality loss.",
+            controller.state.feedbackMessage,
+        )
 
         controller.closeEditorSession(sessionId, discarded = true)
         assertFalse(

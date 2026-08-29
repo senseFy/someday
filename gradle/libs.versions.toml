@@ -8,6 +8,7 @@ android-minSdk = "26"
 android-targetSdk = "36"
 androidx-activity-compose = "1.10.1"
 androidx-core = "1.16.0"
+androidx-exifinterface = "1.4.2"
 androidx-camera = "1.6.1"
 androidx-test-core = "1.6.1"
 androidx-test-ext-junit = "1.2.1"
@@ -43,6 +44,7 @@ aws-sdk-s3 = { module = "software.amazon.awssdk:s3", version.ref = "aws-sdk" }
 aws-sdk-url-connection-client = { module = "software.amazon.awssdk:url-connection-client", version.ref = "aws-sdk" }
 androidx-activity-compose = { module = "androidx.activity:activity-compose", version.ref = "androidx-activity-compose" }
 androidx-core = { module = "androidx.core:core-ktx", version.ref = "androidx-core" }
+androidx-exifinterface = { module = "androidx.exifinterface:exifinterface", version.ref = "androidx-exifinterface" }
 androidx-camera-core = { module = "androidx.camera:camera-core", version.ref = "androidx-camera" }
 androidx-camera-camera2 = { module = "androidx.camera:camera-camera2", version.ref = "androidx-camera" }
 androidx-camera-lifecycle = { module = "androidx.camera:camera-lifecycle", version.ref = "androidx-camera" }

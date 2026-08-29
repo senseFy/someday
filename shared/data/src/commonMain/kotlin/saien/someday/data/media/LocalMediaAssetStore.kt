@@ -6,6 +6,8 @@ import saien.someday.data.crypto.SodiumWorkspaceCrypto
 import saien.someday.data.local.db.SomedayDatabase
 import saien.someday.domain.media.MediaAssetId
 import saien.someday.domain.media.MediaAssetMetadata
+import saien.someday.domain.media.MAX_MEDIA_ASSET_ENCODED_BYTE_COUNT
+import saien.someday.domain.media.MAX_MEDIA_ASSET_PIXEL_COUNT
 import saien.someday.domain.media.canonicalMediaTypeOrNull
 import saien.someday.domain.media.isSafeOriginalFileName
 import kotlin.time.Clock
@@ -24,7 +26,7 @@ import okio.Source
 import okio.Timeout
 import okio.buffer
 
-const val DEFAULT_MEDIA_IMPORT_MAX_BYTES: Long = 4L * 1_024L * 1_024L
+const val DEFAULT_MEDIA_IMPORT_MAX_BYTES: Long = MAX_MEDIA_ASSET_ENCODED_BYTE_COUNT
 const val MAX_MEDIA_IMPORT_BOUND_BYTES: Long = DEFAULT_MEDIA_IMPORT_MAX_BYTES
 
 private const val MEDIA_STORAGE_DIRECTORY: String = "media-v1"
@@ -260,6 +262,107 @@ class LocalMediaAssetStore(
             result = checkNotNull(getAsset(assetId))
         }
         return checkNotNull(result)
+    }
+
+    /**
+     * Imports one user-selected image. Selection has a larger bounded staging
+     * envelope than the immutable System V3 object, so oversized sources can be
+     * normalized before they enter the ordinary verified import path.
+     */
+    fun importSelectedImage(
+        source: Source,
+        request: SelectedImageImportRequest,
+        normalizer: MediaImageNormalizer,
+    ): MediaAssetImportResult {
+        ensureStorageDirectories()
+        val selectedSourcePath = newTemporaryPath()
+        try {
+            val selectedSource = try {
+                writeStagedObject(selectedSourcePath, request.maxSourceBytes) { sink ->
+                    sink.writeAll(source)
+                }
+            } catch (failure: MediaAssetImportTooLargeException) {
+                throw SelectedImageImportException(
+                    reason = SelectedImageImportFailureReason.SourceTooLarge,
+                    message = "Selected image exceeds the configured source byte limit.",
+                    cause = failure,
+                )
+            }
+            val sourceInspection = try {
+                inspectStagedMetadata(
+                    path = selectedSourcePath,
+                    encodedByteSize = selectedSource.byteSize,
+                    declaredMediaType = null,
+                    maxDecodedPixelCount = request.maxSourcePixelCount,
+                )
+            } catch (failure: MediaAssetInspectionException) {
+                throw failure.toSelectedImageImportException()
+            }
+            val finalRequest = MediaAssetImportRequest(
+                originalFileName = request.originalFileName,
+                maxBytes = MAX_MEDIA_ASSET_ENCODED_BYTE_COUNT,
+                maxDecodedPixelCount = MAX_MEDIA_ASSET_PIXEL_COUNT,
+            )
+            if (selectedSource.byteSize <= MAX_MEDIA_ASSET_ENCODED_BYTE_COUNT &&
+                sourceInspection.decodedPixelCount <= MAX_MEDIA_ASSET_PIXEL_COUNT
+            ) {
+                return try {
+                    val stagedSource = fileSystem.source(selectedSourcePath)
+                    try {
+                        importAsset(stagedSource, finalRequest)
+                    } finally {
+                        stagedSource.close()
+                    }
+                } catch (failure: MediaAssetInspectionException) {
+                    throw failure.toSelectedImageImportException()
+                }
+            }
+
+            val normalizedBytes = try {
+                val stagedSource = fileSystem.source(selectedSourcePath).buffer()
+                try {
+                    normalizer.normalize(
+                        stagedSource,
+                        MediaImageNormalizationRequest(sourceInspection),
+                    )
+                } finally {
+                    stagedSource.close()
+                }
+            } catch (failure: MediaImageNormalizationException) {
+                throw SelectedImageImportException(
+                    reason = if (failure.violatesQualityBounds) {
+                        SelectedImageImportFailureReason.NormalizationWouldViolateQualityBounds
+                    } else {
+                        SelectedImageImportFailureReason.NormalizationFailed
+                    },
+                    message = "Selected image could not be normalized safely.",
+                    cause = failure,
+                )
+            } catch (failure: Exception) {
+                throw SelectedImageImportException(
+                    reason = SelectedImageImportFailureReason.NormalizationFailed,
+                    message = "Selected image normalization failed.",
+                    cause = failure,
+                )
+            }
+            if (normalizedBytes.isEmpty() || normalizedBytes.size > MAX_MEDIA_ASSET_ENCODED_BYTE_COUNT) {
+                throw SelectedImageImportException(
+                    reason = SelectedImageImportFailureReason.NormalizationWouldViolateQualityBounds,
+                    message = "Normalized image does not fit the immutable media byte bound.",
+                )
+            }
+            return try {
+                importAsset(Buffer().write(normalizedBytes), finalRequest)
+            } catch (failure: Exception) {
+                throw SelectedImageImportException(
+                    reason = SelectedImageImportFailureReason.NormalizationFailed,
+                    message = "Normalized image did not pass final validation.",
+                    cause = failure,
+                )
+            }
+        } finally {
+            runCatching { fileSystem.delete(selectedSourcePath, mustExist = false) }
+        }
     }
 
     /**
@@ -528,17 +631,12 @@ class LocalMediaAssetStore(
         encodedByteSize: Long,
         request: MediaAssetImportRequest,
     ): MediaAssetInspection {
-        val source = fileSystem.source(path).buffer()
-        val inspection = try {
-            inspector.inspect(
-                source = source,
-                encodedByteSize = encodedByteSize,
-                declaredMediaType = request.mediaType,
-                maxDecodedPixelCount = request.maxDecodedPixelCount,
-            )
-        } finally {
-            source.close()
-        }
+        val inspection = inspectStagedMetadata(
+            path = path,
+            encodedByteSize = encodedByteSize,
+            declaredMediaType = request.mediaType,
+            maxDecodedPixelCount = request.maxDecodedPixelCount,
+        )
         if (request.mediaType != null && inspection.mediaType != request.mediaType) {
             throw MediaAssetInspectionException("Inspected media type does not match the declared media type.")
         }
@@ -553,6 +651,25 @@ class LocalMediaAssetStore(
         }
         validateDecodedObject(path, inspection)
         return inspection
+    }
+
+    private fun inspectStagedMetadata(
+        path: Path,
+        encodedByteSize: Long,
+        declaredMediaType: String?,
+        maxDecodedPixelCount: Long,
+    ): MediaAssetInspection {
+        val source = fileSystem.source(path).buffer()
+        return try {
+            inspector.inspect(
+                source = source,
+                encodedByteSize = encodedByteSize,
+                declaredMediaType = declaredMediaType,
+                maxDecodedPixelCount = maxDecodedPixelCount,
+            )
+        } finally {
+            source.close()
+        }
     }
 
     private fun validateDecodedObject(
@@ -806,6 +923,22 @@ class LocalMediaAssetStore(
         val contentSha256: String?,
     )
 }
+
+private fun MediaAssetInspectionException.toSelectedImageImportException(): SelectedImageImportException =
+    SelectedImageImportException(
+        reason = when (reason) {
+            MediaAssetInspectionFailureReason.UnsupportedFormat ->
+                SelectedImageImportFailureReason.UnsupportedFormat
+            MediaAssetInspectionFailureReason.AnimatedImage ->
+                SelectedImageImportFailureReason.AnimatedImage
+            MediaAssetInspectionFailureReason.PixelLimitExceeded ->
+                SelectedImageImportFailureReason.SourcePixelLimitExceeded
+            MediaAssetInspectionFailureReason.InvalidEncoding ->
+                SelectedImageImportFailureReason.InvalidEncoding
+        },
+        message = "Selected image did not pass bounded source inspection.",
+        cause = this,
+    )
 
 private fun String.isCanonicalSha256(): Boolean =
     length == SHA256_HEX_LENGTH && all { it in '0'..'9' || it in 'a'..'f' }

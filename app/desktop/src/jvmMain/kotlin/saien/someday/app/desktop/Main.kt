@@ -13,21 +13,13 @@ import androidx.compose.ui.window.application
 import androidx.compose.ui.window.rememberWindowState
 import saien.someday.domain.settings.ClientSettings
 import saien.someday.domain.settings.WorkspacePreferencesConflictResolver
-import saien.someday.domain.media.MediaAssetId
-import saien.someday.domain.media.isSafeOriginalFileName
-import saien.someday.sync.AuthorityCoordinatedMediaAssetStore
-import saien.someday.data.media.MediaAssetImportRequest
-import saien.someday.data.media.MediaAssetLocalState
-import saien.someday.data.media.MediaAssetVerificationResult
 import saien.someday.ui.SomedayApp
 import saien.someday.ui.SomedayBootstrapScreen
-import saien.someday.ui.media.MAX_MEDIA_PREVIEW_BYTE_COUNT
 import saien.someday.ui.media.MediaImportRunner
 import saien.someday.ui.media.MediaImportUiResult
 import saien.someday.ui.media.MediaMaterializationRunner
 import saien.someday.ui.media.MediaMaterializationUiResult
 import saien.someday.ui.media.MediaPreviewLoader
-import saien.someday.ui.media.MediaPreviewUiResult
 import saien.someday.ui.media.MediaUiFailureReason
 import saien.someday.ui.media.MediaUiPorts
 import saien.someday.ui.settings.DayOneImportRunner
@@ -37,8 +29,6 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.awt.FileDialog
 import java.io.File
-import okio.buffer
-import okio.source
 
 fun main() = application {
     println(DesktopShellEntrypoint.startupLog())
@@ -105,25 +95,7 @@ fun main() = application {
                         val file = File(selectedDirectory, selectedFile)
                         importCoroutineScope.launch {
                             val result = withContext(Dispatchers.IO) {
-                                runCatching {
-                                    val originalName = file.name.takeIf(::isSafeOriginalFileName)
-                                    val imported = file.source().use { source ->
-                                        clientRepositories.localMediaAssetStore.importAsset(
-                                            source = source,
-                                            request = MediaAssetImportRequest(
-                                                originalFileName = originalName,
-                                                maxBytes = MAX_MEDIA_PREVIEW_BYTE_COUNT.toLong(),
-                                                maxDecodedPixelCount = MAX_MEDIA_PREVIEW_PIXEL_COUNT,
-                                            ),
-                                        )
-                                    }
-                                    MediaImportUiResult.Imported(
-                                        imported.asset.metadata.id,
-                                        originalName?.substringBeforeLast('.')?.take(120).orEmpty(),
-                                    )
-                                }.getOrElse {
-                                    MediaImportUiResult.Failed(MediaUiFailureReason.ImportFailed)
-                                }
+                                file.importSelectedImage(clientRepositories.localMediaAssetStore)
                             }
                             onResult(result)
                         }
@@ -131,7 +103,7 @@ fun main() = application {
                 },
                 previewLoader = MediaPreviewLoader { assetId ->
                     withContext(Dispatchers.IO) {
-                        clientRepositories.localMediaAssetStore.loadBoundedPreview(assetId)
+                        clientRepositories.localMediaAssetStore.loadMediaPreview(assetId)
                     }
                 },
                 materializationRunner = MediaMaterializationRunner { assetId, onResult ->
@@ -199,41 +171,8 @@ fun main() = application {
     }
 }
 
-private fun AuthorityCoordinatedMediaAssetStore.loadBoundedPreview(assetId: MediaAssetId): MediaPreviewUiResult {
-    val asset = getAsset(assetId) ?: return MediaPreviewUiResult.Missing
-    when (asset.localState) {
-        MediaAssetLocalState.Missing -> return MediaPreviewUiResult.Missing
-        MediaAssetLocalState.Corrupt -> return MediaPreviewUiResult.Missing
-        MediaAssetLocalState.Available -> Unit
-    }
-    if (asset.metadata.byteSize > MAX_MEDIA_PREVIEW_BYTE_COUNT ||
-        asset.metadata.decodedPixelCount > MAX_MEDIA_PREVIEW_PIXEL_COUNT
-    ) {
-        return MediaPreviewUiResult.Failed(MediaUiFailureReason.PreviewTooLarge)
-    }
-    when (runCatching { verifyAsset(assetId) }.getOrElse {
-        return MediaPreviewUiResult.Failed(MediaUiFailureReason.PreviewLoadFailed)
-    }) {
-        is MediaAssetVerificationResult.Verified -> Unit
-        is MediaAssetVerificationResult.Missing,
-        is MediaAssetVerificationResult.Corrupt,
-        -> return MediaPreviewUiResult.Missing
-    }
-    return runCatching {
-        MediaPreviewUiResult.Loaded(openSource(assetId).buffer().use { it.readByteArray() })
-    }.getOrElse {
-        if (getAsset(assetId)?.localState == MediaAssetLocalState.Available) {
-            MediaPreviewUiResult.Failed(MediaUiFailureReason.PreviewLoadFailed)
-        } else {
-            MediaPreviewUiResult.Missing
-        }
-    }
-}
-
 private fun isMacOs(): Boolean =
     System.getProperty("os.name").contains("Mac", ignoreCase = true)
-
-private const val MAX_MEDIA_PREVIEW_PIXEL_COUNT = 12_000_000L
 
 private data class DesktopAppBootstrap(
     val repositories: DesktopClientRepositories,

@@ -231,9 +231,14 @@
     <string name="notes_fb_location_added">Location added.</string>
     <string name="notes_fb_location_permission_denied">Location permission was denied. You can still type a place.</string>
     <string name="notes_fb_location_unavailable">Location is unavailable. You can still type a place.</string>
-    <string name="notes_fb_image_added">Image added.</string>
-    <string name="notes_fb_image_import_cancelled">Image import cancelled.</string>
     <string name="image_import_failed">Unable to import the selected image.</string>
+    <string name="image_import_source_too_large">Choose an image no larger than 32 MB.</string>
+    <string name="image_import_source_pixel_limit_exceeded">The selected image's dimensions are too large.</string>
+    <string name="image_import_unsupported_format">Choose a JPEG, PNG, or WebP image.</string>
+    <string name="image_import_animated_image">Animated images are not supported.</string>
+    <string name="image_import_invalid_encoding">The selected image is damaged or invalid.</string>
+    <string name="image_import_normalization_failed">Unable to prepare the selected image.</string>
+    <string name="image_import_normalization_quality_limit">This image cannot be reduced to 4 MB without excessive quality loss.</string>
     <string name="image_picker_title">Insert image</string>
     <string name="image_toolbar_action">Insert image</string>
     <string name="image_preview_default_alt">Image</string>
