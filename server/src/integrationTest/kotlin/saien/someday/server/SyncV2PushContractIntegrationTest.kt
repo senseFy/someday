@@ -1,5 +1,12 @@
 package saien.someday.server
 
+import java.lang.reflect.InvocationTargetException
+import java.lang.reflect.Method
+import java.lang.reflect.Proxy
+import java.sql.Connection
+import java.sql.DriverManager
+import java.sql.PreparedStatement
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
@@ -12,6 +19,7 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.runBlocking
 import org.junit.Rule
 import org.junit.rules.TemporaryFolder
+import saien.someday.server.persistence.DatabaseConnectionProvider
 import saien.someday.server.persistence.SyncV2PushRepositoryResult
 import saien.someday.server.persistence.SyncV2Repository
 import saien.someday.server.support.ConcurrentStartGate
@@ -138,6 +146,73 @@ class SyncV2PushContractIntegrationTest {
         assertEquals(OBJECT_COUNT.toLong(), database.countRows("someday_sync_v2_mutations", identity.userId, WORKSPACE_ID))
     }
 
+    @Test
+    fun tenThousandObjectImportUsesFixedRoundTripsPerMaximumBatchAndReplaysExactly() {
+        val countingConnections = CountingDatabaseConnectionProvider(database.config)
+        val bulkRepository = SyncV2Repository(database.config, countingConnections)
+        val objects = (0 until IMPORT_OBJECT_COUNT).map { index ->
+            SyncV2ContractFixture.entity(genesis, identity.deviceId, "import-$index")
+        }
+
+        countingConnections.reset()
+        objects.chunked(MAX_PUSH_OBJECTS).forEach { batch ->
+            val result = assertIs<SyncV2PushRepositoryResult.Accepted>(
+                bulkRepository.push(
+                    identity.userId,
+                    WORKSPACE_ID,
+                    identity.deviceId,
+                    genesis.metadata.epochId,
+                    writerProtocolVersion = 2,
+                    objects = batch,
+                ),
+            )
+            assertEquals(batch.size, result.acknowledgements.size)
+            assertTrue(result.acknowledgements.none { it.idempotentReplay })
+        }
+
+        assertEquals(
+            IMPORT_BATCH_COUNT * FRESH_BATCH_DATABASE_EXECUTIONS,
+            countingConnections.statementExecutions,
+            "A push batch must use a fixed number of database round trips instead of one set per object.",
+        )
+        assertEquals(
+            IMPORT_OBJECT_COUNT.toLong(),
+            database.countRows("someday_sync_v2_objects", identity.userId, WORKSPACE_ID),
+        )
+        assertEquals(
+            IMPORT_OBJECT_COUNT.toLong(),
+            database.countRows("someday_sync_v2_changes", identity.userId, WORKSPACE_ID),
+        )
+        assertEquals(
+            IMPORT_OBJECT_COUNT.toLong(),
+            database.countRows("someday_sync_v2_mutations", identity.userId, WORKSPACE_ID),
+        )
+
+        val pulled = bulkRepository.pull(
+            identity.userId,
+            WORKSPACE_ID,
+            genesis.metadata.epochId,
+            afterCursor = 0,
+            limit = IMPORT_OBJECT_COUNT,
+        )
+        assertEquals(objects.map { it.encodedObjectJson }, pulled.changes.map { it.encodedObjectJson })
+        assertTrue(pulled.complete)
+
+        countingConnections.reset()
+        val replay = assertIs<SyncV2PushRepositoryResult.Accepted>(
+            bulkRepository.push(
+                identity.userId,
+                WORKSPACE_ID,
+                identity.deviceId,
+                genesis.metadata.epochId,
+                writerProtocolVersion = 2,
+                objects = objects.take(MAX_PUSH_OBJECTS),
+            ),
+        )
+        assertTrue(replay.acknowledgements.all { it.idempotentReplay })
+        assertEquals(REPLAY_BATCH_DATABASE_EXECUTIONS, countingConnections.statementExecutions)
+    }
+
     private fun push(objects: List<saien.someday.server.persistence.SyncV2ObjectInput>) =
         repository.push(
             identity.userId,
@@ -151,5 +226,68 @@ class SyncV2PushContractIntegrationTest {
     private companion object {
         const val WORKSPACE_ID = "workspace-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         const val OBJECT_COUNT = 24
+        const val MAX_PUSH_OBJECTS = 100
+        const val IMPORT_BATCH_COUNT = 100
+        const val IMPORT_OBJECT_COUNT = MAX_PUSH_OBJECTS * IMPORT_BATCH_COUNT
+        const val FRESH_BATCH_DATABASE_EXECUTIONS = 9
+        const val REPLAY_BATCH_DATABASE_EXECUTIONS = 7
+    }
+}
+
+/** Counts actual JDBC execute calls while retaining the real PostgreSQL contract. */
+private class CountingDatabaseConnectionProvider(
+    private val config: ServerConfig,
+) : DatabaseConnectionProvider {
+    private val executions = AtomicInteger()
+
+    val statementExecutions: Int
+        get() = executions.get()
+
+    fun reset() {
+        executions.set(0)
+    }
+
+    override fun connection(): Connection = wrapConnection(
+        DriverManager.getConnection(
+            config.databaseConnectionUrl,
+            config.databaseUser,
+            config.databasePassword,
+        ),
+    )
+
+    private fun wrapConnection(delegate: Connection): Connection = proxy(Connection::class.java) { method, arguments ->
+        val result = invokeDelegate(delegate, method, arguments)
+        if (method.name == "prepareStatement" && result is PreparedStatement) wrapStatement(result) else result
+    }
+
+    private fun wrapStatement(delegate: PreparedStatement): PreparedStatement =
+        proxy(PreparedStatement::class.java) { method, arguments ->
+            if (method.name in EXECUTION_METHODS) executions.incrementAndGet()
+            invokeDelegate(delegate, method, arguments)
+        }
+
+    private fun <T> proxy(type: Class<T>, invocation: (Method, Array<out Any?>?) -> Any?): T =
+        type.cast(
+            Proxy.newProxyInstance(type.classLoader, arrayOf(type)) { _, method, arguments ->
+                invocation(method, arguments)
+            },
+        )
+
+    private fun invokeDelegate(target: Any, method: Method, arguments: Array<out Any?>?): Any? =
+        try {
+            method.invoke(target, *(arguments ?: emptyArray()))
+        } catch (failure: InvocationTargetException) {
+            throw failure.targetException
+        }
+
+    private companion object {
+        val EXECUTION_METHODS = setOf(
+            "execute",
+            "executeBatch",
+            "executeLargeBatch",
+            "executeLargeUpdate",
+            "executeQuery",
+            "executeUpdate",
+        )
     }
 }

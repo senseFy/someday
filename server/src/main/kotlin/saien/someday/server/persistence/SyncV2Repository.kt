@@ -509,13 +509,27 @@ class SyncV2Repository(
             return@transaction SyncV2PushRepositoryResult.Rejected("device_mismatch")
         }
 
+        val existingMutations = findMutations(
+            connection,
+            userId,
+            workspaceId,
+            epochId,
+            objects.map(SyncV2ObjectInput::mutationId),
+        )
+        val existingObjects = findObjects(
+            connection,
+            userId,
+            workspaceId,
+            epochId,
+            objects.map(SyncV2ObjectInput::objectId),
+        )
         val prepared = mutableListOf<PreparedMutation>()
         for (input in objects) {
-            val mutation = findMutation(connection, userId, workspaceId, epochId, input.mutationId)
+            val mutation = existingMutations[input.mutationId]
             if (mutation != null && (mutation.objectId != input.objectId || mutation.objectDigest != input.objectDigest)) {
                 return@transaction SyncV2PushRepositoryResult.Rejected("mutation_reuse_mismatch")
             }
-            val objectValue = findObject(connection, userId, workspaceId, epochId, input.objectId, true)
+            val objectValue = existingObjects[input.objectId]
             if (objectValue != null && !objectValue.exactlyMatches(input)
             ) {
                 return@transaction SyncV2PushRepositoryResult.Rejected("immutable_object_mismatch")
@@ -526,78 +540,17 @@ class SyncV2Repository(
             prepared += PreparedMutation(input, mutation)
         }
 
+        val freshInputs = prepared.filter { it.existingMutation == null }.map(PreparedMutation::input)
+        val freshCursors = insertObjects(connection, userId, workspaceId, epochId, freshInputs)
+        insertChangesAndMutations(connection, userId, workspaceId, epochId, freshInputs, freshCursors)
+
         val acknowledgements = prepared.map { value ->
-            val input = value.input
-            if (value.existingMutation != null) {
-                SyncV2MutationAckRecord(input.mutationId, input.objectId, input.objectDigest, true)
-            } else {
-                connection.prepareStatement(
-                    """
-                    INSERT INTO someday_sync_v2_objects(
-                        user_id, workspace_id, epoch_id, object_id, object_type, object_digest,
-                        mutation_id, first_writer_device_id, ciphertext_digest,
-                        encrypted_object_json, cursor
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
-                    """.trimIndent(),
-                ).use { statement ->
-                    statement.setObject(1, userId)
-                    statement.setString(2, workspaceId)
-                    statement.setString(3, epochId)
-                    statement.setString(4, input.objectId)
-                    statement.setString(5, input.objectType)
-                    statement.setString(6, input.objectDigest)
-                    statement.setString(7, input.mutationId)
-                    statement.setObject(8, input.writerDeviceId)
-                    statement.setString(9, input.ciphertextDigest)
-                    statement.setString(10, input.encodedObjectJson)
-                    statement.executeUpdate()
-                }
-                val cursor = connection.prepareStatement(
-                    """
-                    INSERT INTO someday_sync_v2_changes(
-                        user_id, workspace_id, epoch_id, object_id, object_digest, mutation_id
-                    ) VALUES (?, ?, ?, ?, ?, ?) RETURNING cursor
-                    """.trimIndent(),
-                ).use { statement ->
-                    statement.setObject(1, userId)
-                    statement.setString(2, workspaceId)
-                    statement.setString(3, epochId)
-                    statement.setString(4, input.objectId)
-                    statement.setString(5, input.objectDigest)
-                    statement.setString(6, input.mutationId)
-                    statement.executeQuery().use { result -> result.next(); result.getLong(1) }
-                }
-                connection.prepareStatement(
-                    """
-                    UPDATE someday_sync_v2_objects SET cursor = ?
-                    WHERE user_id = ? AND workspace_id = ? AND epoch_id = ? AND object_id = ?
-                    """.trimIndent(),
-                ).use { statement ->
-                    statement.setLong(1, cursor)
-                    statement.setObject(2, userId)
-                    statement.setString(3, workspaceId)
-                    statement.setString(4, epochId)
-                    statement.setString(5, input.objectId)
-                    statement.executeUpdate()
-                }
-                connection.prepareStatement(
-                    """
-                    INSERT INTO someday_sync_v2_mutations(
-                        user_id, workspace_id, epoch_id, mutation_id, object_id, object_digest, cursor
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """.trimIndent(),
-                ).use { statement ->
-                    statement.setObject(1, userId)
-                    statement.setString(2, workspaceId)
-                    statement.setString(3, epochId)
-                    statement.setString(4, input.mutationId)
-                    statement.setString(5, input.objectId)
-                    statement.setString(6, input.objectDigest)
-                    statement.setLong(7, cursor)
-                    statement.executeUpdate()
-                }
-                SyncV2MutationAckRecord(input.mutationId, input.objectId, input.objectDigest, false)
-            }
+            SyncV2MutationAckRecord(
+                value.input.mutationId,
+                value.input.objectId,
+                value.input.objectDigest,
+                value.existingMutation != null,
+            )
         }
         SyncV2PushRepositoryResult.Accepted(acknowledgements)
     }
@@ -818,53 +771,184 @@ class SyncV2Repository(
         }
     }
 
-    private fun findMutation(
+    private fun findMutations(
         connection: Connection,
         userId: UUID,
         workspaceId: String,
         epochId: String,
-        mutationId: String,
-    ): ExistingMutation? = connection.prepareStatement(
-        """
-        SELECT object_id, object_digest, cursor FROM someday_sync_v2_mutations
-        WHERE user_id = ? AND workspace_id = ? AND epoch_id = ? AND mutation_id = ? FOR UPDATE
-        """.trimIndent(),
-    ).use { statement ->
-        statement.setObject(1, userId)
-        statement.setString(2, workspaceId)
-        statement.setString(3, epochId)
-        statement.setString(4, mutationId)
-        statement.executeQuery().use { result ->
-            if (!result.next()) null else ExistingMutation(result.getString(1), result.getString(2), result.getLong(3))
-        }
-    }
-
-    private fun findObject(
-        connection: Connection,
-        userId: UUID,
-        workspaceId: String,
-        epochId: String,
-        objectId: String,
-        forUpdate: Boolean,
-    ): ExistingObject? {
-        val lock = if (forUpdate) " FOR UPDATE" else ""
+        mutationIds: List<String>,
+    ): Map<String, ExistingMutation> {
+        if (mutationIds.isEmpty()) return emptyMap()
+        val identityPlaceholders = mutationIds.joinToString(",") { "?" }
         return connection.prepareStatement(
             """
-            SELECT object_type, object_digest, mutation_id, first_writer_device_id,
-                   ciphertext_digest, encrypted_object_json, cursor
-            FROM someday_sync_v2_objects
-            WHERE user_id = ? AND workspace_id = ? AND epoch_id = ? AND object_id = ?$lock
+            SELECT mutation_id, object_id, object_digest, cursor FROM someday_sync_v2_mutations
+            WHERE user_id = ? AND workspace_id = ? AND epoch_id = ?
+              AND mutation_id IN ($identityPlaceholders)
+            FOR UPDATE
             """.trimIndent(),
         ).use { statement ->
             statement.setObject(1, userId)
             statement.setString(2, workspaceId)
             statement.setString(3, epochId)
-            statement.setString(4, objectId)
+            mutationIds.forEachIndexed { index, mutationId -> statement.setString(index + 4, mutationId) }
             statement.executeQuery().use { result ->
-                if (!result.next()) null else ExistingObject(
-                    result.getString(1), result.getString(2), result.getString(3),
-                    result.getObject(4, UUID::class.java), result.getString(5), result.getString(6), result.getLong(7),
-                )
+                buildMap {
+                    while (result.next()) {
+                        put(
+                            result.getString("mutation_id"),
+                            ExistingMutation(
+                                result.getString("object_id"),
+                                result.getString("object_digest"),
+                                result.getLong("cursor"),
+                            ),
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    private fun findObjects(
+        connection: Connection,
+        userId: UUID,
+        workspaceId: String,
+        epochId: String,
+        objectIds: List<String>,
+    ): Map<String, ExistingObject> {
+        if (objectIds.isEmpty()) return emptyMap()
+        val identityPlaceholders = objectIds.joinToString(",") { "?" }
+        return connection.prepareStatement(
+            """
+            SELECT object_id, object_type, object_digest, mutation_id, first_writer_device_id,
+                   ciphertext_digest, encrypted_object_json, cursor
+            FROM someday_sync_v2_objects
+            WHERE user_id = ? AND workspace_id = ? AND epoch_id = ?
+              AND object_id IN ($identityPlaceholders)
+            FOR UPDATE
+            """.trimIndent(),
+        ).use { statement ->
+            statement.setObject(1, userId)
+            statement.setString(2, workspaceId)
+            statement.setString(3, epochId)
+            objectIds.forEachIndexed { index, objectId -> statement.setString(index + 4, objectId) }
+            statement.executeQuery().use { result ->
+                buildMap {
+                    while (result.next()) {
+                        put(
+                            result.getString("object_id"),
+                            ExistingObject(
+                                result.getString("object_type"),
+                                result.getString("object_digest"),
+                                result.getString("mutation_id"),
+                                result.getObject("first_writer_device_id", UUID::class.java),
+                                result.getString("ciphertext_digest"),
+                                result.getString("encrypted_object_json"),
+                                result.getLong("cursor"),
+                            ),
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Persists one bounded push batch with a single database round trip.
+     *
+     * The ordered CTE is intentional: parent generations are sorted before this
+     * repository boundary, so cursor allocation must preserve that causal order.
+     */
+    private fun insertObjects(
+        connection: Connection,
+        userId: UUID,
+        workspaceId: String,
+        epochId: String,
+        inputs: List<SyncV2ObjectInput>,
+    ): Map<String, Long> {
+        if (inputs.isEmpty()) return emptyMap()
+        val inputRows = inputs.joinToString(",") { "(?, ?, ?, ?, ?, ?::uuid, ?, ?)" }
+        val sql =
+            """
+            WITH input(
+                ordinal, object_id, object_type, object_digest, mutation_id,
+                first_writer_device_id, ciphertext_digest, encrypted_object_json
+            ) AS (VALUES $inputRows)
+            INSERT INTO someday_sync_v2_objects(
+                user_id, workspace_id, epoch_id, object_id, object_type, object_digest,
+                mutation_id, first_writer_device_id, ciphertext_digest,
+                encrypted_object_json, cursor
+            )
+            SELECT ?, ?, ?, input.object_id, input.object_type, input.object_digest,
+                   input.mutation_id, input.first_writer_device_id, input.ciphertext_digest,
+                   input.encrypted_object_json, nextval('someday_sync_v2_global_cursor')
+            FROM input
+            ORDER BY input.ordinal
+            RETURNING mutation_id, cursor
+            """.trimIndent()
+        return connection.prepareStatement(sql).use { statement ->
+            var parameter = 1
+            inputs.forEachIndexed { ordinal, input ->
+                statement.setInt(parameter++, ordinal)
+                statement.setString(parameter++, input.objectId)
+                statement.setString(parameter++, input.objectType)
+                statement.setString(parameter++, input.objectDigest)
+                statement.setString(parameter++, input.mutationId)
+                statement.setObject(parameter++, input.writerDeviceId)
+                statement.setString(parameter++, input.ciphertextDigest)
+                statement.setString(parameter++, input.encodedObjectJson)
+            }
+            statement.setObject(parameter++, userId)
+            statement.setString(parameter++, workspaceId)
+            statement.setString(parameter, epochId)
+            statement.executeQuery().use { result ->
+                buildMap {
+                    while (result.next()) put(result.getString("mutation_id"), result.getLong("cursor"))
+                }.also { cursors ->
+                    check(cursors.size == inputs.size) { "Bulk object insert returned an incomplete cursor set." }
+                }
+            }
+        }
+    }
+
+    /** Inserts both durable cursor rows and their replay identities in one round trip. */
+    private fun insertChangesAndMutations(
+        connection: Connection,
+        userId: UUID,
+        workspaceId: String,
+        epochId: String,
+        inputs: List<SyncV2ObjectInput>,
+        cursors: Map<String, Long>,
+    ) {
+        if (inputs.isEmpty()) return
+        val rows = inputs.joinToString(",") { "(?::bigint, ?::uuid, ?, ?, ?, ?, ?)" }
+        val sql =
+            """
+            WITH inserted_changes AS (
+                INSERT INTO someday_sync_v2_changes(
+                    cursor, user_id, workspace_id, epoch_id, object_id, object_digest, mutation_id
+                ) VALUES $rows
+                RETURNING cursor, user_id, workspace_id, epoch_id, mutation_id, object_id, object_digest
+            )
+            INSERT INTO someday_sync_v2_mutations(
+                user_id, workspace_id, epoch_id, mutation_id, object_id, object_digest, cursor
+            )
+            SELECT user_id, workspace_id, epoch_id, mutation_id, object_id, object_digest, cursor
+            FROM inserted_changes
+            """.trimIndent()
+        connection.prepareStatement(sql).use { statement ->
+            var parameter = 1
+            inputs.forEach { input ->
+                statement.setLong(parameter++, checkNotNull(cursors[input.mutationId]))
+                statement.setObject(parameter++, userId)
+                statement.setString(parameter++, workspaceId)
+                statement.setString(parameter++, epochId)
+                statement.setString(parameter++, input.objectId)
+                statement.setString(parameter++, input.objectDigest)
+                statement.setString(parameter++, input.mutationId)
+            }
+            check(statement.executeUpdate() == inputs.size) {
+                "Bulk mutation insert returned an incomplete acknowledgement set."
             }
         }
     }

@@ -124,6 +124,7 @@ class AdminDashboardIntegrationTest {
         assertEquals(HttpStatusCode.OK, loginPage.status, loginPage.bodyAsText())
         assertEquals("no-store", loginPage.headers[HttpHeaders.CacheControl])
         assertEquals("DENY", loginPage.headers["X-Frame-Options"])
+        assertEquals("same-origin", loginPage.headers["Referrer-Policy"])
         assertTrue(loginPage.headers["Content-Security-Policy"].orEmpty().contains("frame-ancestors 'none'"))
 
         val browser = createClient {

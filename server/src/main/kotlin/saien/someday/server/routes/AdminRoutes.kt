@@ -177,7 +177,7 @@ private val AdminSecurityHeaders = createRouteScopedPlugin("AdminSecurityHeaders
     onCall { call ->
         call.response.headers.append(HttpHeaders.CacheControl, "no-store")
         call.response.headers.append("Content-Security-Policy", ADMIN_CONTENT_SECURITY_POLICY)
-        call.response.headers.append("Referrer-Policy", "no-referrer")
+        call.response.headers.append("Referrer-Policy", "same-origin")
         call.response.headers.append("X-Content-Type-Options", "nosniff")
         call.response.headers.append("X-Frame-Options", "DENY")
     }
