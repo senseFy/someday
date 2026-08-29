@@ -18,9 +18,9 @@ typing its full confirmation. For non-interactive use, run
 `make server-release-plan`, `make server-release-status`, or
 `make server-release-rehearse` with `SERVER_RELEASE_VERSION=X.Y.Z`.
 
-These entry points may inspect GitHub and run local tests or containers. They
-never create a tag, push, publish, change package visibility, or run a
-managed-storage gate.
+These entry points inspect GitHub and may run local tests or containers. Tag
+creation, pushes, publication, package visibility, and managed-storage gates
+remain separate maintainer actions.
 
 The maintainer environment is macOS, Linux, or WSL with Bash, Python 3, Git,
 GitHub CLI, JDK 21, Docker, and Docker Compose 2.20 or newer.
@@ -54,7 +54,7 @@ below.
 
 ## Managed evidence
 
-Named providers are release-verified only when both files exist, contain a
+Named providers are release-verified when both files exist, contain a
 passing result, and record the release commit:
 
 ```text
@@ -76,8 +76,8 @@ make server-release-rehearse SERVER_RELEASE_VERSION=X.Y.Z
 ```
 
 The rehearsal reuses the repository's existing checks and exercises both
-deployment topologies with a local image. It does not claim the CI-only
-AMD64/ARM64, Docker Engine 24, anonymous GHCR, or GitHub Release results.
+deployment topologies with a local image. CI later supplies AMD64/ARM64,
+Docker Engine 24, anonymous GHCR, and GitHub Release results.
 Inspect the final summary and rerun `status`; do not tag while it reports an
 action or failure.
 
@@ -88,7 +88,7 @@ tag. This is a manual gate; `status` does not infer it.
 
 ## Publish
 
-Publishing begins only with an explicit annotated tag and exact refspec push:
+To publish, create an annotated tag and push its exact refspec:
 
 ```bash
 VERSION=X.Y.Z
@@ -120,7 +120,7 @@ checks run inside that workflow; `status` does not query the registry itself.
 - Before pushing the tag, fix the issue, commit it, refresh commit-bound managed
   evidence, and rehearse again.
 - If validation fails before an image exists because the release workflow itself
-  is defective, fix the canonical workflow on `main`, wait for main CI on that
+  is defective, fix the workflow on `main`, wait for main CI on that
   workflow-fix commit, then resume the unchanged protected tag:
 
   ```bash

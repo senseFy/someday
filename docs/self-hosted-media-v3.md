@@ -3,7 +3,7 @@
 Status: implemented bounded-image wire, append-only storage, and
 filesystem/S3-compatible server backends.
 
-## Contract
+## Wire format
 
 Media V3 stores one immutable encrypted object per image at:
 
@@ -47,7 +47,7 @@ complete plaintext-envelope digest. AAD binds its own domain, `workspaceId`,
 `mediaId`, and envelope length. The transmitted bytes are the 24-byte nonce
 followed by XChaCha20-Poly1305 ciphertext and tag.
 
-Determinism exists only to make retry of the same immutable local original
+Deterministic encryption makes a retry of the same immutable local original
 byte-identical. The random workspace-scoped media ID prevents public
 cross-asset content equality disclosure.
 
@@ -72,9 +72,8 @@ There is no list, patch, chunk, manifest, draft, finalize, or delete endpoint.
 ## Storage and quota
 
 PostgreSQL stores bounded metadata and the configured blob store holds the
-ciphertext. The accepted server storage target defines exactly two blob
-backends: filesystem for the standalone topology and S3-compatible object
-storage for the recommended external topology.
+ciphertext. The server supports two blob backends: filesystem for standalone
+deployments and S3-compatible object storage for external deployments.
 
 A filesystem implementation may shard that logical identity internally. The
 current layout is:
@@ -98,15 +97,13 @@ metadata alone is not authoritative.
 Blob publication precedes the PostgreSQL metadata commit. A transaction
 failure may leave an invisible immutable orphan; an exact retry reuses that
 object, while different bytes at the same identity are always rejected. The
-first release neither deletes these orphans nor gives the application a
-runtime object-deletion requirement. This avoids a distributed transaction or
-compensation state machine.
+current server leaves these orphans in place and does not delete objects at
+runtime.
 
-Quota is checked atomically per account across all workspaces. It counts
-PostgreSQL-indexed published ciphertext bytes only; there are no draft
-reservations. A safe orphan consumes backend capacity without counting against
-published account quota. Published objects are not garbage-collected in the
-initial release.
+Quota is checked atomically per account across all workspaces and counts
+PostgreSQL-indexed published ciphertext bytes. A safe orphan consumes backend
+capacity without counting against published account quota. Published objects
+are not currently garbage-collected.
 
 ## Client publication proof
 
@@ -126,10 +123,10 @@ atomically promote bytes into app-private storage.
 
 ## Supported content and backup
 
-Only static JPEG, PNG, and WebP are accepted. SVG, animation, video, general
+Supported content is static JPEG, PNG, and WebP. SVG, animation, video, general
 attachments, and automatic URL fetching are unsupported.
 
-Portable JSON export/restore does not contain media bytes in this release.
+Portable JSON export and restore do not contain media bytes.
 Self-hosted operators must protect PostgreSQL and the configured blob store as
 one logical recovery unit. Standalone uses coordinated database and off-host
 directory backups. The recommended external topology uses PostgreSQL recovery

@@ -1,27 +1,25 @@
-# Someday Self-Hosted System V3
+# Someday Self-Hosted Sync (System V3)
 
-Status: pre-release implementation contract.
+Status: implemented.
 
-System V3 is Someday's only product-facing synchronization architecture. It
-has one remote type, `self-hosted`, and two data planes under one authenticated
-account and workspace scope:
+System V3 synchronizes a workspace through one self-hosted server. It has two
+data planes under one authenticated account and workspace scope:
 
 - an encrypted entity DAG for notes, notebooks, and synchronized preferences;
 - one immutable encrypted media object for each supported image.
 
-## 1. Architecture boundary
+## 1. Architecture
 
 The client owns all semantic state and cryptography. The server authenticates
 accounts and devices, applies bounded immutable-object and compare-and-set
 rules, and stores opaque ciphertext. It never receives workspace keys, note
 content, image metadata, or image bytes in plaintext.
 
-The accepted server persistence target defines two topologies. Standalone uses
+Server persistence has two topologies. Standalone uses
 PostgreSQL and a filesystem media volume; the recommended production topology
 uses external PostgreSQL and private S3-compatible object storage so the
-application container holds no durable user data. These are deployment choices
-behind the same server API, never client-selectable sync providers. Both are
-implemented by the same server image. The normative storage decision is in
+application container holds no durable user data. Both use the same server API
+and image; clients do not select the storage backend. Storage details are in
 `server-storage-architecture.md`.
 
 The public API is rooted at:
@@ -33,18 +31,15 @@ GET  /sync/v3/capabilities
 ```
 
 `workspaceId` is a canonical `workspace-` prefix followed by 32 lowercase hex
-characters. It is generated locally with the workspace key metadata. It is a
-real server storage and authorization scope, not an epoch identifier or a
-reserved placeholder.
+characters. It is generated locally with the workspace key metadata and forms
+a server storage and authorization scope.
 
 The current clients expose one active local workspace. The protocol and server
-schema use `(account, workspaceId)` throughout so adding a workspace selector
-later does not require another wire or storage migration. Account quotas still
-apply across all workspaces owned by that account.
+schema scope records by `(account, workspaceId)`, and account quotas apply
+across all workspaces owned by that account.
 
-The entity wire format retains the frozen `someday-system-v2` identifiers.
-Those identifiers describe the independently versioned DAG engine; they are
-not a second product protocol or a user-selectable mode.
+The entity wire format uses the `someday-system-v2` descriptor for the
+independently versioned DAG engine within System V3.
 
 ## 2. Identity and authority
 
@@ -68,8 +63,8 @@ another UUID.
 After first publication, the client persists the exact account, workspace, and
 writer binding. Entity publication, media access, setup reuse, and pairing all
 fail before network mutation if the current session does not match it. Server
-session/device-token revocation remains supported. Master-key rotation and
-cryptographic device revocation are deliberately outside the first release.
+session and device-token revocation are supported. Master-key rotation and
+cryptographic device revocation are not currently supported.
 
 An expired or missing refresh session does not strand the workspace. Explicit
 setup may authenticate again only at the bound endpoint, must recover the same
@@ -81,12 +76,13 @@ stable non-revoked writer UUID. A revoked device remains revoked.
 Creating a local workspace also creates its healthy local draft generation.
 The entity DAG is the product source of truth from the first offline edit,
 before login and before a server endpoint is configured. `SyncMode.Off` pauses
-network work only; it does not switch repositories or data models.
+network work while local changes continue through the same repositories and
+data model.
 
 Product code reads and writes notes, notebooks, deletions, and synchronized
 preferences through typed DAG repositories. A durable outbox records remote
 work in the same local transaction as each mutation. UI and platform workers
-must not write projection or compatibility tables directly.
+do not write protocol or projection tables directly.
 
 Authentication does not choose a workspace. An unbound local draft is not
 eligible for launch, foreground, or local-change automatic sync, so signing in
@@ -105,7 +101,7 @@ the local generation, automatic sync may run and retry normally.
 
 ## 4. Entity DAG
 
-The closed entity set is:
+The synchronized entity types are:
 
 - `note`
 - `notebook`
@@ -113,16 +109,13 @@ The closed entity set is:
 
 Versions are immutable and causally linked. Object identity, canonical
 encoding, encryption, conflict materialization, the transactional outbox,
-cursor progress, checkpoint bootstrap, and a durable fail-closed dead-letter
+cursor progress, checkpoint bootstrap, and a durable blocking dead-letter
 state remain core invariants.
 
-The first release has one generation for a workspace. It does not expose
-rollover, prior-generation retention, repair replicas, quarantine workflows,
-remote migration, or user-triggered protocol recovery. Authenticated corrupt
-or incompatible input blocks synchronization with bounded diagnostics; an
-operator restores server storage from backup rather than asking clients to
-invent replacement ciphertext. The server does not prune entity history or
-signal an offline-window rebootstrap in this release.
+The current protocol supports one generation and retains entity history.
+Authenticated corrupt or incompatible input blocks synchronization with
+bounded diagnostics; recovery restores server storage from backup instead of
+creating replacement ciphertext on a client.
 
 ## 5. Image model
 
@@ -136,7 +129,7 @@ Markdown owns placement and alt text. The image asset is immutable; replacing
 an image creates another asset ID. Binary data is never embedded in entity
 versions.
 
-The initial image surface is intentionally closed:
+The image surface supports:
 
 - static JPEG, PNG, and WebP detected from bytes;
 - at most 4 MiB of encoded original data;
@@ -144,10 +137,8 @@ The initial image surface is intentionally closed:
 - original bytes preserved in app-private storage;
 - no SVG, animation, video, general files, or remote-URL fetching.
 
-Each image is encrypted into one bounded object. There are no media chunks,
-manifests, upload drafts, reservations, resumable-upload journals, or media
-repair state machines. A whole-object retry is acceptable at the 4 MiB bound
-and is substantially easier to reason about.
+Each image is encrypted into one bounded object. At the 4 MiB limit, a retry
+resends the whole object.
 
 The encrypted envelope authenticates the media ID, workspace ID, media type,
 optional safe filename, dimensions, plaintext size, and plaintext digest.
@@ -162,8 +153,8 @@ requires operator restoration; the application never overwrites it.
 
 Media storage uses conditional immutable creation. Blob durability precedes
 the PostgreSQL metadata commit; a database failure may leave an invisible
-orphan that an exact replay reuses. The first release does not require runtime
-blob deletion, provider failover, or a distributed compensation state machine.
+orphan that an exact replay reuses. The current server does not delete blobs or
+switch storage providers at runtime.
 A storage collision is an exact replay only after the server has bounded-read
 and hashed the actual existing bytes; provider metadata alone is insufficient.
 
@@ -212,11 +203,11 @@ they are never merged.
 
 Synchronization is not backup.
 
-For this release, the user-facing portable export and restore cover structured
-workspace data only. The export declares `includesMediaBytes=false`; Markdown
+The current portable export and restore cover structured workspace data but
+not image bytes. The export declares `includesMediaBytes=false`; Markdown
 asset references may remain, but image bytes are not included and restored
-references may therefore be unresolved. A complete portable media archive is
-a separate future feature, not an implicit extension of JSON export.
+references may therefore be unresolved. A complete portable media archive
+would require a separate export format.
 
 An operator backup of a self-hosted deployment is different: PostgreSQL and
 the configured media blob store form one logical recovery unit. Either half
@@ -229,23 +220,23 @@ digest; operators either quiesce writes for capture or run the operator
 integrity validator afterward. The stable JWT secret is backed up separately.
 The operational procedure is defined in `server-backup-and-recovery.md`.
 
-The initial server does not garbage-collect published media. Local previews
+The current server does not garbage-collect published media. Local previews
 are disposable caches; original bytes are retained unless a separately proven
 remote copy exists.
 
-## 9. Evolution rules
+## 9. Evolution
 
-The architecture leaves narrow seams, not generic plugin systems:
+Supported extension points are:
 
 - more local workspaces can be exposed using the existing `workspaceId` scope;
 - target server media storage is limited to filesystem and S3-compatible
   adapters; it does not expose vendor-specific providers to clients;
-- a larger-file protocol may later add resumable objects under a new media
-  contract without changing the bounded-image contract;
+- larger files would require a versioned media format separate from the current
+  bounded-image format;
 - complete media export and authenticated reachability-based deletion require
   explicit new formats;
-- master-key rotation requires a designed media re-encryption migration and is
-  not approximated by a hidden entity-only operation.
+- master-key rotation requires a workspace-wide migration that includes media
+  re-encryption.
 
 Protocol changes require canonical crypto vectors, immutable replay and
 tamper tests, offline/restart tests, two-workspace isolation tests, media-before-
@@ -253,6 +244,6 @@ entity ordering tests, platform compilation, and real PostgreSQL integration.
 Static checks enforce architectural boundaries; they must not substitute for
 behavioral tests or hard-code a brittle list of test method names.
 
-The ownership of those checks across protocol, persistence, server-contract,
-and real self-hosted journey layers is defined in
+Test responsibilities across protocol, persistence, server, and real
+self-hosted journey layers are defined in
 `sync-system-v3-test-strategy.md`.

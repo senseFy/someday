@@ -1,15 +1,15 @@
 # Workspace Pairing Protocol
 
-Status: implementation and interoperability contract.
+Status: implemented interoperability specification.
 
 This protocol gives one additional device a workspace master key without
 revealing that key to the self-hosted service. The user transfers one
 high-entropy capability by QR code or manual entry. The capability is
 single-use, expires after at most ten minutes, and is never written to logs.
 
-There is one pairing protocol. Implementations must not accept a shorter
-numeric token, probe an alternate remote path, or derive lookup identifiers
-with a fast enumerable hash.
+Implementations accept the complete token format below. Short numeric tokens,
+alternate remote paths, and lookup identifiers derived with a fast enumerable
+hash are invalid.
 
 ## 1. Security boundary
 
@@ -126,7 +126,7 @@ creation and before an invite request.
 
 A joining installation claims with its own registered device session. Successful
 local replacement binds that stable installation device id as the new DAG writer.
-The writer id and workspace id are deliberately not part of envelope AAD:
+The writer id and workspace id are not part of envelope AAD because the
 inviter and joiner have different device ids, and the authenticated encrypted
 payload already carries the exact workspace id being joined.
 
@@ -221,8 +221,8 @@ workspace package itself. Completion is attempted after every successful
 claim even when validation or local replacement fails, preserving single-use
 behavior. Pairing uses the same serialized access-token refresh executor as
 normal self-hosted sync. Creation requires the inviter's active publication
-binding. Claiming on a fresh installation is intentionally possible before a
-local publication binding exists.
+binding. A fresh installation may claim before it has a local publication
+binding.
 
 ## 7. Local workspace replacement
 
@@ -271,10 +271,9 @@ discarded workspace.
 - English, Simplified Chinese, Japanese, and Korean use the same pairing
   semantics.
 
-There is no feature activation switch for the local DAG. It is the product
-data model from workspace creation onward, including while network sync is
-off. Pairing is available only with a valid self-hosted session and, for the
-inviter, an active published workspace.
+The local DAG is the product data model from workspace creation onward,
+including while network sync is off. Pairing requires a valid self-hosted
+session and, for the inviter, an active published workspace.
 
 ## 9. Required evidence
 

@@ -11,8 +11,8 @@ license that covers the project.
 
 ## Development setup
 
-See [README.md](README.md) for toolchain requirements, `make setup`, local
-service ports, and common build targets.
+See [Development](docs/development.md) for toolchain requirements, local
+service ports, application runners, and validation targets.
 
 Typical loop:
 
@@ -23,15 +23,16 @@ make compile
 make check
 ```
 
-`make check` is hermetic: it must not require localhost services, network
-accounts, or developer credentials. The Docker-backed System V3 release gate is
-explicit and separate:
+`make check` runs without local services, network accounts, or developer
+credentials. Run the Docker-backed System V3 release gate separately:
 
 ```bash
 make sync-v3-gate
 ```
 
-Platform-specific smoke and packaging targets are documented in the README.
+Platform-specific smoke targets are documented in
+[Development](docs/development.md). Signing and store publication are in
+[Client release](docs/client-release.md).
 
 ## Engineering rules
 
@@ -46,12 +47,11 @@ Important defaults:
   storage I/O. Controllers own dispatcher boundaries for suspend IO.
 - Protocol changes must update the matching `docs/` specification in the same
   change and include tests where the gate docs require them.
-- Synchronization tests follow `docs/sync-system-v3-test-strategy.md`: prove an
-  invariant at its lowest owning layer, keep real E2E journeys few and complete,
-  and use explicit fixtures rather than a scenario DSL.
-- Dependency verification metadata, Gradle wrapper checksums, pinned CI action
-  SHAs, and container digests are security-sensitive review surfaces. Never
-  regenerate or weaken them without reviewing the exact dependency update.
+- Synchronization tests follow `docs/sync-system-v3-test-strategy.md`: test each
+  behavior at the lowest useful layer, keep end-to-end journeys few and
+  complete, and use focused fixtures rather than a scenario DSL.
+- Carefully review changes to dependency verification metadata, Gradle wrapper
+  checksums, pinned CI action SHAs, and container digests.
 
 ## Pull requests
 
@@ -61,8 +61,7 @@ Important defaults:
   and migrations.
 - Do not commit secrets, signing keys, App Store Connect credentials, keystores,
   local `.env` files, device databases, or personal notes data.
-- Do not reintroduce private operator runbooks under `.factory/` or similar
-  ignored paths.
+- Keep private operator runbooks outside the repository.
 - Follow the project [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Server releases
@@ -73,19 +72,5 @@ Open the maintainer workflow from the repository root:
 make server-release
 ```
 
-The terminal assistant delegates planning, status, and rehearsal to the release
-controller. Publication remains an explicit maintainer action. See
-[Server release](docs/server-release.md).
-
-## Scope notes
-
-- Sync is the single self-hosted **System V3** contract: the internal entity
-  DAG plus one immutable encrypted object per media asset. The canonical route
-  roots are `/sync/v3/workspaces/{workspaceId}/entities` and
-  `/sync/v3/workspaces/{workspaceId}/media`. See
-  `docs/sync-system-v3-spec.md`.
-- Static JPEG, PNG, and WebP originals are supported up to 4 MiB and 12MP.
-  General files, SVG, animation, video, and map SDKs remain outside the initial
-  product scope.
-- Portable export/restore intentionally omits image bytes. Self-hosted operator
-  recovery must preserve PostgreSQL and the configured media store together.
+The menu provides planning, status, and rehearsal commands. A maintainer creates
+and pushes the release tag. See [Server release](docs/server-release.md).

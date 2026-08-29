@@ -1,7 +1,7 @@
 # Managed storage profile gates
 
 These maintainer gates validate named services against Someday's PostgreSQL
-and S3 contracts. They require JDK 21 and retain evidence under
+and S3 requirements. They require JDK 21 and retain evidence under
 `build/managed-storage-profile-gate/`. A profile passes only when its current
 `result.json` records the repository commit and source/restore resource names.
 The gate does not write this file for a dirty worktree.
@@ -66,7 +66,7 @@ export SOMEDAY_R2_RESET_TARGETS='<ACCOUNT_ID>/<source-bucket>,<ACCOUNT_ID>/<rest
 scripts/managed-storage-profile-gate r2
 ```
 
-The Cloudflare token is used only to inspect bucket configuration. The two S3
+The Cloudflare token inspects bucket configuration. The two S3
 tokens exercise object access. The gate copies source R2 data to the explicit
 off-provider directory as ordinary files plus a manifest of SHA-256 digests,
 byte counts, and relative keys. Restore verifies that manifest and reapplies the
@@ -74,6 +74,5 @@ canonical ciphertext SHA-256 metadata to each object. The gate also proves
 cross-bucket read and write access is denied, tests Bucket Lock, restores into
 the second bucket, and compares it again after paired-client recovery checks.
 
-A profile is release-verified only when its live gate has retained passing
-evidence. Missing credentials or dedicated resources are reported as an
-unverified external dependency, not a passing result.
+A profile is release-verified when its live gate retains passing evidence.
+Missing credentials or dedicated resources leave the profile unverified.

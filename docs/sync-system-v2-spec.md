@@ -1,19 +1,17 @@
-# Entity DAG V2 Subsystem Contract
+# Entity DAG V2 Subsystem
 
-Status: frozen internal wire contract embedded in System V3.
+Status: frozen internal wire format used by System V3.
 
 The `someday-system-v2` identifiers name Someday's independently versioned
-entity-DAG encoding and merge engine. They do not name a selectable product
-mode, remote provider, release switch, or second synchronization architecture.
-The only public deployment profile is System V3 self-hosting at:
+entity-DAG encoding and merge engine. System V3 exposes that subsystem at:
 
 ```text
 /sync/v3/workspaces/{workspaceId}/entities
 ```
 
-## 1. Product boundary
+## 1. Synchronized data
 
-The closed synchronized entity set is:
+The synchronized entity types are:
 
 - `note`;
 - `notebook`;
@@ -25,15 +23,15 @@ title, sort order, and creation time. Synchronized preferences contain theme,
 preview-by-default, Markdown-toolbar visibility, and default notebook id.
 
 Credentials, endpoints, sessions, device-local settings, workspace keys,
-recovery material, and navigation state never enter the entity graph. Image
-bytes use the sibling V3 media plane. Notes refer to immutable images only by
+recovery material, and navigation state remain outside the entity graph. Image
+bytes use the sibling V3 media plane. Notes refer to immutable images by
 `someday-asset://` URI in Markdown.
 
 ## 2. Frozen wire identity
 
 | Item | Value |
 | --- | --- |
-| Subsystem contract | `someday-system-v2` |
+| Subsystem ID | `someday-system-v2` |
 | Entity schema set | `workspace-entity-schema-set-v2` |
 | Semantic protocol | `2` |
 | Minimum writer protocol | `2` |
@@ -48,17 +46,16 @@ excessive bounds, and any mismatch between authenticated metadata and decoded
 plaintext. Golden canonical and key-derivation vectors make a wire change
 explicit.
 
-`workspaceId` is supplied by the System V3 path and is part of server storage
-scope. It is not duplicated inside strict entity request bodies and is not an
-epoch alias.
+`workspaceId` is supplied by the System V3 path, forms part of the server
+storage scope, and is omitted from entity request bodies.
 
 ## 3. One local source of truth
 
 Creating a workspace also creates one healthy local `PREPARING` generation.
 Notes, notebooks, deletions, and synchronized preferences use the DAG-backed
 repositories from the first offline mutation. Turning network synchronization
-off pauses transport only; it does not switch product repositories or copy
-data between tables.
+off pauses transport while local changes continue through the same repositories
+and tables.
 
 A local mutation commits atomically:
 
@@ -68,14 +65,13 @@ A local mutation commits atomically:
 4. one durable pending transport mutation.
 
 A pulled cursor unit commits the same semantic effects, replay identity, and
-cursor advancement in one transaction. A projection is rebuildable output,
-never a second authority. Product and UI code cannot write protocol tables or
-projection rows directly.
+cursor advancement in one transaction. The DAG is authoritative; projections
+are rebuildable views. Product and UI code write through typed repositories
+rather than protocol tables or projection rows.
 
 Portable structured export reads this same DAG product view. Import creates
-normal DAG mutations in the selected writable local generation; it does not
-revive a pre-DAG compatibility data plane. Media bytes are excluded from the
-current portable format.
+normal DAG mutations in the selected writable local generation. Media bytes
+are excluded from the current portable format.
 
 ## 4. Entity causality and conflicts
 
@@ -122,10 +118,10 @@ must exist before its manifest or pointer becomes visible. When selected
 versions reference media, the System V3 publication boundary first proves or
 uploads each immutable media object in the same account and workspace.
 
-The initial release has no generation rollover. Initial pointer CAS requires
-all predecessor and retention fields to be absent. The frozen descriptor may
-retain nullable fields for decoder compatibility, but clients and the server
-reject non-null lineage rather than implementing history.
+The current protocol supports one generation. Initial pointer CAS requires all
+predecessor and retention fields to be absent. The descriptor retains nullable
+fields for decoder compatibility, but clients and the server reject non-null
+lineage.
 
 ## 6. Normal synchronization
 
@@ -149,8 +145,8 @@ An immutable-object identifier may be replayed only with its exact encrypted
 outer bytes. Authenticated malformed data, a different value at an existing
 identity, a cursor gap, missing checkpoint data, or an incompatible pointer is
 recorded as bounded durable failure evidence and leaves synchronization
-`BLOCKED`. There is no replica selection, repair endpoint, quarantine workflow,
-or client-authored replacement ciphertext.
+`BLOCKED`. Recovery uses a valid operator backup; clients do not synthesize
+replacement ciphertext.
 
 ## 7. Server storage contract
 
@@ -193,10 +189,9 @@ failure before commit preserves the old workspace. After commit, unreferenced
 media files are removed on a best-effort basis. The old workspace and its
 media remain on its server.
 
-Master-key rotation and cryptographic device revocation are not first-release
-features. Server device/session token revocation remains supported. Adding key
-rotation later requires an explicit whole-workspace design that also migrates
-media encryption; it must not appear as an entity-only lifecycle patch.
+Master-key rotation and cryptographic device revocation are not currently
+supported. Server device/session token revocation is supported. Future key
+rotation requires a whole-workspace design that also migrates media encryption.
 
 ## 9. Required evidence
 
@@ -215,5 +210,5 @@ host-specific product acceptance gates. Together they verify:
   and end-to-end self-hosted behavior.
 
 The gates require fresh passing suites for each target and architecture-level
-contract assertions. It intentionally does not pin individual test method
-names, so ordinary test refactoring does not rewrite the acceptance contract.
+assertions. They do not pin individual test method names, so ordinary test
+refactoring does not rewrite the acceptance criteria.

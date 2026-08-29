@@ -34,22 +34,22 @@ reasonable window for assessment and fix before any public disclosure.
 
 ## Secrets and local data
 
-- Never commit API keys, `.p8` files, keystores, passwords, recovery phrases, or
-  production credentials.
+- Keep API keys, `.p8` files, keystores, passwords, recovery phrases, and
+  production credentials out of the repository.
 - Do not attach real user databases, crash logs with personal content, or device
   exports to public issues unless you have stripped personal data.
-- Signing and store-publishing credentials stay outside the repository (see
-  README and local environment variables).
+- Signing and store-publishing credentials stay outside the repository; see
+  [Client release](docs/client-release.md).
 
-## Scope notes
+## Security scope and deployment
 
 - The self-hosted server stores note and image payloads as client ciphertext;
   server bugs that break auth, account/workspace isolation, quota enforcement,
   or transport integrity are still in scope. Media quota is a per-account total
   across all workspaces.
 - `compose.yaml` and the server's `local` mode are development surfaces. A
-  public deployment must use the fail-closed `production` contract, HTTPS, and
-  private database networking documented in
+  public deployment uses `production` mode, HTTPS, and the database security
+  settings documented in
   [`docs/self-hosting.md`](docs/self-hosting.md).
 - Workspace pairing uses a one-use 128-bit capability and an end-to-end
   encrypted invitation. Treat a pairing QR or manual token as a temporary

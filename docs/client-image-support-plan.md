@@ -16,13 +16,13 @@ Complete client image support means that a user can:
    see the same authenticated immutable asset; and
 6. understand and retry supported failure cases without inspecting logs.
 
-This is a client-completion project. System V3 already defines and implements
-the encrypted media object, media-before-entity publication order, lazy
-materialization, storage bounds, and self-hosted server persistence.
+The server and synchronization layers already provide encrypted media objects,
+media-before-note publication, lazy downloads, storage bounds, and remote
+persistence. This work completes the client experience around them.
 
-## 2. Fixed product contract
+## 2. Supported behavior
 
-The implementation must preserve these existing decisions:
+The client supports:
 
 - selected static JPEG, PNG, and WebP sources only;
 - at most 32 MiB and 200,000,000 declared pixels for a selected source;
@@ -42,14 +42,13 @@ The implementation must preserve these existing decisions:
 - portable export and restore continue to omit image bytes.
 
 Removing a Markdown reference does not delete the local or remote object.
-Published media remains append-only in this release. An image imported into an
-abandoned note may remain as a harmless local immutable asset; this plan does
-not add a draft-media or garbage-collection state machine.
+Published media is currently append-only. An image imported into an abandoned
+note may remain as a harmless local immutable asset.
 
-The 32 MiB source limit is an acquisition and memory-safety bound, not part of
-System V3. The existing 4 MiB limit remains the media protocol bound. A source
-that cannot be reduced to that bound without violating the quality rules in
-section 6.5 is rejected before an asset or Markdown reference is created.
+The 32 MiB source limit protects image acquisition and memory use. The protocol
+stores at most 4 MiB per image. A source that cannot be reduced to that bound
+without violating the quality rules in section 6.5 is rejected before an asset
+or Markdown reference is created.
 
 ## 3. Baseline and implementation result
 
@@ -60,14 +59,11 @@ section 6.5 is rejected before an asset or Markdown reference is created.
 | Editor action | Implemented as an image toolbar action | Kept one action, with silent success/cancellation and actionable failure feedback |
 | Local preview | Implemented from verified immutable asset bytes | Consolidated the verified bounded read under the workspace lifecycle lock |
 | Missing-image UI | Implemented with explicit user-requested materialization | Added local-read retry while preserving explicit materialization |
-| Android acquisition | Implemented with a document picker | Uses the single-image Photo Picker contract and its AndroidX fallback |
+| Android acquisition | Implemented with a document picker | Uses the AndroidX single-image Photo Picker and its platform fallback |
 | iOS acquisition | Implemented with a document picker | Uses the single-image Photos picker with a compatible representation |
 | Desktop acquisition | Implemented with a native file dialog | Retained the chooser and extracted its media adapter from the entry point |
 | Cross-device media sync | Implemented and covered by the real self-hosted journey | Wire and server behavior remain unchanged; real-client UI acceptance is pending |
 | UI behavior tests | Parser and controller tests exist | Extended controller tests and added focused Compose preview, download, retry, and remote-URL tests |
-
-The result completes the existing vertical slice without introducing another
-media abstraction or protocol.
 
 ## 4. Scope
 
@@ -104,9 +100,8 @@ media abstraction or protocol.
 - image bytes in portable backup/restore; and
 - local reachability GC or remote object deletion.
 
-These are separate capabilities. None is required to complete the bounded-image
-vertical slice, and each can be added later through existing picker, preview,
-or protocol seams.
+These capabilities can be added separately through the existing picker,
+preview, or protocol boundaries.
 
 ## 5. User flows
 
@@ -161,7 +156,7 @@ Unsupported destination -> Static placeholder, no network request
 
 ## 6. Client architecture
 
-### 6.1 Keep the existing boundaries
+### 6.1 Responsibilities
 
 - `shared:domain` owns canonical asset identity, URI parsing, and fixed limits.
 - `shared:data` owns bounded source staging, inspection, normalization policy,
@@ -170,8 +165,8 @@ Unsupported destination -> Static placeholder, no network request
 - `shared:ui` owns picker/preview ports and user-visible state.
 - platform applications own native picker presentation and platform decoding.
 
-Do not add a media repository beside `LocalMediaAssetStore`, a provider plugin
-system, or a UI-owned copy of media persistence state.
+`LocalMediaAssetStore` remains the media persistence boundary; UI state does not
+duplicate durable media state.
 
 ### 6.2 One coordinated preview read
 
@@ -220,7 +215,7 @@ diagnostics.
 
 ### 6.4 Platform acquisition
 
-- Android uses the system single-image Photo Picker. The AndroidX contract may
+- Android uses the system single-image Photo Picker. The AndroidX API may
   fall back to the platform document picker on unsupported devices. Someday
   copies the returned stream immediately into app-private storage and does not
   retain a content URI.
@@ -262,9 +257,9 @@ never allocate a source-sized bitmap merely to reduce it. It decodes directly
 toward the 12 MP target using the platform sampling APIs. Temporary source and
 candidate files are removed after success, cancellation, or failure.
 
-The source-only pixel bound must be a separate constant and inspection mode.
-Do not widen `MAX_MEDIA_ASSET_PIXEL_COUNT`: stored metadata, previews, sync
-manifests, and the server contract remain limited to 12 MP.
+The source pixel bound uses a separate constant and inspection mode.
+`MAX_MEDIA_ASSET_PIXEL_COUNT` continues to limit stored metadata, previews,
+sync manifests, and server validation to 12 MP.
 
 Normalization uses these fixed rules:
 
@@ -310,11 +305,9 @@ Android applies EXIF orientation explicitly where the platform decoder does not.
 Before release, the maximum accepted fixtures must preview without an
 out-of-memory failure on the target Android device, iOS simulator/device, and
 macOS client. If the full decode cannot meet that acceptance criterion,
-implement sampled platform decoding behind the existing `MediaPreviewLoader`;
-do not change the stored asset, media identity, or wire limit.
-
-This keeps thumbnail complexity evidence-driven and confined to the existing
-preview seam.
+implement sampled platform decoding behind the existing `MediaPreviewLoader`.
+Preview sampling does not change the stored asset, media identity, or wire
+limit.
 
 ## 7. Implementation work packages
 
@@ -363,16 +356,15 @@ Primary files:
 
 ### D. Tests and acceptance
 
-- Add the cases in section 8 at the lowest layer that proves each contract.
+- Add the cases in section 8 at the lowest layer that proves each behavior.
 - Run the real self-hosted image journey and both System V3 release gates.
 - Complete the real-client acceptance matrix before calling the work done.
 
 ### E. Documentation and release
 
 - Update README client image status only after the acceptance matrix passes.
-- Update `docs/sync-system-v3-spec.md` or `docs/self-hosted-media-v3.md` only if
-  implementation discovers a semantic mismatch; UI refactoring alone must not
-  churn the frozen wire contract.
+- Update `docs/sync-system-v3-spec.md` or `docs/self-hosted-media-v3.md` if the
+  implementation changes wire behavior.
 - Release this as a client change. `server-v0.1.0` remains compatible unless a
   separate server or protocol defect is found.
 
@@ -487,7 +479,5 @@ The client image project is complete when:
 - failures are typed, localized, retryable where appropriate, and do not leak
   sensitive input;
 - the real-client matrix and System V3 gates pass without skips;
-- no server or protocol change was introduced accidentally; and
-- the implementation remains the existing bounded immutable-image model,
-  without draft uploads, generic attachment infrastructure, or a second media
-  state machine.
+- server and protocol behavior remain compatible; and
+- the implementation uses the bounded immutable-image model described here.

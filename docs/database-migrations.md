@@ -5,30 +5,26 @@ Someday has two database surfaces:
 - Client local data uses SQLDelight in `shared:data`.
 - The self-hosted server uses Flyway migrations under `server`.
 
-Both surfaces must evolve through versioned migrations. Platform entry points and feature repositories must not recreate, mutate, or inspect schema versions themselves.
+Both surfaces evolve through versioned migrations. Platform entry points and
+feature repositories leave schema management to SQLDelight or Flyway.
 
 ## Client Local Database
 
 The local schema is owned by SQLDelight files under `shared/data/src/commonMain/sqldelight/saien/someday/data/local/db`.
 
-The pre-release repository currently has one squashed System V3 snapshot,
-`databases/1.db`, and no `.sqm` files. Existing development installations must
-clear local app data when adopting this baseline. After the first public
-release, schema history is immutable and every change starts the normal
-numbered migration sequence described below.
+The client currently has one squashed System V3 snapshot, `databases/1.db`, and
+no `.sqm` files. Development installations created before this baseline must
+clear local app data. Once a client release ships the snapshot, later changes
+use numbered migrations and retain its history.
 
-Notes, notebooks, deletions, and synchronized workspace preferences have one
-durable local truth: `workspace_entity_versions_v2` plus its parent/head and
-typed projection tables. There are intentionally no parallel `notes`,
-`notebooks`, `note_versions`, `tombstones`, `locations`, or `sync_metadata`
-tables. The small data-layer repository owns only device-local settings,
-installation/workspace metadata, and the database handle used by the typed DAG
-store.
+`workspace_entity_versions_v2`, its parent/head tables, and typed projections
+store notes, notebooks, deletions, and synchronized workspace preferences.
+Device-local settings and installation metadata stay in their dedicated
+tables.
 
-The first-release sync lifecycle persists only one generation's checkpoint,
-control objects, entity DAG, outbox/cursors, portable source-import mappings,
-and unresolved remote evidence. It intentionally has no durable transport-unit
-packing table or restored-backup reconciliation flag. Checkpoint states are
+The current sync lifecycle persists one generation's checkpoint, control
+objects, entity DAG, outbox/cursors, portable source-import mappings, and
+unresolved remote evidence. Checkpoint states are
 `preparing`, `published`, and `active`; control-object states are `prepared`,
 `published`, and `active`; portable source imports are `committed` or
 `published`.
@@ -37,7 +33,7 @@ The squashed client media table records publication evidence atomically as
 `published_authority_binding_id`, `published_workspace_id`, and
 `published_object_digest`. All three are absent or present together. Evidence
 is valid only for that authenticated account and workspace; switching either
-scope makes the asset pending there without introducing another state machine.
+scope makes the asset pending there.
 The same schema enforces the initial 4 MiB encoded-image and 12,000,000-pixel
 bounds.
 
@@ -64,10 +60,9 @@ The first server release supports PostgreSQL 17. Both the normal server and
 future migration, and check the exact Someday RLS table/policy catalog before
 serving or mutating data.
 
-This pre-release branch rewrites unpublished sync migration history around the
-System V3 server schema. Existing development server databases carrying the
-earlier history must be recreated before running this branch. After the first
-public release, the retained Flyway history is immutable.
+The published server migration history through V8 is immutable. Development
+databases created from earlier unpublished migrations must be recreated rather
+than patched.
 
 Entity workspace registry/data and media metadata use forced PostgreSQL RLS
 bound to both `someday.user_id` and `someday.workspace_id`. Repositories still
@@ -99,10 +94,10 @@ When changing server tables, columns, indexes, or constraints:
 
 Keep tenant-row DML and any RLS wildcard it requires inside the same
 transactional migration. A non-transactional migration must not modify tenant
-rows. Verify its result with the non-empty previous-release upgrade gate; a
-partial SQL parser is not an acceptance test.
+rows. Verify the result with the non-empty previous-release upgrade gate.
 
-Flyway is the only server schema evolution path. Application startup and request handling should not patch database shape.
+Use Flyway for every server schema change. Application startup and request
+handling do not patch database shape.
 
 ## Enforcement
 

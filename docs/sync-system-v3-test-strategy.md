@@ -1,10 +1,10 @@
 # System V3 Test Strategy
 
-Status: implemented first-release verification contract.
+Status: implemented.
 
-The synchronization suite proves protocol invariants and recovery behavior. It
-does not optimize for a line-coverage percentage, duplicate the same cases at
-every layer, or build a second workflow engine inside test code.
+The synchronization suite proves protocol invariants and recovery behavior at
+the lowest useful layer. End-to-end tests cover a small number of complete user
+journeys.
 
 ## 1. Four test layers
 
@@ -12,7 +12,7 @@ every layer, or build a second workflow engine inside test code.
 
 Location: `shared/sync/src/commonTest`.
 
-This layer owns canonical encoding, cryptographic vectors, schema and size
+This layer covers canonical encoding, cryptographic vectors, schema and size
 bounds, DAG validation, deterministic merge, conflict semantics, and media
 envelope authentication. It is deterministic, has no database or network, and
 runs on every supported Kotlin target.
@@ -20,11 +20,11 @@ runs on every supported Kotlin target.
 All field-level merge combinations belong here. Higher layers prove that the
 real composition reaches this model; they do not repeat its full matrix.
 
-### Local persistence contract
+### Local persistence
 
 Location: `shared/sync/src/jvmTest` and `shared/data/src/jvmTest`.
 
-This layer owns SQLite transaction boundaries, the durable outbox, cursor
+This layer covers SQLite transaction boundaries, the durable outbox, cursor
 advancement, checkpoint resumption, dead-letter evidence, app-private media
 promotion, and restart recovery. Tests use file-backed SQLite when reopen is
 part of the invariant and inject a failure at an explicit durable boundary.
@@ -35,19 +35,19 @@ The standard shape is:
 arrange durable state -> inject one failure -> close/reopen -> retry -> assert invariant
 ```
 
-### Server contract
+### Server
 
 Location: `server/src/test`, `server/src/integrationTest`, and
 `server/src/s3IntegrationTest`.
 
-This layer owns HTTP validation, authentication, device revocation,
+This layer covers HTTP validation, authentication, device revocation,
 account/workspace scope, PostgreSQL transactions and RLS, immutable object
 semantics, cursor allocation, account quota, and the database/blob publication
-boundary. Integration tests use real PostgreSQL, the filesystem contract uses a
-real temporary directory, and the S3 contract runs against a pinned compatible
-service. Repository publication tests may replace only the blob boundary with
+boundary. Integration tests use real PostgreSQL; filesystem tests use a real
+temporary directory, and S3 tests use a pinned compatible service. Repository
+publication tests may replace the blob boundary with
 a controllable implementation to force a precise write, corruption, or orphan
-condition. That narrow fault seam does not substitute for either real backend.
+condition. Both real backends remain covered separately.
 
 ### Real self-hosted journeys
 
@@ -72,7 +72,7 @@ reproduce every model-level merge case.
 
 ## 2. Fixture boundary
 
-Shared test support may own only mechanical setup and cleanup:
+Shared test support provides mechanical setup and cleanup:
 
 - a device owns one temporary database and one stable UUIDv4, can close and
   reopen that database, and uses a deterministic clock where time affects the
@@ -87,7 +87,7 @@ Fixtures do not choose business actions, hide retries, catch unexpected
 failures, or form a scenario DSL. IDs, clocks, payloads and fault points are
 explicit in each test. Tests do not depend on execution order or fixed ports.
 
-## 3. First-release failure matrix
+## 3. Failure matrix
 
 The local persistence layer must cover each ambiguous entity delivery result,
 followed by a real database reopen:
@@ -111,7 +111,7 @@ reuse after a database failure, missing-object reconstruction by exact PUT,
 immutable mismatch rejection, same-key concurrency, and an account-wide quota
 race across workspaces.
 
-The shared backend contract proves immutable
+The shared backend suite proves immutable
 PUT/HEAD/GET, exact replay, canonical length/SHA-256 validation, same-key
 concurrency, and the maximum supported object. S3-specific adapter tests prove
 conditional create, read-after-write, bounded error/timeout mapping, and no
@@ -122,14 +122,13 @@ individual storage vendors.
 
 ## 4. Evidence rules
 
-The baseline release contract has two host-native gates.
-`scripts/sync-v3-reliability-gate` runs on Ubuntu and owns JVM/Android,
+Two host-native gates provide release evidence.
+`scripts/sync-v3-reliability-gate` runs on Ubuntu and covers JVM/Android,
 PostgreSQL, installed-server, and real self-hosted journey evidence.
-`scripts/sync-v3-apple-gate` runs on an Apple Silicon macOS host and owns shared
-behavior plus app-shell execution evidence on the iOS simulator. It does not
-claim a platform-native HTTP transport journey, which is outside the
-first-release P0 set. The Ubuntu gate provisions pinned PostgreSQL 17 and
-HTTPS MinIO. Its generated test CA is injected only into gate processes.
+`scripts/sync-v3-apple-gate` runs on an Apple Silicon macOS host and covers shared
+behavior plus app-shell execution evidence on the iOS simulator. The real HTTP
+transport journey runs in the Ubuntu gate, which provisions pinned PostgreSQL
+17 and HTTPS MinIO. Its generated test CA is injected only into gate processes.
 Together the gates:
 
 - create a dedicated application role with `NOSUPERUSER` and `NOBYPASSRLS`,
@@ -178,22 +177,22 @@ is never the installed server runtime identity. The gate queries PostgreSQL to
 prove the application login is neither superuser nor able to bypass RLS before
 accepting any server evidence.
 
-The Ubuntu gate never claims iOS evidence. Simulator behavior runs only on a
-host that can execute it; compilation is recorded separately and is never
-reported as a passing transport test.
+The Ubuntu report excludes iOS evidence. Simulator behavior runs on a capable
+Apple host, and compilation is reported separately from transport tests.
 
-Static architecture checks protect suite boundaries but never hard-code test
-method names or replace behavioral evidence.
+Static architecture checks protect suite boundaries without hard-coding test
+method names or replacing behavioral evidence.
 
 ## 5. Evolution rules
 
 - Add a case to the lowest layer that can prove the invariant.
 - Prefer a table of named fault cases over copied setup.
-- Split a file by contract when its fixture obscures the behavior under test.
+- Split a file by responsibility when its fixture obscures the behavior under
+  test.
 - Do not add sleeps for coordination; use latches, barriers or observable
   durable state.
 - Every regression test must fail against the broken behavior it describes.
 - Randomized convergence and load tests use a printed reproducible seed and
   remain supplemental to deterministic release evidence.
-- New media contracts, key rotation or multi-workspace UI add their own
-  journeys; they do not expand the first-release tests speculatively.
+- New media formats, key rotation, or multi-workspace UI add focused journeys
+  when those features are implemented.

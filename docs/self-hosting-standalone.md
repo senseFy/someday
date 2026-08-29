@@ -4,30 +4,42 @@ This topology runs Someday Server and PostgreSQL 17 on one Docker host. Note
 metadata and encrypted entity objects live in the PostgreSQL volume; encrypted
 images live in a separate media volume.
 
-## 1. Get the exact release
+Prepare a host with Docker Engine 24 or newer, Docker Compose 2.20 or newer,
+and a stable HTTPS hostname.
 
-Replace `X.Y.Z` in these commands with the server version. The release bundle
-contains the digest-pinned image reference.
+## 1. Download an exact release
+
+Replace `X.Y.Z` with the server version shown in
+[GitHub Releases](https://github.com/senseFy/someday/releases):
 
 ```bash
 VERSION=X.Y.Z
 ASSET="someday-server-$VERSION"
+
 curl --fail --location --remote-name \
   "https://github.com/senseFy/someday/releases/download/server-v$VERSION/$ASSET.tar.gz"
 curl --fail --location --remote-name \
   "https://github.com/senseFy/someday/releases/download/server-v$VERSION/$ASSET.tar.gz.sha256"
+
 if command -v sha256sum >/dev/null 2>&1; then
   sha256sum --check "$ASSET.tar.gz.sha256"
 else
   shasum -a 256 --check "$ASSET.tar.gz.sha256"
 fi
+
 tar -xzf "$ASSET.tar.gz"
 cd "$ASSET/deploy/standalone"
 cp .env.example .env
 chmod 600 .env
 ```
 
-Keep the generated `SOMEDAY_IMAGE` value and set these values in `.env`:
+The release-generated `.env.example` already contains the digest-pinned image
+reference. Keep that value unchanged.
+
+## 2. Configure the server
+
+Set these values in the `.env` file in the current `deploy/standalone`
+directory:
 
 ```dotenv
 SOMEDAY_PUBLIC_BASE_URL=https://notes.example.com
@@ -36,29 +48,51 @@ SOMEDAY_POSTGRES_ADMIN_PASSWORD=<different random admin password>
 SOMEDAY_JWT_SECRET=<at least 32 random bytes>
 ```
 
-Generate each secret independently. For example:
+Generate all three secrets independently, for example:
 
 ```bash
 openssl rand -base64 48
 ```
 
-## 2. Start
+Keep `.env` with the protected deployment backup and outside version control.
+
+## 3. Start the services
+
+Validate the resolved configuration before starting:
 
 ```bash
+docker compose config
 docker compose pull
 docker compose up -d
 docker compose ps
 curl --fail http://127.0.0.1:3180/health
 ```
 
-The app port is reachable only on host loopback. Add the HTTPS reverse proxy
-from [Self-hosting Someday](self-hosting.md), then verify:
+If the health check fails, inspect the server before continuing:
+
+```bash
+docker compose logs --tail=200 server
+```
+
+The published port is bound to host loopback, not directly to the internet.
+
+## 4. Add HTTPS
+
+Point the hostname from `SOMEDAY_PUBLIC_BASE_URL` at the Docker host and place
+an HTTPS reverse proxy in front of `127.0.0.1:3180`. The shared
+[self-hosting guide](self-hosting.md#https) includes a minimal Caddy example.
+
+Then verify the public endpoint:
 
 ```bash
 curl --fail https://notes.example.com/health
 ```
 
-## 3. Create the administrator and connect
+The public health URL must use the same origin stored in `.env`.
+
+## 5. Create the administrator and connect clients
+
+Create the first account without enabling public registration:
 
 ```bash
 docker compose run --rm \
@@ -66,11 +100,27 @@ docker compose run --rm \
   server bootstrap-admin
 ```
 
-Open `https://notes.example.com/admin`, then connect a Someday client with the
-same origin and account.
+Enter the password at the prompt, then sign in at:
 
-Before adding real notes, complete
-[Backup and Recovery](server-backup-and-recovery.md).
+```text
+https://notes.example.com/admin
+```
+
+Configure the first Someday client with `https://notes.example.com`, the same
+email, and the same password. Enter the origin without an API path. Pair each
+additional device from an existing workspace so it receives the workspace key.
+
+## 6. Protect the data
+
+Check that every PostgreSQL media record has a matching image object:
+
+```bash
+docker compose run --rm --no-deps server verify-media-integrity
+```
+
+Before storing real notes, complete
+[Backup and Recovery](server-backup-and-recovery.md). The PostgreSQL and media
+volumes are one recovery unit. Docker volumes provide persistence, not backup.
 
 ## Operations
 
@@ -84,8 +134,10 @@ docker compose start
 `docker compose down --volumes` unless you intend to destroy both database and
 media storage.
 
-The release bundle is image-only. To build the exact source tag, clone it and
-configure its `.env` with the same values above:
+## Build from the exact source tag
+
+The release bundle deploys the published image. To build the same version from
+source instead, clone its exact server tag:
 
 ```bash
 VERSION=X.Y.Z
