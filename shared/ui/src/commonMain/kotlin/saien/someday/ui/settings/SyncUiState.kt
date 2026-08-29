@@ -49,6 +49,7 @@ enum class SyncIssueReason {
     RetryRequired,
     Blocked,
     SyncFailed,
+    WorkspaceSettingsReloadRequired,
 }
 
 data class SyncIssueUi(
@@ -66,6 +67,7 @@ data class SyncIssueUi(
             SyncIssueReason.RetryRequired,
             SyncIssueReason.Blocked,
             SyncIssueReason.SyncFailed,
+            SyncIssueReason.WorkspaceSettingsReloadRequired,
             -> SyncIssueAction.RetrySync
             SyncIssueReason.RemoteHistoryConflict,
             SyncIssueReason.CheckpointInvalid,
@@ -83,8 +85,18 @@ data class SyncUiState(
     val syncing: Boolean get() = operation == SyncUiOperation.Syncing
     val busy: Boolean get() = operation != null
     val pairingAvailable: Boolean
-        get() = connection is SyncConnectionUi.Connected &&
-            (issue == null || issue.action == SyncIssueAction.RetrySync)
+        get() = connection is SyncConnectionUi.Connected && when (issue?.reason) {
+            null,
+            SyncIssueReason.WorkspaceLocked,
+            SyncIssueReason.RemoteHistoryConflict,
+            SyncIssueReason.CheckpointInvalid,
+            SyncIssueReason.RetryRequired,
+            SyncIssueReason.Blocked,
+            SyncIssueReason.SyncFailed,
+            SyncIssueReason.WorkspaceSettingsReloadRequired,
+            -> true
+            else -> false
+        }
 }
 
 internal enum class SyncAccountFormMode(

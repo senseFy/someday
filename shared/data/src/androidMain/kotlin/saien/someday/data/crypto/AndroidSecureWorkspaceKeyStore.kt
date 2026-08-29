@@ -48,10 +48,11 @@ class AndroidSecureWorkspaceKeyStore(
 
     override fun remove(alias: String) {
         val key = alias.storageKey()
-        preferences.edit()
+        val removed = preferences.edit()
             .remove("${key}_iv")
             .remove("${key}_ciphertext")
             .commit()
+        require(removed) { "Android secure preferences rejected the workspace key removal." }
     }
 
     private fun getOrCreateSecretKey(): SecretKey {

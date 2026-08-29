@@ -22,8 +22,8 @@ import okio.Path.Companion.toPath
 
 class AuthorityCoordinatedMediaAssetStoreTest {
     @Test
-    fun finalAdoptionEmptyCheckWaitsForInFlightMediaImportAndSeesIt() {
-        val directory = Files.createTempDirectory("someday-media-adoption-race-")
+    fun workspaceReplacementWaitsForInFlightMediaImportBeforeTakingFinalSnapshot() {
+        val directory = Files.createTempDirectory("someday-media-replacement-race-")
         val driver = createSomedayJdbcDriver("jdbc:sqlite:${directory.resolve("someday.db").toAbsolutePath()}")
         val rawStore = LocalMediaAssetStore(
             database = SomedayDatabase(driver),
@@ -34,13 +34,13 @@ class AuthorityCoordinatedMediaAssetStoreTest {
             },
             decodeValidator = MediaAssetDecodeValidator { DecodedMediaAsset(32, 32) },
         )
-        val mutationCoordinator = WorkspaceAuthorityMutationCoordinator()
-        val mediaStore = AuthorityCoordinatedMediaAssetStore(rawStore, mutationCoordinator)
+        val workspaceLifecycleCoordinator = WorkspaceLifecycleCoordinator()
+        val mediaStore = AuthorityCoordinatedMediaAssetStore(rawStore, workspaceLifecycleCoordinator)
         val importEntered = CountDownLatch(1)
         val releaseImport = CountDownLatch(1)
-        val adoptionAttempted = CountDownLatch(1)
-        val adoptionEntered = CountDownLatch(1)
-        val adoptionSawContent = AtomicBoolean(false)
+        val replacementAttempted = CountDownLatch(1)
+        val replacementEntered = CountDownLatch(1)
+        val replacementSawImportedAsset = AtomicBoolean(false)
         val executor = Executors.newFixedThreadPool(2)
 
         try {
@@ -55,27 +55,27 @@ class AuthorityCoordinatedMediaAssetStoreTest {
             }
             assertTrue(importEntered.await(5, TimeUnit.SECONDS))
 
-            val finalAdoptionCheck = executor.submit {
-                adoptionAttempted.countDown()
-                mutationCoordinator.productAccess {
-                    adoptionEntered.countDown()
-                    adoptionSawContent.set(rawStore.listAssets().isNotEmpty())
+            val replacementSnapshot = executor.submit {
+                replacementAttempted.countDown()
+                workspaceLifecycleCoordinator.productAccess {
+                    replacementEntered.countDown()
+                    replacementSawImportedAsset.set(rawStore.listAssets().isNotEmpty())
                 }
             }
-            assertTrue(adoptionAttempted.await(5, TimeUnit.SECONDS))
+            assertTrue(replacementAttempted.await(5, TimeUnit.SECONDS))
             assertFalse(
-                adoptionEntered.await(250, TimeUnit.MILLISECONDS),
-                "The final adoption check bypassed an in-flight coordinated media import.",
+                replacementEntered.await(250, TimeUnit.MILLISECONDS),
+                "Workspace replacement bypassed an in-flight coordinated media import.",
             )
 
             releaseImport.countDown()
             importing.get(5, TimeUnit.SECONDS)
-            finalAdoptionCheck.get(5, TimeUnit.SECONDS)
+            replacementSnapshot.get(5, TimeUnit.SECONDS)
 
-            assertTrue(adoptionEntered.await(1, TimeUnit.SECONDS))
+            assertTrue(replacementEntered.await(1, TimeUnit.SECONDS))
             assertTrue(
-                adoptionSawContent.get(),
-                "Adoption must re-check emptiness after the media import commits.",
+                replacementSawImportedAsset.get(),
+                "Workspace replacement must snapshot state after the media import commits.",
             )
         } finally {
             releaseImport.countDown()

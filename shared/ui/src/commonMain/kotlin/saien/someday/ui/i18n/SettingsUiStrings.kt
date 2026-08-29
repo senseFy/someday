@@ -47,19 +47,27 @@ data class SettingsUiStrings(
     val exportPrepared: String = "Export prepared: %1\$d notebooks and %2\$d notes.",
     val exportSaved: String = "Export saved: %1\$d notebooks and %2\$d notes.",
     val exportFailed: String = "Export failed: %1\$s",
-    val pairingInvitationFailed: String = "Workspace pairing invitation failed; secrets redacted.",
+    val pairingInvitationFailed: String = "The workspace pairing invitation operation failed. Try again.",
     val pairingInvitationCreated: String = "Pairing invitation created. Use it before it expires.",
     val pairingInvitationCancelled: String = "Pairing invitation cancelled.",
     val pairingInvitationUnavailable: String = "Pairing invitation is no longer available.",
     val pairingJoined: String = "This device joined the workspace.",
+    val pairingSettingsReloadFailed: String =
+        "This device joined the workspace, but its settings could not be loaded. Run Sync again before making changes.",
     val pairingPublishRequired: String = "Sync this workspace successfully before inviting another device.",
     val pairingSessionRequired: String = "Sign in to the self-hosted server before pairing devices.",
     val pairingExpired: String = "Pairing invitation expired. Create a new invitation and try again.",
-    val pairingWorkspaceLocked: String = "Unlock the local workspace before pairing.",
-    val pairingLocalWorkspaceNotReplaceable: String = "This device already has a published or bound workspace that cannot be replaced.",
-    val pairingLocalContentPresent: String = "This device has local notes, images, or unpublished changes and cannot silently replace its workspace.",
+    val pairingWorkspaceLocked: String =
+        "The local workspace key is unavailable. Restore access before pairing.",
+    val pairingReplacementFailed: String = "The current workspace could not be replaced safely.",
+    val pairingReplacementConfirmationRequired: String =
+        "Confirm replacing this device's current workspace before joining.",
+    val pairingServerRequestFailed: String =
+        "Could not complete the server request. Check the server address, network, and sign-in, then try again.",
+    val pairingVerificationFailed: String =
+        "The pairing invitation could not be verified. Make sure both devices use the same server address, then create a new invitation.",
     val enterPairingToken: String = "Enter the pairing token or scan its QR code.",
-    val pairingFailed: String = "Workspace pairing failed; secrets redacted.",
+    val pairingFailed: String = "Workspace pairing failed. Try again.",
     val settingsSaveFailed: String = "Settings save failed: %1\$s",
     val signInBeforeSync: String = "Sign in to the self-hosted server before syncing.",
     val chooseDayOne: String = "Choose a Day One JSON export zip.",

@@ -11,11 +11,9 @@ import saien.someday.domain.media.findSomedayAssetIds
 import saien.someday.domain.settings.ManualSyncReason
 import saien.someday.domain.settings.ManualSyncResult
 import saien.someday.domain.settings.ManualSyncRunner
-import saien.someday.domain.settings.LocalWorkspaceAdoptionPolicy
 import saien.someday.domain.settings.WorkspaceJoinPackage
 import saien.someday.domain.settings.SelfHostedSessionCredentialStore
 import saien.someday.domain.settings.SyncMode
-import saien.someday.domain.settings.WorkspacePairingReason
 import saien.someday.domain.settings.authorityBindingId
 import saien.someday.sync.causality.v2.SqlDelightSyncProtocolStoreV2
 import saien.someday.sync.causality.v2.SyncRemoteProfileV2
@@ -29,8 +27,7 @@ import saien.someday.sync.causality.v2.WorkspaceLocalDataTransferV2
 import saien.someday.sync.causality.v2.SystemV2ClientSettingsRepository
 import saien.someday.sync.causality.v2.normalizeWriterDeviceIdV2
 import saien.someday.sync.causality.v2.ensureWorkspaceLocalDraftV2
-import saien.someday.sync.causality.v2.localWorkspaceAdoptionRefusalReasonV2
-import saien.someday.sync.causality.v2.discardEmptyLocalWorkspaceDraftForAdoptionV2
+import saien.someday.sync.causality.v2.discardLocalWorkspaceForReplacementV2
 import saien.someday.sync.selfhosted.RefreshingSelfHostedSyncTransportV2
 import saien.someday.sync.selfhosted.RefreshingSelfHostedSessionExecutor
 import saien.someday.sync.selfhosted.SelfHostedSyncRemoteV2
@@ -45,14 +42,15 @@ data class SystemV3ClientServices(
     val notesRepository: NotesRepository,
     val settingsRepository: ClientSettingsRepository,
     val manualSyncRunner: ManualSyncRunner,
+    val automaticSyncEligible: () -> Boolean,
     val selfHostedSessionExecutor: RefreshingSelfHostedSessionExecutor,
     val activeWorkspaceSessionGuard: ActiveWorkspaceSessionGuard,
     val localMediaAssetStore: AuthorityCoordinatedMediaAssetStore,
     val mediaCoordinator: SystemV3MediaCoordinator,
-    val authorityMutationCoordinator: WorkspaceAuthorityMutationCoordinator,
-    val workspaceAdoptionPolicy: LocalWorkspaceAdoptionPolicy,
-    val discardEmptyDraftForWorkspaceAdoption: () -> Boolean,
-    val bindAdoptedWorkspaceToCurrentSession: (WorkspaceJoinPackage, WorkspaceMasterKey, String) -> Boolean,
+    val workspaceLifecycleCoordinator: WorkspaceLifecycleCoordinator,
+    val discardLocalWorkspaceForReplacement: () -> Boolean,
+    val finalizeLocalWorkspaceReplacement: () -> Unit,
+    val bindReplacementWorkspaceToCurrentSession: (WorkspaceJoinPackage, WorkspaceMasterKey, String) -> Boolean,
     val workspacePairingInviterReady: () -> Boolean,
     val localDataExportProvider: (kotlin.time.Instant) -> LocalDataExportDocument,
     val localDataImportProvider: (LocalDataExportDocument) -> LocalDataImportSummary,
@@ -73,10 +71,10 @@ fun createSystemV3ClientServices(
         authenticationTransport = selfHostedTransport,
         sessionStore = selfHostedSessionStore,
     )
-    val authorityMutationCoordinator = WorkspaceAuthorityMutationCoordinator()
+    val workspaceLifecycleCoordinator = WorkspaceLifecycleCoordinator()
     val coordinatedMediaAssetStore = AuthorityCoordinatedMediaAssetStore(
         delegate = localMediaAssetStore,
-        authorityMutationCoordinator = authorityMutationCoordinator,
+        workspaceLifecycleCoordinator = workspaceLifecycleCoordinator,
     )
     val protocolStore = SqlDelightSyncProtocolStoreV2(localRepository.database)
     workspaceKeyProvider()?.let { key ->
@@ -93,6 +91,7 @@ fun createSystemV3ClientServices(
         workspaceIdProvider = workspaceIdProvider,
         activeWorkspaceSessionGuard = activeWorkspaceSessionGuard,
         sessionExecutor = activeSelfHostedSessionExecutor,
+        workspaceLifecycleCoordinator = workspaceLifecycleCoordinator,
     )
     fun createSelfHostedRemoteV2(): SelfHostedSyncRemoteV2 {
         val credentials = selfHostedSessionStore.load()
@@ -148,13 +147,13 @@ fun createSystemV3ClientServices(
             normalizeWriterDeviceIdV2(localRepository.localDeviceId)
         },
         transportFactory = SyncRemoteTransportFactoryV2 { createSelfHostedRemoteV2() },
-        authorityMutationCoordinator = authorityMutationCoordinator,
+        workspaceLifecycleCoordinator = workspaceLifecycleCoordinator,
         beforeEntityPublication = { versions ->
             val mediaIds = versions.asSequence()
                 .mapNotNull { it.contentPayload as? NoteContentV2 }
                 .flatMap { findSomedayAssetIds(it.markdownBody).asSequence() }
                 .toSet()
-            mediaCoordinator.ensurePublished(mediaIds)
+            mediaCoordinator.ensurePublishedWithinWorkspaceLifecycle(mediaIds)
         },
     )
 
@@ -186,7 +185,7 @@ fun createSystemV3ClientServices(
             normalizeWriterDeviceIdV2(localRepository.localDeviceId)
         },
         remoteProfileProvider = { SyncRemoteProfileV2.SELF_HOSTED.wireValue },
-        authorityMutationCoordinator = authorityMutationCoordinator,
+        workspaceLifecycleCoordinator = workspaceLifecycleCoordinator,
     )
     val v2LocalDataTransfer = WorkspaceLocalDataTransferV2(
         localRepository = localRepository,
@@ -198,25 +197,25 @@ fun createSystemV3ClientServices(
         remoteProfileProvider = { SyncRemoteProfileV2.SELF_HOSTED.wireValue },
     )
     return SystemV3ClientServices(
-        notesRepository = AuthorityCoordinatedNotesRepository(v2Notes, authorityMutationCoordinator),
+        notesRepository = AuthorityCoordinatedNotesRepository(v2Notes, workspaceLifecycleCoordinator),
         settingsRepository = v2Settings,
         manualSyncRunner = manual,
+        automaticSyncEligible = { isAutomaticSyncEligible(protocolStore) },
         selfHostedSessionExecutor = activeSelfHostedSessionExecutor,
         activeWorkspaceSessionGuard = activeWorkspaceSessionGuard,
         localMediaAssetStore = coordinatedMediaAssetStore,
         mediaCoordinator = mediaCoordinator,
-        authorityMutationCoordinator = authorityMutationCoordinator,
-        workspaceAdoptionPolicy = LocalWorkspaceAdoptionPolicy {
-            val key = workspaceKeyProvider()
-                ?: return@LocalWorkspaceAdoptionPolicy WorkspacePairingReason.WorkspaceLocked
-            localWorkspaceAdoptionRefusalReasonV2(localRepository, key, localMediaAssetStore)
+        workspaceLifecycleCoordinator = workspaceLifecycleCoordinator,
+        discardLocalWorkspaceForReplacement = {
+            discardLocalWorkspaceForReplacementV2(localRepository, settingsRepository)
         },
-        discardEmptyDraftForWorkspaceAdoption = {
-            workspaceKeyProvider()?.let { key ->
-                discardEmptyLocalWorkspaceDraftForAdoptionV2(localRepository, key, localMediaAssetStore)
-            } ?: false
+        finalizeLocalWorkspaceReplacement = {
+            runCatching {
+                localMediaAssetStore.purgeUnreferencedFilesWithoutGracePeriod()
+            }
+            Unit
         },
-        bindAdoptedWorkspaceToCurrentSession = { packageData, key, workspaceId ->
+        bindReplacementWorkspaceToCurrentSession = { packageData, key, workspaceId ->
             runCatching {
                 val credentials = selfHostedSessionStore.load()
                     ?: error("The authenticated self-hosted session is unavailable.")
@@ -246,21 +245,26 @@ fun createSystemV3ClientServices(
             } == true
         },
         localDataExportProvider = { exportedAt ->
-            authorityMutationCoordinator.exclusive {
-                authorityMutationCoordinator.productAccess {
+            workspaceLifecycleCoordinator.exclusive {
+                workspaceLifecycleCoordinator.productAccess {
                     v2LocalDataTransfer.exportDocument(exportedAt)
                 }
             }
         },
         localDataImportProvider = { document ->
-            authorityMutationCoordinator.exclusive {
-                authorityMutationCoordinator.productAccess {
+            workspaceLifecycleCoordinator.exclusive {
+                workspaceLifecycleCoordinator.productAccess {
                     v2LocalDataTransfer.importDocument(document)
                 }
             }
         },
     )
 }
+
+internal fun isAutomaticSyncEligible(protocolStore: SqlDelightSyncProtocolStoreV2): Boolean =
+    protocolStore.loadLocalAuthority() != null ||
+        protocolStore.loadEpochs(SyncRemoteProfileV2.SELF_HOSTED.wireValue)
+            .any { it.authorityBindingId != null }
 
 internal fun resolveActiveWorkspaceSessionRequirement(
     protocolStore: SqlDelightSyncProtocolStoreV2,

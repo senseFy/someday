@@ -507,6 +507,9 @@ SET published_authority_binding_id = ?,
     published_object_digest = ?
 WHERE asset_id = ?;
 
+deleteAllMediaAssets:
+DELETE FROM media_assets;
+
 deleteSetting:
 DELETE FROM settings
 WHERE id = ?;
@@ -1192,6 +1195,91 @@ WHERE remote_profile = ? AND epoch_id = ?;
 deleteEpochRunHistorySystemV2:
 DELETE FROM sync_run_history_v2
 WHERE remote_profile = ? AND epoch_id = ?;
+
+deleteAllRunHistorySystemV2:
+DELETE FROM sync_run_history_v2;
+
+-- Explicit local workspace replacement. These are unconditional so cleanup
+-- also removes rows orphaned by an interrupted migration or an older bug.
+deleteAllLocalAuthorityForWorkspaceReplacementV2:
+DELETE FROM sync_local_authority_system_v2;
+
+deleteAllCheckpointObjectsForWorkspaceReplacementV2:
+DELETE FROM sync_checkpoint_objects_system_v2;
+
+deleteAllCheckpointsForWorkspaceReplacementV2:
+DELETE FROM sync_checkpoints_system_v2;
+
+deleteAllPendingMutationsForWorkspaceReplacementV2:
+DELETE FROM sync_pending_mutations_system_v2;
+
+deleteAllAppliedMutationsForWorkspaceReplacementV2:
+DELETE FROM sync_applied_mutations_system_v2;
+
+deleteAllRemoteCursorsForWorkspaceReplacementV2:
+DELETE FROM sync_remote_cursors_system_v2;
+
+deleteAllSourceImportsForWorkspaceReplacementV2:
+DELETE FROM sync_source_imports_system_v2;
+
+deleteAllProjectionWarningsForWorkspaceReplacementV2:
+DELETE FROM projection_warnings_v2;
+
+deleteAllPreferencesProjectionsForWorkspaceReplacementV2:
+DELETE FROM workspace_preferences_projection_v2;
+
+deleteAllNoteProjectionsForWorkspaceReplacementV2:
+DELETE FROM note_projections_system_v2;
+
+deleteAllNotebookProjectionsForWorkspaceReplacementV2:
+DELETE FROM notebook_projections_v2;
+
+deleteAllConflictHeadsForWorkspaceReplacementV2:
+DELETE FROM workspace_entity_conflict_heads_v2;
+
+deleteAllConflictsForWorkspaceReplacementV2:
+DELETE FROM workspace_entity_conflicts_v2;
+
+deleteAllHeadsForWorkspaceReplacementV2:
+DELETE FROM workspace_entity_heads_v2;
+
+deleteAllParentsForWorkspaceReplacementV2:
+DELETE FROM workspace_entity_version_parents_v2;
+
+deleteAllVersionsForWorkspaceReplacementV2:
+DELETE FROM workspace_entity_versions_v2;
+
+deleteAllControlObjectsForWorkspaceReplacementV2:
+DELETE FROM sync_control_objects_system_v2;
+
+deleteAllDeadLettersForWorkspaceReplacementV2:
+DELETE FROM sync_dead_letters_v2;
+
+deleteAllEpochsForWorkspaceReplacementV2:
+DELETE FROM sync_epochs_v2;
+
+selectWorkspaceOwnedRowCountV2:
+SELECT
+  (SELECT COUNT(*) FROM sync_epochs_v2) +
+  (SELECT COUNT(*) FROM sync_local_authority_system_v2) +
+  (SELECT COUNT(*) FROM sync_dead_letters_v2) +
+  (SELECT COUNT(*) FROM sync_run_history_v2) +
+  (SELECT COUNT(*) FROM workspace_entity_versions_v2) +
+  (SELECT COUNT(*) FROM workspace_entity_version_parents_v2) +
+  (SELECT COUNT(*) FROM workspace_entity_heads_v2) +
+  (SELECT COUNT(*) FROM workspace_entity_conflicts_v2) +
+  (SELECT COUNT(*) FROM workspace_entity_conflict_heads_v2) +
+  (SELECT COUNT(*) FROM note_projections_system_v2) +
+  (SELECT COUNT(*) FROM notebook_projections_v2) +
+  (SELECT COUNT(*) FROM workspace_preferences_projection_v2) +
+  (SELECT COUNT(*) FROM projection_warnings_v2) +
+  (SELECT COUNT(*) FROM sync_pending_mutations_system_v2) +
+  (SELECT COUNT(*) FROM sync_applied_mutations_system_v2) +
+  (SELECT COUNT(*) FROM sync_remote_cursors_system_v2) +
+  (SELECT COUNT(*) FROM sync_checkpoints_system_v2) +
+  (SELECT COUNT(*) FROM sync_checkpoint_objects_system_v2) +
+  (SELECT COUNT(*) FROM sync_control_objects_system_v2) +
+  (SELECT COUNT(*) FROM sync_source_imports_system_v2);
 
 -- Explicit remote-folder reset only: drops authority then any lifecycle for one profile.
 deleteLocalAuthoritySystemV2:

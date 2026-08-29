@@ -374,6 +374,20 @@ class LocalMediaAssetStoreTest {
     }
 
     @Test
+    fun committedWorkspaceReplacementPurgesFreshUnreferencedMediaImmediately() = withFixture { fixture ->
+        val asset = fixture.importPng().asset
+        val storedObject = objectPath(fixture.root, asset.contentSha256)
+        assertTrue(FileSystem.SYSTEM.exists(storedObject))
+
+        fixture.database.somedayQueries.deleteAllMediaAssets()
+        val result = fixture.store.purgeUnreferencedFilesWithoutGracePeriod()
+
+        assertEquals(1, result.orphanObjectFilesRemoved)
+        assertFalse(FileSystem.SYSTEM.exists(storedObject))
+        assertTrue(fixture.store.listAssets().isEmpty())
+    }
+
+    @Test
     fun productionAddressingDefaultDoesNotExposeContentHash() {
         val contentHash = "ab".repeat(32)
         val strategy = RandomMediaAssetAddressingStrategy { size -> ByteArray(size) { 0x5a } }
@@ -396,6 +410,7 @@ class LocalMediaAssetStoreTest {
         val database = SomedayDatabase(driver)
         val fixture = Fixture(
             root = root,
+            database = database,
             store = testStore(database, root, fileSystem, decodeValidator),
         )
         try {
@@ -408,6 +423,7 @@ class LocalMediaAssetStoreTest {
 
     private data class Fixture(
         val root: Path,
+        val database: SomedayDatabase,
         val store: LocalMediaAssetStore,
     ) {
         fun importPng(originalFileName: String? = null): MediaAssetImportResult =

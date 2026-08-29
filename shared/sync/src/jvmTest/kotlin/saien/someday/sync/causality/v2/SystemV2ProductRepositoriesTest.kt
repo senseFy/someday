@@ -25,7 +25,7 @@ import saien.someday.domain.settings.OnThisDayNotificationPreferences
 import saien.someday.domain.settings.SyncConfiguration
 import saien.someday.domain.settings.SyncMode
 import saien.someday.domain.settings.WorkspacePreferencesSyncStatus
-import saien.someday.sync.WorkspaceAuthorityMutationCoordinator
+import saien.someday.sync.WorkspaceLifecycleCoordinator
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -106,7 +106,7 @@ class SystemV2ProductRepositoriesTest {
 
     @Test
     fun settingsReadWaitsForProductRouteCommitBarrier() = withFixture { fixture ->
-        val coordinator = WorkspaceAuthorityMutationCoordinator()
+        val coordinator = WorkspaceLifecycleCoordinator()
         val settings = SystemV2ClientSettingsRepository(
             fixture.local,
             fixture.rawSettings,
@@ -114,7 +114,7 @@ class SystemV2ProductRepositoriesTest {
             { WRITER_A },
             { PROFILE },
             clock = { T1 },
-            authorityMutationCoordinator = coordinator,
+            workspaceLifecycleCoordinator = coordinator,
         )
         val barrierEntered = CountDownLatch(1)
         val releaseBarrier = CountDownLatch(1)

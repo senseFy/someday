@@ -13,6 +13,7 @@ import saien.someday.domain.settings.SelfHostedSessionCredentialStore
 import saien.someday.domain.settings.SelfHostedSessionCredentials
 import saien.someday.domain.settings.authorityBindingId
 import saien.someday.sync.AuthorityCoordinatedMediaAssetStore
+import saien.someday.sync.WorkspaceLifecycleCoordinator
 
 data class SystemV3MediaPublicationSummary(
     val publishedAssets: Int,
@@ -29,6 +30,7 @@ class SystemV3MediaCoordinator(
     private val sessionStore: SelfHostedSessionCredentialStore,
     private val workspaceKeyProvider: () -> WorkspaceMasterKey?,
     private val workspaceIdProvider: () -> String?,
+    private val workspaceLifecycleCoordinator: WorkspaceLifecycleCoordinator,
     private val activeWorkspaceSessionGuard: ActiveWorkspaceSessionGuard =
         ActiveWorkspaceSessionGuard { null },
     private val sessionExecutor: RefreshingSelfHostedSessionExecutor? = null,
@@ -46,7 +48,10 @@ class SystemV3MediaCoordinator(
         return credentials.authorityBindingId
     }
 
-    fun publishPending(): SystemV3MediaPublicationSummary {
+    fun publishPending(): SystemV3MediaPublicationSummary =
+        workspaceLifecycleCoordinator.exclusive { publishPendingWithinWorkspaceLifecycle() }
+
+    private fun publishPendingWithinWorkspaceLifecycle(): SystemV3MediaPublicationSummary {
         val connection = connectedService()
         val pending = localStore.listAssetsPendingPublication(
             connection.credentials.authorityBindingId,
@@ -64,13 +69,23 @@ class SystemV3MediaCoordinator(
     }
 
     /** Exact reachability gate used immediately before publishing an entity/checkpoint batch. */
-    fun ensurePublished(assetIds: Set<MediaAssetId>) {
+    fun ensurePublished(assetIds: Set<MediaAssetId>) =
+        workspaceLifecycleCoordinator.exclusive {
+            ensurePublishedWithinWorkspaceLifecycle(assetIds)
+        }
+
+    internal fun ensurePublishedWithinWorkspaceLifecycle(assetIds: Set<MediaAssetId>) {
         if (assetIds.isEmpty()) return
         val connection = connectedService()
         assetIds.sortedBy { it.value }.forEach { ensurePublished(it, connection) }
     }
 
-    fun materialize(assetId: MediaAssetId): SystemV3MediaMaterialization {
+    fun materialize(assetId: MediaAssetId): SystemV3MediaMaterialization =
+        workspaceLifecycleCoordinator.exclusive {
+            materializeWithinWorkspaceLifecycle(assetId)
+        }
+
+    private fun materializeWithinWorkspaceLifecycle(assetId: MediaAssetId): SystemV3MediaMaterialization {
         localStore.getAsset(assetId)?.let {
             if (localStore.verifyAsset(assetId) is MediaAssetVerificationResult.Verified) {
                 return SystemV3MediaMaterialization(it, downloaded = false)
@@ -223,10 +238,9 @@ class SystemV3MediaCoordinator(
     }
 
     /**
-     * Network I/O is deliberately completed before this short critical section.
-     * A pairing flow may replace the workspace while a request is in flight, so
-     * every resulting local write revalidates the captured authority, writer,
-     * workspace id, and key before committing.
+     * The workspace lifecycle lock remains held across the request. This narrower
+     * product lock serializes the resulting local write with product mutations;
+     * captured authority validation remains a final invariant check.
      */
     private fun <T> commitToCapturedWorkspace(
         connection: Connection,

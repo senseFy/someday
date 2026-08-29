@@ -124,11 +124,11 @@ published pointer; a merely local `PREPARING` draft is not an invitation
 authority. A wrong account, workspace, or device fails before join-package
 creation and before an invite request.
 
-A fresh installation claims with its own registered device session. Successful
-local adoption binds that stable installation device id as the new DAG writer.
+A joining installation claims with its own registered device session. Successful
+local replacement binds that stable installation device id as the new DAG writer.
 The writer id and workspace id are deliberately not part of envelope AAD:
 inviter and joiner have different device ids, and the authenticated encrypted
-payload already carries the exact workspace id being adopted.
+payload already carries the exact workspace id being joined.
 
 ## 5. Encrypted envelope
 
@@ -218,38 +218,46 @@ There is no read or delete route.
 
 The client checks the server digest, expiry, authority-bound envelope, and
 workspace package itself. Completion is attempted after every successful
-claim even when validation or local adoption fails, preserving single-use
+claim even when validation or local replacement fails, preserving single-use
 behavior. Pairing uses the same serialized access-token refresh executor as
 normal self-hosted sync. Creation requires the inviter's active publication
 binding. Claiming on a fresh installation is intentionally possible before a
 local publication binding exists.
 
-## 7. Local workspace adoption
+## 7. Local workspace replacement
 
-Joining is allowed only when the current local workspace is semantically
-empty. A normal fresh installation already owns a healthy `PREPARING` DAG
-draft, so key-bound state alone is not a refusal reason. Semantic content
-means any note, notebook, deletion history, non-default synchronized state,
-pending semantic mutation, conflict branch, or local image. An `ACTIVE`,
-`BLOCKED`, unhealthy, ambiguous, or non-empty generation is always refused.
+Every installation already has a local workspace. Joining another workspace
+therefore requires explicit, per-attempt user confirmation that the current
+local workspace will be discarded without merging. Without that confirmation,
+the client refuses before remote claim. Confirmation may authorize replacement
+of an `ACTIVE`, bound, `BLOCKED`, unhealthy, ambiguous, or contentful workspace;
+none of those states grants implicit consent.
 
-The semantic-emptiness check happens before remote claim and again while
-holding the shared authority-mutation lock. Inside that same transaction the
-empty draft is discarded before the staged workspace key becomes current.
-First publication uses the same lock, so adoption cannot race a local edit or
-publication. Existing content is never silently merged into the invited
-workspace.
+Replacement is local to the joining installation. It does not delete the old
+workspace or its media from the server, and other devices may continue using
+that workspace. There is no DAG merge or workspace rebinding operation.
 
 The imported recovery package must authenticate the workspace metadata,
-workspace id, and expected key fingerprint. The new key is first written
-under a fresh secure-storage alias. Local metadata and empty-draft disposal
-then commit as one adoption operation. If that operation fails, the staged
-alias is removed and the prior empty workspace remains usable. The prior alias
-is removed only after the new metadata commit.
+workspace id, and expected key fingerprint before local state changes. The new
+key is first written under a fresh secure-storage alias. While holding the
+shared workspace-lifecycle coordination boundary, one database transaction
+then removes every old local generation and its DAG, projections, protocol
+state, and media records, installs the joined workspace metadata, and binds its
+new authority. Device identity, authenticated session, and installation-local
+preferences remain intact.
 
-There is no general DAG merge or rebinding mechanism. A device with semantic
-history must export and clear its local workspace, or later select a separate
-workspace, before joining another one.
+If validation or secure-key staging fails, no local database state changes. If
+cleanup, metadata installation, or authority binding fails, the transaction
+rolls back, the staged alias is removed, and the prior workspace remains
+usable. The prior alias is removed only after commit. A normal sync or product
+mutation cannot write old-workspace state after replacement commits.
+
+Media files are outside the database transaction. After commit, the client
+best-effort removes files no longer referenced by the new database state. A
+filesystem cleanup failure may leave harmless orphan files for later cleanup;
+it does not turn the committed replacement into a pairing failure. Likewise,
+failure of the first sync after replacement is retryable and does not restore the
+discarded workspace.
 
 ## 8. UI and release rules
 
@@ -276,8 +284,14 @@ The reliability gate must cover:
   decoding, authority binding, and expiry;
 - self-hosted account/device scoping, atomic claim, replay behavior,
   completion, cancellation, expiry, and absence of read/delete routes;
-- semantic-empty adoption, atomic empty-draft disposal, non-empty refusal, and
-  authority-mutation serialization;
+- refusal before claim without explicit replacement confirmation;
+- confirmed replacement of active, bound, and contentful local workspaces;
+- atomic rollback that preserves all prior local state when validation,
+  cleanup, metadata installation, or authority binding fails;
+- complete transactional removal of old DAG, projection, protocol, and media
+  records, plus post-commit best-effort media-file cleanup;
+- serialization with active sync, local product mutation, and initial
+  authority establishment so old-workspace state cannot reappear;
 - inviter rejection before active publication and stable UUIDv4 writer
   binding on the joining device;
 - encrypted end-to-end join followed by follower bootstrap and Notes refresh;

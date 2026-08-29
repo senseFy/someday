@@ -19,6 +19,7 @@ class WorkspaceKeyRepository(
     private var unlockedKey: WorkspaceMasterKey? = null
 
     fun startupState(): WorkspaceUnlockState {
+        runCatching(::retryPendingSecureStorageAliasDeletions)
         val metadata = loadMetadata() ?: return WorkspaceUnlockState.Uninitialized
         val current = unlockedKey
         return if (current != null) {
@@ -49,9 +50,18 @@ class WorkspaceKeyRepository(
         )
         val metadataJson = encodeMetadata(metadata)
 
-        secureKeyStore.put(secureStorageAlias, workspaceKey)
-        persistMetadata(metadataJson, deviceName, platform)
+        // Journal the staged alias before secure storage so startup can clean
+        // up a partially acknowledged write after an interrupted setup.
+        recordPendingSecureStorageAliasDeletion(secureStorageAlias)
+        try {
+            secureKeyStore.put(secureStorageAlias, workspaceKey)
+            persistMetadata(metadataJson, deviceName, platform)
+        } catch (failure: Throwable) {
+            runCatching(::retryPendingSecureStorageAliasDeletions)
+            throw failure
+        }
         unlockedKey = workspaceKey.copy()
+        runCatching(::retryPendingSecureStorageAliasDeletions)
 
         return FirstRunWorkspaceSetup(
             state = WorkspaceUnlockState.Unlocked(workspaceId, workspaceKey.fingerprint),
@@ -170,28 +180,35 @@ class WorkspaceKeyRepository(
         }
 
         val secureStorageAlias = aliasGenerator.newAlias(importedMetadata.workspaceId)
+        check(secureStorageAlias != existingMetadata?.secureStorageAlias) {
+            "Secure storage alias generation reused the current workspace key alias."
+        }
         val restoredMetadata = importedMetadata.copy(
             secureStorageAlias = secureStorageAlias,
             restoredAt = clock().toString(),
         )
         val restoredMetadataJson = encodeMetadata(restoredMetadata)
 
-        secureKeyStore.put(secureStorageAlias, workspaceKey)
+        // Journal the staged alias before secure storage so startup can clean
+        // it if the process stops before the replacement transaction commits.
+        recordPendingSecureStorageAliasDeletion(secureStorageAlias)
         try {
+            secureKeyStore.put(secureStorageAlias, workspaceKey)
             localRepository.database.transaction {
                 beforeMetadataReplacement?.invoke()
                 persistMetadata(restoredMetadataJson, deviceName, platform)
+                existingMetadata
+                    ?.secureStorageAlias
+                    ?.takeUnless { it == secureStorageAlias }
+                    ?.let(::recordPendingSecureStorageAliasDeletion)
                 afterMetadataReplacement?.invoke(workspaceKey, importedMetadata.workspaceId)
             }
         } catch (failure: Throwable) {
-            runCatching { secureKeyStore.remove(secureStorageAlias) }
+            runCatching(::retryPendingSecureStorageAliasDeletions)
             throw failure
         }
         unlockedKey = workspaceKey.copy()
-        existingMetadata
-            ?.secureStorageAlias
-            ?.takeUnless { it == secureStorageAlias }
-            ?.let { oldAlias -> runCatching { secureKeyStore.remove(oldAlias) } }
+        runCatching(::retryPendingSecureStorageAliasDeletions)
 
         return WorkspaceRestoreResult.Restored(
             state = WorkspaceUnlockState.Unlocked(importedMetadata.workspaceId, workspaceKey.fingerprint),
@@ -324,6 +341,54 @@ class WorkspaceKeyRepository(
             ?.value
             ?.let(::decodeMetadata)
 
+    private fun recordPendingSecureStorageAliasDeletion(alias: String) {
+        val pending = loadPendingSecureStorageAliasDeletions()
+            ?: error("Pending secure-storage alias deletion metadata is invalid.")
+        persistPendingSecureStorageAliasDeletions((pending + alias).distinct())
+    }
+
+    private fun retryPendingSecureStorageAliasDeletions() {
+        val currentAlias = loadMetadata()?.secureStorageAlias
+        val pending = loadPendingSecureStorageAliasDeletions() ?: return
+        if (pending.isEmpty()) return
+
+        val remaining = pending.filter { alias ->
+            alias != currentAlias && runCatching { secureKeyStore.remove(alias) }.isFailure
+        }
+        persistPendingSecureStorageAliasDeletions(remaining)
+    }
+
+    private fun loadPendingSecureStorageAliasDeletions(): List<String>? {
+        val value = localRepository
+            .getSetting(PENDING_SECURE_STORAGE_ALIAS_DELETIONS_SETTING_KEY)
+            ?.value
+            ?: return emptyList()
+        return try {
+            json.decodeFromString(PersistedSecureStorageAliasDeletions.serializer(), value)
+                .aliases
+                .filter(String::isNotBlank)
+                .distinct()
+        } catch (_: SerializationException) {
+            null
+        } catch (_: IllegalArgumentException) {
+            null
+        }
+    }
+
+    private fun persistPendingSecureStorageAliasDeletions(aliases: List<String>) {
+        if (aliases.isEmpty()) {
+            localRepository.deleteLocalOnlySetting(PENDING_SECURE_STORAGE_ALIAS_DELETIONS_SETTING_KEY)
+        } else {
+            localRepository.putLocalOnlySetting(
+                PENDING_SECURE_STORAGE_ALIAS_DELETIONS_SETTING_KEY,
+                json.encodeToString(
+                    PersistedSecureStorageAliasDeletions.serializer(),
+                    PersistedSecureStorageAliasDeletions(aliases),
+                ),
+            )
+        }
+    }
+
     private fun decodeMetadata(metadataJson: String): PersistedWorkspaceKeyMetadata? =
         try {
             json.decodeFromString(PersistedWorkspaceKeyMetadata.serializer(), metadataJson)
@@ -347,6 +412,8 @@ class WorkspaceKeyRepository(
 
     companion object {
         const val WORKSPACE_KEY_METADATA_SETTING_KEY = "encryption.workspace.key_metadata"
+        internal const val PENDING_SECURE_STORAGE_ALIAS_DELETIONS_SETTING_KEY =
+            "encryption.workspace.pending_secure_storage_alias_deletions"
         private const val RECOVERY_SALT_BYTES = 16
 
         private val json = Json {
@@ -355,6 +422,11 @@ class WorkspaceKeyRepository(
         }
     }
 }
+
+@Serializable
+internal data class PersistedSecureStorageAliasDeletions(
+    val aliases: List<String>,
+)
 
 @Serializable
 internal data class PersistedWorkspaceKeyMetadata(

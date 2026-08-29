@@ -88,16 +88,16 @@ internal class TestDevice(
             transport = transport,
             sessionStore = sessionStore,
             activeWorkspaceSessionGuard = services.activeWorkspaceSessionGuard,
-            authorityMutationCoordinator = services.authorityMutationCoordinator,
+            workspaceLifecycleCoordinator = services.workspaceLifecycleCoordinator,
             localDeviceIdProvider = { deviceId },
         )
         workspaceJoinPackageProvider = workspaceKeys.workspaceJoinPackageProvider()
         workspaceJoiner = workspaceKeys.workspaceJoiner(
             deviceName = "$label device",
             platform = platform,
-            adoptionPolicy = services.workspaceAdoptionPolicy,
-            beforeWorkspaceReplacement = services.discardEmptyDraftForWorkspaceAdoption,
-            afterWorkspaceReplacement = services.bindAdoptedWorkspaceToCurrentSession,
+            beforeWorkspaceReplacement = services.discardLocalWorkspaceForReplacement,
+            afterWorkspaceReplacement = services.bindReplacementWorkspaceToCurrentSession,
+            afterWorkspaceReplacementCommitted = services.finalizeLocalWorkspaceReplacement,
         )
         pairing = SelfHostedWorkspacePairingService(
             settingsProvider = services.settingsRepository::load,
@@ -106,8 +106,7 @@ internal class TestDevice(
             sessionExecutor = services.selfHostedSessionExecutor,
             workspaceJoinPackageProvider = workspaceJoinPackageProvider,
             workspaceJoiner = workspaceJoiner,
-            adoptionPolicy = services.workspaceAdoptionPolicy,
-            authorityMutationCoordinator = services.authorityMutationCoordinator,
+            workspaceLifecycleCoordinator = services.workspaceLifecycleCoordinator,
             activeWorkspaceSessionGuard = services.activeWorkspaceSessionGuard,
             workspacePairingInviterReady = services.workspacePairingInviterReady,
         )

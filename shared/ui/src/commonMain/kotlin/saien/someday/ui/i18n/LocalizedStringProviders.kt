@@ -197,12 +197,16 @@ fun rememberSettingsUiStrings(): SettingsUiStrings {
     val pairingInvitationCancelled = stringResource(Res.string.settings_fb_pairing_invitation_cancelled)
     val pairingInvitationUnavailable = stringResource(Res.string.settings_fb_pairing_invitation_unavailable)
     val pairingJoined = stringResource(Res.string.settings_fb_pairing_joined)
+    val pairingSettingsReloadFailed = stringResource(Res.string.settings_fb_pairing_settings_reload_failed)
     val pairingPublishRequired = stringResource(Res.string.settings_fb_pairing_publish_required)
     val pairingSessionRequired = stringResource(Res.string.settings_fb_pairing_session_required)
     val pairingExpired = stringResource(Res.string.settings_fb_pairing_expired)
     val pairingWorkspaceLocked = stringResource(Res.string.settings_fb_pairing_workspace_locked)
-    val pairingLocalWorkspaceNotReplaceable = stringResource(Res.string.settings_fb_pairing_local_workspace_not_replaceable)
-    val pairingLocalContentPresent = stringResource(Res.string.settings_fb_pairing_local_content_present)
+    val pairingReplacementFailed = stringResource(Res.string.settings_fb_pairing_replacement_failed)
+    val pairingReplacementConfirmationRequired =
+        stringResource(Res.string.settings_fb_pairing_replacement_confirmation_required)
+    val pairingServerRequestFailed = stringResource(Res.string.settings_fb_pairing_server_request_failed)
+    val pairingVerificationFailed = stringResource(Res.string.settings_fb_pairing_verification_failed)
     val enterPairingToken = stringResource(Res.string.settings_fb_enter_pairing_token)
     val pairingFailed = stringResource(Res.string.settings_fb_pairing_failed)
     val settingsSaveFailed = stringResource(Res.string.settings_fb_settings_save_failed)
@@ -258,12 +262,15 @@ fun rememberSettingsUiStrings(): SettingsUiStrings {
         pairingInvitationCancelled = pairingInvitationCancelled,
         pairingInvitationUnavailable = pairingInvitationUnavailable,
         pairingJoined = pairingJoined,
+        pairingSettingsReloadFailed = pairingSettingsReloadFailed,
         pairingPublishRequired = pairingPublishRequired,
         pairingSessionRequired = pairingSessionRequired,
         pairingExpired = pairingExpired,
         pairingWorkspaceLocked = pairingWorkspaceLocked,
-        pairingLocalWorkspaceNotReplaceable = pairingLocalWorkspaceNotReplaceable,
-        pairingLocalContentPresent = pairingLocalContentPresent,
+        pairingReplacementFailed = pairingReplacementFailed,
+        pairingReplacementConfirmationRequired = pairingReplacementConfirmationRequired,
+        pairingServerRequestFailed = pairingServerRequestFailed,
+        pairingVerificationFailed = pairingVerificationFailed,
         enterPairingToken = enterPairingToken,
         pairingFailed = pairingFailed,
         settingsSaveFailed = settingsSaveFailed,

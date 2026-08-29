@@ -63,7 +63,7 @@ contains only a small set of product journeys:
 1. bootstrap and non-conflicting two-device convergence;
 2. durable same-field conflict on both devices;
 3. image import, media-first publication, entity sync, and lazy materialization;
-4. pairing, atomic workspace adoption, bootstrap, and visible notes.
+4. pairing, atomic workspace replacement, bootstrap, and visible notes.
 
 An E2E journey asserts externally meaningful state. It may observe a public
 cross-plane boundary to prove that media is already durable before entity

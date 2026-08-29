@@ -4,7 +4,7 @@ package saien.someday.sync.causality.v2
 
 import saien.someday.data.crypto.WorkspaceMasterKey
 import saien.someday.data.local.SqlDelightLocalDataRepository
-import saien.someday.sync.WorkspaceAuthorityMutationCoordinator
+import saien.someday.sync.WorkspaceLifecycleCoordinator
 import kotlin.time.Clock
 import kotlin.time.Instant
 import kotlinx.serialization.Serializable
@@ -204,7 +204,7 @@ class WorkspaceSyncCoordinatorV2(
      * cannot switch the active epoch while a repository operation is still
      * routing to the previous local surface.
      */
-    private val authorityMutationCoordinator: WorkspaceAuthorityMutationCoordinator? = null,
+    private val workspaceLifecycleCoordinator: WorkspaceLifecycleCoordinator? = null,
     /**
      * Runs after the checkpoint is locally activated but before that activation
      * transaction and the product-routing barrier commit. A failure rolls the
@@ -534,8 +534,8 @@ class WorkspaceSyncCoordinatorV2(
                 hookFailure
             }
         }
-        return if (authorityMutationCoordinator != null) {
-            authorityMutationCoordinator.productAccess(activate)
+        return if (workspaceLifecycleCoordinator != null) {
+            workspaceLifecycleCoordinator.productAccess(activate)
         } else {
             activate()
         }

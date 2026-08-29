@@ -88,16 +88,20 @@ preferences through typed DAG repositories. A durable outbox records remote
 work in the same local transaction as each mutation. UI and platform workers
 must not write projection or compatibility tables directly.
 
-The initial server connection has two valid outcomes:
+Authentication does not choose a workspace. An unbound local draft is not
+eligible for launch, foreground, or local-change automatic sync, so signing in
+cannot silently publish it as a new remote workspace. The user chooses one of
+two explicit operations:
 
-1. An empty remote workspace accepts the prepared checkpoint with one
-   compare-and-set and activates that same local generation.
-2. An existing remote workspace may replace a semantically empty local draft.
-   A non-empty local workspace is refused and is never silently merged.
+1. Manual Sync publishes the current local workspace. An empty remote pointer
+   accepts its prepared checkpoint with one compare-and-set and activates that
+   same local generation.
+2. Pair joins an existing workspace after destructive confirmation. The
+   current local workspace is discarded without merging; the old server copy,
+   if any, is not deleted.
 
-The same adoption rule applies to pairing. Semantic content includes notes,
-notebooks, deletion history, and local images. This keeps accidental
-cross-workspace merging out of the synchronization engine.
+Once a publication attempt or successful Pair records an account authority on
+the local generation, automatic sync may run and retry normally.
 
 ## 4. Entity DAG
 
@@ -180,8 +184,10 @@ Unknown, missing, corrupt, or differently bound media aborts before the entity
 write. Unreferenced local images neither upload automatically nor block sync.
 
 The complete media-then-entity operation is single-flight per running client.
-Concurrent manual or automatic requests do not read and acknowledge the same
-durable outbox twice.
+Active sync and media materialization share the workspace-lifecycle gate with
+Pair, so work authenticated against an old workspace cannot write local state
+after replacement. Concurrent manual or automatic requests do not read and
+acknowledge the same durable outbox twice.
 
 Receiving text does not wait for all images. A client applies the entity DAG,
 then materializes referenced images lazily and verifies authenticated identity
@@ -193,11 +199,14 @@ Pairing transfers the workspace key end to end through the single-use,
 ten-minute capability defined in `workspace-pairing-protocol.md`. The server
 stores only opaque invitation state and encrypted envelope bytes.
 
-An inviter must have an authenticated, published workspace authority. A fresh
-joining installation may discard its semantically empty default workspace
-only after authenticating the invitation package. The adoption policy is
-checked before remote claim and again inside the serialized local replacement
-transaction. Non-empty local state is refused.
+An inviter must have an authenticated, published workspace authority. A
+joining installation must explicitly authorize replacement on each attempt;
+without that authorization it refuses before remote claim. After the invitation
+package authenticates, one serialized database transaction discards all local
+DAG, projection, protocol, and media records, installs the invited metadata,
+and binds the new authority. Active, bound, blocked, locked, and contentful
+workspaces are replaceable because the user has explicitly chosen deletion;
+they are never merged.
 
 ## 8. Backup and recovery boundary
 

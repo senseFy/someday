@@ -327,6 +327,7 @@ fun SomedayApp(
         TwentyFourHourOnThisDayNotificationTimeFormatter,
     pendingOpenMemories: Boolean = false,
     onPendingOpenMemoriesConsumed: () -> Unit = {},
+    loadSettings: () -> ClientSettings,
     onSettingsChanged: (ClientSettings) -> ClientSettings = { it },
     workspacePreferencesConflictResolver: WorkspacePreferencesConflictResolver? = null,
     onAppliedSettingsChanged: (ClientSettings) -> Unit = {},
@@ -337,6 +338,7 @@ fun SomedayApp(
     selfHostedSetupClient: SelfHostedSetupClient? = null,
     selfHostedSessionCredentialStore: SelfHostedSessionCredentialStore? = null,
     manualSyncRunner: ManualSyncRunner? = null,
+    automaticSyncEligible: () -> Boolean,
     workspacePairingInvitationCreator: WorkspacePairingInvitationCreator? = null,
     workspacePairingInvitationJoiner: WorkspacePairingInvitationJoiner? = null,
     workspacePairingInvitationCanceller: WorkspacePairingInvitationCanceller? = null,
@@ -411,11 +413,14 @@ fun SomedayApp(
             workspacePairingInvitationCreator,
             workspacePairingInvitationJoiner,
             workspacePairingInvitationCanceller,
+            automaticSyncEligible,
+            loadSettings,
         ) {
             startupTrace?.invoke("SomedayApp.settingsController.start")
             SettingsUiController(
                 initialSettings = appSettings,
                 notebooksProvider = { notesController.state.notebooks },
+                loadSettings = loadSettings,
                 persistSettings = onSettingsChanged,
                 workspacePreferencesConflictResolver = workspacePreferencesConflictResolver,
                 exportProvider = onLocalExport,
@@ -442,12 +447,13 @@ fun SomedayApp(
                         reason = ManualSyncReason.Unavailable,
                     )
                 },
+                automaticSyncEligible = automaticSyncEligible,
                 workspacePairingInvitationCreator =
                     workspacePairingInvitationCreator ?: WorkspacePairingInvitationCreator {
                         WorkspacePairingInvitationResult.failure(WorkspacePairingReason.Unavailable)
                     },
                 workspacePairingInvitationJoiner =
-                    workspacePairingInvitationJoiner ?: WorkspacePairingInvitationJoiner {
+                    workspacePairingInvitationJoiner ?: WorkspacePairingInvitationJoiner { _, _ ->
                         WorkspaceJoinResult.failure(WorkspacePairingReason.Unavailable)
                     },
                 workspacePairingInvitationCanceller =
@@ -4949,6 +4955,8 @@ private fun SyncIssueReason.localizedMessage(): String =
         SyncIssueReason.RetryRequired -> stringResource(Res.string.settings_fb_sync_retry_required)
         SyncIssueReason.Blocked -> stringResource(Res.string.settings_fb_sync_blocked)
         SyncIssueReason.SyncFailed -> stringResource(Res.string.settings_fb_sync_failed)
+        SyncIssueReason.WorkspaceSettingsReloadRequired ->
+            stringResource(Res.string.settings_fb_pairing_settings_reload_failed)
     }
 
 @Composable
@@ -5065,7 +5073,7 @@ private fun DialogOptionRow(
 }
 
 @Composable
-private fun WorkspacePairingContent(
+internal fun WorkspacePairingContent(
     state: SettingsUiState,
     controller: SettingsUiController,
     readinessSubtitle: String,
@@ -5082,6 +5090,7 @@ private fun WorkspacePairingContent(
         )
     }
     var joinPairingToken by remember { mutableStateOf("") }
+    var pendingReplacementToken by remember { mutableStateOf<String?>(null) }
     val actionRunning = state.sync.busy
     val tokenEntered = joinPairingToken.isNotBlank()
     val invitationExpiresAt = state.sync.invitation?.expiresAtEpochMillis
@@ -5229,7 +5238,7 @@ private fun WorkspacePairingContent(
                 }
             }
             Text(
-                text = stringResource(Res.string.pairing_local_notes_stay),
+                text = stringResource(Res.string.pairing_replacement_warning),
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 style = MaterialTheme.typography.bodySmall,
                 modifier = Modifier.padding(vertical = 4.dp),
@@ -5245,13 +5254,45 @@ private fun WorkspacePairingContent(
                 actionText = stringResource(Res.string.common_join),
                 busy = state.sync.operation == SyncUiOperation.JoiningInvitation,
                 enabled = !actionRunning && tokenEntered,
-                onClick = {
-                    runWorkspacePairingAction(clearJoinFormOnSuccess = true) {
-                        controller.joinWorkspaceWithToken(joinPairingToken)
-                    }
-                },
+                onClick = { pendingReplacementToken = joinPairingToken },
             )
         }
+    }
+
+    val replacementToken = pendingReplacementToken
+    if (replacementToken != null) {
+        AlertDialog(
+            onDismissRequest = { pendingReplacementToken = null },
+            title = { Text(stringResource(Res.string.pairing_replace_dialog_title)) },
+            text = { Text(stringResource(Res.string.pairing_replace_dialog_body)) },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        pendingReplacementToken = null
+                        runWorkspacePairingAction(clearJoinFormOnSuccess = true) {
+                            controller.joinWorkspaceWithToken(
+                                tokenInput = replacementToken,
+                                replaceExistingWorkspace = true,
+                            )
+                        }
+                    },
+                    enabled = !actionRunning,
+                ) {
+                    Text(
+                        text = stringResource(Res.string.pairing_replace_dialog_confirm),
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = { pendingReplacementToken = null },
+                    enabled = !actionRunning,
+                ) {
+                    Text(stringResource(Res.string.common_cancel))
+                }
+            },
+        )
     }
 }
 

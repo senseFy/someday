@@ -3,7 +3,7 @@
 package saien.someday.sync.causality.v2
 
 import saien.someday.data.crypto.SodiumWorkspaceCrypto
-import saien.someday.sync.WorkspaceAuthorityMutationCoordinator
+import saien.someday.sync.WorkspaceLifecycleCoordinator
 import saien.someday.sync.causality.v2.testkit.FileBackedSyncDevice
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -368,7 +368,7 @@ class WorkspaceSyncCoordinatorV2Test {
                 WRITER_B,
                 remote,
                 beforeEntityPublication = {},
-                authorityMutationCoordinator = WorkspaceAuthorityMutationCoordinator(),
+                workspaceLifecycleCoordinator = WorkspaceLifecycleCoordinator(),
                 bootstrapCommitHook = {
                     successfulHookCalls += 1
                     null
@@ -471,7 +471,7 @@ class WorkspaceSyncCoordinatorV2Test {
                 racingRemote,
                 {},
                 protocol,
-                authorityMutationCoordinator = WorkspaceAuthorityMutationCoordinator(),
+                workspaceLifecycleCoordinator = WorkspaceLifecycleCoordinator(),
             ).syncOnce()
 
             assertEquals(SyncCoordinatorStatusV2.BLOCKED, result.status)

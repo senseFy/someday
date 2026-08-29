@@ -28,7 +28,7 @@ import saien.someday.domain.notes.NotesLocationInput
 import saien.someday.domain.notes.NotesRepository
 import saien.someday.domain.notes.VersionConflictBranch
 import saien.someday.domain.notes.noteCalendarDate
-import saien.someday.sync.WorkspaceAuthorityMutationCoordinator
+import saien.someday.sync.WorkspaceLifecycleCoordinator
 import kotlin.time.Clock
 import kotlin.time.Instant
 import kotlinx.datetime.LocalDate
@@ -40,7 +40,7 @@ class SystemV2NotesRepository(
     writerDeviceIdProvider: () -> String,
     remoteProfileProvider: () -> String,
     private val clock: () -> Instant = { Clock.System.now() },
-    private val authorityMutationCoordinator: WorkspaceAuthorityMutationCoordinator? = null,
+    private val workspaceLifecycleCoordinator: WorkspaceLifecycleCoordinator? = null,
 ) : NotesRepository {
     private val protocolStore = SqlDelightSyncProtocolStoreV2(localRepository.database)
     private val contexts = WorkspaceSystemV2ContextProvider(
@@ -717,7 +717,7 @@ class SystemV2NotesRepository(
                 is WorkspaceLocalCommitResultV2.Rejected -> error(result.error.safeMessage)
             }
         }
-        authorityMutationCoordinator?.productAccess(action) ?: action()
+        workspaceLifecycleCoordinator?.productAccess(action) ?: action()
     }
 
     private fun requireTokenBase(

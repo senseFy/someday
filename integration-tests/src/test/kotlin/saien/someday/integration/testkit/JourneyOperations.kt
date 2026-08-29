@@ -4,13 +4,16 @@ import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
 /** Mechanical setup shared by journeys that are not themselves testing pairing. */
-internal fun TestDevice.adoptWorkspaceFrom(inviter: TestDevice) {
+internal fun TestDevice.replaceWorkspaceFrom(inviter: TestDevice) {
     val packageResult = inviter.workspaceJoinPackageProvider.createPackage()
     assertTrue(
         packageResult.success,
         packageResult.diagnosticMessage ?: packageResult.reason.name,
     )
-    val joined = workspaceJoiner.join(assertNotNull(packageResult.packageData))
+    val joined = workspaceJoiner.join(
+        assertNotNull(packageResult.packageData),
+        replaceExistingWorkspace = true,
+    )
     assertTrue(joined.success, joined.diagnosticMessage ?: joined.reason.name)
 }
 

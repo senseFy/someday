@@ -15,7 +15,7 @@ import saien.someday.domain.settings.WorkspacePreferencesConflictView
 import saien.someday.domain.settings.WorkspacePreferencesSnapshot
 import saien.someday.domain.settings.WorkspacePreferencesSyncState
 import saien.someday.domain.settings.WorkspacePreferencesSyncStatus
-import saien.someday.sync.WorkspaceAuthorityMutationCoordinator
+import saien.someday.sync.WorkspaceLifecycleCoordinator
 import kotlin.time.Clock
 import kotlin.time.Instant
 
@@ -31,7 +31,7 @@ class SystemV2ClientSettingsRepository(
     writerDeviceIdProvider: () -> String,
     remoteProfileProvider: () -> String,
     private val clock: () -> Instant = { Clock.System.now() },
-    private val authorityMutationCoordinator: WorkspaceAuthorityMutationCoordinator? = null,
+    private val workspaceLifecycleCoordinator: WorkspaceLifecycleCoordinator? = null,
 ) : ClientSettingsRepository, WorkspacePreferencesConflictResolver {
     private val contexts = WorkspaceSystemV2ContextProvider(
         localRepository,
@@ -41,8 +41,8 @@ class SystemV2ClientSettingsRepository(
     )
 
     private fun <T> productAccess(block: () -> T): T =
-        if (authorityMutationCoordinator != null) {
-            authorityMutationCoordinator.productAccess(block)
+        if (workspaceLifecycleCoordinator != null) {
+            workspaceLifecycleCoordinator.productAccess(block)
         } else {
             block()
         }

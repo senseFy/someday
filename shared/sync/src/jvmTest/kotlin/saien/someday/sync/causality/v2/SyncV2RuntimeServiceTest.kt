@@ -21,7 +21,7 @@ import saien.someday.domain.settings.ManualSyncResult
 import saien.someday.domain.settings.SyncConfiguration
 import saien.someday.domain.settings.SyncMode
 import saien.someday.domain.notes.NoteInput
-import saien.someday.sync.WorkspaceAuthorityMutationCoordinator
+import saien.someday.sync.WorkspaceLifecycleCoordinator
 import java.nio.file.Files
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
@@ -241,6 +241,47 @@ class SyncV2RuntimeServiceTest {
     }
 
     @Test
+    fun activeSyncHoldsTheWorkspaceLifecycleLockForItsRemoteRoundTrip() {
+        val remote = InMemoryWorkspaceSyncRemoteV2(SyncRemoteProfileV2.SELF_HOSTED.wireValue)
+        withRuntimeFixture(remote) { fixture ->
+            assertTrue(fixture.runtime().run().success)
+            val remoteEntered = CountDownLatch(1)
+            val releaseRemote = CountDownLatch(1)
+            val replacementEntered = CountDownLatch(1)
+            val executor = Executors.newFixedThreadPool(2)
+            try {
+                val sync = executor.submit<ManualSyncResult> {
+                    fixture.runtime(
+                        transportRemote = BlockingPointerLoadRemote(
+                            delegate = remote,
+                            entered = remoteEntered,
+                            release = releaseRemote,
+                        ),
+                    ).run()
+                }
+                assertTrue(remoteEntered.await(5, TimeUnit.SECONDS))
+                val replacement = executor.submit {
+                    fixture.workspaceLifecycleCoordinator.exclusive {
+                        replacementEntered.countDown()
+                    }
+                }
+                assertFalse(
+                    replacementEntered.await(150, TimeUnit.MILLISECONDS),
+                    "Workspace replacement entered while an ACTIVE sync was in flight.",
+                )
+
+                releaseRemote.countDown()
+                assertTrue(sync.get(10, TimeUnit.SECONDS).success)
+                replacement.get(10, TimeUnit.SECONDS)
+                assertTrue(replacementEntered.await(1, TimeUnit.SECONDS))
+            } finally {
+                releaseRemote.countDown()
+                executor.shutdownNow()
+            }
+        }
+    }
+
+    @Test
     fun unauthenticatedCompetingPointerDoesNotDiscardPreparedDraft() {
         val remote = InMemoryWorkspaceSyncRemoteV2(SyncRemoteProfileV2.SELF_HOSTED.wireValue)
         withRuntimeFixture(remote) { fixture ->
@@ -415,7 +456,7 @@ class SyncV2RuntimeServiceTest {
         val writerDeviceId: String,
     ) {
         val protocolStore = SqlDelightSyncProtocolStoreV2(localRepository.database)
-        val authorityMutationCoordinator = WorkspaceAuthorityMutationCoordinator()
+        val workspaceLifecycleCoordinator = WorkspaceLifecycleCoordinator()
 
         fun runtime(
             clockValue: Instant = NOW,
@@ -427,7 +468,7 @@ class SyncV2RuntimeServiceTest {
             workspaceKeyProvider = { WORKSPACE_KEY },
             writerDeviceIdProvider = { writerDeviceId },
             transportFactory = SyncRemoteTransportFactoryV2 { transportRemote },
-            authorityMutationCoordinator = authorityMutationCoordinator,
+            workspaceLifecycleCoordinator = workspaceLifecycleCoordinator,
             clock = { clockValue },
             beforeEntityPublication = {},
         )
@@ -449,7 +490,7 @@ class SyncV2RuntimeServiceTest {
             { writerDeviceId },
             { remote.remoteProfile },
             clock = { clockValue },
-        ), authorityMutationCoordinator)
+        ), workspaceLifecycleCoordinator)
     }
 
     private class InMemorySettingsRepository(
@@ -549,6 +590,18 @@ class SyncV2RuntimeServiceTest {
             entered.countDown()
             check(release.await(5, TimeUnit.SECONDS))
             return delegate.compareAndSetEpochPointer(descriptor, expectedCurrentDigest, pointer)
+        }
+    }
+
+    private class BlockingPointerLoadRemote(
+        private val delegate: WorkspaceSyncRemoteV2,
+        private val entered: CountDownLatch,
+        private val release: CountDownLatch,
+    ) : WorkspaceSyncRemoteV2 by delegate {
+        override fun loadEpochPointer(): EncryptedWorkspaceObjectV2? {
+            entered.countDown()
+            check(release.await(5, TimeUnit.SECONDS))
+            return delegate.loadEpochPointer()
         }
     }
 

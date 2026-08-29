@@ -26,12 +26,12 @@
   entity-DAG subsystem remains specified by `docs/sync-system-v2-spec.md`, and
   media wire details by `docs/self-hosted-media-v3.md`.
 - `docs/workspace-pairing-protocol.md` is the frozen workspace-pairing
-  capability, encryption, transport-state, and local-adoption contract.
+  capability, encryption, transport-state, and local-replacement contract.
 - Any change to epoch pointers, checkpoints, entity envelopes, validation,
   encryption metadata, media objects, or authority binding must update the
   relevant V3/subsystem spec in the same change.
 - Any change to pairing token parsing, derivation domains, QR payload,
-  authority AAD, expiry, envelope fields, remote transitions, or adoption
+  authority AAD, expiry, envelope fields, remote transitions, or replacement
   ordering must update the pairing protocol and its golden/interoperability
   evidence in the same change.
 - Sync changes that touch segment matching, pointer CAS, idempotent replay, or cursor advancement must include JVM protocol tests and relevant client compile checks across iOS, Android, and Desktop.
@@ -41,13 +41,21 @@
   `scripts/verify-system-v3-architecture` green when changing synchronization
   behavior. The gates require fresh passing suites but must not pin individual
   JUnit method names.
-- Pairing may replace exactly one healthy, unbound, semantically empty local
-  draft. It must refuse active, blocked, unhealthy, ambiguous, or non-empty
-  local state. Recheck under the shared authority lock and discard the empty
-  draft atomically with workspace adoption.
-- Pairing and initial workspace authority establishment must use the same
-  authority-mutation coordinator. Do not introduce a per-service lock or claim
-  before the key-bound-state check.
+- Pairing may replace the current local workspace only after explicit,
+  per-attempt user confirmation that all of its local data will be discarded
+  without merging. The workspace may be active, bound, blocked, unhealthy, or
+  contain content; none of those states implies consent. Refuse before remote
+  claim when confirmation is absent.
+- Pairing replacement must remove every local generation and its DAG,
+  projections, protocol state, and media records in the same database
+  transaction that installs the joined workspace metadata and authority. A
+  failure before commit preserves the prior workspace. Delete unreferenced
+  media files only after commit, as best-effort cleanup that cannot turn a
+  committed replacement into a pairing failure.
+- Pairing, initial workspace authority establishment, active sync, and product
+  mutations must share the workspace-lifecycle coordination boundary. Do not
+  introduce a per-service lock that allows old-workspace state to be written
+  after replacement.
 - Pairing secrets are 128-bit random capabilities. Domain-derived identifiers
   are opaque Base64url values; never use a human-entered token or a fast hash
   as a server lookup key, and never log QR/manual-token text.

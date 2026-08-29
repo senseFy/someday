@@ -14,14 +14,14 @@ import saien.someday.domain.media.MediaAssetId
 /**
  * The only writable local-media entry point exposed by System V3 composition.
  *
- * Workspace adoption performs its final empty-workspace check and pointer swap
- * under the same [WorkspaceAuthorityMutationCoordinator.productAccess] lock.
- * Keeping imports and maintenance behind this facade means a media row cannot
- * appear between that check and the workspace replacement.
+ * Workspace replacement discards local media rows and swaps authority under the
+ * same [WorkspaceLifecycleCoordinator.productAccess] lock. Keeping
+ * imports and maintenance behind this facade prevents an old-workspace media
+ * row from appearing during replacement.
  */
 class AuthorityCoordinatedMediaAssetStore internal constructor(
     private val delegate: LocalMediaAssetStore,
-    private val authorityMutationCoordinator: WorkspaceAuthorityMutationCoordinator,
+    private val workspaceLifecycleCoordinator: WorkspaceLifecycleCoordinator,
 ) {
     fun getAsset(assetId: MediaAssetId): LocalMediaAsset? = delegate.getAsset(assetId)
 
@@ -51,5 +51,5 @@ class AuthorityCoordinatedMediaAssetStore internal constructor(
     ): List<LocalMediaAsset> = delegate.listAssetsPendingPublication(authorityBindingId, workspaceId)
 
     internal fun <T> localMutation(block: LocalMediaAssetStore.() -> T): T =
-        authorityMutationCoordinator.productAccess { delegate.block() }
+        workspaceLifecycleCoordinator.productAccess { delegate.block() }
 }

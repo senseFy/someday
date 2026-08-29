@@ -12,7 +12,6 @@ import saien.someday.domain.settings.normalizeSelfHostedEndpoint
 import saien.someday.domain.settings.WorkspaceJoinPackageProvider
 import saien.someday.domain.settings.WorkspaceJoinResult
 import saien.someday.domain.settings.WorkspaceJoiner
-import saien.someday.domain.settings.LocalWorkspaceAdoptionPolicy
 import saien.someday.domain.settings.WorkspacePairingInvitation
 import saien.someday.domain.settings.WorkspacePairingInvitationCanceller
 import saien.someday.domain.settings.WorkspacePairingInvitationCreator
@@ -24,7 +23,7 @@ import saien.someday.sync.pairing.WorkspacePairingEnvelopeCodec
 import saien.someday.sync.pairing.WorkspacePairingEnvelopeDecodeResult
 import saien.someday.sync.pairing.WorkspacePairingToken
 import saien.someday.sync.pairing.base64UrlNoPadding
-import saien.someday.sync.WorkspaceAuthorityMutationCoordinator
+import saien.someday.sync.WorkspaceLifecycleCoordinator
 
 class SelfHostedWorkspacePairingService(
     private val settingsProvider: () -> ClientSettings,
@@ -33,8 +32,7 @@ class SelfHostedWorkspacePairingService(
     private val sessionExecutor: RefreshingSelfHostedSessionExecutor,
     private val workspaceJoinPackageProvider: WorkspaceJoinPackageProvider,
     private val workspaceJoiner: WorkspaceJoiner,
-    private val adoptionPolicy: LocalWorkspaceAdoptionPolicy,
-    private val authorityMutationCoordinator: WorkspaceAuthorityMutationCoordinator,
+    private val workspaceLifecycleCoordinator: WorkspaceLifecycleCoordinator,
     private val activeWorkspaceSessionGuard: ActiveWorkspaceSessionGuard,
     private val workspacePairingInviterReady: () -> Boolean,
     private val crypto: SodiumWorkspaceCrypto = SodiumWorkspaceCrypto(),
@@ -46,62 +44,7 @@ class SelfHostedWorkspacePairingService(
 
     override fun createInvitation(): WorkspacePairingInvitationResult =
         runCatching {
-            if (!workspacePairingInviterReady()) {
-                return WorkspacePairingInvitationResult.failure(
-                    WorkspacePairingReason.PublishRequired,
-                )
-            }
-            val session = when (val sessionResult = requireSession()) {
-                is PairingSessionResult.Ready -> sessionResult.session
-                is PairingSessionResult.Failed ->
-                    return WorkspacePairingInvitationResult.failure(sessionResult.reason)
-            }
-            val packageResult = workspaceJoinPackageProvider.createPackage()
-            val packageData = packageResult.packageData
-                ?: return WorkspacePairingInvitationResult.failure(
-                    packageResult.reason,
-                    packageResult.diagnosticMessage,
-                )
-            val authority = authority(session)
-
-            repeat(MAX_CREATE_ATTEMPTS) {
-                val token = WorkspacePairingToken.generate(crypto)
-                val nowMillis = clock().toEpochMilliseconds()
-                val requestedExpiry = nowMillis + WorkspacePairingEnvelopeCodec.MAX_TTL_MILLIS
-                val encoded = envelopeCodec.encode(
-                    token = token,
-                    authority = authority,
-                    createdAtEpochMillis = nowMillis,
-                    expiresAtEpochMillis = requestedExpiry,
-                    packageData = packageData,
-                )
-                val response = try {
-                    sessionExecutor.authorized(session.endpoint, session.userId, session.accessToken) { accessToken ->
-                        transport.createPairingInvite(
-                            endpoint = session.endpoint,
-                            accessToken = accessToken,
-                            inviteId = encoded.inviteId,
-                            request = SelfHostedPairingInviteCreateRequest(
-                                envelopeJson = encoded.bytes.decodeToString(),
-                                envelopeDigest = encoded.digest,
-                                expiresAtEpochMillis = requestedExpiry,
-                            ),
-                        )
-                    }
-                } catch (error: SelfHostedSyncHttpException) {
-                    if (error.status == 409) return@repeat
-                    throw error
-                }
-                return WorkspacePairingInvitationResult.success(
-                    reason = WorkspacePairingReason.InvitationCreated,
-                    invitation = WorkspacePairingInvitation.create(
-                        manualToken = token.formattedManualToken(),
-                        qrPayload = token.qrPayload(),
-                        expiresAtEpochMillis = response.expiresAtEpochMillis,
-                    ),
-                )
-            }
-            WorkspacePairingInvitationResult.failure(WorkspacePairingReason.Failed)
+            workspaceLifecycleCoordinator.exclusive { createInvitationLocked() }
         }.getOrElse { error ->
             WorkspacePairingInvitationResult.failure(
                 reason = WorkspacePairingReason.Failed,
@@ -109,12 +52,86 @@ class SelfHostedWorkspacePairingService(
             )
         }
 
-    override fun joinWithToken(tokenInput: String): WorkspaceJoinResult =
+    private fun createInvitationLocked(): WorkspacePairingInvitationResult {
+        if (!workspacePairingInviterReady()) {
+            return WorkspacePairingInvitationResult.failure(
+                WorkspacePairingReason.PublishRequired,
+            )
+        }
+        val session = when (val sessionResult = requireSession()) {
+            is PairingSessionResult.Ready -> sessionResult.session
+            is PairingSessionResult.Failed ->
+                return WorkspacePairingInvitationResult.failure(sessionResult.reason)
+        }
+        val packageResult = workspaceJoinPackageProvider.createPackage()
+        val packageData = packageResult.packageData
+            ?: return WorkspacePairingInvitationResult.failure(
+                packageResult.reason,
+                packageResult.diagnosticMessage,
+            )
+        val authority = authority(session)
+
+        repeat(MAX_CREATE_ATTEMPTS) {
+            val token = WorkspacePairingToken.generate(crypto)
+            val nowMillis = clock().toEpochMilliseconds()
+            val requestedExpiry = nowMillis + WorkspacePairingEnvelopeCodec.MAX_TTL_MILLIS
+            val encoded = envelopeCodec.encode(
+                token = token,
+                authority = authority,
+                createdAtEpochMillis = nowMillis,
+                expiresAtEpochMillis = requestedExpiry,
+                packageData = packageData,
+            )
+            val response = try {
+                sessionExecutor.authorized(session.endpoint, session.userId, session.accessToken) { accessToken ->
+                    transport.createPairingInvite(
+                        endpoint = session.endpoint,
+                        accessToken = accessToken,
+                        inviteId = encoded.inviteId,
+                        request = SelfHostedPairingInviteCreateRequest(
+                            envelopeJson = encoded.bytes.decodeToString(),
+                            envelopeDigest = encoded.digest,
+                            expiresAtEpochMillis = requestedExpiry,
+                        ),
+                    )
+                }
+            } catch (error: SelfHostedSyncHttpException) {
+                if (error.status == 409) return@repeat
+                return WorkspacePairingInvitationResult.failure(
+                    reason = WorkspacePairingReason.ServerRequestFailed,
+                    diagnosticMessage = error.safePairingFailureDetail(),
+                )
+            } catch (error: Throwable) {
+                return WorkspacePairingInvitationResult.failure(
+                    reason = WorkspacePairingReason.ServerRequestFailed,
+                    diagnosticMessage = error.safePairingFailureDetail(),
+                )
+            }
+            return WorkspacePairingInvitationResult.success(
+                reason = WorkspacePairingReason.InvitationCreated,
+                invitation = WorkspacePairingInvitation.create(
+                    manualToken = token.formattedManualToken(),
+                    qrPayload = token.qrPayload(),
+                    expiresAtEpochMillis = response.expiresAtEpochMillis,
+                ),
+            )
+        }
+        return WorkspacePairingInvitationResult.failure(WorkspacePairingReason.Failed)
+    }
+
+    override fun joinWithToken(
+        tokenInput: String,
+        replaceExistingWorkspace: Boolean,
+    ): WorkspaceJoinResult =
         runCatching {
+            if (!replaceExistingWorkspace) {
+                return WorkspaceJoinResult.failure(
+                    WorkspacePairingReason.ReplacementConfirmationRequired,
+                )
+            }
             val token = WorkspacePairingToken.parse(tokenInput)
                 ?: return WorkspaceJoinResult.failure(WorkspacePairingReason.InvalidToken)
-            adoptionPolicy.refusalReason()?.let { return WorkspaceJoinResult.failure(it) }
-            authorityMutationCoordinator.exclusive {
+            workspaceLifecycleCoordinator.exclusive {
                 joinWithTokenLocked(token)
             }
         }.getOrElse { error ->
@@ -125,7 +142,6 @@ class SelfHostedWorkspacePairingService(
         }
 
     private fun joinWithTokenLocked(token: WorkspacePairingToken): WorkspaceJoinResult {
-        adoptionPolicy.refusalReason()?.let { return WorkspaceJoinResult.failure(it) }
         val session = when (val sessionResult = requireSession()) {
             is PairingSessionResult.Ready -> sessionResult.session
             is PairingSessionResult.Failed -> return WorkspaceJoinResult.failure(sessionResult.reason)
@@ -147,10 +163,15 @@ class SelfHostedWorkspacePairingService(
                 409 -> WorkspaceJoinResult.failure(WorkspacePairingReason.InvitationAlreadyUsed)
                 410 -> WorkspaceJoinResult.failure(WorkspacePairingReason.InvitationExpired)
                 else -> WorkspaceJoinResult.failure(
-                    WorkspacePairingReason.Failed,
+                    WorkspacePairingReason.ServerRequestFailed,
                     error.safeMessage,
                 )
             }
+        } catch (error: Throwable) {
+            return WorkspaceJoinResult.failure(
+                WorkspacePairingReason.ServerRequestFailed,
+                error.safePairingFailureDetail(),
+            )
         }
         try {
             val bytes = claimed.envelopeJson.encodeToByteArray()
@@ -174,9 +195,11 @@ class SelfHostedWorkspacePairingService(
                 WorkspacePairingEnvelopeDecodeResult.Invalid ->
                     return WorkspaceJoinResult.failure(WorkspacePairingReason.VerificationFailed)
             }
-            return authorityMutationCoordinator.productAccess {
-                adoptionPolicy.refusalReason()?.let { return@productAccess WorkspaceJoinResult.failure(it) }
-                workspaceJoiner.join(decoded.packageData)
+            return workspaceLifecycleCoordinator.productAccess {
+                workspaceJoiner.join(
+                    packageData = decoded.packageData,
+                    replaceExistingWorkspace = true,
+                )
             }
         } finally {
             runCatching {
@@ -214,10 +237,15 @@ class SelfHostedWorkspacePairingService(
                     404, 410 -> WorkspaceJoinResult.success(WorkspacePairingReason.InvitationUnavailable)
                     409 -> WorkspaceJoinResult.failure(WorkspacePairingReason.InvitationAlreadyUsed)
                     else -> WorkspaceJoinResult.failure(
-                        WorkspacePairingReason.Failed,
+                        WorkspacePairingReason.ServerRequestFailed,
                         error.safeMessage,
                     )
                 }
+            } catch (error: Throwable) {
+                WorkspaceJoinResult.failure(
+                    WorkspacePairingReason.ServerRequestFailed,
+                    error.safePairingFailureDetail(),
+                )
             }
         }.getOrElse { error ->
             WorkspaceJoinResult.failure(
