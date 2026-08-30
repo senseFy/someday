@@ -21,9 +21,9 @@ cannot load all project dependencies.
 - `shared:domain` — note, notebook, navigation, settings, location, and merge
   domain models.
 - `shared:data` — local persistence, app-private media, SQLDelight
-  repositories, encryption, recovery keys, settings, and export.
+  repositories, encryption, portable recovery metadata, settings, and export.
 - `shared:sync` — System V3 clients, encrypted entity/media synchronization,
-  and conflict resolution.
+  workspace recovery and pairing, and conflict resolution.
 - `shared:ui` — shared Compose UI, controllers, and application shell.
 - `app/android`, `app/ios`, `app/desktop` — platform entry points and adapters.
 - `server` — Ktor sync/admin service.
@@ -156,8 +156,12 @@ make sync-v3-apple-gate
 `make server-container-smoke` validates the production image, standalone
 Compose setup, and operator commands. `make sync-v3-gate` provisions isolated
 PostgreSQL, S3-compatible storage, and Ktor endpoints for end-to-end sync and
-recovery tests. `make sync-v3-apple-gate` runs shared behavior and application
-shell checks on an iOS Simulator.
+paired-device server-recovery tests. Recovery-code cryptography, client service,
+and server API behavior run in their JVM and PostgreSQL suites. Fresh-client
+recovery through the account-current opaque envelope is part of release
+acceptance.
+`make sync-v3-apple-gate` runs shared behavior and application shell checks on an
+iOS Simulator.
 
 Connected platform checks require their native runtimes:
 

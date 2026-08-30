@@ -153,6 +153,89 @@ class WorkspaceSyncDeadLetterRecoveryV2Test {
         }
     }
 
+    @Test
+    fun unitOneHundredOneMissingParentCommitsValidPrefixBeforeRecordingBlocker() {
+        val key = workspaceKey(31)
+        val baseRemote = InMemoryWorkspaceSyncRemoteV2()
+        val publisher = FileBackedSyncDevice.create(WRITER_A) { T0 }
+        val consumer = FileBackedSyncDevice.create(WRITER_B) { T1 }
+        try {
+            val checkpoint = persistAndPublishMinimalCheckpoint(publisher, key, baseRemote)
+            assertEquals(
+                SyncCoordinatorStatusV2.SUCCESS,
+                consumer.coordinator(key, baseRemote).syncOnce().status,
+            )
+            val source = publisher.requireActiveContext(key)
+            var parent = source.store.loadHeads(PREFERENCES_KEY).single()
+            val validVersions = (1..100).map { index ->
+                source.factory.createContentChild(
+                    parent,
+                    (parent.contentPayload as WorkspacePreferencesV2).copy(
+                        theme = if (index % 2 == 0) WorkspaceThemeV2.DARK else WorkspaceThemeV2.LIGHT,
+                    ),
+                    source.deviceActorId,
+                    T1,
+                ).also { parent = it }
+            }
+            val missingParent = source.factory.createContentChild(
+                parent,
+                (parent.contentPayload as WorkspacePreferencesV2).copy(theme = WorkspaceThemeV2.LIGHT),
+                source.deviceActorId,
+                T2,
+            )
+            val blockedChild = source.factory.createContentChild(
+                missingParent,
+                (missingParent.contentPayload as WorkspacePreferencesV2).copy(theme = WorkspaceThemeV2.DARK),
+                source.deviceActorId,
+                T2,
+            )
+            val encrypted = (validVersions + blockedChild).map { version ->
+                source.cipher.encryptEntity(
+                    version,
+                    source.factory.newMutationId(),
+                    WRITER_A,
+                    source.wireCodec.encode(version),
+                )
+            }
+            val units = encrypted.mapIndexed { index, objectValue ->
+                val cursor = index + 1
+                WorkspaceEncryptedCursorUnitV2(
+                    syncEpochId = checkpoint.descriptor.syncEpochId,
+                    streamId = BATCH_STREAM,
+                    expectedCursorValue = index.takeIf { it > 0 }?.toString(),
+                    nextCursorValue = cursor.toString(),
+                    unitId = "$BATCH_UNIT_PREFIX$cursor",
+                    unitDigest = objectValue.ciphertextDigest,
+                    objects = listOf(objectValue),
+                )
+            }
+            val remote = FixedCursorUnitsRemote(baseRemote, units)
+
+            val blocked = consumer.coordinator(key, remote).syncOnce()
+
+            assertEquals(SyncCoordinatorStatusV2.BLOCKED, blocked.status)
+            assertEquals("missing_parent", blocked.safeErrorCode)
+            assertEquals(100, blocked.pulledUnits)
+            val context = consumer.requireActiveContext(key)
+            val cursor = context.store.loadCursor(baseRemote.remoteProfile, BATCH_STREAM)
+            assertEquals("100", cursor?.cursorValue)
+            assertEquals("${BATCH_UNIT_PREFIX}100", cursor?.unitId)
+            assertEquals(encrypted[99].ciphertextDigest, cursor?.unitDigest)
+            assertEquals(
+                validVersions.last().versionId,
+                context.store.loadProjection(PREFERENCES_KEY)?.preferredHeadVersionId,
+            )
+            val deadLetter = consumer.protocolStore()
+                .loadUnresolvedDeadLetters(baseRemote.remoteProfile, checkpoint.descriptor.syncEpochId)
+                .single()
+            assertEquals(SyncDeadLetterFailureClassV2.RETRYABLE_DEPENDENCY, deadLetter.input.failureClass)
+            assertEquals("${BATCH_UNIT_PREFIX}101", deadLetter.input.unitId)
+        } finally {
+            publisher.close()
+            consumer.close()
+        }
+    }
+
     private fun persistAndPublishMinimalCheckpoint(
         publisher: FileBackedSyncDevice,
         key: WorkspaceMasterKey,
@@ -210,6 +293,7 @@ class WorkspaceSyncDeadLetterRecoveryV2Test {
                 )
                 1 -> WorkspaceSyncPullResultV2(
                     units = listOf(
+                        childUnit(),
                         WorkspaceEncryptedCursorUnitV2(
                             syncEpochId = epochId,
                             streamId = PARENT_STREAM,
@@ -219,7 +303,6 @@ class WorkspaceSyncDeadLetterRecoveryV2Test {
                             unitDigest = PARENT_UNIT_DIGEST,
                             objects = listOf(parent),
                         ),
-                        childUnit(),
                     ),
                     frontierStable = true,
                 )
@@ -238,6 +321,25 @@ class WorkspaceSyncDeadLetterRecoveryV2Test {
         )
     }
 
+    private class FixedCursorUnitsRemote(
+        private val delegate: WorkspaceSyncRemoteV2,
+        private val units: List<WorkspaceEncryptedCursorUnitV2>,
+    ) : WorkspaceSyncRemoteV2 by delegate {
+        override fun pull(
+            syncEpochId: String,
+            cursors: Map<String, String?>,
+            limit: Int,
+        ): WorkspaceSyncPullResultV2 {
+            require(units.all { it.syncEpochId == syncEpochId })
+            val after = cursors[BATCH_STREAM]?.toIntOrNull() ?: 0
+            val selected = units.drop(after).take(limit)
+            return WorkspaceSyncPullResultV2(
+                units = selected,
+                frontierStable = after + selected.size == units.size,
+            )
+        }
+    }
+
     private companion object {
         const val WRITER_A = "10000000-0000-4000-8000-000000000021"
         const val WRITER_B = "10000000-0000-4000-8000-000000000022"
@@ -250,6 +352,8 @@ class WorkspaceSyncDeadLetterRecoveryV2Test {
         const val CHILD_UNIT_ID = "child-unit"
         const val PARENT_UNIT_DIGEST = "parent-unit-digest"
         const val CHILD_UNIT_DIGEST = "child-unit-digest"
+        const val BATCH_STREAM = "batch-dependency"
+        const val BATCH_UNIT_PREFIX = "batch-unit-"
         val PREFERENCES_KEY = WorkspaceEntityKeyV2(
             WorkspaceEntityTypeV2.WORKSPACE_PREFERENCES,
             WORKSPACE_PREFERENCES_ENTITY_ID_V2,

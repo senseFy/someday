@@ -13,6 +13,7 @@ import saien.someday.data.crypto.WorkspaceMasterKey
 import saien.someday.data.crypto.WorkspaceUnlockState
 import saien.someday.data.crypto.workspaceJoinPackageProvider
 import saien.someday.data.crypto.workspaceJoiner
+import saien.someday.data.crypto.workspaceRecoveryPackageProvider
 import saien.someday.data.export.LocalDataExporter
 import saien.someday.data.importing.dayone.DayOneImportService
 import saien.someday.data.importing.dayone.DayOneImportSummary
@@ -24,16 +25,20 @@ import saien.someday.data.settings.SqlDelightClientSettingsRepository
 import saien.someday.domain.notes.NotesRepository
 import saien.someday.domain.settings.ClientSettings
 import saien.someday.domain.settings.ManualSyncRunner
+import saien.someday.domain.settings.SelfHostedConnectionSwitcher
 import saien.someday.domain.settings.SelfHostedSessionCredentialStore
 import saien.someday.domain.settings.SelfHostedSetupClient
 import saien.someday.domain.settings.WorkspacePairingInvitationCanceller
 import saien.someday.domain.settings.WorkspacePairingInvitationCreator
 import saien.someday.domain.settings.WorkspacePairingInvitationJoiner
+import saien.someday.domain.settings.WorkspaceRecoveryManager
 import saien.someday.sync.AuthorityCoordinatedMediaAssetStore
 import saien.someday.sync.createSystemV3ClientServices
 import saien.someday.sync.selfhosted.IosSelfHostedSyncTransport
+import saien.someday.sync.selfhosted.SelfHostedConnectionSwitchService
 import saien.someday.sync.selfhosted.SelfHostedSetupService
 import saien.someday.sync.selfhosted.SelfHostedWorkspacePairingService
+import saien.someday.sync.selfhosted.SelfHostedWorkspaceRecoveryService
 import saien.someday.sync.selfhosted.SystemV3MediaCoordinator
 import saien.someday.sync.selfhosted.WorkspaceBoundSessionCredentialStore
 import saien.someday.ui.settings.SettingsExportSummary
@@ -53,11 +58,13 @@ class IosClientRepositories(
     val settingsRepository: ClientSettingsRepository,
     val selfHostedSetupClient: SelfHostedSetupClient,
     val selfHostedSessionCredentialStore: SelfHostedSessionCredentialStore,
+    val selfHostedConnectionSwitcher: SelfHostedConnectionSwitcher,
     val manualSyncRunner: ManualSyncRunner,
     val automaticSyncEligible: () -> Boolean,
     val workspacePairingInvitationCreator: WorkspacePairingInvitationCreator,
     val workspacePairingInvitationJoiner: WorkspacePairingInvitationJoiner,
     val workspacePairingInvitationCanceller: WorkspacePairingInvitationCanceller,
+    val workspaceRecoveryManager: WorkspaceRecoveryManager,
     val localMediaAssetStore: AuthorityCoordinatedMediaAssetStore,
     val mediaCoordinator: SystemV3MediaCoordinator,
     private val localDataExporter: LocalDataExporter,
@@ -167,6 +174,7 @@ private fun assembleIosClientRepositories(
     )
     runCatching { localMediaAssetStore.purgeUnreferencedFilesWithoutGracePeriod() }
     val workspaceJoinPackageProvider = workspaceKeys.workspaceJoinPackageProvider()
+    val workspaceRecoveryPackageProvider = workspaceKeys.workspaceRecoveryPackageProvider()
     val workspaceJoiner = workspaceKeys.workspaceJoiner(
         deviceName = "iOS device",
         platform = "ios",
@@ -185,6 +193,18 @@ private fun assembleIosClientRepositories(
         activeWorkspaceSessionGuard = systemV3Services.activeWorkspaceSessionGuard,
         workspacePairingInviterReady = systemV3Services.workspacePairingInviterReady,
     )
+    val selfHostedRecoveryService = SelfHostedWorkspaceRecoveryService(
+        settingsProvider = settingsRepository::load,
+        sessionStore = selfHostedSessionCredentialStore,
+        transport = selfHostedTransport,
+        sessionExecutor = systemV3Services.selfHostedSessionExecutor,
+        workspaceJoinPackageProvider = workspaceRecoveryPackageProvider,
+        workspaceJoiner = workspaceJoiner,
+        workspaceLifecycleCoordinator = systemV3Services.workspaceLifecycleCoordinator,
+        activeWorkspaceSessionGuard = systemV3Services.activeWorkspaceSessionGuard,
+        workspaceRecoveryPublisherReady = systemV3Services.workspacePairingInviterReady,
+        localWorkspaceKeyFingerprint = { workspaceKeys.unlockedOrUnlock()?.fingerprint },
+    )
     return IosClientRepositories(
         notesRepository = systemV3Services.notesRepository,
         settingsRepository = systemV3Services.settingsRepository,
@@ -199,11 +219,24 @@ private fun assembleIosClientRepositories(
             selfHostedSessionCredentialStore,
             systemV3Services.activeWorkspaceSessionGuard,
         ),
+        selfHostedConnectionSwitcher = SelfHostedConnectionSwitchService(
+            localRepository = localRepository,
+            settingsRepository = settingsRepository,
+            workspaceKeyRepository = workspaceKeys,
+            sessionStore = selfHostedSessionCredentialStore,
+            activeWorkspaceSessionGuard = systemV3Services.activeWorkspaceSessionGuard,
+            workspaceLifecycleCoordinator = systemV3Services.workspaceLifecycleCoordinator,
+            discardLocalWorkspaceForReplacement = systemV3Services.discardLocalWorkspaceForReplacement,
+            finalizeLocalWorkspaceReplacement = systemV3Services.finalizeLocalWorkspaceReplacement,
+            deviceName = "iOS device",
+            platform = "ios",
+        ),
         manualSyncRunner = systemV3Services.manualSyncRunner,
         automaticSyncEligible = systemV3Services.automaticSyncEligible,
         workspacePairingInvitationCreator = selfHostedPairingService,
         workspacePairingInvitationJoiner = selfHostedPairingService,
         workspacePairingInvitationCanceller = selfHostedPairingService,
+        workspaceRecoveryManager = selfHostedRecoveryService,
         localMediaAssetStore = systemV3Services.localMediaAssetStore,
         mediaCoordinator = systemV3Services.mediaCoordinator,
         localDataExporter = LocalDataExporter(

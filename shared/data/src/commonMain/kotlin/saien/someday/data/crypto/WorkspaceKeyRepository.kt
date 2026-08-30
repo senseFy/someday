@@ -7,6 +7,7 @@ import kotlin.time.Instant
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
+import saien.someday.data.serialization.StrictJsonFraming
 import kotlin.time.Clock
 
 class WorkspaceKeyRepository(
@@ -56,6 +57,59 @@ class WorkspaceKeyRepository(
         try {
             secureKeyStore.put(secureStorageAlias, workspaceKey)
             persistMetadata(metadataJson, deviceName, platform)
+        } catch (failure: Throwable) {
+            runCatching(::retryPendingSecureStorageAliasDeletions)
+            throw failure
+        }
+        unlockedKey = workspaceKey.copy()
+        runCatching(::retryPendingSecureStorageAliasDeletions)
+
+        return FirstRunWorkspaceSetup(
+            state = WorkspaceUnlockState.Unlocked(workspaceId, workspaceKey.fingerprint),
+            recoveryMaterial = recoveryMaterial,
+            secureStorageAlias = secureStorageAlias,
+            metadataJson = metadataJson,
+        )
+    }
+
+    /**
+     * Replaces the current workspace with a newly generated one inside the same
+     * database transaction as the caller's workspace cleanup.
+     *
+     * The new secure-storage key is staged first. The old key is deleted only
+     * after the replacement metadata and caller-owned state have committed.
+     */
+    fun replaceWithFreshWorkspace(
+        deviceName: String,
+        platform: String,
+        beforeMetadataReplacement: () -> Unit,
+        afterMetadataReplacement: (WorkspaceMasterKey, String) -> Unit,
+    ): FirstRunWorkspaceSetup {
+        val existingMetadata = requireNotNull(loadMetadata()) { "Workspace does not exist." }
+        val workspaceId = "workspace-${crypto.randomBytes(16).hex()}"
+        val workspaceKey = crypto.generateWorkspaceKey()
+        val recoveryMaterial = crypto.generateRecoveryMaterial()
+        val secureStorageAlias = aliasGenerator.newAlias(workspaceId)
+        check(secureStorageAlias != existingMetadata.secureStorageAlias) {
+            "Secure storage alias generation reused the current workspace key alias."
+        }
+        val metadata = createMetadata(
+            workspaceId = workspaceId,
+            workspaceKey = workspaceKey,
+            recoveryMaterial = recoveryMaterial,
+            secureStorageAlias = secureStorageAlias,
+        )
+        val metadataJson = encodeMetadata(metadata)
+
+        recordPendingSecureStorageAliasDeletion(secureStorageAlias)
+        try {
+            secureKeyStore.put(secureStorageAlias, workspaceKey)
+            localRepository.database.transaction {
+                beforeMetadataReplacement()
+                persistMetadata(metadataJson, deviceName, platform)
+                recordPendingSecureStorageAliasDeletion(existingMetadata.secureStorageAlias)
+                afterMetadataReplacement(workspaceKey, workspaceId)
+            }
         } catch (failure: Throwable) {
             runCatching(::retryPendingSecureStorageAliasDeletions)
             throw failure
@@ -122,6 +176,44 @@ class WorkspaceKeyRepository(
         )
     }
 
+    /**
+     * Creates portable wrapped-key metadata for durable server-assisted
+     * recovery. Device-local secure-storage aliases are deliberately omitted.
+     */
+    fun createWorkspaceRecoveryPackage(): WorkspaceJoinPackageResult {
+        val metadata = loadMetadata() ?: return WorkspaceJoinPackageResult.Failed(WorkspaceUnlockFailure.NO_WORKSPACE)
+        val workspaceKey = unlockedKeyOrNull()
+            ?: secureKeyStore.get(metadata.secureStorageAlias)
+            ?: return WorkspaceJoinPackageResult.Failed(WorkspaceUnlockFailure.SECURE_STORAGE_UNAVAILABLE)
+        if (!verifyWorkspaceKey(metadata, workspaceKey)) {
+            return WorkspaceJoinPackageResult.Failed(WorkspaceUnlockFailure.AUTHENTICATION_FAILED)
+        }
+
+        val recoveryMaterial = crypto.generateRecoveryMaterial()
+        val recoveryMetadata = createMetadata(
+            workspaceId = metadata.workspaceId,
+            workspaceKey = workspaceKey,
+            recoveryMaterial = recoveryMaterial,
+            secureStorageAlias = metadata.secureStorageAlias,
+        ).copy(createdAt = metadata.createdAt)
+        val portable = PersistedPortableWorkspaceRecoveryEnvelope(
+            workspaceId = recoveryMetadata.workspaceId,
+            createdAt = recoveryMetadata.createdAt,
+            keyAlgorithm = recoveryMetadata.keyAlgorithm,
+            recoveryKdf = recoveryMetadata.recoveryKdf,
+            keyLengthBytes = recoveryMetadata.keyLengthBytes,
+            keyFingerprint = workspaceKey.fingerprint,
+            verifier = recoveryMetadata.verifier,
+            recovery = recoveryMetadata.recovery,
+        )
+        return WorkspaceJoinPackageResult.Created(
+            metadataJson = encodePortableRecoveryEnvelope(portable),
+            recoveryMaterial = recoveryMaterial,
+            workspaceId = metadata.workspaceId,
+            keyFingerprint = workspaceKey.fingerprint,
+        )
+    }
+
     fun unlockWithSecureStorage(): WorkspaceUnlockResult {
         val metadata = loadMetadata() ?: return WorkspaceUnlockResult.Failed(WorkspaceUnlockFailure.NO_WORKSPACE)
         val storedKey = secureKeyStore.get(metadata.secureStorageAlias)
@@ -165,14 +257,29 @@ class WorkspaceKeyRepository(
         if (existingMetadata != null && !replaceExistingWorkspace) {
             return WorkspaceRestoreResult.Failed(WorkspaceUnlockFailure.WORKSPACE_ALREADY_EXISTS)
         }
-        val importedMetadata = decodeMetadata(metadataJson)
+        val localMetadata = decodeMetadata(metadataJson)
+        val portableMetadata = if (localMetadata == null) decodePortableRecoveryEnvelope(metadataJson) else null
+        val importedMetadata = localMetadata
+            ?: portableMetadata?.toPersistedMetadata()
             ?: return WorkspaceRestoreResult.Failed(WorkspaceUnlockFailure.INVALID_METADATA)
+        if (expectedWorkspaceId != null && importedMetadata.workspaceId != expectedWorkspaceId) {
+            return WorkspaceRestoreResult.Failed(WorkspaceUnlockFailure.INVALID_METADATA)
+        }
+        if (portableMetadata != null &&
+            expectedKeyFingerprint != null &&
+            portableMetadata.keyFingerprint != expectedKeyFingerprint
+        ) {
+            return WorkspaceRestoreResult.Failed(WorkspaceUnlockFailure.INVALID_METADATA)
+        }
+        if (!hasSupportedRecoveryContract(importedMetadata)) {
+            return WorkspaceRestoreResult.Failed(WorkspaceUnlockFailure.INVALID_METADATA)
+        }
         val workspaceKey = unwrapRecoveryKey(importedMetadata, recoveryMaterial)
             ?: return WorkspaceRestoreResult.Failed(WorkspaceUnlockFailure.AUTHENTICATION_FAILED)
         if (!verifyWorkspaceKey(importedMetadata, workspaceKey)) {
             return WorkspaceRestoreResult.Failed(WorkspaceUnlockFailure.AUTHENTICATION_FAILED)
         }
-        if (expectedWorkspaceId != null && importedMetadata.workspaceId != expectedWorkspaceId) {
+        if (portableMetadata != null && portableMetadata.keyFingerprint != workspaceKey.fingerprint) {
             return WorkspaceRestoreResult.Failed(WorkspaceUnlockFailure.INVALID_METADATA)
         }
         if (expectedKeyFingerprint != null && workspaceKey.fingerprint != expectedKeyFingerprint) {
@@ -297,6 +404,7 @@ class WorkspaceKeyRepository(
         metadata: PersistedWorkspaceKeyMetadata,
         recoveryMaterial: String,
     ): WorkspaceMasterKey? {
+        if (!hasSupportedRecoveryContract(metadata)) return null
         val wrapper = metadata.recovery.toAeadCiphertextOrNull() ?: return null
         val salt = runCatching { metadata.recovery.salt.decodeBase64Bytes() }.getOrNull() ?: return null
         val policy = RecoveryKdfPolicy(
@@ -321,6 +429,35 @@ class WorkspaceKeyRepository(
             CryptoResult.InvalidCiphertext,
             -> null
         }
+    }
+
+    /** Rejects attacker-controlled KDF and cipher parameters before invoking libsodium. */
+    private fun hasSupportedRecoveryContract(metadata: PersistedWorkspaceKeyMetadata): Boolean {
+        if (metadata.version != 1 ||
+            !RECOVERY_WORKSPACE_ID.matches(metadata.workspaceId) ||
+            metadata.createdAt.isBlank() ||
+            metadata.keyAlgorithm != "XCHACHA20-POLY1305-IETF" ||
+            metadata.recoveryKdf != "ARGON2ID13" ||
+            metadata.keyLengthBytes != WorkspaceMasterKey.WORKSPACE_KEY_BYTES ||
+            metadata.secureStorageAlias.isBlank()
+        ) {
+            return false
+        }
+        val opsLimit = metadata.recovery.opsLimit.toULongOrNull() ?: return false
+        if (opsLimit != crypto.recoveryKdfPolicy.opsLimit ||
+            metadata.recovery.memLimit != crypto.recoveryKdfPolicy.memLimit ||
+            metadata.recovery.algorithm != crypto.recoveryKdfPolicy.algorithm
+        ) {
+            return false
+        }
+        val salt = runCatching { metadata.recovery.salt.decodeBase64Bytes() }.getOrNull() ?: return false
+        val verifier = metadata.verifier.toAeadCiphertextOrNull() ?: return false
+        val wrapper = metadata.recovery.toAeadCiphertextOrNull() ?: return false
+        return salt.size == RECOVERY_SALT_BYTES &&
+            verifier.nonce.size == XCHACHA20_NONCE_BYTES &&
+            verifier.ciphertext.size == verifierPlaintext(metadata.workspaceId).size + POLY1305_TAG_BYTES &&
+            wrapper.nonce.size == XCHACHA20_NONCE_BYTES &&
+            wrapper.ciphertext.size == WorkspaceMasterKey.WORKSPACE_KEY_BYTES + POLY1305_TAG_BYTES
     }
 
     private fun persistMetadata(
@@ -401,6 +538,28 @@ class WorkspaceKeyRepository(
     private fun encodeMetadata(metadata: PersistedWorkspaceKeyMetadata): String =
         json.encodeToString(PersistedWorkspaceKeyMetadata.serializer(), metadata)
 
+    private fun encodePortableRecoveryEnvelope(envelope: PersistedPortableWorkspaceRecoveryEnvelope): String =
+        json.encodeToString(PersistedPortableWorkspaceRecoveryEnvelope.serializer(), envelope)
+
+    private fun decodePortableRecoveryEnvelope(value: String): PersistedPortableWorkspaceRecoveryEnvelope? {
+        if (!StrictJsonFraming.isStrictWorkspaceRecoveryMetadata(value, MAX_PORTABLE_RECOVERY_METADATA_BYTES)) {
+            return null
+        }
+        return try {
+            json.decodeFromString(PersistedPortableWorkspaceRecoveryEnvelope.serializer(), value)
+                .takeIf {
+                    it.format == PersistedPortableWorkspaceRecoveryEnvelope.FORMAT &&
+                        it.version == PersistedPortableWorkspaceRecoveryEnvelope.VERSION &&
+                        RECOVERY_WORKSPACE_ID.matches(it.workspaceId) &&
+                        RECOVERY_KEY_FINGERPRINT.matches(it.keyFingerprint)
+                }
+        } catch (_: SerializationException) {
+            null
+        } catch (_: IllegalArgumentException) {
+            null
+        }
+    }
+
     private fun verifierAssociatedData(workspaceId: String): ByteArray =
         "someday-workspace-verifier-v2|$workspaceId".encodeToByteArray()
 
@@ -415,6 +574,11 @@ class WorkspaceKeyRepository(
         internal const val PENDING_SECURE_STORAGE_ALIAS_DELETIONS_SETTING_KEY =
             "encryption.workspace.pending_secure_storage_alias_deletions"
         private const val RECOVERY_SALT_BYTES = 16
+        private const val XCHACHA20_NONCE_BYTES = 24
+        private const val POLY1305_TAG_BYTES = 16
+        private const val MAX_PORTABLE_RECOVERY_METADATA_BYTES = 48 * 1_024
+        private val RECOVERY_WORKSPACE_ID = Regex("^workspace-[0-9a-f]{32}$")
+        private val RECOVERY_KEY_FINGERPRINT = Regex("^[0-9a-f]{32}$")
 
         private val json = Json {
             encodeDefaults = true
@@ -472,4 +636,35 @@ internal data class PersistedRecoveryWrapper(
                 ciphertext = ciphertext.decodeBase64Bytes(),
             )
         }.getOrNull()
+}
+
+@Serializable
+internal data class PersistedPortableWorkspaceRecoveryEnvelope(
+    val format: String = FORMAT,
+    val version: Int = VERSION,
+    val workspaceId: String,
+    val createdAt: String,
+    val keyAlgorithm: String,
+    val recoveryKdf: String,
+    val keyLengthBytes: Int,
+    val keyFingerprint: String,
+    val verifier: PersistedAeadCiphertext,
+    val recovery: PersistedRecoveryWrapper,
+) {
+    fun toPersistedMetadata(): PersistedWorkspaceKeyMetadata = PersistedWorkspaceKeyMetadata(
+        workspaceId = workspaceId,
+        createdAt = createdAt,
+        keyAlgorithm = keyAlgorithm,
+        recoveryKdf = recoveryKdf,
+        keyLengthBytes = keyLengthBytes,
+        secureStorageAlias = PORTABLE_ALIAS_PLACEHOLDER,
+        verifier = verifier,
+        recovery = recovery,
+    )
+
+    companion object {
+        const val FORMAT = "someday.workspace-recovery-metadata"
+        const val VERSION = 1
+        private const val PORTABLE_ALIAS_PLACEHOLDER = "portable-recovery-envelope"
+    }
 }

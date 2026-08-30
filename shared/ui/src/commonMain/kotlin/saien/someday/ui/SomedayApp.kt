@@ -25,6 +25,7 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -116,9 +117,13 @@ import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
@@ -126,6 +131,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.OffsetMapping
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.input.TransformedText
@@ -157,6 +163,7 @@ import com.composables.icons.lucide.ChevronRight
 import com.composables.icons.lucide.Clock
 import com.composables.icons.lucide.Cloud
 import com.composables.icons.lucide.Code
+import com.composables.icons.lucide.Copy
 import com.composables.icons.lucide.Download
 import com.composables.icons.lucide.Ellipsis
 import com.composables.icons.lucide.Eye
@@ -166,6 +173,7 @@ import com.composables.icons.lucide.Globe
 import com.composables.icons.lucide.Info
 import com.composables.icons.lucide.Image as ImageIcon
 import com.composables.icons.lucide.Italic
+import com.composables.icons.lucide.KeyRound
 import com.composables.icons.lucide.Link
 import com.composables.icons.lucide.LockKeyhole
 import com.composables.icons.lucide.Lucide
@@ -211,6 +219,7 @@ import saien.someday.domain.settings.ClientTheme
 import saien.someday.domain.settings.EditorPreferences
 import saien.someday.domain.settings.ManualSyncReason
 import saien.someday.domain.settings.ManualSyncRunner
+import saien.someday.domain.settings.SelfHostedConnectionSwitcher
 import saien.someday.domain.settings.SelfHostedSessionCredentialStore
 import saien.someday.domain.settings.SelfHostedSetupClient
 import saien.someday.domain.settings.SelfHostedSetupReason
@@ -220,6 +229,7 @@ import saien.someday.domain.settings.WorkspacePairingInvitationCreator
 import saien.someday.domain.settings.WorkspacePairingInvitationJoiner
 import saien.someday.domain.settings.WorkspacePairingInvitationResult
 import saien.someday.domain.settings.WorkspacePairingReason
+import saien.someday.domain.settings.WorkspaceRecoveryManager
 import saien.someday.domain.settings.WorkspacePreferencesConflictResolver
 import saien.someday.domain.settings.WorkspacePreferencesSyncStatus
 import saien.someday.ui.designsystem.SomedayDesignDefaults
@@ -295,6 +305,7 @@ import saien.someday.ui.settings.SyncConnectionUi
 import saien.someday.ui.settings.SyncIssueAction
 import saien.someday.ui.settings.SyncIssueReason
 import saien.someday.ui.settings.SyncUiOperation
+import saien.someday.ui.settings.WorkspaceRecoveryUiAvailability
 import saien.someday.ui.settings.accountFormMode
 import saien.someday.ui.settings.resolveAppliedTheme
 import kotlin.math.roundToInt
@@ -336,11 +347,13 @@ fun SomedayApp(
     },
     selfHostedSetupClient: SelfHostedSetupClient? = null,
     selfHostedSessionCredentialStore: SelfHostedSessionCredentialStore? = null,
+    selfHostedConnectionSwitcher: SelfHostedConnectionSwitcher? = null,
     manualSyncRunner: ManualSyncRunner? = null,
     automaticSyncEligible: () -> Boolean,
     workspacePairingInvitationCreator: WorkspacePairingInvitationCreator? = null,
     workspacePairingInvitationJoiner: WorkspacePairingInvitationJoiner? = null,
     workspacePairingInvitationCanceller: WorkspacePairingInvitationCanceller? = null,
+    workspaceRecoveryManager: WorkspaceRecoveryManager? = null,
     workspacePairingScanner: WorkspacePairingScanner = UnavailableWorkspacePairingScanner,
     appDispatchers: AppDispatchers = AppDispatchers(),
     foregroundSyncSignal: Int = 0,
@@ -412,6 +425,8 @@ fun SomedayApp(
             workspacePairingInvitationCreator,
             workspacePairingInvitationJoiner,
             workspacePairingInvitationCanceller,
+            selfHostedConnectionSwitcher,
+            workspaceRecoveryManager,
             automaticSyncEligible,
             loadSettings,
         ) {
@@ -438,6 +453,10 @@ fun SomedayApp(
                 },
                 selfHostedSessionCredentialStore = selfHostedSessionCredentialStore
                     ?: saien.someday.domain.settings.UnavailableSelfHostedSessionCredentialStore,
+                selfHostedConnectionSwitcher = selfHostedConnectionSwitcher
+                    ?: SelfHostedConnectionSwitcher {
+                        saien.someday.domain.settings.SelfHostedConnectionSwitchResult.failure()
+                    },
                 selfHostedDeviceName = selfHostedDeviceName,
                 selfHostedDevicePlatform = platformName,
                 manualSyncRunner = manualSyncRunner ?: ManualSyncRunner {
@@ -459,6 +478,7 @@ fun SomedayApp(
                     workspacePairingInvitationCanceller ?: WorkspacePairingInvitationCanceller {
                         WorkspaceJoinResult.failure(WorkspacePairingReason.Unavailable)
                     },
+                workspaceRecoveryManager = workspaceRecoveryManager,
                 onThisDayNotificationScheduler = onThisDayNotificationScheduler,
                 onThisDayNotificationStrings = onThisDayNotificationStrings,
                 uiStrings = settingsUiStrings,
@@ -4731,7 +4751,7 @@ private fun EditorSettingsContent(
 }
 
 @Composable
-private fun SyncSettingsContent(
+internal fun SyncSettingsContent(
     state: SettingsUiState,
     controller: SettingsUiController,
     workspacePairingScanner: WorkspacePairingScanner,
@@ -4760,6 +4780,7 @@ private fun SyncSettingsContent(
         mutableStateOf(accountEmail.orEmpty())
     }
     var selfHostedPassword by remember { mutableStateOf("") }
+    var connectionSwitchConfirmationVisible by remember { mutableStateOf(false) }
 
     LaunchedEffect(accountFormMode) {
         when {
@@ -4859,6 +4880,53 @@ private fun SyncSettingsContent(
                 }
             }
         }
+        if (!configuredEndpoint.isNullOrBlank() || savedAccount) {
+            HorizontalDivider()
+            SettingsActionRow(
+                icon = Lucide.Server,
+                title = stringResource(Res.string.connection_switch_action),
+                subtitle = configuredEndpoint,
+                actionText = stringResource(Res.string.connection_switch_dialog_confirm),
+                busy = state.sync.operation == SyncUiOperation.SwitchingConnection,
+                enabled = !state.sync.busy,
+                onClick = { connectionSwitchConfirmationVisible = true },
+            )
+        }
+    }
+
+    if (connectionSwitchConfirmationVisible) {
+        AlertDialog(
+            onDismissRequest = { connectionSwitchConfirmationVisible = false },
+            title = { Text(stringResource(Res.string.connection_switch_dialog_title)) },
+            text = { Text(stringResource(Res.string.connection_switch_dialog_body)) },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        connectionSwitchConfirmationVisible = false
+                        actionScope.launch {
+                            if (controller.switchSelfHostedConnection()) {
+                                selfHostedPassword = ""
+                                connectionFormVisible = true
+                            }
+                        }
+                    },
+                    enabled = !state.sync.busy,
+                ) {
+                    Text(
+                        text = stringResource(Res.string.connection_switch_dialog_confirm),
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = { connectionSwitchConfirmationVisible = false },
+                    enabled = !state.sync.busy,
+                ) {
+                    Text(stringResource(Res.string.common_cancel))
+                }
+            },
+        )
     }
 
     if (connectionFormVisible) {
@@ -4887,6 +4955,7 @@ private fun SyncSettingsContent(
                 label = { Text(stringResource(Res.string.common_password)) },
                 enabled = !state.sync.busy,
                 singleLine = true,
+                keyboardOptions = secretInputKeyboardOptions,
                 visualTransformation = PasswordVisualTransformation(),
                 modifier = Modifier.fillMaxWidth(),
             )
@@ -4928,6 +4997,14 @@ private fun SyncSettingsContent(
         }
     }
 
+    if (signedIn) {
+        WorkspaceRecoveryContent(
+            state = state,
+            controller = controller,
+            actionScope = actionScope,
+        )
+    }
+
     if (state.sync.pairingAvailable) {
         WorkspacePairingContent(
             state = state,
@@ -4938,6 +5015,257 @@ private fun SyncSettingsContent(
         )
     }
 }
+
+@Composable
+internal fun WorkspaceRecoveryContent(
+    state: SettingsUiState,
+    controller: SettingsUiController,
+    actionScope: CoroutineScope,
+) {
+    val clipboard = LocalClipboard.current
+    val clipboardLabel = stringResource(Res.string.recovery_title)
+    val recovery = state.sync.recovery
+    val preparedCode = recovery.preparedCode?.value
+    var confirmationCode by remember(preparedCode) { mutableStateOf("") }
+    var copyState by remember(preparedCode) { mutableStateOf<RecoveryCodeCopyState?>(null) }
+    var restoreCode by remember { mutableStateOf("") }
+    var pendingRestoreCode by remember { mutableStateOf<String?>(null) }
+    val busy = state.sync.busy
+
+    LaunchedEffect(recovery.availability) {
+        if (recovery.availability != WorkspaceRecoveryUiAvailability.RecoveryAvailable) {
+            restoreCode = ""
+            pendingRestoreCode = null
+        }
+    }
+
+    SettingsSection(title = stringResource(Res.string.recovery_section)) {
+        SettingsRow(
+            icon = Lucide.KeyRound,
+            title = stringResource(Res.string.recovery_title),
+            subtitle = when (recovery.availability) {
+                WorkspaceRecoveryUiAvailability.Unknown ->
+                    stringResource(Res.string.recovery_unavailable_help)
+                WorkspaceRecoveryUiAvailability.NotConfigured ->
+                    stringResource(Res.string.recovery_not_configured_help)
+                WorkspaceRecoveryUiAvailability.Configured ->
+                    stringResource(Res.string.recovery_configured_help)
+                WorkspaceRecoveryUiAvailability.RecoveryAvailable ->
+                    stringResource(Res.string.recovery_available_help)
+                WorkspaceRecoveryUiAvailability.Unavailable ->
+                    stringResource(Res.string.recovery_unavailable_help)
+            },
+        )
+
+        if (preparedCode != null) {
+            val copyScope = rememberCoroutineScope()
+            val copyInProgress = copyState == RecoveryCodeCopyState.Copying
+            HorizontalDivider()
+            Text(
+                text = stringResource(Res.string.recovery_prepared_warning),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.padding(vertical = 8.dp),
+            )
+            Text(
+                text = preparedCode,
+                fontFamily = FontFamily.Monospace,
+                fontWeight = FontWeight.SemiBold,
+                textAlign = TextAlign.Center,
+                style = MaterialTheme.typography.titleLarge,
+                modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+            )
+            TextButton(
+                onClick = {
+                    copyState = RecoveryCodeCopyState.Copying
+                    copyScope.launch {
+                        copyState = try {
+                            clipboard.setClipEntry(recoveryCodeClipEntry(preparedCode, clipboardLabel))
+                            RecoveryCodeCopyState.Copied
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (_: Throwable) {
+                            RecoveryCodeCopyState.Failed
+                        }
+                    }
+                },
+                enabled = !copyInProgress,
+                modifier = Modifier.align(Alignment.CenterHorizontally),
+            ) {
+                Icon(Lucide.Copy, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(stringResource(Res.string.recovery_copy_action))
+            }
+            when (copyState) {
+                RecoveryCodeCopyState.Copied,
+                RecoveryCodeCopyState.Failed,
+                -> Text(
+                    text = stringResource(
+                        if (copyState == RecoveryCodeCopyState.Copied) {
+                            Res.string.recovery_copy_success
+                        } else {
+                            Res.string.recovery_copy_failed
+                        },
+                    ),
+                    color = if (copyState == RecoveryCodeCopyState.Copied) {
+                        MaterialTheme.colorScheme.primary
+                    } else {
+                        MaterialTheme.colorScheme.error
+                    },
+                    textAlign = TextAlign.Center,
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .semantics { liveRegion = LiveRegionMode.Polite },
+                )
+                RecoveryCodeCopyState.Copying,
+                null,
+                -> Unit
+            }
+            OutlinedTextField(
+                value = confirmationCode,
+                onValueChange = { confirmationCode = it.take(96) },
+                label = { Text(stringResource(Res.string.recovery_confirm_code_label)) },
+                enabled = !busy,
+                singleLine = true,
+                keyboardOptions = secretInputKeyboardOptions,
+                visualTransformation = PasswordVisualTransformation(),
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+            ) {
+                CompactSettingsActionButton(
+                    text = stringResource(Res.string.recovery_confirm_action),
+                    busy = state.sync.operation == SyncUiOperation.PublishingRecoveryCode,
+                    enabled = !busy && !copyInProgress && confirmationCode.isNotBlank(),
+                    onClick = {
+                        actionScope.launch {
+                            if (controller.confirmWorkspaceRecoveryCode(confirmationCode)) {
+                                confirmationCode = ""
+                            }
+                        }
+                    },
+                )
+                CompactSettingsActionButton(
+                    text = stringResource(Res.string.recovery_cancel_action),
+                    enabled = !busy && !copyInProgress,
+                    onClick = {
+                        actionScope.launch {
+                            controller.discardPreparedWorkspaceRecoveryCode()
+                            confirmationCode = ""
+                        }
+                    },
+                )
+            }
+        } else {
+            when (recovery.availability) {
+                WorkspaceRecoveryUiAvailability.NotConfigured,
+                WorkspaceRecoveryUiAvailability.Configured,
+                -> {
+                    HorizontalDivider()
+                    SettingsActionRow(
+                        icon = Lucide.KeyRound,
+                        title = if (recovery.availability == WorkspaceRecoveryUiAvailability.Configured) {
+                            stringResource(Res.string.recovery_replace_action)
+                        } else {
+                            stringResource(Res.string.recovery_setup_action)
+                        },
+                        subtitle = null,
+                        actionText = if (recovery.availability == WorkspaceRecoveryUiAvailability.Configured) {
+                            stringResource(Res.string.recovery_replace_action)
+                        } else {
+                            stringResource(Res.string.recovery_setup_action)
+                        },
+                        busy = state.sync.operation == SyncUiOperation.PreparingRecoveryCode,
+                        enabled = !busy,
+                        onClick = { actionScope.launch { controller.prepareWorkspaceRecoveryCode() } },
+                    )
+                }
+                WorkspaceRecoveryUiAvailability.RecoveryAvailable -> {
+                    HorizontalDivider()
+                    OutlinedTextField(
+                        value = restoreCode,
+                        onValueChange = { restoreCode = it.take(96) },
+                        label = { Text(stringResource(Res.string.recovery_code_label)) },
+                        enabled = !busy,
+                        singleLine = true,
+                        keyboardOptions = secretInputKeyboardOptions,
+                        visualTransformation = PasswordVisualTransformation(),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    SettingsActionRow(
+                        icon = Lucide.KeyRound,
+                        title = stringResource(Res.string.recovery_use_code_action),
+                        subtitle = stringResource(Res.string.recovery_available_help),
+                        actionText = stringResource(Res.string.recovery_restore_action),
+                        busy = state.sync.operation == SyncUiOperation.RestoringWorkspace,
+                        enabled = !busy && restoreCode.isNotBlank(),
+                        onClick = { pendingRestoreCode = restoreCode },
+                    )
+                }
+                WorkspaceRecoveryUiAvailability.Unknown,
+                WorkspaceRecoveryUiAvailability.Unavailable,
+                -> {
+                    HorizontalDivider()
+                    SettingsActionRow(
+                        icon = Lucide.KeyRound,
+                        title = stringResource(Res.string.sync_retry),
+                        subtitle = stringResource(Res.string.recovery_unavailable_help),
+                        actionText = stringResource(Res.string.sync_retry),
+                        busy = state.sync.operation == SyncUiOperation.CheckingRecovery,
+                        enabled = !busy,
+                        onClick = { actionScope.launch { controller.retryWorkspaceRecoveryStatus() } },
+                    )
+                }
+            }
+        }
+    }
+
+    val codeToRestore = pendingRestoreCode
+    if (codeToRestore != null) {
+        AlertDialog(
+            onDismissRequest = { pendingRestoreCode = null },
+            title = { Text(stringResource(Res.string.recovery_restore_dialog_title)) },
+            text = { Text(stringResource(Res.string.recovery_restore_dialog_body)) },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        pendingRestoreCode = null
+                        actionScope.launch {
+                            if (controller.recoverWorkspaceWithCode(codeToRestore, replaceExistingWorkspace = true)) {
+                                restoreCode = ""
+                            }
+                        }
+                    },
+                    enabled = !busy,
+                ) {
+                    Text(
+                        text = stringResource(Res.string.recovery_restore_dialog_confirm),
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingRestoreCode = null }, enabled = !busy) {
+                    Text(stringResource(Res.string.common_cancel))
+                }
+            },
+        )
+    }
+}
+
+private enum class RecoveryCodeCopyState {
+    Copying,
+    Copied,
+    Failed,
+}
+
+private val secretInputKeyboardOptions = KeyboardOptions(
+    autoCorrectEnabled = false,
+    keyboardType = KeyboardType.Password,
+)
 
 @Composable
 private fun SyncIssueReason.localizedMessage(): String =

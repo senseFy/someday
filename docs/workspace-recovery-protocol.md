@@ -26,6 +26,14 @@ client settings. A server or database reader can see the account, selected
 workspace id, key fingerprint, envelope digest and size, revision, timestamps,
 and opaque envelope bytes. Those values do not reveal the workspace key.
 
+The operating-system clipboard is outside Someday's secret-storage boundary.
+Copying a recovery code therefore requires an explicit user action; the client
+does not copy it automatically, read it back, persist it, or include it in
+logs. Platforms may retain clipboard contents in previews, history, or
+cross-device clipboard services. The client marks the clip as sensitive where
+the platform supports that hint, but the user must still save the code in a
+trusted location and clear the clipboard afterwards.
+
 All recovery-envelope routes require an authenticated, non-revoked device
 session with `sync` scope. An attacker who steals an active device sync or
 refresh session can read or replace the account's opaque envelope. An attacker
@@ -194,6 +202,13 @@ Setup and replacement use two phases:
    revalidate the authority, then PUT with the observed revision. Success is
    reported only after the returned bytes and identity match the candidate.
 
+While the pending code is visible, an explicit copy action writes the exact
+user-visible value to the platform clipboard. Copy success does not confirm or
+publish the candidate, and copy failure leaves the candidate visible without
+changing server state. The UI reports either outcome without echoing the code.
+Discarding or publishing the candidate removes the copy action, but it cannot
+reliably erase copies retained by the operating system or clipboard history.
+
 Explicit cancellation or process loss before PUT discards the
 in-memory candidate and leaves the previous server envelope valid. A wrong
 confirmation does not publish and leaves the candidate visible so the user can
@@ -328,9 +343,11 @@ Release evidence must cover:
   `REPEATABLE READ`, in both recovery-wins and epoch-wins lock orderings, plus
   abandonment of the rejected never-authoritative local epoch before recovery
   status refresh;
-- prepare-confirm-publish ordering, pre-PUT cancellation and process-loss
-  preservation, post-PUT lost-response ambiguity, exact replay, restart GET and
-  code verification, and concurrent replacement;
+- prepare-copy-confirm-publish ordering, no automatic copy, exact-value copy
+  without logging or publication, safe copy-failure feedback, pre-PUT
+  cancellation and process-loss preservation, post-PUT lost-response
+  ambiguity, exact replay, restart GET and code verification, and concurrent
+  replacement;
 - wrong-code and tampered-envelope refusal before local deletion, atomic
   replacement rollback, post-commit cleanup, and first-sync retry;
 - a fresh installation recovering non-empty text and media without another

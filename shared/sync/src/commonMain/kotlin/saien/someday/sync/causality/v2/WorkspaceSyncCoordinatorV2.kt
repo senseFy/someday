@@ -611,7 +611,94 @@ class WorkspaceSyncCoordinatorV2(
             val remaining = pulled.units.toMutableList()
             val decodedUnits = mutableMapOf<Pair<String, String>, DecodeEntityObjectsResultV2.Decoded>()
             val missingParents = mutableMapOf<Pair<String, String>, DecodeEntityObjectsResultV2.Rejected>()
+            data class BatchCandidate(
+                val encrypted: WorkspaceEncryptedCursorUnitV2,
+                val decoded: DecodeEntityObjectsResultV2.Decoded,
+                val remoteUnit: RemoteWorkspaceCursorUnitV2,
+            )
+
             while (remaining.isNotEmpty()) {
+                val virtualCursors = store.loadCursors(remote.remoteProfile)
+                    .associateTo(mutableMapOf<String, String?>()) { it.streamId to it.cursorValue }
+                val selected = mutableSetOf<Pair<String, String>>()
+                val candidates = mutableListOf<BatchCandidate>()
+                var selectedObjects = 0
+                selection@ while (
+                    candidates.size < MAX_REMOTE_APPLY_BATCH_UNITS_V2 &&
+                    selectedObjects < MAX_REMOTE_APPLY_BATCH_MUTATIONS_V2
+                ) {
+                    var selectedInPass = false
+                    for (unit in remaining) {
+                        val unitKey = unit.streamId to unit.unitId
+                        if (unitKey in selected || virtualCursors[unit.streamId] != unit.expectedCursorValue) continue
+                        if (unit.syncEpochId != descriptor.syncEpochId || unit.objects.size > 100) break@selection
+                        if (selectedObjects + unit.objects.size > MAX_REMOTE_APPLY_BATCH_MUTATIONS_V2) break@selection
+                        val decoded = decodedUnits[unitKey] ?: when (
+                            val value = decodeEntityObjects(epoch, descriptor.syncEpochId, unit.objects)
+                        ) {
+                            is DecodeEntityObjectsResultV2.Rejected -> break@selection
+                            is DecodeEntityObjectsResultV2.Decoded -> value.also { decodedUnits[unitKey] = it }
+                        }
+                        candidates += BatchCandidate(
+                            encrypted = unit,
+                            decoded = decoded,
+                            remoteUnit = RemoteWorkspaceCursorUnitV2(
+                                remote.remoteProfile,
+                                WorkspaceRemoteCursorAdvanceV2(
+                                    unit.streamId,
+                                    unit.expectedCursorValue,
+                                    unit.nextCursorValue,
+                                    unit.unitId,
+                                    unit.unitDigest,
+                                ),
+                                decoded.mutations,
+                                clock(),
+                            ),
+                        )
+                        selected += unitKey
+                        selectedObjects += unit.objects.size
+                        virtualCursors[unit.streamId] = unit.nextCursorValue
+                        selectedInPass = true
+                        if (candidates.size == MAX_REMOTE_APPLY_BATCH_UNITS_V2 ||
+                            selectedObjects == MAX_REMOTE_APPLY_BATCH_MUTATIONS_V2
+                        ) break@selection
+                    }
+                    if (!selectedInPass) break
+                }
+
+                var committedBatch = false
+                var candidateCount = candidates.size
+                while (candidateCount > 0 && !committedBatch) {
+                    val attempted = candidates.take(candidateCount)
+                    when (val batch = store.applyRemoteCursorUnitsAtomically(attempted.map { it.remoteUnit })) {
+                        is WorkspaceRemoteBatchApplyResultV2.Committed -> {
+                            check(batch.units.size == attempted.size)
+                            batch.units.forEach { committed ->
+                                val candidate = attempted[committed.inputIndex]
+                                when (val applied = committed.result) {
+                                    is WorkspaceRemoteUnitApplyResultV2.Applied ->
+                                        counts.observeApplied(applied, candidate.decoded.mutations)
+                                    is WorkspaceRemoteUnitApplyResultV2.AlreadyApplied ->
+                                        counts.replays += candidate.encrypted.objects.size
+                                }
+                                resolveRetryableBlocker(candidate.encrypted)
+                                missingParents.remove(candidate.encrypted.streamId to candidate.encrypted.unitId)
+                                check(remaining.remove(candidate.encrypted))
+                                counts.pulledUnits++
+                                counts.pulledObjects += candidate.encrypted.objects.size
+                            }
+                            committedBatch = true
+                        }
+                        is WorkspaceRemoteBatchApplyResultV2.Rejected -> {
+                            candidateCount = batch.failedUnitIndex
+                        }
+                    }
+                }
+                if (committedBatch) continue
+
+                // A dependency or authenticated input error can invalidate the optimistic
+                // ordered batch. Advance one independently eligible unit, then rebuild the
+                // bounded batch from the new durable frontier.
                 var madeProgress = false
                 val iterator = remaining.listIterator()
                 while (iterator.hasNext()) {
@@ -677,6 +764,7 @@ class WorkspaceSyncCoordinatorV2(
                     counts.pulledUnits++
                     counts.pulledObjects += unit.objects.size
                     madeProgress = true
+                    break
                 }
                 if (!madeProgress) {
                     val blocker = remaining.firstOrNull { unit ->
@@ -706,52 +794,47 @@ class WorkspaceSyncCoordinatorV2(
             return "remote_input_unresolved" to "Push is blocked while a cursor unit is unresolved."
         }
         while (true) {
-            val pending = store.loadPending(remote.remoteProfile)
-            if (pending.isEmpty()) return null
-            val batch = pending.sortedWith(compareBy<StoredWorkspacePendingMutationV2>(
-                { store.loadVersion(it.objectId)?.generation ?: Long.MAX_VALUE },
-                { store.loadVersion(it.objectId)?.entityType?.wireValue ?: "" },
-                { store.loadVersion(it.objectId)?.entityId ?: "" },
-                { it.objectId },
-            )).take(capabilities.maxPushObjects)
-            val versions = batch.map { pendingValue ->
-                val version = store.loadVersion(pendingValue.objectId)
-                    ?: return "local_transaction_failed" to "A durable outbox entity is missing."
-                if (version.objectDigest != pendingValue.objectDigest) {
-                    return "mutation_reuse_mismatch" to
-                        "A durable outbox tuple no longer matches its immutable entity."
+            val plan = store.loadPendingPublicationPlan(remote.remoteProfile)
+            if (plan.isEmpty()) return null
+            plan.chunked(capabilities.maxPushObjects).forEach publicationBatch@ { plannedBatch ->
+                val publications = runCatching {
+                    store.loadPendingPublicationBatch(remote.remoteProfile, plannedBatch)
+                }.getOrElse {
+                    return "local_transaction_failed" to
+                        "A durable publication plan no longer matches the local outbox."
                 }
-                version
-            }
-            runCatching { beforeEntityPublication(versions) }.getOrElse {
-                return "entity_publication_prerequisite_failed" to
-                    "A referenced media asset is not fully published for this workspace authority."
-            }
-            val objects = batch.map { pendingValue ->
-                epoch.cipher.decodeJson(pendingValue.encodedOuter).getOrElse {
-                    return "local_transaction_failed" to "A durable outbox outer object is malformed."
-                }.also { outer ->
-                    if (outer.mutationId != pendingValue.mutationId || outer.objectId != pendingValue.objectId ||
-                        outer.objectDigest != pendingValue.objectDigest || outer.writerDeviceId != pendingValue.writerDeviceId
-                    ) return "mutation_reuse_mismatch" to "A durable outbox tuple no longer matches its encrypted object."
+                if (publications.isEmpty()) return@publicationBatch
+                val batch = publications.map { it.pending }
+                runCatching { beforeEntityPublication(publications.map { it.version }) }.getOrElse {
+                    return "entity_publication_prerequisite_failed" to
+                        "A referenced media asset is not fully published for this workspace authority."
                 }
-            }
-            when (val pushed = remote.push(descriptor.syncEpochId, objects)) {
-                is WorkspaceSyncPushResultV2.Rejected -> return pushed.safeErrorCode to pushed.safeMessage
-                is WorkspaceSyncPushResultV2.Accepted -> {
-                    if (pushed.acknowledgements.size != batch.size) {
-                        return "transport_metadata_mismatch" to "Remote returned an incomplete entity acknowledgement set."
+                val objects = batch.map { pendingValue ->
+                    epoch.cipher.decodeJson(pendingValue.encodedOuter).getOrElse {
+                        return "local_transaction_failed" to "A durable outbox outer object is malformed."
+                    }.also { outer ->
+                        if (outer.mutationId != pendingValue.mutationId || outer.objectId != pendingValue.objectId ||
+                            outer.objectDigest != pendingValue.objectDigest || outer.writerDeviceId != pendingValue.writerDeviceId
+                        ) return "mutation_reuse_mismatch" to "A durable outbox tuple no longer matches its encrypted object."
                     }
-                    batch.zip(pushed.acknowledgements).forEach { (pendingValue, ack) ->
-                        if (ack.mutationId != pendingValue.mutationId || ack.objectId != pendingValue.objectId ||
-                            ack.objectDigest != pendingValue.objectDigest
-                        ) return "mutation_reuse_mismatch" to "Remote acknowledgement does not match the exact outbox tuple."
-                    }
-                    batch.zip(pushed.acknowledgements).forEach { (pendingValue, ack) ->
-                        check(store.acknowledgePending(remote.remoteProfile, ack.mutationId, ack.objectId, ack.objectDigest))
-                        counts.pushedObjects++
-                        counts.pushedMutations++
-                        if (ack.idempotentReplay) counts.replays++
+                }
+                when (val pushed = remote.push(descriptor.syncEpochId, objects)) {
+                    is WorkspaceSyncPushResultV2.Rejected -> return pushed.safeErrorCode to pushed.safeMessage
+                    is WorkspaceSyncPushResultV2.Accepted -> {
+                        if (pushed.acknowledgements.size != batch.size) {
+                            return "transport_metadata_mismatch" to "Remote returned an incomplete entity acknowledgement set."
+                        }
+                        batch.zip(pushed.acknowledgements).forEach { (pendingValue, ack) ->
+                            if (ack.mutationId != pendingValue.mutationId || ack.objectId != pendingValue.objectId ||
+                                ack.objectDigest != pendingValue.objectDigest
+                            ) return "mutation_reuse_mismatch" to "Remote acknowledgement does not match the exact outbox tuple."
+                        }
+                        batch.zip(pushed.acknowledgements).forEach { (pendingValue, ack) ->
+                            check(store.acknowledgePending(remote.remoteProfile, ack.mutationId, ack.objectId, ack.objectDigest))
+                            counts.pushedObjects++
+                            counts.pushedMutations++
+                            if (ack.idempotentReplay) counts.replays++
+                        }
                     }
                 }
             }
@@ -875,7 +958,7 @@ class WorkspaceSyncCoordinatorV2(
                 if (descriptor != null) {
                     counts.captureWorkspaceState(store, protocolStore, remote.remoteProfile, descriptor)
                 } else {
-                    counts.activeConflicts = store.loadActiveConflicts().size
+                    counts.activeConflicts = store.loadStateCounts().activeConflicts
                 }
             }
         }
@@ -975,14 +1058,12 @@ private data class MutableWorkspaceSyncCountsV2(
         remoteProfile: String,
         descriptor: SyncEpochDescriptorV2,
     ) {
-        val conflicts = store.loadActiveConflicts()
-        activeConflicts = conflicts.size
-        activeNoteConflicts = conflicts.count { it.descriptor.entityType == WorkspaceEntityTypeV2.NOTE }
-        activeNotebookConflicts = conflicts.count { it.descriptor.entityType == WorkspaceEntityTypeV2.NOTEBOOK }
-        activePreferenceConflicts = conflicts.count {
-            it.descriptor.entityType == WorkspaceEntityTypeV2.WORKSPACE_PREFERENCES
-        }
-        projectionWarnings = store.loadProjections().count { it.warning != null }
+        val state = store.loadStateCounts()
+        activeConflicts = state.activeConflicts
+        activeNoteConflicts = state.activeConflictsByEntityType[WorkspaceEntityTypeV2.NOTE] ?: 0
+        activeNotebookConflicts = state.activeConflictsByEntityType[WorkspaceEntityTypeV2.NOTEBOOK] ?: 0
+        activePreferenceConflicts = state.activeConflictsByEntityType[WorkspaceEntityTypeV2.WORKSPACE_PREFERENCES] ?: 0
+        projectionWarnings = state.projectionWarnings
         deadLetters = protocolStore.loadUnresolvedDeadLetters(remoteProfile, descriptor.syncEpochId).size
     }
 

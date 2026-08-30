@@ -41,6 +41,18 @@ fun ClientSettings.resetWorkspaceStateForReplacement(): ClientSettings =
     )
 
 /**
+ * Forgets only the remote account selection while retaining an unbound local workspace.
+ * A workspace that already has a publication authority must use
+ * [resetBoundWorkspaceForConnectionSwitch] instead.
+ */
+fun ClientSettings.resetUnboundSelfHostedConnection(): ClientSettings =
+    copy(syncConfiguration = SyncConfiguration())
+
+/** Drops the old workspace together with the remote account it was bound to. */
+fun ClientSettings.resetBoundWorkspaceForConnectionSwitch(): ClientSettings =
+    resetWorkspaceStateForReplacement().copy(syncConfiguration = SyncConfiguration())
+
+/**
  * In-app UI language override for compose string resources.
  *
  * [System] uses the platform locale. Explicit values force a language tag
@@ -564,6 +576,26 @@ fun interface ManualSyncRunner {
     fun run(): ManualSyncResult
 }
 
+data class SelfHostedConnectionSwitchResult(
+    val success: Boolean,
+    val workspaceReplaced: Boolean = false,
+) {
+    companion object {
+        fun switched(workspaceReplaced: Boolean): SelfHostedConnectionSwitchResult =
+            SelfHostedConnectionSwitchResult(success = true, workspaceReplaced = workspaceReplaced)
+
+        fun failure(): SelfHostedConnectionSwitchResult = SelfHostedConnectionSwitchResult(success = false)
+    }
+}
+
+fun interface SelfHostedConnectionSwitcher {
+    /**
+     * Prepares this installation to select another server or account.
+     * Implementations replace an authority-bound workspace instead of rebinding it.
+     */
+    fun switchConnection(): SelfHostedConnectionSwitchResult
+}
+
 class WorkspaceJoinPackage(
     val metadataJson: String,
     val recoveryCode: String,
@@ -721,6 +753,183 @@ fun interface WorkspacePairingInvitationCanceller {
     fun cancelInvitation(invitation: WorkspacePairingInvitation): WorkspaceJoinResult
 }
 
+class WorkspaceRecoveryCode private constructor(
+    private val value: String,
+) {
+    fun revealForUserConfirmation(): String = value
+
+    override fun toString(): String = "WorkspaceRecoveryCode(<redacted>)"
+
+    companion object {
+        fun fromUserVisibleValue(value: String): WorkspaceRecoveryCode {
+            require(value.isNotBlank()) { "Workspace recovery code must not be blank." }
+            return WorkspaceRecoveryCode(value)
+        }
+    }
+}
+
+enum class WorkspaceRecoveryState {
+    NotConfigured,
+    Configured,
+    RecoveryAvailable,
+    Unavailable,
+}
+
+/**
+ * Keeps recovery-control-plane health separate from permission to use an
+ * already verified local workspace on the synchronization data plane.
+ */
+enum class WorkspaceRecoverySyncGate {
+    Pending,
+    Allowed,
+    RecoveryRequired,
+    VerificationUnavailable,
+}
+
+enum class WorkspaceRecoveryReason {
+    NotConfigured,
+    Configured,
+    RecoveryAvailable,
+    CodePrepared,
+    CodeCreated,
+    Recovered,
+    PublishRequired,
+    SessionRequired,
+    AuthorityMismatch,
+    WorkspaceLocked,
+    InvalidCode,
+    RecoveryNotRequired,
+    ReplacementConfirmationRequired,
+    ReplacementFailed,
+    ServerConflict,
+    ServerRequestFailed,
+    Unavailable,
+    Failed,
+}
+
+data class WorkspaceRecoveryStatusResult(
+    val success: Boolean,
+    val state: WorkspaceRecoveryState,
+    val syncGate: WorkspaceRecoverySyncGate,
+    val reason: WorkspaceRecoveryReason,
+    val diagnosticMessage: String? = null,
+) {
+    companion object {
+        fun ready(
+            state: WorkspaceRecoveryState,
+            syncGate: WorkspaceRecoverySyncGate,
+            reason: WorkspaceRecoveryReason,
+        ): WorkspaceRecoveryStatusResult = WorkspaceRecoveryStatusResult(
+            success = true,
+            state = state,
+            syncGate = syncGate,
+            reason = reason,
+        )
+
+        fun failure(
+            reason: WorkspaceRecoveryReason,
+            syncGate: WorkspaceRecoverySyncGate = WorkspaceRecoverySyncGate.VerificationUnavailable,
+            diagnosticMessage: String? = null,
+        ): WorkspaceRecoveryStatusResult = WorkspaceRecoveryStatusResult(
+            success = false,
+            state = WorkspaceRecoveryState.Unavailable,
+            syncGate = syncGate,
+            reason = reason,
+            diagnosticMessage = diagnosticMessage?.let(::redactSelfHostedSecretWords),
+        )
+    }
+}
+
+data class WorkspaceRecoveryCodeResult(
+    val success: Boolean,
+    val reason: WorkspaceRecoveryReason,
+    val recoveryCode: WorkspaceRecoveryCode? = null,
+    val diagnosticMessage: String? = null,
+) {
+    companion object {
+        fun prepared(recoveryCode: WorkspaceRecoveryCode): WorkspaceRecoveryCodeResult =
+            WorkspaceRecoveryCodeResult(
+                success = true,
+                reason = WorkspaceRecoveryReason.CodePrepared,
+                recoveryCode = recoveryCode,
+            )
+
+        fun created(): WorkspaceRecoveryCodeResult = WorkspaceRecoveryCodeResult(
+            success = true,
+            reason = WorkspaceRecoveryReason.CodeCreated,
+        )
+
+        fun failure(
+            reason: WorkspaceRecoveryReason,
+            diagnosticMessage: String? = null,
+        ): WorkspaceRecoveryCodeResult = WorkspaceRecoveryCodeResult(
+            success = false,
+            reason = reason,
+            diagnosticMessage = diagnosticMessage?.let(::redactSelfHostedSecretWords),
+        )
+    }
+}
+
+data class WorkspaceRecoveryRestoreResult(
+    val success: Boolean,
+    val reason: WorkspaceRecoveryReason,
+    val diagnosticMessage: String? = null,
+) {
+    companion object {
+        fun recovered(): WorkspaceRecoveryRestoreResult = WorkspaceRecoveryRestoreResult(
+            success = true,
+            reason = WorkspaceRecoveryReason.Recovered,
+        )
+
+        fun failure(
+            reason: WorkspaceRecoveryReason,
+            diagnosticMessage: String? = null,
+        ): WorkspaceRecoveryRestoreResult = WorkspaceRecoveryRestoreResult(
+            success = false,
+            reason = reason,
+            diagnosticMessage = diagnosticMessage?.let(::redactSelfHostedSecretWords),
+        )
+    }
+}
+
+interface WorkspaceRecoveryManager {
+    fun status(): WorkspaceRecoveryStatusResult
+
+    /** Prepares a code locally; nothing is published until the user confirms it. */
+    fun prepareCode(): WorkspaceRecoveryCodeResult
+
+    fun confirmPreparedCode(candidate: String): WorkspaceRecoveryCodeResult
+
+    fun discardPreparedCode()
+
+    fun recover(
+        recoveryCode: String,
+        replaceExistingWorkspace: Boolean,
+    ): WorkspaceRecoveryRestoreResult
+}
+
+object UnavailableWorkspaceRecoveryManager : WorkspaceRecoveryManager {
+    override fun status(): WorkspaceRecoveryStatusResult = WorkspaceRecoveryStatusResult.failure(
+        WorkspaceRecoveryReason.Unavailable,
+    )
+
+    override fun prepareCode(): WorkspaceRecoveryCodeResult = WorkspaceRecoveryCodeResult.failure(
+        WorkspaceRecoveryReason.Unavailable,
+    )
+
+    override fun confirmPreparedCode(candidate: String): WorkspaceRecoveryCodeResult =
+        WorkspaceRecoveryCodeResult.failure(WorkspaceRecoveryReason.Unavailable)
+
+    override fun discardPreparedCode() = Unit
+
+    override fun recover(
+        recoveryCode: String,
+        replaceExistingWorkspace: Boolean,
+    ): WorkspaceRecoveryRestoreResult = WorkspaceRecoveryRestoreResult.failure(
+        WorkspaceRecoveryReason.Unavailable,
+    )
+}
+
 fun normalizeSelfHostedEndpoint(value: String): String {
     val trimmed = value.trim()
     return parseSelfHostedOriginOrNull(trimmed)?.canonicalValue ?: trimmed.trimEnd('/')
@@ -805,4 +1014,7 @@ private fun redactSelfHostedSecretWords(message: String): String =
     message
         .replace(Regex("(?i)(password|token|secret|recovery\\s*code|recoveryCode)\\s*[:=]\\s*\\S+"), "$1=redacted")
         .replace(Regex("(?i)super-secret|correct-password|bad-password"), "redacted")
-        .replace(Regex("SOMEDAY-[A-Za-z0-9-]+"), "SOMEDAY-REDACTED")
+        .replace(
+            Regex("(?i)SOMEDAY(?:-[A-Za-z0-9-]+|[A-F0-9]{32})"),
+            "SOMEDAY-REDACTED",
+        )

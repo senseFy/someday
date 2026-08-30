@@ -16,6 +16,8 @@ import saien.someday.domain.settings.EditorPreferences
 import saien.someday.domain.settings.ManualSyncReason
 import saien.someday.domain.settings.ManualSyncResult
 import saien.someday.domain.settings.OnThisDayNotificationPreferences
+import saien.someday.domain.settings.SelfHostedConnectionSwitchResult
+import saien.someday.domain.settings.SelfHostedConnectionSwitcher
 import saien.someday.domain.settings.SelfHostedSessionCredentialStore
 import saien.someday.domain.settings.SelfHostedSessionCredentials
 import saien.someday.domain.settings.SelfHostedSessionSummary
@@ -33,9 +35,18 @@ import saien.someday.domain.settings.WorkspacePairingInvitationCreator
 import saien.someday.domain.settings.WorkspacePairingInvitationJoiner
 import saien.someday.domain.settings.WorkspacePairingInvitationResult
 import saien.someday.domain.settings.WorkspacePairingReason
+import saien.someday.domain.settings.WorkspaceRecoveryCode
+import saien.someday.domain.settings.WorkspaceRecoveryCodeResult
+import saien.someday.domain.settings.WorkspaceRecoveryManager
+import saien.someday.domain.settings.WorkspaceRecoveryReason
+import saien.someday.domain.settings.WorkspaceRecoveryRestoreResult
+import saien.someday.domain.settings.WorkspaceRecoveryState
+import saien.someday.domain.settings.WorkspaceRecoveryStatusResult
+import saien.someday.domain.settings.WorkspaceRecoverySyncGate
 import saien.someday.domain.settings.WorkspacePreferencesSnapshot
 import saien.someday.domain.settings.WorkspacePreferencesSyncState
 import saien.someday.domain.settings.WorkspacePreferencesSyncStatus
+import saien.someday.domain.settings.resetBoundWorkspaceForConnectionSwitch
 import saien.someday.ui.i18n.SettingsUiStrings
 import saien.someday.ui.notes.InMemoryNotesRepository
 import kotlin.coroutines.CoroutineContext
@@ -609,6 +620,63 @@ class SettingsUiControllerTest {
     }
 
     @Test
+    fun confirmedConnectionSwitchReopensEditableFirstSetupAndRefreshesReplacedWorkspace() = runBlocking {
+        var stored = connectedSettings().copy(theme = ClientTheme.Dark)
+        var refreshCalls = 0
+        lateinit var controller: SettingsUiController
+        controller = SettingsUiController(
+            loadSettings = { stored },
+            initialSettings = stored,
+            selfHostedConnectionSwitcher = SelfHostedConnectionSwitcher {
+                assertEquals(SyncUiOperation.SwitchingConnection, controller.state.sync.operation)
+                stored = stored.resetBoundWorkspaceForConnectionSwitch()
+                SelfHostedConnectionSwitchResult.switched(workspaceReplaced = true)
+            },
+            onDataRestored = { refreshCalls += 1 },
+            uiStrings = SettingsUiStrings(
+                selfHostedConnectionSwitchReady = "ready-for-another-authority",
+            ),
+            backgroundDispatcher = Dispatchers.Unconfined,
+        )
+
+        assertTrue(controller.switchSelfHostedConnection())
+
+        assertEquals(1, refreshCalls)
+        assertEquals(SyncAccountFormMode.InitialSetup, controller.state.sync.accountFormMode())
+        assertFalse(controller.state.sync.accountFormMode().serverReadOnly)
+        assertFalse(controller.state.sync.accountFormMode().emailReadOnly)
+        assertEquals(SyncMode.Off, controller.state.settings.syncConfiguration.mode)
+        assertNull(controller.state.settings.syncConfiguration.selfHostedEndpoint)
+        assertFalse(controller.state.settings.syncConfiguration.selfHostedSession.loggedIn)
+        assertEquals(ClientTheme.System, controller.state.settings.theme)
+        assertEquals("ready-for-another-authority", controller.state.feedbackMessage)
+        assertNull(controller.state.sync.operation)
+    }
+
+    @Test
+    fun failedConnectionSwitchKeepsTheExistingBindingAndReportsSafeFeedback() = runBlocking {
+        val original = connectedSettings()
+        val controller = SettingsUiController(
+            loadSettings = { original },
+            initialSettings = original,
+            selfHostedConnectionSwitcher = SelfHostedConnectionSwitcher {
+                SelfHostedConnectionSwitchResult.failure()
+            },
+            uiStrings = SettingsUiStrings(
+                selfHostedConnectionSwitchFailed = "safe-switch-failure",
+            ),
+            backgroundDispatcher = Dispatchers.Unconfined,
+        )
+
+        assertFalse(controller.switchSelfHostedConnection())
+
+        assertEquals(original, controller.state.settings)
+        assertEquals(SyncAccountFormMode.BoundSession, controller.state.sync.accountFormMode())
+        assertEquals("safe-switch-failure", controller.state.feedbackMessage)
+        assertNull(controller.state.sync.operation)
+    }
+
+    @Test
     fun userSyncUsesOneOperationAndRefreshesEvenWithZeroTransportDeltas() = runBlocking {
         var persisted = connectedSettings(lastError = "sync:Failed")
         var refreshCalls = 0
@@ -1141,6 +1209,48 @@ class SettingsUiControllerTest {
     }
 
     @Test
+    fun pairingReplacementStillSyncsWhenOnlyRecoveryVerificationIsUnavailable() = runBlocking {
+        var syncCalls = 0
+        var refreshCalls = 0
+        val recoveryManager = FakeWorkspaceRecoveryManager(
+            statusResult = WorkspaceRecoveryStatusResult.failure(
+                reason = WorkspaceRecoveryReason.ServerRequestFailed,
+                syncGate = WorkspaceRecoverySyncGate.Allowed,
+            ),
+        )
+        val controller = SettingsUiController(
+            loadSettings = ::connectedSettings,
+            initialSettings = connectedSettings(),
+            workspacePairingInvitationJoiner = WorkspacePairingInvitationJoiner { _, _ ->
+                WorkspaceJoinResult.success(WorkspacePairingReason.Joined)
+            },
+            workspaceRecoveryManager = recoveryManager,
+            manualSyncRunner = {
+                syncCalls += 1
+                ManualSyncResult.success(SyncMode.SelfHosted, 0, 0, 0)
+            },
+            onDataRestored = { refreshCalls += 1 },
+            backgroundDispatcher = Dispatchers.Unconfined,
+        )
+
+        assertTrue(
+            controller.joinWorkspaceWithToken(
+                tokenInput = "valid-looking-token",
+                replaceExistingWorkspace = true,
+            ),
+        )
+
+        assertEquals(1, syncCalls)
+        assertEquals(1, refreshCalls)
+        assertEquals(1, recoveryManager.discardCalls)
+        assertEquals(
+            WorkspaceRecoveryUiAvailability.Unavailable,
+            controller.state.sync.recovery.availability,
+        )
+        assertTrue(controller.canRunAutomaticSync())
+    }
+
+    @Test
     fun successfulReplacementRefreshesProductDataWhenFirstSyncFailsWithoutChanges() = runBlocking {
         var refreshCalls = 0
         val replacementSettings = connectedSettings()
@@ -1303,6 +1413,305 @@ class SettingsUiControllerTest {
     }
 
     @Test
+    fun recoveryGateRetriesPendingStateAndBlocksOnlyWhenWorkspaceVerificationRequiresIt() = runBlocking {
+        suspend fun assertSyncBlocked(
+            controller: SettingsUiController,
+            expectedAvailability: WorkspaceRecoveryUiAvailability,
+            syncCalls: () -> Int,
+        ) {
+            assertEquals(expectedAvailability, controller.state.sync.recovery.availability)
+            assertFalse(controller.canRunAutomaticSync())
+            assertFalse(controller.runUserSync())
+            assertFalse(controller.runAutomaticSync())
+            assertEquals(0, syncCalls())
+        }
+
+        var unknownSyncCalls = 0
+        val unknown = SettingsUiController(
+            loadSettings = ::connectedSettings,
+            initialSettings = connectedSettings(),
+            selfHostedSessionCredentialStore = FakeSelfHostedSessionCredentialStore(testCredentials()),
+            automaticSyncEligible = { true },
+            workspaceRecoveryManager = FakeWorkspaceRecoveryManager(),
+            manualSyncRunner = {
+                unknownSyncCalls += 1
+                ManualSyncResult.success(SyncMode.SelfHosted, 0, 0, 0)
+            },
+            backgroundDispatcher = Dispatchers.Unconfined,
+        )
+        assertEquals(WorkspaceRecoveryUiAvailability.Unknown, unknown.state.sync.recovery.availability)
+        assertFalse(unknown.canRunAutomaticSync())
+        assertFalse(unknown.runAutomaticSync())
+        assertTrue(unknown.runUserSync())
+        assertEquals(1, unknownSyncCalls)
+        assertEquals(WorkspaceRecoveryUiAvailability.NotConfigured, unknown.state.sync.recovery.availability)
+
+        var availableSyncCalls = 0
+        val available = SettingsUiController(
+            loadSettings = ::connectedSettings,
+            initialSettings = connectedSettings(),
+            selfHostedSessionCredentialStore = FakeSelfHostedSessionCredentialStore(testCredentials()),
+            automaticSyncEligible = { true },
+            workspaceRecoveryManager = FakeWorkspaceRecoveryManager(
+                statusResult = WorkspaceRecoveryStatusResult.ready(
+                    state = WorkspaceRecoveryState.RecoveryAvailable,
+                    syncGate = WorkspaceRecoverySyncGate.RecoveryRequired,
+                    reason = WorkspaceRecoveryReason.RecoveryAvailable,
+                ),
+            ),
+            manualSyncRunner = {
+                availableSyncCalls += 1
+                ManualSyncResult.success(SyncMode.SelfHosted, 0, 0, 0)
+            },
+            backgroundDispatcher = Dispatchers.Unconfined,
+        )
+        available.refresh()
+        assertSyncBlocked(
+            controller = available,
+            expectedAvailability = WorkspaceRecoveryUiAvailability.RecoveryAvailable,
+            syncCalls = { availableSyncCalls },
+        )
+
+        var unavailableSyncCalls = 0
+        val unavailableManager = FakeWorkspaceRecoveryManager(
+            statusResult = WorkspaceRecoveryStatusResult.failure(
+                WorkspaceRecoveryReason.ServerRequestFailed,
+            ),
+        )
+        val unavailable = SettingsUiController(
+            loadSettings = ::connectedSettings,
+            initialSettings = connectedSettings(),
+            selfHostedSessionCredentialStore = FakeSelfHostedSessionCredentialStore(testCredentials()),
+            automaticSyncEligible = { true },
+            workspaceRecoveryManager = unavailableManager,
+            manualSyncRunner = {
+                unavailableSyncCalls += 1
+                ManualSyncResult.success(SyncMode.SelfHosted, 0, 0, 0)
+            },
+            backgroundDispatcher = Dispatchers.Unconfined,
+        )
+        unavailable.refresh()
+        assertSyncBlocked(
+            controller = unavailable,
+            expectedAvailability = WorkspaceRecoveryUiAvailability.Unavailable,
+            syncCalls = { unavailableSyncCalls },
+        )
+
+        unavailableManager.statusResult = WorkspaceRecoveryStatusResult.ready(
+            state = WorkspaceRecoveryState.NotConfigured,
+            syncGate = WorkspaceRecoverySyncGate.Allowed,
+            reason = WorkspaceRecoveryReason.NotConfigured,
+        )
+        assertTrue(unavailable.retryWorkspaceRecoveryStatus())
+        assertTrue(unavailable.canRunAutomaticSync())
+        assertTrue(unavailable.runAutomaticSync())
+        assertEquals(1, unavailableSyncCalls)
+    }
+
+    @Test
+    fun recoveryControlPlaneFailureDoesNotBlockAnAlreadyVerifiedLocalWorkspace() = runBlocking {
+        var syncCalls = 0
+        val controller = SettingsUiController(
+            loadSettings = ::connectedSettings,
+            initialSettings = connectedSettings(),
+            selfHostedSessionCredentialStore = FakeSelfHostedSessionCredentialStore(testCredentials()),
+            automaticSyncEligible = { true },
+            workspaceRecoveryManager = FakeWorkspaceRecoveryManager(
+                statusResult = WorkspaceRecoveryStatusResult.failure(
+                    reason = WorkspaceRecoveryReason.ServerRequestFailed,
+                    syncGate = WorkspaceRecoverySyncGate.Allowed,
+                ),
+            ),
+            manualSyncRunner = {
+                syncCalls += 1
+                ManualSyncResult.success(SyncMode.SelfHosted, 0, 0, 0)
+            },
+            backgroundDispatcher = Dispatchers.Unconfined,
+        )
+
+        controller.refresh()
+
+        assertEquals(WorkspaceRecoveryUiAvailability.Unavailable, controller.state.sync.recovery.availability)
+        assertTrue(controller.canRunAutomaticSync())
+        assertTrue(controller.runUserSync())
+        assertTrue(controller.runAutomaticSync())
+        assertEquals(2, syncCalls)
+    }
+
+    @Test
+    fun remoteHistoryConflictRefreshesAStaleMissingRecoveryStatusBeforeAnotherSync() = runBlocking {
+        val manager = FakeWorkspaceRecoveryManager()
+        var syncCalls = 0
+        val controller = SettingsUiController(
+            loadSettings = ::connectedSettings,
+            initialSettings = connectedSettings(),
+            selfHostedSessionCredentialStore = FakeSelfHostedSessionCredentialStore(testCredentials()),
+            workspaceRecoveryManager = manager,
+            manualSyncRunner = {
+                syncCalls += 1
+                ManualSyncResult.failure(
+                    mode = SyncMode.SelfHosted,
+                    reason = ManualSyncReason.RemoteHistoryConflict,
+                )
+            },
+            backgroundDispatcher = Dispatchers.Unconfined,
+        )
+        controller.refresh()
+        manager.statusResult = WorkspaceRecoveryStatusResult.ready(
+            state = WorkspaceRecoveryState.RecoveryAvailable,
+            syncGate = WorkspaceRecoverySyncGate.RecoveryRequired,
+            reason = WorkspaceRecoveryReason.RecoveryAvailable,
+        )
+
+        assertFalse(controller.runUserSync())
+
+        assertEquals(1, syncCalls)
+        assertEquals(2, manager.statusCalls)
+        assertEquals(
+            WorkspaceRecoveryUiAvailability.RecoveryAvailable,
+            controller.state.sync.recovery.availability,
+        )
+        assertFalse(controller.canRunAutomaticSync())
+    }
+
+    @Test
+    fun preparedRecoveryCodePublishesOnlyAfterTheExactCodeIsEnteredAgain() = runBlocking {
+        val manager = FakeWorkspaceRecoveryManager(
+            statusResult = WorkspaceRecoveryStatusResult.ready(
+                state = WorkspaceRecoveryState.NotConfigured,
+                syncGate = WorkspaceRecoverySyncGate.Allowed,
+                reason = WorkspaceRecoveryReason.NotConfigured,
+            ),
+        )
+        val controller = SettingsUiController(
+            loadSettings = ::connectedSettings,
+            initialSettings = connectedSettings(),
+            selfHostedSessionCredentialStore = FakeSelfHostedSessionCredentialStore(testCredentials()),
+            workspaceRecoveryManager = manager,
+            backgroundDispatcher = Dispatchers.Unconfined,
+        )
+        controller.refresh()
+
+        assertTrue(controller.prepareWorkspaceRecoveryCode())
+        assertEquals(1, manager.prepareCalls)
+        assertEquals(0, manager.publishCalls)
+        assertEquals(RECOVERY_CODE, controller.state.sync.recovery.preparedCode?.value)
+
+        assertFalse(controller.confirmWorkspaceRecoveryCode("SOMEDAY-WRONG-CODE"))
+        assertEquals(listOf("SOMEDAY-WRONG-CODE"), manager.confirmationCandidates)
+        assertEquals(0, manager.publishCalls)
+        assertEquals(RECOVERY_CODE, controller.state.sync.recovery.preparedCode?.value)
+        assertEquals(
+            WorkspaceRecoveryUiAvailability.NotConfigured,
+            controller.state.sync.recovery.availability,
+        )
+
+        assertTrue(controller.confirmWorkspaceRecoveryCode(RECOVERY_CODE))
+        assertEquals(
+            listOf("SOMEDAY-WRONG-CODE", RECOVERY_CODE),
+            manager.confirmationCandidates,
+        )
+        assertEquals(1, manager.publishCalls)
+        assertNull(controller.state.sync.recovery.preparedCode)
+        assertEquals(
+            WorkspaceRecoveryUiAvailability.Configured,
+            controller.state.sync.recovery.availability,
+        )
+    }
+
+    @Test
+    fun successfulRecoveryReloadsTheWorkspaceRunsFirstSyncAndRefreshesProductData() = runBlocking {
+        val replacementSettings = connectedSettings().copy(theme = ClientTheme.Dark)
+        val manager = FakeWorkspaceRecoveryManager(
+            statusResult = WorkspaceRecoveryStatusResult.ready(
+                state = WorkspaceRecoveryState.RecoveryAvailable,
+                syncGate = WorkspaceRecoverySyncGate.RecoveryRequired,
+                reason = WorkspaceRecoveryReason.RecoveryAvailable,
+            ),
+        )
+        var loadCalls = 0
+        var syncCalls = 0
+        var refreshCalls = 0
+        lateinit var controller: SettingsUiController
+        controller = SettingsUiController(
+            loadSettings = {
+                loadCalls += 1
+                replacementSettings
+            },
+            initialSettings = connectedSettings(),
+            selfHostedSessionCredentialStore = FakeSelfHostedSessionCredentialStore(testCredentials()),
+            workspaceRecoveryManager = manager,
+            manualSyncRunner = {
+                syncCalls += 1
+                assertEquals(SyncUiOperation.Syncing, controller.state.sync.operation)
+                ManualSyncResult.success(SyncMode.SelfHosted, 0, 0, 0)
+            },
+            onDataRestored = { refreshCalls += 1 },
+            backgroundDispatcher = Dispatchers.Unconfined,
+        )
+        controller.refresh()
+        assertEquals(
+            WorkspaceRecoveryUiAvailability.RecoveryAvailable,
+            controller.state.sync.recovery.availability,
+        )
+
+        assertTrue(
+            controller.recoverWorkspaceWithCode(
+                recoveryCode = RECOVERY_CODE,
+                replaceExistingWorkspace = true,
+            ),
+        )
+
+        assertEquals(listOf(RECOVERY_CODE to true), manager.recoveryRequests)
+        assertEquals(1, loadCalls)
+        assertEquals(1, syncCalls)
+        assertEquals(1, refreshCalls)
+        assertEquals(ClientTheme.Dark, controller.state.settings.theme)
+        assertEquals(
+            WorkspaceRecoveryUiAvailability.Configured,
+            controller.state.sync.recovery.availability,
+        )
+        assertNull(controller.state.sync.operation)
+    }
+
+    @Test
+    fun recoveredWorkspaceStillRunsFirstSyncWhenOnlyRecoveryVerificationChanges() = runBlocking {
+        val manager = FakeWorkspaceRecoveryManager(
+            statusResult = WorkspaceRecoveryStatusResult.ready(
+                state = WorkspaceRecoveryState.RecoveryAvailable,
+                syncGate = WorkspaceRecoverySyncGate.RecoveryRequired,
+                reason = WorkspaceRecoveryReason.RecoveryAvailable,
+            ),
+            statusAfterSuccessfulRecovery = WorkspaceRecoveryStatusResult.failure(
+                reason = WorkspaceRecoveryReason.AuthorityMismatch,
+                syncGate = WorkspaceRecoverySyncGate.Allowed,
+            ),
+        )
+        var syncCalls = 0
+        var refreshCalls = 0
+        val controller = SettingsUiController(
+            loadSettings = ::connectedSettings,
+            initialSettings = connectedSettings(),
+            selfHostedSessionCredentialStore = FakeSelfHostedSessionCredentialStore(testCredentials()),
+            workspaceRecoveryManager = manager,
+            manualSyncRunner = {
+                syncCalls += 1
+                ManualSyncResult.success(SyncMode.SelfHosted, 0, 0, 0)
+            },
+            onDataRestored = { refreshCalls += 1 },
+            backgroundDispatcher = Dispatchers.Unconfined,
+        )
+        controller.refresh()
+
+        assertTrue(controller.recoverWorkspaceWithCode(RECOVERY_CODE, replaceExistingWorkspace = true))
+
+        assertEquals(1, syncCalls)
+        assertEquals(1, refreshCalls)
+        assertEquals(WorkspaceRecoveryUiAvailability.Unavailable, controller.state.sync.recovery.availability)
+        assertTrue(controller.canRunAutomaticSync())
+    }
+
+    @Test
     fun failedJoinNeverReloadsWorkspaceSettings() = runBlocking {
         var loadCalls = 0
         val controller = SettingsUiController(
@@ -1358,6 +1767,8 @@ class SettingsUiControllerTest {
     }
 }
 
+private const val RECOVERY_CODE = "SOMEDAY-0123-4567-89AB-CDEF-0123-4567-89AB-CDEF"
+
 private fun connectedSettings(
     endpoint: String = "https://sync.example.test",
     lastError: String? = null,
@@ -1405,6 +1816,67 @@ private class FakeSelfHostedSessionCredentialStore(
 
     override fun clear() {
         credentials = null
+    }
+}
+
+private class FakeWorkspaceRecoveryManager(
+    var statusResult: WorkspaceRecoveryStatusResult = WorkspaceRecoveryStatusResult.ready(
+        state = WorkspaceRecoveryState.NotConfigured,
+        syncGate = WorkspaceRecoverySyncGate.Allowed,
+        reason = WorkspaceRecoveryReason.NotConfigured,
+    ),
+    var restoreResult: WorkspaceRecoveryRestoreResult = WorkspaceRecoveryRestoreResult.recovered(),
+    private val statusAfterSuccessfulRecovery: WorkspaceRecoveryStatusResult =
+        WorkspaceRecoveryStatusResult.ready(
+            state = WorkspaceRecoveryState.Configured,
+            syncGate = WorkspaceRecoverySyncGate.Allowed,
+            reason = WorkspaceRecoveryReason.Configured,
+        ),
+) : WorkspaceRecoveryManager {
+    var statusCalls: Int = 0
+        private set
+    var prepareCalls: Int = 0
+        private set
+    var publishCalls: Int = 0
+        private set
+    var discardCalls: Int = 0
+        private set
+    val confirmationCandidates = mutableListOf<String>()
+    val recoveryRequests = mutableListOf<Pair<String, Boolean>>()
+
+    override fun status(): WorkspaceRecoveryStatusResult {
+        statusCalls += 1
+        return statusResult
+    }
+
+    override fun prepareCode(): WorkspaceRecoveryCodeResult {
+        prepareCalls += 1
+        return WorkspaceRecoveryCodeResult.prepared(
+            WorkspaceRecoveryCode.fromUserVisibleValue(RECOVERY_CODE),
+        )
+    }
+
+    override fun confirmPreparedCode(candidate: String): WorkspaceRecoveryCodeResult {
+        confirmationCandidates += candidate
+        return if (candidate == RECOVERY_CODE) {
+            publishCalls += 1
+            WorkspaceRecoveryCodeResult.created()
+        } else {
+            WorkspaceRecoveryCodeResult.failure(WorkspaceRecoveryReason.InvalidCode)
+        }
+    }
+
+    override fun discardPreparedCode() {
+        discardCalls += 1
+    }
+
+    override fun recover(
+        recoveryCode: String,
+        replaceExistingWorkspace: Boolean,
+    ): WorkspaceRecoveryRestoreResult {
+        recoveryRequests += recoveryCode to replaceExistingWorkspace
+        if (restoreResult.success) statusResult = statusAfterSuccessfulRecovery
+        return restoreResult
     }
 }
 

@@ -751,6 +751,24 @@ FROM workspace_entity_versions_v2
 WHERE epoch_id = ?
 ORDER BY entity_type ASC, entity_id ASC, generation ASC, version_id ASC;
 
+selectWorkspaceEntityVersionsByIdsV2:
+SELECT *
+FROM workspace_entity_versions_v2
+WHERE epoch_id = ? AND version_id IN ?
+ORDER BY entity_type ASC, entity_id ASC, generation ASC, version_id ASC;
+
+selectWorkspaceEntityVersionsByEntitiesV2:
+SELECT *
+FROM workspace_entity_versions_v2
+WHERE epoch_id = ? AND entity_type = ? AND entity_id IN ?
+ORDER BY entity_id ASC, generation ASC, version_id ASC;
+
+selectExistingWorkspaceEntityVersionIdsV2:
+SELECT version_id
+FROM workspace_entity_versions_v2
+WHERE epoch_id = ? AND version_id IN ?
+ORDER BY version_id ASC;
+
 selectWorkspaceEntityKeysV2:
 SELECT DISTINCT entity_type, entity_id
 FROM workspace_entity_versions_v2
@@ -768,6 +786,12 @@ SELECT parent_version_id
 FROM workspace_entity_version_parents_v2
 WHERE epoch_id = ? AND version_id = ?
 ORDER BY parent_version_id ASC;
+
+selectWorkspaceEntityParentsByVersionsV2:
+SELECT version_id, parent_version_id
+FROM workspace_entity_version_parents_v2
+WHERE epoch_id = ? AND version_id IN ?
+ORDER BY version_id ASC, parent_version_id ASC;
 
 deleteWorkspaceEntityHeadsV2:
 DELETE FROM workspace_entity_heads_v2
@@ -803,11 +827,24 @@ FROM workspace_entity_conflicts_v2
 WHERE epoch_id = ? AND entity_type = ? AND entity_id = ?
 ORDER BY detected_at ASC, conflict_id ASC;
 
+selectWorkspaceEntityConflictsByEntitiesV2:
+SELECT *
+FROM workspace_entity_conflicts_v2
+WHERE epoch_id = ? AND entity_type = ? AND entity_id IN ?
+ORDER BY entity_id ASC, detected_at ASC, conflict_id ASC;
+
 selectActiveWorkspaceEntityConflictsV2:
 SELECT *
 FROM workspace_entity_conflicts_v2
 WHERE epoch_id = ? AND lifecycle = 'active'
 ORDER BY entity_type ASC, entity_id ASC, conflict_id ASC;
+
+selectActiveWorkspaceEntityConflictCountsV2:
+SELECT entity_type, count(*) AS conflict_count
+FROM workspace_entity_conflicts_v2
+WHERE epoch_id = ? AND lifecycle = 'active'
+GROUP BY entity_type
+ORDER BY entity_type ASC;
 
 updateWorkspaceEntityConflictV2:
 UPDATE workspace_entity_conflicts_v2
@@ -823,6 +860,12 @@ SELECT head_version_id
 FROM workspace_entity_conflict_heads_v2
 WHERE epoch_id = ? AND conflict_id = ?
 ORDER BY head_version_id ASC;
+
+selectWorkspaceEntityConflictHeadsByConflictsV2:
+SELECT conflict_id, head_version_id
+FROM workspace_entity_conflict_heads_v2
+WHERE epoch_id = ? AND conflict_id IN ?
+ORDER BY conflict_id ASC, head_version_id ASC;
 
 upsertNoteProjectionSystemV2:
 INSERT OR REPLACE INTO note_projections_system_v2(
@@ -924,6 +967,12 @@ SELECT *
 FROM notebook_projections_v2
 WHERE epoch_id = ? AND notebook_id = ?;
 
+selectNotebookProjectionsByIdsV2:
+SELECT *
+FROM notebook_projections_v2
+WHERE epoch_id = ? AND notebook_id IN ?
+ORDER BY notebook_id ASC;
+
 selectAllNotebookProjectionsV2:
 SELECT *
 FROM notebook_projections_v2
@@ -969,6 +1018,15 @@ FROM projection_warnings_v2
 WHERE epoch_id = ?
 ORDER BY entity_type ASC, entity_id ASC, warning_code ASC;
 
+selectProjectionWarningCountV2:
+SELECT
+  (SELECT count(*) FROM note_projections_system_v2
+    WHERE epoch_id = :epochId AND warning IS NOT NULL) +
+  (SELECT count(*) FROM notebook_projections_v2
+    WHERE epoch_id = :epochId AND warning IS NOT NULL) +
+  (SELECT count(*) FROM workspace_preferences_projection_v2
+    WHERE epoch_id = :epochId AND warning IS NOT NULL);
+
 insertPendingMutationSystemV2:
 INSERT INTO sync_pending_mutations_system_v2(
   remote_profile, epoch_id, mutation_id, object_id, object_digest,
@@ -991,6 +1049,34 @@ SELECT *
 FROM sync_pending_mutations_system_v2
 WHERE remote_profile = ? AND epoch_id = ?
 ORDER BY created_at ASC, mutation_id ASC;
+
+selectPendingPublicationPlanSystemV2:
+SELECT pending.mutation_id, pending.object_id
+FROM sync_pending_mutations_system_v2 AS pending
+LEFT JOIN workspace_entity_versions_v2 AS version
+  ON version.epoch_id = pending.epoch_id AND version.version_id = pending.object_id
+WHERE pending.remote_profile = ? AND pending.epoch_id = ?
+ORDER BY
+  CASE WHEN version.version_id IS NULL THEN 0 ELSE 1 END ASC,
+  version.generation ASC,
+  version.entity_type ASC,
+  version.entity_id ASC,
+  version.version_id ASC,
+  pending.created_at ASC,
+  pending.mutation_id ASC;
+
+selectPendingMutationsByIdsSystemV2:
+SELECT *
+FROM sync_pending_mutations_system_v2
+WHERE remote_profile = ? AND epoch_id = ? AND mutation_id IN ?
+ORDER BY mutation_id ASC;
+
+selectPendingMutationsByIdentitiesSystemV2:
+SELECT *
+FROM sync_pending_mutations_system_v2
+WHERE remote_profile = ? AND epoch_id = ?
+  AND (mutation_id IN ? OR object_id IN ?)
+ORDER BY mutation_id ASC;
 
 selectPendingMutationObjectIdsSystemV2:
 SELECT object_id
@@ -1017,6 +1103,12 @@ selectAppliedMutationSystemV2:
 SELECT *
 FROM sync_applied_mutations_system_v2
 WHERE remote_profile = ? AND epoch_id = ? AND mutation_id = ?;
+
+selectAppliedMutationsByIdsSystemV2:
+SELECT *
+FROM sync_applied_mutations_system_v2
+WHERE remote_profile = ? AND epoch_id = ? AND mutation_id IN ?
+ORDER BY mutation_id ASC;
 
 upsertRemoteCursorSystemV2:
 INSERT OR REPLACE INTO sync_remote_cursors_system_v2(

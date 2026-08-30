@@ -22,6 +22,7 @@ import saien.someday.domain.settings.SyncConfiguration
 import saien.someday.domain.settings.SyncMode
 import saien.someday.domain.notes.NoteInput
 import saien.someday.sync.WorkspaceLifecycleCoordinator
+import saien.someday.sync.resolveActiveWorkspaceSessionRequirement
 import java.nio.file.Files
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
@@ -374,6 +375,38 @@ class SyncV2RuntimeServiceTest {
     }
 
     @Test
+    fun recoveryProtectedGenesisIsReportedAsRemoteHistoryConflict() {
+        val remote = InMemoryWorkspaceSyncRemoteV2(SyncRemoteProfileV2.SELF_HOSTED.wireValue)
+        withRuntimeFixture(remote) { fixture ->
+            val result = fixture.runtime(
+                transportRemote = RejectingPointerCommitRemote(
+                    delegate = remote,
+                    safeErrorCode = "workspace_recovery_required",
+                ),
+            ).run()
+
+            assertFalse(result.success)
+            assertEquals(
+                ManualSyncReason.RemoteHistoryConflict,
+                result.reason,
+                result.diagnosticMessage,
+            )
+            assertNull(remote.loadEpochPointer())
+            assertEquals(
+                SyncEpochLifecycleV2.ABANDONED,
+                fixture.protocolStore.loadAllEpochs().single().lifecycle,
+            )
+            assertNull(fixture.protocolStore.loadLocalAuthority())
+            assertNull(
+                resolveActiveWorkspaceSessionRequirement(
+                    fixture.protocolStore,
+                    workspaceIdProvider = { "workspace-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+                ),
+            )
+        }
+    }
+
+    @Test
     fun sameProfileDifferentEndpointCannotSilentlyReplaceBoundAuthority() {
         val boundRemote = InMemoryWorkspaceSyncRemoteV2(
             SyncRemoteProfileV2.SELF_HOSTED.wireValue,
@@ -603,6 +636,20 @@ class SyncV2RuntimeServiceTest {
             check(release.await(5, TimeUnit.SECONDS))
             return delegate.loadEpochPointer()
         }
+    }
+
+    private class RejectingPointerCommitRemote(
+        private val delegate: WorkspaceSyncRemoteV2,
+        private val safeErrorCode: String,
+    ) : WorkspaceSyncRemoteV2 by delegate {
+        override fun compareAndSetEpochPointer(
+            descriptor: SyncEpochDescriptorV2,
+            expectedCurrentDigest: String?,
+            pointer: EncryptedWorkspaceObjectV2,
+        ): WorkspacePointerPublishResultV2 = WorkspacePointerPublishResultV2.Rejected(
+            safeErrorCode = safeErrorCode,
+            safeMessage = "The account recovery pointer requires an explicit recovery flow.",
+        )
     }
 
     private class UnauthenticatedCompetingPointerRemote(

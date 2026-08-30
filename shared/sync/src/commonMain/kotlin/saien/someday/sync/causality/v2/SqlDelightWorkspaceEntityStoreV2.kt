@@ -67,6 +67,18 @@ data class StoredWorkspacePendingMutationV2(
     val attemptCount: Long,
 )
 
+/** Lightweight, causally ordered identity used to plan one outbox drain. */
+data class WorkspacePendingPublicationPlanItemV2(
+    val mutationId: String,
+    val objectId: String,
+)
+
+/** Exact durable outbox tuple paired with its already-validated immutable version. */
+data class StoredWorkspacePendingPublicationV2(
+    val pending: StoredWorkspacePendingMutationV2,
+    val version: WorkspaceEntityVersionV2,
+)
+
 data class StoredWorkspaceAppliedMutationV2(
     val remoteProfile: String,
     val syncEpochId: String,
@@ -104,6 +116,13 @@ data class WorkspaceProjectionSnapshotV2(
     val warning: String?,
     val authoredAt: Instant?,
 )
+
+data class WorkspaceStoreStateCountsV2(
+    val activeConflictsByEntityType: Map<WorkspaceEntityTypeV2, Int>,
+    val projectionWarnings: Int,
+) {
+    val activeConflicts: Int = activeConflictsByEntityType.values.sum()
+}
 
 /**
  * Denormalized note row for diary list/search paths.
@@ -152,21 +171,44 @@ sealed interface WorkspaceLocalCommitResultV2 {
     data class Rejected(val error: WorkspaceStoreErrorV2) : WorkspaceLocalCommitResultV2
 }
 
+internal const val MAX_REMOTE_APPLY_BATCH_UNITS_V2: Int = 200
+internal const val MAX_REMOTE_APPLY_BATCH_MUTATIONS_V2: Int = 200
+
 sealed interface WorkspaceRemoteUnitApplyResultV2 {
+    sealed interface Success : WorkspaceRemoteUnitApplyResultV2
+
     data class Applied(
         val plans: Map<WorkspaceEntityKeyV2, WorkspaceReconciliationPlanV2>,
         val replayedMutations: Int,
         val cursor: StoredWorkspaceCursorV2,
-    ) : WorkspaceRemoteUnitApplyResultV2
+    ) : Success
 
-    data class AlreadyApplied(val cursor: StoredWorkspaceCursorV2) : WorkspaceRemoteUnitApplyResultV2
+    data class AlreadyApplied(val cursor: StoredWorkspaceCursorV2) : Success
 
     data class Rejected(val error: WorkspaceStoreErrorV2) : WorkspaceRemoteUnitApplyResultV2
+}
+
+internal data class WorkspaceRemoteBatchCommittedUnitV2(
+    val inputIndex: Int,
+    val result: WorkspaceRemoteUnitApplyResultV2.Success,
+)
+
+internal sealed interface WorkspaceRemoteBatchApplyResultV2 {
+    data class Committed(
+        val units: List<WorkspaceRemoteBatchCommittedUnitV2>,
+    ) : WorkspaceRemoteBatchApplyResultV2
+
+    data class Rejected(
+        val failedUnitIndex: Int,
+        val error: WorkspaceStoreErrorV2,
+    ) : WorkspaceRemoteBatchApplyResultV2
 }
 
 private data class PreparedEntityPlanV2(
     val incoming: List<WorkspaceEntityVersionV2>,
     val plan: WorkspaceReconciliationPlanV2,
+    val versionsById: Map<String, WorkspaceEntityVersionV2>,
+    val existingConflictIds: Set<String>,
 )
 
 private sealed interface PrepareEntityPlansResultV2 {
@@ -265,10 +307,57 @@ class SqlDelightWorkspaceEntityStoreV2(
             .executeAsList()
             .map(::mapConflictState)
 
+    /** Aggregate sync-run telemetry without reconstructing entity DAGs or projections. */
+    fun loadStateCounts(): WorkspaceStoreStateCountsV2 = WorkspaceStoreStateCountsV2(
+        activeConflictsByEntityType = queries.selectActiveWorkspaceEntityConflictCountsV2(syncEpochId)
+            .executeAsList()
+            .associate { row ->
+                checkNotNull(WorkspaceEntityTypeV2.fromWire(row.entity_type)) to row.conflict_count.toInt()
+            },
+        projectionWarnings = queries.selectProjectionWarningCountV2(syncEpochId).executeAsOne().toInt(),
+    )
+
     fun loadPending(remoteProfile: String): List<StoredWorkspacePendingMutationV2> =
         queries.selectPendingMutationsSystemV2(remoteProfile, syncEpochId)
             .executeAsList()
             .map(Sync_pending_mutations_system_v2::toDomainV2)
+
+    /**
+     * Takes one lightweight snapshot of the current outbox in causal publication order.
+     * Callers may drain it in bounded transport batches, then request another plan to
+     * include product mutations committed concurrently with that drain.
+     */
+    fun loadPendingPublicationPlan(remoteProfile: String): List<WorkspacePendingPublicationPlanItemV2> =
+        queries.selectPendingPublicationPlanSystemV2(remoteProfile, syncEpochId)
+            .executeAsList()
+            .map { WorkspacePendingPublicationPlanItemV2(it.mutation_id, it.object_id) }
+
+    /** Loads only the exact durable tuples named by a bounded publication-plan slice. */
+    fun loadPendingPublicationBatch(
+        remoteProfile: String,
+        plan: List<WorkspacePendingPublicationPlanItemV2>,
+    ): List<StoredWorkspacePendingPublicationV2> {
+        if (plan.isEmpty()) return emptyList()
+        val planByMutation = plan.associateBy { it.mutationId }
+        require(planByMutation.size == plan.size) { "A V2 publication plan repeated a mutation identity." }
+        val pendingByMutation = queries.selectPendingMutationsByIdsSystemV2(
+            remoteProfile,
+            syncEpochId,
+            planByMutation.keys,
+        ).executeAsList().associateBy { it.mutation_id }
+        val versionsById = loadStoredVersionsByIds(pendingByMutation.values.map { it.object_id }).associateBy { it.versionId }
+        return plan.mapNotNull { item ->
+            // An earlier acknowledgement in this same drain may retire a source
+            // tuple that was present when the lightweight plan was captured.
+            val pending = pendingByMutation[item.mutationId] ?: return@mapNotNull null
+            require(pending.object_id == item.objectId) { "A planned V2 outbox mutation changed its immutable object identity." }
+            val version = checkNotNull(versionsById[item.objectId]) { "A durable V2 outbox entity is missing." }
+            require(version.objectDigest == pending.object_digest) {
+                "A durable V2 outbox tuple no longer matches its immutable entity."
+            }
+            StoredWorkspacePendingPublicationV2(pending.toDomainV2(), version)
+        }
+    }
 
     fun loadCursor(remoteProfile: String, streamId: String): StoredWorkspaceCursorV2? =
         queries.selectRemoteCursorSystemV2(remoteProfile, syncEpochId, streamId)
@@ -373,7 +462,7 @@ class SqlDelightWorkspaceEntityStoreV2(
                 insertPending(mutation.remoteProfile, mutation.mutationId, mutation.version, encoded, mutation.createdAt)
             }
             persistGeneratedOutbox(mutations.first().remoteProfile, generatedOutbox, mutations.first().createdAt)
-            rebuildAffectedProjections(prepared.keys, mutations.first().createdAt)
+            rebuildAffectedProjections(prepared, mutations.first().createdAt)
             val allPending = mutations.map { mutation ->
                 checkNotNull(
                     queries.selectPendingMutationByObjectSystemV2(
@@ -417,14 +506,42 @@ class SqlDelightWorkspaceEntityStoreV2(
                 result = WorkspaceRemoteUnitApplyResultV2.Rejected(it)
                 return@transaction
             }
+            val mutationIds = unit.mutations.map { it.mutationId }.distinct()
+            val objectIds = unit.mutations.map { it.objectId }.distinct()
+            val appliedByMutation = if (mutationIds.isEmpty()) emptyMap() else {
+                queries.selectAppliedMutationsByIdsSystemV2(unit.remoteProfile, syncEpochId, mutationIds)
+                    .executeAsList()
+                    .associateBy { it.mutation_id }
+            }
+            val storedByObject = loadStoredVersionsByIds(objectIds).associateBy { it.versionId }
             var replayed = 0
-            val fresh = mutableListOf<RemoteWorkspaceMutationV2>()
+            val unapplied = mutableListOf<RemoteWorkspaceMutationV2>()
+            val toMaterialize = mutableListOf<RemoteWorkspaceMutationV2>()
             unit.mutations.forEach { mutation ->
-                val applied = findApplied(unit.remoteProfile, mutation.mutationId)
+                val applied = appliedByMutation[mutation.mutationId]
+                val stored = storedByObject[mutation.objectId]
                 when {
-                    applied == null -> fresh += mutation
-                    applied.objectId == mutation.objectId && applied.objectDigest == mutation.objectDigest -> {
-                        if (loadVersion(mutation.objectId) != mutation.version) {
+                    applied == null -> {
+                        if (stored != null && stored != mutation.version) {
+                            result = WorkspaceRemoteUnitApplyResultV2.Rejected(
+                                WorkspaceStoreErrorV2(
+                                    WorkspaceStoreErrorCodeV2.IMMUTABLE_OBJECT_MISMATCH,
+                                    "Version id is already bound to another immutable envelope.",
+                                ),
+                            )
+                            return@transaction
+                        }
+                        unapplied += mutation
+                        if (stored == null) {
+                            toMaterialize += mutation
+                        } else {
+                            // The immutable entity and its projection were committed atomically
+                            // by a local write. This remote unit only establishes replay identity.
+                            replayed++
+                        }
+                    }
+                    applied.object_id == mutation.objectId && applied.object_digest == mutation.objectDigest -> {
+                        if (stored != mutation.version) {
                             result = WorkspaceRemoteUnitApplyResultV2.Rejected(
                                 WorkspaceStoreErrorV2(WorkspaceStoreErrorCodeV2.STORED_OBJECT_INVALID, "Applied mutation no longer has its exact immutable object."),
                             )
@@ -442,17 +559,28 @@ class SqlDelightWorkspaceEntityStoreV2(
             }
             if (result != null) return@transaction
             val remotelyAcknowledgedPending = mutableListOf<RemoteWorkspaceMutationV2>()
-            fresh.forEach { mutation ->
-                val byMutation = queries.selectPendingMutationSystemV2(
+            val pendingRows = if (unapplied.isEmpty()) emptyList() else {
+                queries.selectPendingMutationsByIdentitiesSystemV2(
                     unit.remoteProfile,
                     syncEpochId,
-                    mutation.mutationId,
-                ).executeAsOneOrNull()
-                val byObject = queries.selectPendingMutationByObjectSystemV2(
-                    unit.remoteProfile,
-                    syncEpochId,
-                    mutation.objectId,
-                ).executeAsOneOrNull()
+                    unapplied.map { it.mutationId }.distinct(),
+                    unapplied.map { it.objectId }.distinct(),
+                ).executeAsList()
+            }
+            val pendingByMutation = pendingRows.associateBy { it.mutation_id }
+            val pendingByObject = pendingRows.associateBy { it.object_id }
+            unapplied.forEach { mutation ->
+                val byMutation = pendingByMutation[mutation.mutationId]
+                val byObject = pendingByObject[mutation.objectId]
+                if (byMutation != null && byObject != null && byMutation.mutation_id != byObject.mutation_id) {
+                    result = WorkspaceRemoteUnitApplyResultV2.Rejected(
+                        WorkspaceStoreErrorV2(
+                            WorkspaceStoreErrorCodeV2.OUTBOX_IDENTITY_MISMATCH,
+                            "A remote mutation intersects two different durable V2 outbox identities.",
+                        ),
+                    )
+                    return@transaction
+                }
                 val pending = byMutation ?: byObject
                 if (pending != null) {
                     if (pending.mutation_id != mutation.mutationId ||
@@ -471,7 +599,7 @@ class SqlDelightWorkspaceEntityStoreV2(
                 }
             }
             if (result != null) return@transaction
-            val prepared = when (val value = prepareEntityPlans(fresh.map { it.version })) {
+            val prepared = when (val value = prepareEntityPlans(toMaterialize.map { it.version })) {
                 is PrepareEntityPlansResultV2.Prepared -> value.values
                 is PrepareEntityPlansResultV2.Rejected -> {
                     result = WorkspaceRemoteUnitApplyResultV2.Rejected(value.error)
@@ -486,7 +614,7 @@ class SqlDelightWorkspaceEntityStoreV2(
             }
             val committedAt = unit.appliedAt.toEpochMilliseconds()
             persistPreparedPlans(prepared, committedAt)
-            fresh.forEach { mutation ->
+            unapplied.forEach { mutation ->
                 queries.insertAppliedMutationSystemV2(
                     unit.remoteProfile,
                     syncEpochId,
@@ -509,7 +637,7 @@ class SqlDelightWorkspaceEntityStoreV2(
                 ) { "An exact remote mutation did not acknowledge its durable V2 outbox tuple." }
             }
             persistGeneratedOutbox(unit.remoteProfile, generatedOutbox, unit.appliedAt)
-            rebuildAffectedProjections(prepared.keys, unit.appliedAt)
+            rebuildAffectedProjections(prepared, unit.appliedAt)
             queries.upsertRemoteCursorSystemV2(
                 unit.remoteProfile,
                 syncEpochId,
@@ -526,6 +654,38 @@ class SqlDelightWorkspaceEntityStoreV2(
             )
         }
         return checkNotNull(result)
+    }
+
+    /**
+     * Co-commits a bounded set of already ordered protocol units without merging their identities.
+     * Every nested unit still advances its own authenticated cursor; only the local durability
+     * boundary is shared. A rejected unit rolls the complete batch back.
+     */
+    internal fun applyRemoteCursorUnitsAtomically(
+        units: List<RemoteWorkspaceCursorUnitV2>,
+    ): WorkspaceRemoteBatchApplyResultV2 {
+        require(units.isNotEmpty()) { "A remote apply batch must contain at least one cursor unit." }
+        require(units.size <= MAX_REMOTE_APPLY_BATCH_UNITS_V2) {
+            "A remote apply batch exceeds its cursor-unit bound."
+        }
+        require(units.sumOf { it.mutations.size } <= MAX_REMOTE_APPLY_BATCH_MUTATIONS_V2) {
+            "A remote apply batch exceeds its mutation bound."
+        }
+        return database.transactionWithResult {
+            val committed = ArrayList<WorkspaceRemoteBatchCommittedUnitV2>(units.size)
+            units.forEachIndexed { index, unit ->
+                when (val result = applyRemoteCursorUnit(unit)) {
+                    is WorkspaceRemoteUnitApplyResultV2.Applied ->
+                        committed += WorkspaceRemoteBatchCommittedUnitV2(index, result)
+                    is WorkspaceRemoteUnitApplyResultV2.AlreadyApplied ->
+                        committed += WorkspaceRemoteBatchCommittedUnitV2(index, result)
+                    is WorkspaceRemoteUnitApplyResultV2.Rejected -> rollback(
+                        WorkspaceRemoteBatchApplyResultV2.Rejected(index, result.error),
+                    )
+                }
+            }
+            WorkspaceRemoteBatchApplyResultV2.Committed(committed)
+        }
     }
 
     fun acknowledgePending(
@@ -651,7 +811,9 @@ class SqlDelightWorkspaceEntityStoreV2(
             when {
                 reference != null && !targetLive && key.entityType == WorkspaceEntityTypeV2.NOTE -> "unresolved_notebook_reference"
                 reference != null && !targetLive -> "unresolved_default_notebook_reference"
-                content is NoteContentV2 && content.timeZoneId != null && runCatching { TimeZone.of(content.timeZoneId) }.isFailure -> "time_zone_fallback"
+                content is NoteContentV2 &&
+                    content.timeZoneId != null &&
+                    runCatching { TimeZone.of(content.timeZoneId) }.isFailure -> "time_zone_fallback"
                 else -> null
             },
             head.authoredAt,
@@ -667,23 +829,27 @@ class SqlDelightWorkspaceEntityStoreV2(
                 )
             }
         }
-        incoming.forEach { version ->
-            val stored = queries.selectWorkspaceEntityVersionV2(syncEpochId, version.versionId)
-                .executeAsOneOrNull()
-                ?.let(::decodeStoredVersion)
+        val distinctIncoming = incoming.distinctBy { it.versionId }
+        val grouped = distinctIncoming.groupBy { it.key }
+        val exactStoredById = loadStoredVersionsByIds(distinctIncoming.map { it.versionId })
+            .associateBy { it.versionId }
+        val storedByKey = loadStoredVersionsByKeys(grouped.keys)
+        distinctIncoming.forEach { version ->
+            val stored = exactStoredById[version.versionId]
             if (stored != null && stored != version) {
                 return PrepareEntityPlansResultV2.Rejected(
                     WorkspaceStoreErrorV2(WorkspaceStoreErrorCodeV2.IMMUTABLE_OBJECT_MISMATCH, "Version id is already bound to another immutable envelope."),
                 )
             }
         }
+        val conflictsByKey = loadStoredConflictsByKeys(grouped.keys)
         val output = linkedMapOf<WorkspaceEntityKeyV2, PreparedEntityPlanV2>()
-        val grouped = incoming.distinctBy { it.versionId }.groupBy { it.key }
         grouped.keys.sortedWith(compareBy({ it.entityType.wireValue }, { it.entityId })).forEach { key ->
             val values = checkNotNull(grouped[key])
-            val stored = loadVersions(key)
+            val stored = storedByKey[key].orEmpty()
             val all = (stored + values).distinctBy { it.versionId }
-            val known = loadConflicts(key).map { it.descriptor }
+            val storedConflicts = conflictsByKey[key].orEmpty()
+            val known = storedConflicts.map { it.descriptor }
             when (val reconciled = engine.reconcile(syncEpochId, key, all, known)) {
                 is WorkspaceReconciliationResultV2.InvalidGraph -> return PrepareEntityPlansResultV2.Rejected(
                     WorkspaceStoreErrorV2(
@@ -695,6 +861,8 @@ class SqlDelightWorkspaceEntityStoreV2(
                 is WorkspaceReconciliationResultV2.Reconciled -> output[key] = PreparedEntityPlanV2(
                     incoming = values.filter { candidate -> stored.none { it.versionId == candidate.versionId } },
                     plan = reconciled.plan,
+                    versionsById = (all + reconciled.plan.generatedVersions).associateBy { it.versionId },
+                    existingConflictIds = storedConflicts.mapTo(mutableSetOf()) { it.descriptor.conflictId },
                 )
             }
         }
@@ -709,24 +877,20 @@ class SqlDelightWorkspaceEntityStoreV2(
             .flatMap { it.incoming }
             .distinctBy { it.versionId }
             .sortedWith(compareBy({ it.generation }, { it.entityType.wireValue }, { it.entityId }, { it.versionId }))
-            .forEach(::insertVersion)
+            .forEach(::insertPreparedVersion)
         prepared.values
             .flatMap { it.plan.generatedVersions }
             .distinctBy { it.versionId }
             .sortedWith(compareBy({ it.generation }, { it.entityType.wireValue }, { it.entityId }, { it.versionId }))
-            .forEach(::insertVersion)
+            .forEach(::insertPreparedVersion)
         prepared.values.sortedWith(compareBy({ it.plan.key.entityType.wireValue }, { it.plan.key.entityId })).forEach { value ->
             persistHeads(value.plan)
-            persistConflicts(value.plan, committedAtEpochMilliseconds)
+            persistConflicts(value.plan, value.existingConflictIds, committedAtEpochMilliseconds)
         }
     }
 
-    private fun insertVersion(version: WorkspaceEntityVersionV2) {
-        val existing = queries.selectWorkspaceEntityVersionV2(syncEpochId, version.versionId).executeAsOneOrNull()
-        if (existing != null) {
-            require(decodeStoredVersion(existing) == version) { "Immutable V2 version mismatch during replay." }
-            return
-        }
+    /** [prepareEntityPlans] proved these immutable ids absent in the same write transaction. */
+    private fun insertPreparedVersion(version: WorkspaceEntityVersionV2) {
         val deletion = version.deletionPayload
         val provenance = version.provenance
         queries.insertWorkspaceEntityVersionV2(
@@ -775,31 +939,36 @@ class SqlDelightWorkspaceEntityStoreV2(
         }
     }
 
-    private fun persistConflicts(plan: WorkspaceReconciliationPlanV2, detectedAt: Long) {
-        val existing = queries.selectWorkspaceEntityConflictsV2(
-            syncEpochId,
-            plan.key.entityType.wireValue,
-            plan.key.entityId,
-        ).executeAsList().associateBy { it.conflict_id }
+    private fun persistConflicts(
+        plan: WorkspaceReconciliationPlanV2,
+        existingConflictIds: Set<String>,
+        detectedAt: Long,
+    ) {
         plan.conflictStates.filter { it.lifecycle != WorkspaceConflictLifecycleV2.ACTIVE }.forEach { state ->
-            val row = existing[state.descriptor.conflictId]
-            if (row == null) insertConflict(state, detectedAt) else queries.updateWorkspaceEntityConflictV2(
-                state.lifecycle.wireValue,
-                state.supersededByConflictId,
-                state.resolvedByVersionId,
-                syncEpochId,
-                state.descriptor.conflictId,
-            )
+            if (state.descriptor.conflictId !in existingConflictIds) {
+                insertConflict(state, detectedAt)
+            } else {
+                queries.updateWorkspaceEntityConflictV2(
+                    state.lifecycle.wireValue,
+                    state.supersededByConflictId,
+                    state.resolvedByVersionId,
+                    syncEpochId,
+                    state.descriptor.conflictId,
+                )
+            }
         }
         plan.conflictStates.filter { it.lifecycle == WorkspaceConflictLifecycleV2.ACTIVE }.forEach { state ->
-            val row = existing[state.descriptor.conflictId]
-            if (row == null) insertConflict(state, detectedAt) else queries.updateWorkspaceEntityConflictV2(
-                state.lifecycle.wireValue,
-                null,
-                null,
-                syncEpochId,
-                state.descriptor.conflictId,
-            )
+            if (state.descriptor.conflictId !in existingConflictIds) {
+                insertConflict(state, detectedAt)
+            } else {
+                queries.updateWorkspaceEntityConflictV2(
+                    state.lifecycle.wireValue,
+                    null,
+                    null,
+                    syncEpochId,
+                    state.descriptor.conflictId,
+                )
+            }
         }
     }
 
@@ -887,28 +1056,132 @@ class SqlDelightWorkspaceEntityStoreV2(
     }
 
     private fun rebuildAffectedProjections(
-        changedKeys: Set<WorkspaceEntityKeyV2>,
+        prepared: Map<WorkspaceEntityKeyV2, PreparedEntityPlanV2>,
         rebuiltAt: Instant,
     ) {
-        if (changedKeys.isEmpty()) {
-            return
+        if (prepared.isEmpty()) return
+
+        val referencedNotebookIds = prepared.values.mapNotNullTo(mutableSetOf()) { value ->
+            val headId = value.plan.finalHeadVersionIds.singleOrNull() ?: return@mapNotNullTo null
+            when (val content = value.versionsById[headId]?.contentPayload) {
+                is NoteContentV2 -> content.notebookId
+                is WorkspacePreferencesV2 -> content.defaultNotebookId
+                is NotebookContentV2, null -> null
+            }
         }
-        val keys = linkedSetOf<WorkspaceEntityKeyV2>()
-        changedKeys.forEach { key ->
-            keys += key
+        val liveNotebookIds = referencedNotebookIds.chunked(SQLITE_COLLECTION_QUERY_LIMIT_V2)
+            .flatMapTo(mutableSetOf()) { notebookIds ->
+                queries.selectNotebookProjectionsByIdsV2(syncEpochId, notebookIds)
+                    .executeAsList()
+                    .filter { it.state == WorkspaceProjectionStatusV2.CONTENT.name.lowercase() }
+                    .map { it.notebook_id }
+            }
+        prepared.values.filter { it.plan.key.entityType == WorkspaceEntityTypeV2.NOTEBOOK }.forEach { value ->
+            val notebookId = value.plan.key.entityId
+            val head = value.plan.finalHeadVersionIds.singleOrNull()?.let(value.versionsById::get)
+            if (head?.kind == WorkspaceEntityVersionKindV2.CONTENT) {
+                liveNotebookIds += notebookId
+            } else {
+                liveNotebookIds -= notebookId
+            }
+        }
+
+        val preparedSnapshots = prepared.values.map { value ->
+            projectionSnapshot(value.plan, value.versionsById, liveNotebookIds)
+        }
+        preparedSnapshots.forEach { snapshot ->
+            queries.deleteProjectionWarningsForEntityV2(
+                syncEpochId,
+                snapshot.key.entityType.wireValue,
+                snapshot.key.entityId,
+            )
+        }
+        preparedSnapshots.filter { it.key.entityType == WorkspaceEntityTypeV2.NOTEBOOK }
+            .forEach(::persistNotebookProjection)
+        preparedSnapshots.filter { it.key.entityType == WorkspaceEntityTypeV2.NOTE }
+            .forEach { persistNoteProjection(it, rebuiltAt) }
+        preparedSnapshots.filter { it.key.entityType == WorkspaceEntityTypeV2.WORKSPACE_PREFERENCES }
+            .forEach { persistPreferencesProjection(it, rebuiltAt) }
+
+        val secondaryKeys = linkedSetOf<WorkspaceEntityKeyV2>()
+        prepared.keys.forEach { key ->
             if (key.entityType == WorkspaceEntityTypeV2.NOTEBOOK) {
                 queries.selectNoteIdsReferencingNotebookSystemV2(syncEpochId, key.entityId)
                     .executeAsList()
                     .forEach { noteId ->
-                        keys += WorkspaceEntityKeyV2(WorkspaceEntityTypeV2.NOTE, noteId)
+                        secondaryKeys += WorkspaceEntityKeyV2(WorkspaceEntityTypeV2.NOTE, noteId)
                     }
-                keys += WorkspaceEntityKeyV2(
+                secondaryKeys += WorkspaceEntityKeyV2(
                     WorkspaceEntityTypeV2.WORKSPACE_PREFERENCES,
                     WORKSPACE_PREFERENCES_ENTITY_ID_V2,
                 )
             }
         }
-        persistProjectionKeys(keys, rebuiltAt)
+        secondaryKeys.removeAll(prepared.keys)
+        persistProjectionKeys(secondaryKeys, rebuiltAt)
+    }
+
+    private fun projectionSnapshot(
+        plan: WorkspaceReconciliationPlanV2,
+        versionsById: Map<String, WorkspaceEntityVersionV2>,
+        liveNotebookIds: Set<String>,
+    ): WorkspaceProjectionSnapshotV2 {
+        if (plan.finalHeadVersionIds.size != 1) {
+            return WorkspaceProjectionSnapshotV2(
+                plan.key,
+                WorkspaceProjectionStatusV2.CONFLICT,
+                null,
+                null,
+                null,
+                null,
+                null,
+                "conflict",
+                null,
+            )
+        }
+        val head = checkNotNull(versionsById[plan.finalHeadVersionIds.single()]) {
+            "A prepared V2 reconciliation plan does not contain its final immutable head."
+        }
+        if (head.kind == WorkspaceEntityVersionKindV2.DELETION) {
+            return WorkspaceProjectionSnapshotV2(
+                plan.key,
+                WorkspaceProjectionStatusV2.DELETION,
+                head.versionId,
+                null,
+                head.deletionPayload,
+                null,
+                null,
+                null,
+                head.authoredAt,
+            )
+        }
+        val content = checkNotNull(head.contentPayload)
+        val reference = when (content) {
+            is NoteContentV2 -> content.notebookId
+            is WorkspacePreferencesV2 -> content.defaultNotebookId
+            is NotebookContentV2 -> null
+        }
+        val targetLive = reference == null || reference in liveNotebookIds
+        return WorkspaceProjectionSnapshotV2(
+            plan.key,
+            WorkspaceProjectionStatusV2.CONTENT,
+            head.versionId,
+            content,
+            null,
+            reference,
+            when (plan.key.entityType) {
+                WorkspaceEntityTypeV2.NOTE -> if (targetLive) reference else RECOVERY_INBOX_EFFECTIVE_NOTEBOOK_ID_V2
+                WorkspaceEntityTypeV2.WORKSPACE_PREFERENCES -> reference?.takeIf { targetLive }
+                WorkspaceEntityTypeV2.NOTEBOOK -> null
+            },
+            when {
+                reference != null && !targetLive && plan.key.entityType == WorkspaceEntityTypeV2.NOTE -> "unresolved_notebook_reference"
+                reference != null && !targetLive -> "unresolved_default_notebook_reference"
+                content is NoteContentV2 && content.timeZoneId != null && runCatching { TimeZone.of(content.timeZoneId) }.isFailure -> "time_zone_fallback"
+                else -> null
+            },
+            head.authoredAt,
+        )
     }
 
     private fun persistProjectionKeys(
@@ -1097,14 +1370,59 @@ class SqlDelightWorkspaceEntityStoreV2(
         )
     }
 
-    private fun decodeStoredVersion(row: Workspace_entity_versions_v2): WorkspaceEntityVersionV2 {
+    private fun loadStoredVersionsByIds(versionIds: Collection<String>): List<WorkspaceEntityVersionV2> {
+        if (versionIds.isEmpty()) return emptyList()
+        val rows = versionIds.distinct().chunked(SQLITE_COLLECTION_QUERY_LIMIT_V2).flatMap { ids ->
+            queries.selectWorkspaceEntityVersionsByIdsV2(syncEpochId, ids).executeAsList()
+        }
+        return decodeStoredVersions(rows)
+    }
+
+    private fun loadStoredVersionsByKeys(
+        keys: Collection<WorkspaceEntityKeyV2>,
+    ): Map<WorkspaceEntityKeyV2, List<WorkspaceEntityVersionV2>> {
+        if (keys.isEmpty()) return emptyMap()
+        val rows = keys.groupBy { it.entityType }.flatMap { (entityType, typedKeys) ->
+            typedKeys.map { it.entityId }.distinct().chunked(SQLITE_COLLECTION_QUERY_LIMIT_V2).flatMap { entityIds ->
+                queries.selectWorkspaceEntityVersionsByEntitiesV2(
+                    syncEpochId,
+                    entityType.wireValue,
+                    entityIds,
+                ).executeAsList()
+            }
+        }
+        return decodeStoredVersions(rows).groupBy { it.key }
+    }
+
+    private fun decodeStoredVersions(
+        rows: List<Workspace_entity_versions_v2>,
+    ): List<WorkspaceEntityVersionV2> {
+        if (rows.isEmpty()) return emptyList()
+        val parentsByVersion = rows.map { it.version_id }.distinct()
+            .chunked(SQLITE_COLLECTION_QUERY_LIMIT_V2)
+            .flatMap { versionIds ->
+                queries.selectWorkspaceEntityParentsByVersionsV2(syncEpochId, versionIds).executeAsList()
+            }
+            .groupBy({ it.version_id }, { it.parent_version_id })
+        return rows.map { row -> decodeStoredVersion(row, parentsByVersion[row.version_id].orEmpty()) }
+    }
+
+    private fun decodeStoredVersion(row: Workspace_entity_versions_v2): WorkspaceEntityVersionV2 =
+        decodeStoredVersion(
+            row,
+            queries.selectWorkspaceEntityParentsV2(row.epoch_id, row.version_id).executeAsList(),
+        )
+
+    private fun decodeStoredVersion(
+        row: Workspace_entity_versions_v2,
+        parentRows: List<String>,
+    ): WorkspaceEntityVersionV2 {
         val decoded = wireCodec.decode(
             row.canonical_payload,
             WorkspaceVersionOuterMetadataV2(row.epoch_id, row.version_id, row.object_digest),
         )
         val version = (decoded as? WorkspaceEntityWireDecodeResultV2.Decoded)?.version
             ?: error("Stored V2 entity envelope failed canonical validation.")
-        val parentRows = queries.selectWorkspaceEntityParentsV2(row.epoch_id, row.version_id).executeAsList()
         check(version.parentVersionIds == parentRows)
         check(version.contractId == row.contract_id)
         check(version.schemaSetVersion == row.schema_set_version)
@@ -1113,8 +1431,40 @@ class SqlDelightWorkspaceEntityStoreV2(
         return version
     }
 
+    private fun loadStoredConflictsByKeys(
+        keys: Collection<WorkspaceEntityKeyV2>,
+    ): Map<WorkspaceEntityKeyV2, List<WorkspaceConflictStateV2>> {
+        if (keys.isEmpty()) return emptyMap()
+        val rows = keys.groupBy { it.entityType }.flatMap { (entityType, typedKeys) ->
+            typedKeys.map { it.entityId }.distinct().chunked(SQLITE_COLLECTION_QUERY_LIMIT_V2).flatMap { entityIds ->
+                queries.selectWorkspaceEntityConflictsByEntitiesV2(
+                    syncEpochId,
+                    entityType.wireValue,
+                    entityIds,
+                ).executeAsList()
+            }
+        }
+        val headsByConflict = rows.map { it.conflict_id }.distinct()
+            .chunked(SQLITE_COLLECTION_QUERY_LIMIT_V2)
+            .flatMap { conflictIds ->
+                queries.selectWorkspaceEntityConflictHeadsByConflictsV2(syncEpochId, conflictIds).executeAsList()
+            }
+            .groupBy({ it.conflict_id }, { it.head_version_id })
+        return rows.map { row -> mapConflictState(row, headsByConflict[row.conflict_id].orEmpty()) }
+            .groupBy { state ->
+                WorkspaceEntityKeyV2(state.descriptor.entityType, state.descriptor.entityId)
+            }
+    }
+
     private fun mapConflictState(row: Workspace_entity_conflicts_v2): WorkspaceConflictStateV2 {
         val heads = queries.selectWorkspaceEntityConflictHeadsV2(row.epoch_id, row.conflict_id).executeAsList()
+        return mapConflictState(row, heads)
+    }
+
+    private fun mapConflictState(
+        row: Workspace_entity_conflicts_v2,
+        heads: List<String>,
+    ): WorkspaceConflictStateV2 {
         val descriptor = WorkspaceConflictDescriptorV2(
             row.conflict_id,
             row.epoch_id,
@@ -1135,7 +1485,9 @@ class SqlDelightWorkspaceEntityStoreV2(
 
     private fun remoteUnitShapeError(unit: RemoteWorkspaceCursorUnitV2): WorkspaceStoreErrorV2? {
         val seenMutations = mutableMapOf<String, RemoteWorkspaceMutationV2>()
-        val available = loadAllVersions().mapTo(mutableSetOf()) { it.versionId }
+        val unitObjectIds = unit.mutations.mapTo(mutableSetOf()) { it.objectId }
+        val earlierObjectIds = mutableSetOf<String>()
+        val externallyRequiredParents = mutableSetOf<String>()
         unit.mutations.forEach { mutation ->
             if (!UUID_V4_PATTERN_SYSTEM_V2.matches(mutation.mutationId) ||
                 mutation.objectId != mutation.version.versionId ||
@@ -1149,16 +1501,32 @@ class SqlDelightWorkspaceEntityStoreV2(
                 WorkspaceStoreErrorCodeV2.MUTATION_OBJECT_MISMATCH,
                 "One cursor unit reuses a mutation id for unequal objects.",
             )
-            mutation.version.parentVersionIds.forEach { parent ->
-                if (parent !in available) {
-                    val later = unit.mutations.any { it.objectId == parent }
+            mutation.version.parentVersionIds.forEach parent@ { parentVersionId ->
+                if (parentVersionId !in earlierObjectIds) {
+                    val later = parentVersionId in unitObjectIds
+                    if (!later) {
+                        externallyRequiredParents += parentVersionId
+                        return@parent
+                    }
                     return WorkspaceStoreErrorV2(
-                        if (later) WorkspaceStoreErrorCodeV2.NON_TOPOLOGICAL_UNIT else WorkspaceStoreErrorCodeV2.MISSING_PARENT,
-                        if (later) "A cursor unit places a child before its parent." else "A cursor unit is missing a required same-entity parent.",
+                        WorkspaceStoreErrorCodeV2.NON_TOPOLOGICAL_UNIT,
+                        "A cursor unit places a child before its parent.",
                     )
                 }
             }
-            available += mutation.objectId
+            earlierObjectIds += mutation.objectId
+        }
+        if (externallyRequiredParents.isNotEmpty()) {
+            val existing = externallyRequiredParents.chunked(SQLITE_COLLECTION_QUERY_LIMIT_V2)
+                .flatMapTo(mutableSetOf()) { ids ->
+                    queries.selectExistingWorkspaceEntityVersionIdsV2(syncEpochId, ids).executeAsList()
+                }
+            if (!existing.containsAll(externallyRequiredParents)) {
+                return WorkspaceStoreErrorV2(
+                    WorkspaceStoreErrorCodeV2.MISSING_PARENT,
+                    "A cursor unit is missing a required same-entity parent.",
+                )
+            }
         }
         return null
     }
@@ -1168,6 +1536,11 @@ class SqlDelightWorkspaceEntityStoreV2(
 
     private fun cursorMismatch(message: String) =
         WorkspaceStoreErrorV2(WorkspaceStoreErrorCodeV2.CURSOR_STATE_MISMATCH, message)
+
+    private companion object {
+        // Remains below the 999-variable ceiling of older Android SQLite builds.
+        const val SQLITE_COLLECTION_QUERY_LIMIT_V2 = 500
+    }
 }
 
 private fun Sync_pending_mutations_system_v2.toDomainV2() = StoredWorkspacePendingMutationV2(

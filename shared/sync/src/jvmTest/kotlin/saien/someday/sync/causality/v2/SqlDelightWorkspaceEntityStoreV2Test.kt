@@ -2,6 +2,11 @@
 
 package saien.someday.sync.causality.v2
 
+import app.cash.sqldelight.Transacter
+import app.cash.sqldelight.db.QueryResult
+import app.cash.sqldelight.db.SqlCursor
+import app.cash.sqldelight.db.SqlDriver
+import app.cash.sqldelight.db.SqlPreparedStatement
 import saien.someday.data.local.createSomedayJdbcDriver
 import saien.someday.data.local.db.SomedayDatabase
 import kotlin.test.Test
@@ -13,6 +18,239 @@ import kotlin.test.assertTrue
 import kotlin.time.Instant
 
 class SqlDelightWorkspaceEntityStoreV2Test {
+    @Test
+    fun publicationPlanIsCausalEvenWhenOutboxInsertionOrderIsNot() = withFixture { fixture ->
+        val root = fixture.factory.createGenesis(
+            WorkspaceEntityTypeV2.NOTEBOOK,
+            NOTEBOOK_ID,
+            NotebookContentV2("Root", 0, at(1)),
+            ACTOR,
+            at(1),
+        )
+        val child = fixture.factory.createContentChild(
+            root,
+            NotebookContentV2("Child", 0, at(1)),
+            ACTOR,
+            at(2),
+        )
+        assertIs<WorkspaceLocalCommitResultV2.Committed>(
+            fixture.store.commitLocalMutations(
+                listOf(
+                    LocalWorkspaceMutationV2(PROFILE, fixture.ids.newId(), child, at(3)),
+                    LocalWorkspaceMutationV2(PROFILE, fixture.ids.newId(), root, at(3)),
+                ),
+            ),
+        )
+
+        assertEquals(
+            listOf(root.versionId, child.versionId),
+            fixture.store.loadPendingPublicationPlan(PROFILE).map { it.objectId },
+        )
+    }
+
+    @Test
+    fun hundredFreshRemoteObjectsUseOneBoundedMaterializationWorkset() = withFixture { fixture ->
+        val notebook = fixture.factory.createGenesis(
+            WorkspaceEntityTypeV2.NOTEBOOK,
+            NOTEBOOK_ID,
+            NotebookContentV2("Remote target", 0, at(1)),
+            ACTOR,
+            at(1),
+        )
+        fixture.commit(notebook)
+        fixture.store.loadPending(PROFILE).forEach { pending ->
+            assertTrue(fixture.store.acknowledgePending(PROFILE, pending.mutationId, pending.objectId, pending.objectDigest))
+        }
+        val notes = (1..100).map { index ->
+            fixture.factory.createGenesis(
+                WorkspaceEntityTypeV2.NOTE,
+                "31000000-0000-4000-8000-${index.toString().padStart(12, '0')}",
+                NoteContentV2(NOTEBOOK_ID, "Remote $index", "body $index", at(index.toLong()), null, null),
+                ACTOR,
+                at(index.toLong() + 1),
+            )
+        }
+
+        fixture.driver.resetQueryCount()
+        val applied = assertIs<WorkspaceRemoteUnitApplyResultV2.Applied>(
+            fixture.store.applyRemoteCursorUnit(fixture.unit(notes.map(fixture::remote))),
+        )
+
+        assertEquals(0, applied.replayedMutations)
+        assertEquals(100, applied.plans.size)
+        assertTrue(fixture.driver.queryCount <= 10, "Fresh unit performed ${fixture.driver.queryCount} SQL reads")
+        assertEquals(100, fixture.database.somedayQueries.selectAllNoteProjectionsSystemV2(EPOCH).executeAsList().size)
+    }
+
+    @Test
+    fun twoHundredSingleObjectUnitsShareOnePhysicalTransaction() = withFixture { fixture ->
+        fixture.prepareRemoteNotebook()
+        val units = fixture.singleObjectUnits(200)
+
+        fixture.driver.resetTransactionCount()
+        val committed = assertIs<WorkspaceRemoteBatchApplyResultV2.Committed>(
+            fixture.store.applyRemoteCursorUnitsAtomically(units),
+        )
+
+        assertEquals(200, committed.units.size)
+        assertTrue(committed.units.all { it.result is WorkspaceRemoteUnitApplyResultV2.Applied })
+        assertEquals(1, fixture.driver.outerTransactionCount)
+        assertEquals("200", fixture.store.loadCursor(PROFILE, STREAM)?.cursorValue)
+        assertEquals(200, fixture.database.somedayQueries.selectAllNoteProjectionsSystemV2(EPOCH).executeAsList().size)
+    }
+
+    @Test
+    fun semanticFailureAtUnitOneHundredOneRollsBackBatchAndExactRetrySucceeds() = withFixture { fixture ->
+        fixture.prepareRemoteNotebook()
+        val valid = fixture.singleObjectUnits(200)
+        val baselineVersions = fixture.store.loadAllVersions()
+        val invalid = valid.toMutableList().also { units ->
+            val unit = units[100]
+            val mutation = unit.mutations.single()
+            units[100] = unit.copy(mutations = listOf(mutation.copy(objectDigest = "invalid-object-digest")))
+        }
+
+        fixture.driver.resetTransactionCount()
+        val rejected = assertIs<WorkspaceRemoteBatchApplyResultV2.Rejected>(
+            fixture.store.applyRemoteCursorUnitsAtomically(invalid),
+        )
+
+        assertEquals(100, rejected.failedUnitIndex)
+        assertEquals(WorkspaceStoreErrorCodeV2.INVALID_MUTATION, rejected.error.code)
+        assertEquals(1, fixture.driver.outerTransactionCount)
+        assertNull(fixture.store.loadCursor(PROFILE, STREAM))
+        assertEquals(0, fixture.database.somedayQueries.selectAllNoteProjectionsSystemV2(EPOCH).executeAsList().size)
+        assertEquals(baselineVersions, fixture.store.loadAllVersions())
+        assertTrue(fixture.store.loadActiveConflicts().isEmpty())
+        assertTrue(fixture.store.loadPending(PROFILE).isEmpty())
+        valid.flatMap { it.mutations }.forEach { mutation ->
+            assertNull(fixture.store.findApplied(PROFILE, mutation.mutationId))
+            assertNull(fixture.store.loadVersion(mutation.objectId))
+        }
+
+        fixture.driver.resetTransactionCount()
+        assertIs<WorkspaceRemoteBatchApplyResultV2.Committed>(
+            fixture.store.applyRemoteCursorUnitsAtomically(valid),
+        )
+        assertEquals(1, fixture.driver.outerTransactionCount)
+        assertEquals("200", fixture.store.loadCursor(PROFILE, STREAM)?.cursorValue)
+        assertEquals(200, fixture.database.somedayQueries.selectAllNoteProjectionsSystemV2(EPOCH).executeAsList().size)
+        valid.flatMap { it.mutations }.forEach { mutation ->
+            assertEquals(mutation.objectId, fixture.store.findApplied(PROFILE, mutation.mutationId)?.objectId)
+        }
+    }
+
+    @Test
+    fun sqliteFailureAtUnitOneHundredOneRollsBackTheWholeBatch() = withFixture { fixture ->
+        fixture.prepareRemoteNotebook()
+        val units = fixture.singleObjectUnits(200)
+        val baselineVersions = fixture.store.loadAllVersions()
+        fixture.failRemoteCursor("101")
+        fixture.driver.resetTransactionCount()
+
+        assertFailsWith<Exception> {
+            fixture.store.applyRemoteCursorUnitsAtomically(units)
+        }
+
+        fixture.clearFault()
+        assertEquals(1, fixture.driver.outerTransactionCount)
+        assertNull(fixture.store.loadCursor(PROFILE, STREAM))
+        assertEquals(0, fixture.database.somedayQueries.selectAllNoteProjectionsSystemV2(EPOCH).executeAsList().size)
+        assertEquals(baselineVersions, fixture.store.loadAllVersions())
+        assertTrue(fixture.store.loadActiveConflicts().isEmpty())
+        assertTrue(fixture.store.loadPending(PROFILE).isEmpty())
+        units.flatMap { it.mutations }.forEach { mutation ->
+            assertNull(fixture.store.findApplied(PROFILE, mutation.mutationId))
+            assertNull(fixture.store.loadVersion(mutation.objectId))
+        }
+        assertIs<WorkspaceRemoteBatchApplyResultV2.Committed>(
+            fixture.store.applyRemoteCursorUnitsAtomically(units),
+        )
+        assertEquals("200", fixture.store.loadCursor(PROFILE, STREAM)?.cursorValue)
+    }
+
+    @Test
+    fun tenThousandObjectReplayAcrossHundredMultiObjectUnitsDoesNotRematerialize() = withFixture { fixture ->
+        val notebook = fixture.factory.createGenesis(
+            WorkspaceEntityTypeV2.NOTEBOOK,
+            NOTEBOOK_ID,
+            NotebookContentV2("Imported", 0, at(1)),
+            ACTOR,
+            at(1),
+        )
+        val notes = (1..10_000).map { index ->
+            fixture.factory.createGenesis(
+                WorkspaceEntityTypeV2.NOTE,
+                "30000000-0000-4000-8000-${index.toString().padStart(12, '0')}",
+                NoteContentV2(NOTEBOOK_ID, "Imported $index", "body $index", at(index.toLong()), null, null),
+                ACTOR,
+                at(index.toLong() + 1),
+            )
+        }
+        val versions = listOf(notebook) + notes
+        val localMutations = versions.map { version ->
+            LocalWorkspaceMutationV2(PROFILE, fixture.ids.newId(), version, at(200))
+        }
+        assertIs<WorkspaceLocalCommitResultV2.Committed>(fixture.store.commitLocalMutations(localMutations))
+        val pendingByObject = fixture.store.loadPending(PROFILE).associateBy { it.objectId }
+        pendingByObject.values.forEach { pending ->
+            assertTrue(
+                fixture.store.acknowledgePending(
+                    PROFILE,
+                    pending.mutationId,
+                    pending.objectId,
+                    pending.objectDigest,
+                ),
+            )
+        }
+        val remoteEcho = notes.map { version ->
+            val pending = checkNotNull(pendingByObject[version.versionId])
+            RemoteWorkspaceMutationV2(
+                pending.mutationId,
+                pending.objectId,
+                pending.objectDigest,
+                WRITER,
+                version,
+            )
+        }
+
+        fixture.driver.resetQueryCount()
+        var expectedCursor: String? = null
+        var replayed = 0
+        remoteEcho.chunked(100).forEachIndexed { index, mutations ->
+            val nextCursor = (index + 1).toString()
+            val applied = assertIs<WorkspaceRemoteUnitApplyResultV2.Applied>(
+                fixture.store.applyRemoteCursorUnit(
+                    RemoteWorkspaceCursorUnitV2(
+                        PROFILE,
+                        WorkspaceRemoteCursorAdvanceV2(
+                            STREAM,
+                            expectedCursor,
+                            nextCursor,
+                            "unit-$nextCursor",
+                            "unit-digest-$nextCursor",
+                        ),
+                        mutations,
+                        at(300 + index.toLong()),
+                    ),
+                ),
+            )
+            replayed += applied.replayedMutations
+            assertTrue(applied.plans.isEmpty())
+            expectedCursor = nextCursor
+        }
+
+        assertEquals(10_000, replayed)
+        assertTrue(fixture.driver.queryCount <= 800, "Server echo performed ${fixture.driver.queryCount} SQL reads")
+        assertEquals(10_000, fixture.database.somedayQueries.selectAllNoteProjectionsSystemV2(EPOCH).executeAsList().size)
+
+        fixture.driver.resetQueryCount()
+        val state = fixture.store.loadStateCounts()
+        assertEquals(0, state.activeConflicts)
+        assertEquals(0, state.projectionWarnings)
+        assertEquals(2, fixture.driver.queryCount)
+    }
+
     @Test
     fun localMutationRollsBackAtEveryDurableEffectBoundary() = withFixture { fixture ->
         val note = fixture.factory.createGenesis(
@@ -504,7 +742,7 @@ class SqlDelightWorkspaceEntityStoreV2Test {
     }
 
     private fun withFixture(block: (Fixture) -> Unit) {
-        val driver = createSomedayJdbcDriver("jdbc:sqlite::memory:")
+        val driver = CountingSqlDriver(createSomedayJdbcDriver("jdbc:sqlite::memory:"))
         val database = SomedayDatabase(driver)
         val ids = StoreIdsV2()
         val materializer = CanonicalWorkspaceCausalityMaterializerV2(
@@ -538,7 +776,7 @@ class SqlDelightWorkspaceEntityStoreV2Test {
     }
 
     private data class Fixture(
-        val driver: app.cash.sqldelight.db.SqlDriver,
+        val driver: CountingSqlDriver,
         val database: SomedayDatabase,
         val ids: StoreIdsV2,
         val factory: WorkspaceEntityVersionFactoryV2,
@@ -556,6 +794,17 @@ class SqlDelightWorkspaceEntityStoreV2Test {
             ).value
         }
 
+        fun failRemoteCursor(cursorValue: String) {
+            require(cursorValue.all(Char::isDigit))
+            driver.execute(
+                null,
+                "CREATE TEMP TRIGGER sync_v2_fault BEFORE INSERT ON sync_remote_cursors_system_v2 " +
+                    "WHEN NEW.cursor_value = '$cursorValue' " +
+                    "BEGIN SELECT RAISE(ABORT, 'sync-v2 injected batch fault'); END",
+                0,
+            ).value
+        }
+
         fun clearFault() {
             driver.execute(null, "DROP TRIGGER IF EXISTS sync_v2_fault", 0).value
         }
@@ -563,6 +812,46 @@ class SqlDelightWorkspaceEntityStoreV2Test {
         fun commit(version: WorkspaceEntityVersionV2) = assertIs<WorkspaceLocalCommitResultV2.Committed>(
             store.commitLocalMutations(listOf(LocalWorkspaceMutationV2(PROFILE, ids.newId(), version, at(8)))),
         )
+
+        fun prepareRemoteNotebook() {
+            val notebook = factory.createGenesis(
+                WorkspaceEntityTypeV2.NOTEBOOK,
+                NOTEBOOK_ID,
+                NotebookContentV2("Remote target", 0, at(1)),
+                ACTOR,
+                at(1),
+            )
+            commit(notebook)
+            store.loadPending(PROFILE).forEach { pending ->
+                assertTrue(store.acknowledgePending(PROFILE, pending.mutationId, pending.objectId, pending.objectDigest))
+            }
+        }
+
+        fun singleObjectUnits(count: Int): List<RemoteWorkspaceCursorUnitV2> {
+            var expectedCursor: String? = null
+            return (1..count).map { index ->
+                val version = factory.createGenesis(
+                    WorkspaceEntityTypeV2.NOTE,
+                    "32000000-0000-4000-8000-${index.toString().padStart(12, '0')}",
+                    NoteContentV2(NOTEBOOK_ID, "Remote $index", "body $index", at(index.toLong()), null, null),
+                    ACTOR,
+                    at(index.toLong() + 1),
+                )
+                val nextCursor = index.toString()
+                RemoteWorkspaceCursorUnitV2(
+                    PROFILE,
+                    WorkspaceRemoteCursorAdvanceV2(
+                        STREAM,
+                        expectedCursor,
+                        nextCursor,
+                        "unit-$nextCursor",
+                        "unit-digest-$nextCursor",
+                    ),
+                    listOf(remote(version)),
+                    at(20 + index.toLong()),
+                ).also { expectedCursor = nextCursor }
+            }
+        }
 
         fun remote(version: WorkspaceEntityVersionV2): RemoteWorkspaceMutationV2 = RemoteWorkspaceMutationV2(
             mutationId = "70000000-0000-4000-8000-${(mutationCounter++).toString().padStart(12, '0')}",
@@ -606,6 +895,39 @@ class SqlDelightWorkspaceEntityStoreV2Test {
         const val STREAM = "writer-stream"
 
         fun at(seconds: Long): Instant = Instant.fromEpochSeconds(seconds)
+    }
+}
+
+private class CountingSqlDriver(
+    private val delegate: SqlDriver,
+) : SqlDriver by delegate {
+    var queryCount: Int = 0
+        private set
+    var outerTransactionCount: Int = 0
+        private set
+
+    fun resetQueryCount() {
+        queryCount = 0
+    }
+
+    fun resetTransactionCount() {
+        outerTransactionCount = 0
+    }
+
+    override fun newTransaction(): QueryResult<Transacter.Transaction> {
+        if (delegate.currentTransaction() == null) outerTransactionCount++
+        return delegate.newTransaction()
+    }
+
+    override fun <R> executeQuery(
+        identifier: Int?,
+        sql: String,
+        mapper: (SqlCursor) -> QueryResult<R>,
+        parameters: Int,
+        binders: (SqlPreparedStatement.() -> Unit)?,
+    ): QueryResult<R> {
+        queryCount++
+        return delegate.executeQuery(identifier, sql, mapper, parameters, binders)
     }
 }
 

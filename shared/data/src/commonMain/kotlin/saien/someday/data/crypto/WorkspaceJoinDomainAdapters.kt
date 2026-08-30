@@ -22,6 +22,22 @@ fun WorkspaceKeyRepository.workspaceJoinPackageProvider(): WorkspaceJoinPackageP
         }
     }
 
+fun WorkspaceKeyRepository.workspaceRecoveryPackageProvider(): WorkspaceJoinPackageProvider =
+    WorkspaceJoinPackageProvider {
+        when (val result = createWorkspaceRecoveryPackage()) {
+            is WorkspaceJoinPackageResult.Created -> WorkspaceJoinResult.success(
+                reason = WorkspacePairingReason.PackageCreated,
+                packageData = WorkspaceJoinPackage(
+                    metadataJson = result.metadataJson,
+                    recoveryCode = result.recoveryMaterial.revealForUserConfirmation(),
+                    workspaceId = result.workspaceId,
+                    keyFingerprint = result.keyFingerprint,
+                ),
+            )
+            is WorkspaceJoinPackageResult.Failed -> WorkspaceJoinResult.failure(result.reason.workspacePairingReason())
+        }
+    }
+
 fun WorkspaceKeyRepository.workspaceJoiner(
     deviceName: String,
     platform: String,

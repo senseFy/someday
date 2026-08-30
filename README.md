@@ -2,16 +2,24 @@
 
 Someday is a Kotlin Multiplatform, local-first notes and journal application
 for Android, iOS, macOS, Windows, and Linux. It combines Markdown editing,
-history, memories, location capture, and encrypted self-hosted synchronization.
+history, memories, location capture, and encrypted synchronization through a
+Someday Server operated by the user or a service provider.
 
 ## Status
 
 - Notes, notebooks, Markdown, version history, memories, search, settings,
-  export, and recovery-key workflows are implemented on the shared client.
-- Self-hosted synchronization keeps encrypted notes and images consistent
-  across paired devices.
+  export, and workspace-recovery workflows are implemented on the shared
+  client.
+- Someday Server synchronization keeps encrypted notes and images consistent
+  across trusted devices.
 - An existing device can securely transfer the workspace key when pairing a
   new device; the server cannot read that key or the synchronized content.
+- A user-held 128-bit recovery code can restore the workspace without another
+  device. The server stores only an opaque wrapped-key envelope and never
+  receives the code or plaintext workspace key.
+- If every device holding the key, the current recovery code, and every
+  readable plaintext backup are lost, neither the service operator nor a
+  self-hosted administrator can recover the ciphertext.
 - Static JPEG, PNG, and WebP inputs are normalized into app-owned image assets
   bounded to 4 MiB and 12 megapixels. Other files, SVG, animation, and video
   are not currently supported.

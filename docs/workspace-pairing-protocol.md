@@ -3,7 +3,7 @@
 Status: implemented interoperability specification.
 
 This protocol gives one additional device a workspace master key without
-revealing that key to the self-hosted service. The user transfers one
+revealing that key to Someday Server. The user transfers one
 high-entropy capability by QR code or manual entry. The capability is
 single-use, expires after at most ten minutes, and is never written to logs.
 
@@ -15,7 +15,7 @@ hash are invalid.
 
 The protocol is designed for these conditions:
 
-- a database reader, storage provider, or self-hosted operator can read every
+- a database reader, storage provider, or server operator can read every
   remote pairing record but does not know the transferred capability;
 - the remote may reorder, replay, replace, or withhold bytes;
 - another device using the same remote credentials may race a legitimate
@@ -100,11 +100,11 @@ Any change to this vector is a protocol change.
 
 ## 4. Authority binding
 
-Pairing is bound to the configured self-hosted remote account. Each component
+Pairing is bound to the configured Someday Server account. Each component
 is encoded as `<UTF-8 byte length>:<value>`, then components are joined with
 `|`.
 
-- Self-hosted components: canonical endpoint (lowercase scheme/host, default
+- Server components: canonical endpoint (lowercase scheme/host, default
   port and trailing slash removed), authenticated user id.
 
 The authority binding is authenticated but is not included in encrypted
@@ -175,6 +175,12 @@ The encrypted payload has exactly four string fields:
 }
 ```
 
+The `recoveryCode` field is invitation-local wrapping material carried only
+inside this authenticated encrypted envelope. It is not the user-held,
+long-lived workspace recovery code defined in
+[`workspace-recovery-protocol.md`](workspace-recovery-protocol.md). Pairing does
+not read, publish, replace, or rotate the account's current recovery envelope.
+
 Decoders require valid UTF-8, strict JSON, the exact field sets and types,
 unique object keys, canonical unpadded Base64url, the expected identifiers,
 and authenticated decryption. The payload is limited to 47 KiB and the outer
@@ -187,7 +193,7 @@ when `now >= expiresAtEpochMillis`.
 The envelope digest is unpadded Base64url SHA-256 of the exact outer JSON
 bytes.
 
-## 6. Self-hosted state machine
+## 6. Someday Server state machine
 
 All routes require an authenticated, non-revoked device session with `sync`
 scope. Records are keyed by `(user id, invitation id)`, so an invitation
@@ -220,7 +226,7 @@ The client checks the server digest, expiry, authority-bound envelope, and
 workspace package itself. Completion is attempted after every successful
 claim even when validation or local replacement fails, preserving single-use
 behavior. Pairing uses the same serialized access-token refresh executor as
-normal self-hosted sync. Creation requires the inviter's active publication
+normal Someday Server sync. Creation requires the inviter's active publication
 binding. A fresh installation may claim before it has a local publication
 binding.
 
@@ -259,6 +265,10 @@ it does not turn the committed replacement into a pairing failure. Likewise,
 failure of the first sync after replacement is retryable and does not restore the
 discarded workspace.
 
+Pairing and durable recovery share authenticated workspace import and this
+atomic local replacement. A pairing invitation remains a separate, short-lived
+capability; it is not a disaster-recovery credential.
+
 ## 8. UI and release rules
 
 - Android and iOS request camera access only after the user selects Scan.
@@ -272,7 +282,7 @@ discarded workspace.
   semantics.
 
 The local DAG is the product data model from workspace creation onward,
-including while network sync is off. Pairing requires a valid self-hosted
+including while network sync is off. Pairing requires a valid Someday Server
 session and, for the inviter, an active published workspace.
 
 ## 9. Required evidence
@@ -281,7 +291,7 @@ The reliability gate must cover:
 
 - token normalization, checksum, golden derivation vector, strict envelope
   decoding, authority binding, and expiry;
-- self-hosted account/device scoping, atomic claim, replay behavior,
+- server account/device scoping, atomic claim, replay behavior,
   completion, cancellation, expiry, and absence of read/delete routes;
 - refusal before claim without explicit replacement confirmation;
 - confirmed replacement of active, bound, and contentful local workspaces;

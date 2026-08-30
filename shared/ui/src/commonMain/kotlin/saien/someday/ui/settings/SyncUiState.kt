@@ -1,5 +1,7 @@
 package saien.someday.ui.settings
 
+import saien.someday.domain.settings.WorkspaceRecoverySyncGate
+
 /** Product-facing connection state. Protocol and transport details stay below this boundary. */
 sealed interface SyncConnectionUi {
     data class LocalOnly(
@@ -23,11 +25,33 @@ sealed interface SyncConnectionUi {
 enum class SyncUiOperation {
     Authenticating,
     CreatingAccount,
+    SwitchingConnection,
     ReloadingSession,
+    CheckingRecovery,
     Syncing,
     CreatingInvitation,
     CancellingInvitation,
     JoiningInvitation,
+    PreparingRecoveryCode,
+    PublishingRecoveryCode,
+    RestoringWorkspace,
+}
+
+enum class WorkspaceRecoveryUiAvailability {
+    Unknown,
+    NotConfigured,
+    Configured,
+    RecoveryAvailable,
+    Unavailable,
+}
+
+data class WorkspaceRecoveryUiState(
+    val availability: WorkspaceRecoveryUiAvailability = WorkspaceRecoveryUiAvailability.Unknown,
+    val syncGate: WorkspaceRecoverySyncGate = WorkspaceRecoverySyncGate.Pending,
+    val preparedCode: WorkspaceRecoveryCodeUi? = null,
+) {
+    val blocksSync: Boolean
+        get() = syncGate != WorkspaceRecoverySyncGate.Allowed
 }
 
 enum class SyncIssueAction {
@@ -81,6 +105,7 @@ data class SyncUiState(
     val operation: SyncUiOperation? = null,
     val issue: SyncIssueUi? = null,
     val invitation: WorkspacePairingInvitationUi? = null,
+    val recovery: WorkspaceRecoveryUiState = WorkspaceRecoveryUiState(),
 ) {
     val syncing: Boolean get() = operation == SyncUiOperation.Syncing
     val busy: Boolean get() = operation != null

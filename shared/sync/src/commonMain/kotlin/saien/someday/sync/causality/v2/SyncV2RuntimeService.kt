@@ -133,7 +133,7 @@ class SyncV2RuntimeService(
                         is FirstEpochPublishAttemptV2.KeepPreparingAndStop ->
                             return failedInitialization(attempt.safeMessage)
                         is FirstEpochPublishAttemptV2.Failed ->
-                            return failedInitialization(attempt.safeMessage)
+                            return failedInitialization(attempt.safeMessage, attempt.manualSyncReason)
                     }
                 }
                 WorkspacePreparedCheckpointLoadResultV2.None -> Unit
@@ -191,13 +191,13 @@ class SyncV2RuntimeService(
                             is FirstEpochPublishAttemptV2.KeepPreparingAndStop ->
                                 return failedInitialization(retry.safeMessage)
                             is FirstEpochPublishAttemptV2.Failed ->
-                                return failedInitialization(retry.safeMessage)
+                                return failedInitialization(retry.safeMessage, retry.manualSyncReason)
                         }
                     }
                     is FirstEpochPublishAttemptV2.KeepPreparingAndStop ->
                         return failedInitialization(attempt.safeMessage)
                     is FirstEpochPublishAttemptV2.Failed ->
-                        return failedInitialization(attempt.safeMessage)
+                        return failedInitialization(attempt.safeMessage, attempt.manualSyncReason)
                 }
             }
         }
@@ -341,7 +341,7 @@ class SyncV2RuntimeService(
                                 is FirstEpochPublishAttemptV2.Failed ->
                                     return ManualSyncResult.failure(
                                         mode,
-                                        ManualSyncReason.Failed,
+                                        rebuilt.manualSyncReason,
                                         rebuilt.safeMessage,
                                     )
                             }
@@ -356,7 +356,7 @@ class SyncV2RuntimeService(
                     is FirstEpochPublishAttemptV2.Failed ->
                         return ManualSyncResult.failure(
                             mode,
-                            ManualSyncReason.Failed,
+                            attempt.manualSyncReason,
                             attempt.safeMessage,
                         )
                 }
@@ -583,16 +583,37 @@ class SyncV2RuntimeService(
                 }
             }
             is WorkspaceCheckpointPublishResultV2.Rejected -> {
-                if (published.safeErrorCode == "prepared_checkpoint_stale") {
-                    discardNeverAuthoritativeEpoch(
-                        remote.remoteProfile,
-                        prepared.descriptor.syncEpochId,
-                        published.safeErrorCode,
-                        published.safeMessage,
+                when (published.safeErrorCode) {
+                    "prepared_checkpoint_stale" -> {
+                        discardNeverAuthoritativeEpoch(
+                            remote.remoteProfile,
+                            prepared.descriptor.syncEpochId,
+                            published.safeErrorCode,
+                            published.safeMessage,
+                        )
+                        FirstEpochPublishAttemptV2.RebuildAfterStale
+                    }
+                    "workspace_recovery_required" -> {
+                        // The server proved that another workspace is already
+                        // the account-current recovery authority. This draft
+                        // can never become authoritative through retry; drop
+                        // its provisional local authority so Recover or Pair
+                        // can take over the workspace lifecycle.
+                        discardNeverAuthoritativeEpoch(
+                            remote.remoteProfile,
+                            prepared.descriptor.syncEpochId,
+                            published.safeErrorCode,
+                            published.safeMessage,
+                        )
+                        FirstEpochPublishAttemptV2.Failed(
+                            safeMessage = published.safeMessage,
+                            safeErrorCode = published.safeErrorCode,
+                        )
+                    }
+                    else -> FirstEpochPublishAttemptV2.Failed(
+                        safeMessage = published.safeMessage,
+                        safeErrorCode = published.safeErrorCode,
                     )
-                    FirstEpochPublishAttemptV2.RebuildAfterStale
-                } else {
-                    FirstEpochPublishAttemptV2.Failed(published.safeMessage)
                 }
             }
         }
@@ -732,8 +753,18 @@ private sealed interface FirstEpochPublishAttemptV2 {
     data object RemoteWon : FirstEpochPublishAttemptV2
     data object RebuildAfterStale : FirstEpochPublishAttemptV2
     data class KeepPreparingAndStop(val safeMessage: String) : FirstEpochPublishAttemptV2
-    data class Failed(val safeMessage: String) : FirstEpochPublishAttemptV2
+    data class Failed(
+        val safeMessage: String,
+        val safeErrorCode: String? = null,
+    ) : FirstEpochPublishAttemptV2
 }
+
+private val FirstEpochPublishAttemptV2.Failed.manualSyncReason: ManualSyncReason
+    get() = if (safeErrorCode == "workspace_recovery_required") {
+        ManualSyncReason.RemoteHistoryConflict
+    } else {
+        ManualSyncReason.Failed
+    }
 
 internal fun Throwable.safeRuntimeMessage(): String =
     (message ?: "System V3 sync setup failed safely.")

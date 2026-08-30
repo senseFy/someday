@@ -9,17 +9,18 @@ import com.ionspin.kotlin.crypto.aead.crypto_aead_xchacha20poly1305_ietf_NPUBBYT
 import com.ionspin.kotlin.crypto.hash.Hash
 import com.ionspin.kotlin.crypto.kdf.Kdf
 import com.ionspin.kotlin.crypto.pwhash.PasswordHash
-import com.ionspin.kotlin.crypto.pwhash.crypto_pwhash_ALG_DEFAULT
-import com.ionspin.kotlin.crypto.pwhash.crypto_pwhash_MEMLIMIT_INTERACTIVE
 import com.ionspin.kotlin.crypto.pwhash.crypto_pwhash_MEMLIMIT_MIN
-import com.ionspin.kotlin.crypto.pwhash.crypto_pwhash_OPSLIMIT_INTERACTIVE
 import com.ionspin.kotlin.crypto.pwhash.crypto_pwhash_OPSLIMIT_MIN
 import com.ionspin.kotlin.crypto.pwhash.crypto_pwhash_SALTBYTES
+import com.ionspin.kotlin.crypto.pwhash.crypto_pwhash_argon2id_ALG_ARGON2ID13
 import com.ionspin.kotlin.crypto.util.LibsodiumRandom
 
-class SodiumWorkspaceCrypto(
-    val recoveryKdfPolicy: RecoveryKdfPolicy = RecoveryKdfPolicy.interactive(),
+class SodiumWorkspaceCrypto internal constructor(
+    internal val recoveryKdfPolicy: RecoveryKdfPolicy,
 ) {
+    /** Production callers always use the protocol-frozen v1 KDF profile. */
+    constructor() : this(RecoveryKdfPolicy.protocolV1())
+
     init {
         ensureInitialized()
     }
@@ -151,19 +152,22 @@ class SodiumWorkspaceCrypto(
     }
 }
 
-fun RecoveryKdfPolicy.Companion.interactive(): RecoveryKdfPolicy =
+internal fun RecoveryKdfPolicy.Companion.protocolV1(): RecoveryKdfPolicy =
     RecoveryKdfPolicy(
-        opsLimit = crypto_pwhash_OPSLIMIT_INTERACTIVE.toULong(),
-        memLimit = crypto_pwhash_MEMLIMIT_INTERACTIVE,
-        algorithm = crypto_pwhash_ALG_DEFAULT,
+        opsLimit = RECOVERY_KDF_V1_OPS_LIMIT,
+        memLimit = RECOVERY_KDF_V1_MEM_LIMIT,
+        algorithm = crypto_pwhash_argon2id_ALG_ARGON2ID13,
     )
 
 internal fun RecoveryKdfPolicy.Companion.forTests(): RecoveryKdfPolicy =
     RecoveryKdfPolicy(
         opsLimit = crypto_pwhash_OPSLIMIT_MIN,
         memLimit = crypto_pwhash_MEMLIMIT_MIN,
-        algorithm = crypto_pwhash_ALG_DEFAULT,
+        algorithm = crypto_pwhash_argon2id_ALG_ARGON2ID13,
     )
+
+internal const val RECOVERY_KDF_V1_OPS_LIMIT: ULong = 2UL
+internal const val RECOVERY_KDF_V1_MEM_LIMIT: Int = 67_108_864
 
 internal fun normalizeRecoveryMaterial(input: String): String =
     input

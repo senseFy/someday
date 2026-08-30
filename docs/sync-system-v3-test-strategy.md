@@ -14,8 +14,9 @@ Location: `shared/sync/src/commonTest`.
 
 This layer covers canonical encoding, cryptographic vectors, schema and size
 bounds, DAG validation, deterministic merge, conflict semantics, and media
-envelope authentication. It is deterministic, has no database or network, and
-runs on every supported Kotlin target.
+envelope authentication. This layer is deterministic, has no database or
+network, and runs on every supported Kotlin target where the primitive is
+available.
 
 All field-level merge combinations belong here. Higher layers prove that the
 real composition reaches this model; they do not repeat its full matrix.
@@ -26,8 +27,27 @@ Location: `shared/sync/src/jvmTest` and `shared/data/src/jvmTest`.
 
 This layer covers SQLite transaction boundaries, the durable outbox, cursor
 advancement, checkpoint resumption, dead-letter evidence, app-private media
-promotion, and restart recovery. Tests use file-backed SQLite when reopen is
-part of the invariant and inject a failure at an explicit durable boundary.
+promotion, restart recovery, secure-key staging, and atomic Pair/Recover
+workspace replacement. Wrong codes, tampered envelopes, and injected failures
+before commit must preserve every prior local row and key alias. Tests use
+file-backed SQLite when reopen is part of the invariant and inject a failure at
+an explicit durable boundary.
+
+Remote-apply batching tests use the production server shape of one encrypted
+object per cursor unit. Two hundred units must share one outer SQLite
+transaction; 201 units cross into a second transaction without changing their
+individual cursor identities. The 934-unit regression crosses two 500-unit
+pull pages and records transaction sizes `200, 200, 100, 200, 200, 34`. A
+structured rejection or injected SQLite fault at unit 101 proves that the
+current batch has no partial versions, projections, replay identities, or
+cursor progress before exact retry. Cross-stream missing-parent tests keep the
+whole pull page as the scheduling window while the local transaction remains
+bounded.
+
+Workspace-recovery JVM tests cover 128-bit code generation and normalization,
+portable metadata without device-local aliases, KDF/AEAD authentication,
+envelope identity binding, secret redaction, setup confirmation, and atomic
+replacement behavior.
 
 The standard shape is:
 
@@ -66,7 +86,8 @@ contains only a small set of product journeys:
 1. bootstrap and non-conflicting two-device convergence;
 2. durable same-field conflict on both devices;
 3. image import, media-first publication, entity sync, and lazy materialization;
-4. pairing, atomic workspace replacement, bootstrap, and visible notes.
+4. pairing, atomic workspace replacement, bootstrap, and visible notes;
+5. recovery-code setup, fresh-client recovery, bootstrap, and visible notes.
 
 An E2E journey asserts externally meaningful state. It may observe a public
 cross-plane boundary to prove that media is already durable before entity
@@ -102,6 +123,8 @@ followed by a real database reopen:
 | acknowledgement lost | outbox remains; exact replay acknowledges once |
 | acknowledgement corrupted | no outbox row is acknowledged |
 | pull failure | local cursor and projection do not advance |
+| structured rejection inside a pull batch | current batch rolls back; valid prefix is retried and committed before exact blocker evidence |
+| SQLite failure inside a pull batch | every unit in the current batch rolls back; exact retry commits once |
 
 Checkpoint tests cover interruption after a chunk, after the manifest, after
 the pointer, and before local activation. Multi-chunk preparation retains one
@@ -113,6 +136,20 @@ replay. Required target media tests cover blob-write failure, durable orphan
 reuse after a database failure, missing-object reconstruction by exact PUT,
 immutable mismatch rejection, same-key concurrency, and an account-wide quota
 race across workspaces.
+
+Real-PostgreSQL tests also hold the recovery account advisory lock and prove
+that both first-epoch CAS and recovery-envelope PUT wait on it. They publish an
+account-current recovery pointer, reject a competing genesis with
+`workspace_recovery_required` without creating an epoch, and prove that an
+existing workspace's exact epoch replay remains available. This is the server
+authority boundary behind the client's stale-`404` recovery check; a client-only
+preflight is not accepted as race protection. The same test starts repository
+connections at `REPEATABLE READ` and proves each write path pins
+`READ COMMITTED`: a waiting CAS sees the holder's newly committed recovery
+pointer, and a waiting recovery PUT sees the holder's newly committed epoch.
+Client tests then prove the rejected PREPARING epoch and its provisional local
+authority are abandoned before the real recovery service refreshes to
+Recovery Available.
 
 The shared backend suite proves immutable
 PUT/HEAD/GET, exact replay, canonical length/SHA-256 validation, same-key
@@ -162,9 +199,15 @@ The Ubuntu gate also:
   and image through a write-blocked ingress, and prove both write planes are
   rejected.
 
+Recovery-code release evidence must combine JVM cryptography, repository, service,
+and atomic-replacement tests with real-PostgreSQL recovery-envelope API tests,
+an installed-server fresh-client journey, and explicit recovery-envelope
+survival through operator restore. Managed-provider certification includes the
+same recovery boundary when its scoped changes require that gate.
+
 `scripts/managed-storage-profile-gate planetscale|r2` applies the focused
-recovery journey to dedicated managed resources. A named profile is verified
-only when a current `result.json` records a complete passing live run.
+paired-client recovery journey to dedicated managed resources. A named profile
+is verified only when a current `result.json` records a complete passing live run.
 The release controller consumes that evidence as described in
 [Server release](server-release.md).
 
@@ -199,3 +242,5 @@ method names or replacing behavioral evidence.
   remain supplemental to deterministic release evidence.
 - New media formats, key rotation, or multi-workspace UI add focused journeys
   when those features are implemented.
+- Recovery-code replacement is wrapped-key rotation, not master-key rotation;
+  changes still add focused prepare/confirm/CAS and historical-envelope cases.

@@ -161,11 +161,13 @@ fun main() = application {
             mediaUiPorts = mediaUiPorts,
             selfHostedSetupClient = clientRepositories.selfHostedSetupClient,
             selfHostedSessionCredentialStore = clientRepositories.selfHostedSessionCredentialStore,
+            selfHostedConnectionSwitcher = clientRepositories.selfHostedConnectionSwitcher,
             manualSyncRunner = clientRepositories.manualSyncRunner,
             automaticSyncEligible = clientRepositories.automaticSyncEligible,
             workspacePairingInvitationCreator = clientRepositories.workspacePairingInvitationCreator,
             workspacePairingInvitationJoiner = clientRepositories.workspacePairingInvitationJoiner,
             workspacePairingInvitationCanceller = clientRepositories.workspacePairingInvitationCanceller,
+            workspaceRecoveryManager = clientRepositories.workspaceRecoveryManager,
             pullToRefreshSyncEnabled = false,
         )
     }

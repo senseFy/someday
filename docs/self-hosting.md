@@ -41,9 +41,13 @@ identical; only the server's storage settings differ.
    [standalone](self-hosting-standalone.md) Docker guide.
 3. Point a stable HTTPS origin at the server and confirm `/health` succeeds.
 4. Run `bootstrap-admin`, then sign in to `/admin`.
-5. Configure the first client with the HTTPS origin, email, and password.
-6. Pair additional clients so they receive the workspace key.
-7. Complete the [backup and recovery checklist](server-backup-and-recovery.md)
+5. Configure the first client with the HTTPS origin, email, and password, then
+   publish its workspace.
+6. Set up the recovery code, save it outside Someday, and enter it again to
+   publish the account's recovery envelope.
+7. Pair additional clients from a trusted device, or recover a fresh client
+   with the saved code.
+8. Complete the [backup and recovery checklist](server-backup-and-recovery.md)
    before storing real data.
 
 For later releases, follow the [upgrade runbook](server-upgrades.md).
@@ -122,8 +126,10 @@ you want open account creation.
 
 Configure a client with the public HTTPS origin and account credentials. Do
 not append an API path, query, or fragment. Signing in identifies the server
-account; pairing transfers the end-to-end encrypted workspace key to another
-device.
+account but does not decrypt its workspace. Pairing transfers the workspace key
+from a trusted device. The independent recovery path downloads an opaque
+wrapped-key envelope and unwraps it locally with the user's saved code; the code
+never reaches the server.
 
 ## Run without Docker
 

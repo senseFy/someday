@@ -16,7 +16,7 @@ import saien.someday.sync.StrictJsonV2
 
 class JdkSelfHostedSyncTransport(
     private val client: HttpClient = HttpClient.newBuilder()
-        .connectTimeout(Duration.ofSeconds(10))
+        .connectTimeout(Duration.ofMillis(SELF_HOSTED_CONNECT_TIMEOUT_MILLIS))
         .followRedirects(HttpClient.Redirect.NEVER)
         .build(),
     private val json: Json = Json {
@@ -25,7 +25,11 @@ class JdkSelfHostedSyncTransport(
         explicitNulls = true
         isLenient = false
     },
-) : SelfHostedSyncTransport, SelfHostedSyncTransportV2, SelfHostedMediaTransportV3, AutoCloseable {
+) : SelfHostedSyncTransport,
+    SelfHostedWorkspaceRecoveryTransport,
+    SelfHostedSyncTransportV2,
+    SelfHostedMediaTransportV3,
+    AutoCloseable {
     override fun close() {
         client.close()
     }
@@ -128,6 +132,33 @@ class JdkSelfHostedSyncTransport(
         path = "/pairing/invites/${encodePathSegment(inviteId)}/cancel",
         bearerToken = accessToken,
         encodedBody = "{}",
+    )
+
+    override fun getWorkspaceRecoveryEnvelope(
+        endpoint: String,
+        accessToken: String,
+    ): SelfHostedWorkspaceRecoveryEnvelopeResponse? =
+        try {
+            get(
+                endpoint,
+                "/workspace/recovery-envelope",
+                accessToken,
+                SelfHostedWorkspaceRecoveryEnvelopeResponse.serializer(),
+            )
+        } catch (failure: SelfHostedSyncHttpException) {
+            if (failure.status == 404) null else throw failure
+        }
+
+    override fun putWorkspaceRecoveryEnvelope(
+        endpoint: String,
+        accessToken: String,
+        request: SelfHostedWorkspaceRecoveryEnvelopePutRequest,
+    ): SelfHostedWorkspaceRecoveryEnvelopeResponse = put(
+        endpoint,
+        "/workspace/recovery-envelope",
+        accessToken,
+        json.encodeToString(request),
+        SelfHostedWorkspaceRecoveryEnvelopeResponse.serializer(),
     )
 
     override fun v2Capabilities(endpoint: String, accessToken: String): SelfHostedV2CapabilitiesResponse =
@@ -297,7 +328,7 @@ class JdkSelfHostedSyncTransport(
         ciphertextSha256: String,
     ): SelfHostedMediaPutResponseV3 {
         val builder = HttpRequest.newBuilder(uri(endpoint, path))
-            .timeout(Duration.ofSeconds(20))
+            .timeout(Duration.ofMillis(SELF_HOSTED_REQUEST_TIMEOUT_MILLIS))
             .header("Content-Type", SYSTEM_V3_MEDIA_OBJECT_CONTENT_TYPE)
             .header("Authorization", "Bearer $accessToken")
             .header(SYSTEM_V3_MEDIA_CIPHERTEXT_SHA256_HEADER, ciphertextSha256)
@@ -315,7 +346,7 @@ class JdkSelfHostedSyncTransport(
         accessToken: String,
     ): SelfHostedMediaRemoteHeadV3? {
         val request = HttpRequest.newBuilder(uri(endpoint, path))
-            .timeout(Duration.ofSeconds(20))
+            .timeout(Duration.ofMillis(SELF_HOSTED_REQUEST_TIMEOUT_MILLIS))
             .header("Authorization", "Bearer $accessToken")
             .method("HEAD", HttpRequest.BodyPublishers.noBody())
             .build()
@@ -332,7 +363,7 @@ class JdkSelfHostedSyncTransport(
         maxBytes: Int,
     ): SelfHostedMediaRemoteObjectV3 {
         val request = HttpRequest.newBuilder(uri(endpoint, path))
-            .timeout(Duration.ofSeconds(20))
+            .timeout(Duration.ofMillis(SELF_HOSTED_REQUEST_TIMEOUT_MILLIS))
             .header("Authorization", "Bearer $accessToken")
             .GET()
             .build()
@@ -381,7 +412,7 @@ class JdkSelfHostedSyncTransport(
             "Self-hosted request exceeds the V2 encoded body limit."
         }
         val builder = HttpRequest.newBuilder(uri(endpoint, path))
-            .timeout(Duration.ofSeconds(20))
+            .timeout(Duration.ofMillis(SELF_HOSTED_REQUEST_TIMEOUT_MILLIS))
             .header("Content-Type", "application/json")
             .POST(HttpRequest.BodyPublishers.ofString(encodedBody))
         bearerToken?.let { builder.header("Authorization", "Bearer $it") }
@@ -400,7 +431,7 @@ class JdkSelfHostedSyncTransport(
             "Self-hosted request exceeds the V2 encoded body limit."
         }
         val builder = HttpRequest.newBuilder(uri(endpoint, path))
-            .timeout(Duration.ofSeconds(20))
+            .timeout(Duration.ofMillis(SELF_HOSTED_REQUEST_TIMEOUT_MILLIS))
             .header("Content-Type", "application/json")
             .PUT(HttpRequest.BodyPublishers.ofString(encodedBody))
         bearerToken?.let { builder.header("Authorization", "Bearer $it") }
@@ -415,7 +446,7 @@ class JdkSelfHostedSyncTransport(
     ) {
         require(encodedBody.encodeToByteArray().size <= MAX_ENCODED_BODY_BYTES)
         val request = HttpRequest.newBuilder(uri(endpoint, path))
-            .timeout(Duration.ofSeconds(20))
+            .timeout(Duration.ofMillis(SELF_HOSTED_REQUEST_TIMEOUT_MILLIS))
             .header("Content-Type", "application/json")
             .header("Authorization", "Bearer $bearerToken")
             .POST(HttpRequest.BodyPublishers.ofString(encodedBody))
@@ -436,7 +467,7 @@ class JdkSelfHostedSyncTransport(
         responseSerializer: KSerializer<T>,
     ): T {
         val request = HttpRequest.newBuilder(uri(endpoint, path))
-            .timeout(Duration.ofSeconds(20))
+            .timeout(Duration.ofMillis(SELF_HOSTED_REQUEST_TIMEOUT_MILLIS))
             .header("Authorization", "Bearer $bearerToken")
             .GET()
             .build()

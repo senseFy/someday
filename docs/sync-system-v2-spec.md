@@ -64,10 +64,12 @@ A local mutation commits atomically:
 3. the typed product projection;
 4. one durable pending transport mutation.
 
-A pulled cursor unit commits the same semantic effects, replay identity, and
-cursor advancement in one transaction. The DAG is authoritative; projections
-are rebuildable views. Product and UI code write through typed repositories
-rather than protocol tables or projection rows.
+A pulled cursor unit's semantic effects, replay identity, outbox effects,
+projection state, and cursor advancement are atomic. A bounded set of causally
+ordered units may share one local transaction. Batching does not merge protocol
+units, relax stream ordering, or advance a rejected unit's cursor. The DAG is
+authoritative; projections are rebuildable views. Product and UI code write
+through typed repositories rather than protocol tables or projection rows.
 
 Portable structured export reads this same DAG product view. Import creates
 normal DAG mutations in the selected writable local generation. Media bytes
@@ -106,10 +108,10 @@ ordinary first connection:
   semantic changes.
 
 A normal sync never replaces or merges a contentful local workspace. Joining
-another workspace is a separate Pair operation with explicit destructive
-confirmation, described in section 8. Stable installation UUIDv4 is used as
-the local DAG writer and is claimed exactly by device registration before
-first publication.
+another workspace is a separate Pair or Recover operation with explicit
+destructive confirmation, described by the System V3 control plane. Stable
+installation UUIDv4 is used as the local DAG writer and is claimed exactly by
+device registration before first publication.
 
 A checkpoint manifest references immutable bounded chunks containing the
 complete entity graph needed to bootstrap another device, including live and
@@ -141,6 +143,13 @@ writers may arrive in any order. Missing-parent units remain deferred while
 eligible units progress; a run that cannot make causal progress does not push
 unsafe work or advance the blocked cursor.
 
+The pull page is the dependency-scheduling window, not the SQLite transaction
+boundary. The client selects bounded, causally continuous work from the complete
+page and continues from each durable frontier. A rejected unit does not prevent
+independently valid work from progressing, and exact per-unit failure evidence
+is retained. An unexpected SQLite failure rolls the complete current local
+transaction back for exact retry.
+
 An immutable-object identifier may be replayed only with its exact encrypted
 outer bytes. Authenticated malformed data, a different value at an existing
 identity, a cursor gap, missing checkpoint data, or an incompatible pointer is
@@ -167,13 +176,17 @@ decoded, and size bounded. Device/session revocation is checked before access.
 There is no epoch-history, object-repair, remote-migration, rotation, or
 retained-generation API.
 
-## 8. Keys and pairing
+## 8. Keys, recovery, and pairing
 
 The workspace master key is generated on-device and stays in platform secure
 storage. Subkeys bind purpose, generation identity, and the frozen key-set
-version. Pairing transfers recovery material through the end-to-end encrypted,
-single-use capability in
-[`workspace-pairing-protocol.md`](workspace-pairing-protocol.md).
+version. Durable recovery and device pairing remain outside this frozen entity
+graph. System V3 stores one opaque recovery-code-wrapped envelope per account
+under [`workspace-recovery-protocol.md`](workspace-recovery-protocol.md).
+Pairing transfers an invitation-local recovery package through the end-to-end
+encrypted, single-use capability in
+[`workspace-pairing-protocol.md`](workspace-pairing-protocol.md); that package
+does not contain or rotate the user's durable recovery code.
 
 An inviter needs an active published pointer. Joining requires explicit,
 per-attempt confirmation that the current local workspace will be discarded

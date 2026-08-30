@@ -20,6 +20,7 @@ import saien.someday.domain.settings.ManualSyncReason
 import saien.someday.domain.settings.ManualSyncResult
 import saien.someday.domain.settings.ManualSyncRunner
 import saien.someday.domain.settings.OnThisDayNotificationPreferences
+import saien.someday.domain.settings.SelfHostedConnectionSwitcher
 import saien.someday.domain.settings.SelfHostedSessionCredentialStore
 import saien.someday.domain.settings.SelfHostedSessionSummary
 import saien.someday.domain.settings.SelfHostedSetupClient
@@ -37,8 +38,18 @@ import saien.someday.domain.settings.WorkspacePairingInvitationCreator
 import saien.someday.domain.settings.WorkspacePairingInvitationJoiner
 import saien.someday.domain.settings.WorkspacePairingInvitationResult
 import saien.someday.domain.settings.WorkspacePairingReason
+import saien.someday.domain.settings.WorkspaceRecoveryCode
+import saien.someday.domain.settings.WorkspaceRecoveryCodeResult
+import saien.someday.domain.settings.WorkspaceRecoveryManager
+import saien.someday.domain.settings.WorkspaceRecoveryReason
+import saien.someday.domain.settings.WorkspaceRecoveryRestoreResult
+import saien.someday.domain.settings.WorkspaceRecoveryState
+import saien.someday.domain.settings.WorkspaceRecoveryStatusResult
+import saien.someday.domain.settings.WorkspaceRecoverySyncGate
 import saien.someday.domain.settings.WorkspacePreferencesSnapshot
 import saien.someday.domain.settings.WorkspacePreferencesSyncState
+import saien.someday.domain.settings.resetBoundWorkspaceForConnectionSwitch
+import saien.someday.domain.settings.resetUnboundSelfHostedConnection
 import saien.someday.domain.settings.resetWorkspaceStateForReplacement
 import saien.someday.ui.i18n.SettingsUiStrings
 import saien.someday.ui.i18n.formatUiString
@@ -75,6 +86,8 @@ class SettingsUiController(
     },
     private val selfHostedSessionCredentialStore: SelfHostedSessionCredentialStore =
         UnavailableSelfHostedSessionCredentialStore,
+    private val selfHostedConnectionSwitcher: SelfHostedConnectionSwitcher =
+        SelfHostedConnectionSwitcher { saien.someday.domain.settings.SelfHostedConnectionSwitchResult.failure() },
     selfHostedDeviceName: String = "Someday device",
     private val selfHostedDevicePlatform: String = "shared",
     private val manualSyncRunner: ManualSyncRunner = ManualSyncRunner {
@@ -96,6 +109,7 @@ class SettingsUiController(
         WorkspacePairingInvitationCanceller {
             WorkspaceJoinResult.failure(WorkspacePairingReason.Unavailable)
         },
+    private val workspaceRecoveryManager: WorkspaceRecoveryManager? = null,
     private val onThisDayNotificationScheduler: OnThisDayNotificationScheduler =
         UnavailableOnThisDayNotificationScheduler,
     onThisDayNotificationStrings: OnThisDayNotificationStrings = OnThisDayNotificationStrings(),
@@ -109,6 +123,18 @@ class SettingsUiController(
     private var selfHostedDeviceName = selfHostedDeviceName
 
     private var currentWorkspacePairingInvitation: WorkspacePairingInvitationUi? = null
+    private var currentWorkspaceRecovery = WorkspaceRecoveryUiState(
+        availability = if (workspaceRecoveryManager == null) {
+            WorkspaceRecoveryUiAvailability.NotConfigured
+        } else {
+            WorkspaceRecoveryUiAvailability.Unknown
+        },
+        syncGate = if (workspaceRecoveryManager == null) {
+            WorkspaceRecoverySyncGate.Allowed
+        } else {
+            WorkspaceRecoverySyncGate.Pending
+        },
+    )
     private var currentSyncOperation: SyncUiOperation? = null
     /**
      * Serializes every read-modify-write of [ClientSettings] with sync and pairing.
@@ -140,6 +166,21 @@ class SettingsUiController(
     }
 
     suspend fun refresh() = withSettingsMutation { refreshLocked() }
+
+    suspend fun retryWorkspaceRecoveryStatus(): Boolean =
+        runExclusiveSyncLifecycle(false) {
+            if (workspaceRecoveryManager == null || currentSyncOperation != null) {
+                return@runExclusiveSyncLifecycle false
+            }
+            currentSyncOperation = SyncUiOperation.CheckingRecovery
+            publishCurrentState()
+            try {
+                refreshWorkspaceRecoveryStatusLocked(showFeedback = true)
+            } finally {
+                currentSyncOperation = null
+                publishCurrentState()
+            }
+        }
 
     private suspend fun refreshLocked() {
         val previousSettings = state.settings
@@ -222,6 +263,9 @@ class SettingsUiController(
             feedbackSeverity = state.feedbackSeverity,
             feedbackEventId = state.feedbackEventId,
         )
+        if (state.sync.connection is SyncConnectionUi.Connected) {
+            refreshWorkspaceRecoveryStatusLocked(showFeedback = false)
+        }
         rescheduleOnThisDayNotifications()
     }
 
@@ -466,6 +510,81 @@ class SettingsUiController(
         setupSelfHostedLocked(endpoint, email, password, createAccount)
     }
 
+    suspend fun switchSelfHostedConnection(): Boolean {
+        val completion = runExclusiveSyncLifecycle(ConnectionSwitchCompletion()) {
+            switchSelfHostedConnectionLocked()
+        }
+        if (completion.refreshProductData) {
+            onDataRestored()
+        }
+        return completion.switched
+    }
+
+    private suspend fun switchSelfHostedConnectionLocked(): ConnectionSwitchCompletion {
+        if (currentSyncOperation != null) return ConnectionSwitchCompletion()
+        currentSyncOperation = SyncUiOperation.SwitchingConnection
+        publishCurrentState()
+        return try {
+            val result = try {
+                withContext(backgroundDispatcher) { selfHostedConnectionSwitcher.switchConnection() }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Throwable) {
+                saien.someday.domain.settings.SelfHostedConnectionSwitchResult.failure()
+            }
+            if (!result.success) {
+                state = buildState(
+                    settings = state.settings,
+                    exportSummary = state.exportSummary,
+                    feedbackMessage = uiStrings.selfHostedConnectionSwitchFailed,
+                    feedbackSeverity = SettingsFeedbackSeverity.Error,
+                )
+                return ConnectionSwitchCompletion()
+            }
+
+            currentWorkspacePairingInvitation = null
+            discardPendingWorkspaceRecoveryCodeLocked()
+            currentWorkspaceRecovery = WorkspaceRecoveryUiState(
+                availability = if (workspaceRecoveryManager == null) {
+                    WorkspaceRecoveryUiAvailability.NotConfigured
+                } else {
+                    WorkspaceRecoveryUiAvailability.Unknown
+                },
+                syncGate = if (workspaceRecoveryManager == null) {
+                    WorkspaceRecoverySyncGate.Allowed
+                } else {
+                    WorkspaceRecoverySyncGate.Pending
+                },
+            )
+            currentSyncIssue = null
+            secureSessionAccess = SecureSessionAccess.Missing
+            val fallback = if (result.workspaceReplaced) {
+                state.settings.resetBoundWorkspaceForConnectionSwitch()
+            } else {
+                state.settings.resetUnboundSelfHostedConnection()
+            }
+            val resetSettings = runCatching {
+                withContext(backgroundDispatcher) { loadSettings() }
+            }.getOrElse { failure ->
+                failure.rethrowCancellation()
+                fallback
+            }
+            state = buildState(
+                settings = resetSettings,
+                exportSummary = state.exportSummary,
+                feedbackMessage = uiStrings.selfHostedConnectionSwitchReady,
+                feedbackSeverity = SettingsFeedbackSeverity.Success,
+            )
+            ConnectionSwitchCompletion(
+                switched = true,
+                refreshProductData = result.workspaceReplaced,
+            )
+        } finally {
+            currentSyncOperation = null
+            publishCurrentState()
+        }
+    }
+
     private suspend fun setupSelfHostedLocked(
         endpoint: String,
         email: String,
@@ -565,6 +684,8 @@ class SettingsUiController(
                     secureSessionAccess = SecureSessionAccess.Unavailable
                     currentSyncIssue = SyncIssueUi(SyncIssueReason.SecureSessionUnavailable)
                     publishCurrentState()
+                } else {
+                    refreshWorkspaceRecoveryStatusLocked(showFeedback = false)
                 }
                 persisted
             }
@@ -580,10 +701,56 @@ class SettingsUiController(
     private fun canStartSync(): Boolean =
         currentSyncOperation == null &&
             state.sync.connection is SyncConnectionUi.Connected &&
+            !currentWorkspaceRecovery.blocksSync &&
             (currentSyncIssue == null || currentSyncIssue?.action == SyncIssueAction.RetrySync)
 
     private fun canUseWorkspacePairing(): Boolean =
         state.sync.pairingAvailable
+
+    private suspend fun refreshWorkspaceRecoveryStatusLocked(showFeedback: Boolean): Boolean {
+        val manager = workspaceRecoveryManager ?: return true
+        val result = try {
+            withContext(backgroundDispatcher) { manager.status() }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Throwable) {
+            WorkspaceRecoveryStatusResult.failure(WorkspaceRecoveryReason.Failed)
+        }
+        currentWorkspaceRecovery = currentWorkspaceRecovery.copy(
+            availability = when {
+                !result.success -> WorkspaceRecoveryUiAvailability.Unavailable
+                result.state == WorkspaceRecoveryState.NotConfigured ->
+                    WorkspaceRecoveryUiAvailability.NotConfigured
+                result.state == WorkspaceRecoveryState.Configured ->
+                    WorkspaceRecoveryUiAvailability.Configured
+                result.state == WorkspaceRecoveryState.RecoveryAvailable ->
+                    WorkspaceRecoveryUiAvailability.RecoveryAvailable
+                else -> WorkspaceRecoveryUiAvailability.Unavailable
+            },
+            syncGate = result.syncGate,
+        )
+        state = buildState(
+            settings = state.settings,
+            exportSummary = state.exportSummary,
+            feedbackMessage = if (showFeedback) workspaceRecoveryMessage(result.reason) else state.feedbackMessage,
+            feedbackSeverity = if (!showFeedback) {
+                state.feedbackSeverity
+            } else if (result.success) {
+                SettingsFeedbackSeverity.Info
+            } else {
+                SettingsFeedbackSeverity.Error
+            },
+            feedbackEventId = if (showFeedback) null else state.feedbackEventId,
+        )
+        return result.success
+    }
+
+    private suspend fun discardPendingWorkspaceRecoveryCodeLocked() {
+        runCatching {
+            withContext(backgroundDispatcher) { workspaceRecoveryManager?.discardPreparedCode() }
+        }.exceptionOrNull()?.rethrowCancellation()
+        currentWorkspaceRecovery = currentWorkspaceRecovery.copy(preparedCode = null)
+    }
 
     private fun beginSync(showFeedback: Boolean): Boolean {
         if (currentSyncOperation != null) return false
@@ -592,6 +759,9 @@ class SettingsUiController(
             ?.takeUnless { it.action == SyncIssueAction.RetrySync }
         val blockingMessage = when {
             !connected -> uiStrings.signInBeforeSync
+            currentWorkspaceRecovery.availability == WorkspaceRecoveryUiAvailability.RecoveryAvailable ->
+                uiStrings.recoveryRequiredBeforeSync
+            currentWorkspaceRecovery.blocksSync -> uiStrings.recoveryStatusUnavailable
             blockingIssue != null -> syncIssueMessage(blockingIssue.reason)
             else -> null
         }
@@ -673,6 +843,9 @@ class SettingsUiController(
             },
             feedbackEventId = if (showFeedback || persistenceFailure != null) null else state.feedbackEventId,
         )
+        if (result.reason == ManualSyncReason.RemoteHistoryConflict && workspaceRecoveryManager != null) {
+            refreshWorkspaceRecoveryStatusLocked(showFeedback = false)
+        }
         return result.success && persistenceFailure == null
     }
 
@@ -718,6 +891,13 @@ class SettingsUiController(
     private suspend fun runSyncLocked(userInitiated: Boolean): SyncCompletion {
         if (!userInitiated && !canStartSync()) return SyncCompletion()
         if (!userInitiated && !preflightAutomaticSync()) return SyncCompletion()
+        if (userInitiated &&
+            state.sync.connection is SyncConnectionUi.Connected &&
+            currentWorkspaceRecovery.blocksSync &&
+            workspaceRecoveryManager != null
+        ) {
+            refreshWorkspaceRecoveryStatusLocked(showFeedback = false)
+        }
         if (!beginSync(showFeedback = userInitiated)) return SyncCompletion()
         return try {
             val result = executeSyncRunner()
@@ -834,6 +1014,191 @@ class SettingsUiController(
                 false
             },
         )
+    }
+
+    suspend fun prepareWorkspaceRecoveryCode(): Boolean =
+        runExclusiveSyncLifecycle(false) { prepareWorkspaceRecoveryCodeLocked() }
+
+    private suspend fun prepareWorkspaceRecoveryCodeLocked(): Boolean {
+        val manager = workspaceRecoveryManager ?: return false
+        if (state.sync.connection !is SyncConnectionUi.Connected ||
+            currentWorkspaceRecovery.availability !in setOf(
+                WorkspaceRecoveryUiAvailability.NotConfigured,
+                WorkspaceRecoveryUiAvailability.Configured,
+            ) ||
+            currentSyncOperation != null
+        ) {
+            return false
+        }
+        currentSyncOperation = SyncUiOperation.PreparingRecoveryCode
+        publishCurrentState()
+        return try {
+            val result = try {
+                withContext(backgroundDispatcher) { manager.prepareCode() }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Throwable) {
+                WorkspaceRecoveryCodeResult.failure(WorkspaceRecoveryReason.Failed)
+            }
+            val prepared = result.recoveryCode?.let(::WorkspaceRecoveryCodeUi)
+            if (result.success && prepared != null) {
+                currentWorkspaceRecovery = currentWorkspaceRecovery.copy(preparedCode = prepared)
+            }
+            state = buildState(
+                settings = state.settings,
+                exportSummary = state.exportSummary,
+                feedbackMessage = workspaceRecoveryMessage(result.reason),
+                feedbackSeverity = if (result.success) SettingsFeedbackSeverity.Warning else SettingsFeedbackSeverity.Error,
+            )
+            result.success && prepared != null
+        } finally {
+            currentSyncOperation = null
+            publishCurrentState()
+        }
+    }
+
+    suspend fun confirmWorkspaceRecoveryCode(candidate: String): Boolean =
+        runExclusiveSyncLifecycle(false) { confirmWorkspaceRecoveryCodeLocked(candidate) }
+
+    private suspend fun confirmWorkspaceRecoveryCodeLocked(candidate: String): Boolean {
+        val manager = workspaceRecoveryManager ?: return false
+        if (currentWorkspaceRecovery.preparedCode == null || currentSyncOperation != null) return false
+        currentSyncOperation = SyncUiOperation.PublishingRecoveryCode
+        publishCurrentState()
+        return try {
+            val result = try {
+                withContext(backgroundDispatcher) { manager.confirmPreparedCode(candidate) }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Throwable) {
+                WorkspaceRecoveryCodeResult.failure(WorkspaceRecoveryReason.Failed)
+            }
+            if (result.success) {
+                currentWorkspaceRecovery = WorkspaceRecoveryUiState(
+                    availability = WorkspaceRecoveryUiAvailability.Configured,
+                    syncGate = WorkspaceRecoverySyncGate.Allowed,
+                )
+            } else if (result.reason in setOf(
+                    WorkspaceRecoveryReason.AuthorityMismatch,
+                    WorkspaceRecoveryReason.ServerConflict,
+                )
+            ) {
+                currentWorkspaceRecovery = currentWorkspaceRecovery.copy(preparedCode = null)
+            }
+            state = buildState(
+                settings = state.settings,
+                exportSummary = state.exportSummary,
+                feedbackMessage = workspaceRecoveryMessage(result.reason),
+                feedbackSeverity = if (result.success) SettingsFeedbackSeverity.Success else SettingsFeedbackSeverity.Error,
+            )
+            result.success
+        } finally {
+            currentSyncOperation = null
+            publishCurrentState()
+        }
+    }
+
+    suspend fun discardPreparedWorkspaceRecoveryCode() {
+        if (workspaceRecoveryManager == null) return
+        runExclusiveSyncLifecycle(Unit) {
+            if (currentSyncOperation != null) return@runExclusiveSyncLifecycle
+            discardPendingWorkspaceRecoveryCodeLocked()
+            publishCurrentState()
+        }
+    }
+
+    suspend fun recoverWorkspaceWithCode(
+        recoveryCode: String,
+        replaceExistingWorkspace: Boolean,
+    ): Boolean {
+        val completion = runExclusiveSyncLifecycle(WorkspaceJoinCompletion()) {
+            recoverWorkspaceWithCodeLocked(recoveryCode, replaceExistingWorkspace)
+        }
+        if (completion.refreshProductData) onDataRestored()
+        return completion.joined
+    }
+
+    private suspend fun recoverWorkspaceWithCodeLocked(
+        recoveryCode: String,
+        replaceExistingWorkspace: Boolean,
+    ): WorkspaceJoinCompletion {
+        val manager = workspaceRecoveryManager ?: return WorkspaceJoinCompletion()
+        if (recoveryCode.isBlank()) {
+            state = buildState(
+                settings = state.settings,
+                exportSummary = state.exportSummary,
+                feedbackMessage = uiStrings.recoveryCodeRequired,
+                feedbackSeverity = SettingsFeedbackSeverity.Warning,
+            )
+            return WorkspaceJoinCompletion()
+        }
+        if (state.sync.connection !is SyncConnectionUi.Connected ||
+            currentWorkspaceRecovery.availability != WorkspaceRecoveryUiAvailability.RecoveryAvailable ||
+            currentSyncOperation != null
+        ) {
+            return WorkspaceJoinCompletion()
+        }
+        currentSyncOperation = SyncUiOperation.RestoringWorkspace
+        publishCurrentState()
+        return try {
+            val result = try {
+                withContext(backgroundDispatcher) {
+                    manager.recover(recoveryCode, replaceExistingWorkspace)
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Throwable) {
+                WorkspaceRecoveryRestoreResult.failure(WorkspaceRecoveryReason.Failed)
+            }
+            if (!result.success) {
+                state = buildState(
+                    settings = state.settings,
+                    exportSummary = state.exportSummary,
+                    feedbackMessage = workspaceRecoveryMessage(result.reason),
+                    feedbackSeverity = SettingsFeedbackSeverity.Error,
+                )
+                return WorkspaceJoinCompletion()
+            }
+
+            currentWorkspacePairingInvitation = null
+            discardPendingWorkspaceRecoveryCodeLocked()
+            currentSyncIssue = null
+            currentWorkspaceRecovery = WorkspaceRecoveryUiState(
+                availability = WorkspaceRecoveryUiAvailability.Configured,
+                syncGate = WorkspaceRecoverySyncGate.Allowed,
+            )
+            val replacementSettings = runCatching {
+                withContext(backgroundDispatcher) { loadSettings() }
+            }.getOrElse { failure ->
+                failure.rethrowCancellation()
+                currentSyncIssue = SyncIssueUi(SyncIssueReason.WorkspaceSettingsReloadRequired)
+                state = buildState(
+                    settings = state.settings.safeWorkspaceReplacementFallback(),
+                    exportSummary = state.exportSummary,
+                    feedbackMessage = uiStrings.pairingSettingsReloadFailed,
+                    feedbackSeverity = SettingsFeedbackSeverity.Error,
+                )
+                return WorkspaceJoinCompletion(joined = true, refreshProductData = true)
+            }
+            state = buildState(
+                settings = replacementSettings,
+                exportSummary = state.exportSummary,
+                feedbackMessage = workspaceRecoveryMessage(WorkspaceRecoveryReason.Recovered),
+                feedbackSeverity = SettingsFeedbackSeverity.Success,
+            )
+            refreshWorkspaceRecoveryStatusLocked(showFeedback = false)
+            if (currentWorkspaceRecovery.blocksSync) {
+                return WorkspaceJoinCompletion(joined = true, refreshProductData = true)
+            }
+            currentSyncOperation = SyncUiOperation.Syncing
+            publishCurrentState()
+            val syncResult = executeSyncRunner()
+            completeSync(syncResult, showFeedback = !syncResult.success)
+            WorkspaceJoinCompletion(joined = true, refreshProductData = true)
+        } finally {
+            currentSyncOperation = null
+            publishCurrentState()
+        }
     }
 
     suspend fun createWorkspacePairingInvitation(): Boolean =
@@ -966,6 +1331,7 @@ class SettingsUiController(
             }
             if (result.success) {
                 currentWorkspacePairingInvitation = null
+                discardPendingWorkspaceRecoveryCodeLocked()
                 currentSyncIssue = null
                 val replacementSettings = runCatching {
                     withContext(backgroundDispatcher) { loadSettings() }
@@ -989,6 +1355,13 @@ class SettingsUiController(
                     feedbackMessage = workspacePairingMessage(result.reason),
                     feedbackSeverity = SettingsFeedbackSeverity.Success,
                 )
+                refreshWorkspaceRecoveryStatusLocked(showFeedback = false)
+                if (currentWorkspaceRecovery.blocksSync) {
+                    return WorkspaceJoinCompletion(
+                        joined = true,
+                        refreshProductData = true,
+                    )
+                }
                 currentSyncOperation = SyncUiOperation.Syncing
                 publishCurrentState()
                 val syncResult = executeSyncRunner()
@@ -1128,6 +1501,29 @@ class SettingsUiController(
             -> if (invitationOperation) uiStrings.pairingInvitationFailed else uiStrings.pairingFailed
         }
 
+    private fun workspaceRecoveryMessage(reason: WorkspaceRecoveryReason): String =
+        when (reason) {
+            WorkspaceRecoveryReason.NotConfigured -> uiStrings.recoveryNotConfigured
+            WorkspaceRecoveryReason.Configured -> uiStrings.recoveryConfigured
+            WorkspaceRecoveryReason.RecoveryAvailable -> uiStrings.recoveryAvailable
+            WorkspaceRecoveryReason.CodePrepared -> uiStrings.recoveryCodePrepared
+            WorkspaceRecoveryReason.CodeCreated -> uiStrings.recoveryCodeCreated
+            WorkspaceRecoveryReason.Recovered -> uiStrings.recoveryCompleted
+            WorkspaceRecoveryReason.PublishRequired -> uiStrings.recoveryPublishRequired
+            WorkspaceRecoveryReason.SessionRequired -> uiStrings.pairingSessionRequired
+            WorkspaceRecoveryReason.AuthorityMismatch -> uiStrings.syncAuthorityMismatch
+            WorkspaceRecoveryReason.WorkspaceLocked -> uiStrings.pairingWorkspaceLocked
+            WorkspaceRecoveryReason.InvalidCode -> uiStrings.recoveryCodeInvalid
+            WorkspaceRecoveryReason.RecoveryNotRequired -> uiStrings.recoveryNotRequired
+            WorkspaceRecoveryReason.ReplacementConfirmationRequired ->
+                uiStrings.recoveryReplacementConfirmationRequired
+            WorkspaceRecoveryReason.ReplacementFailed -> uiStrings.recoveryReplacementFailed
+            WorkspaceRecoveryReason.ServerConflict -> uiStrings.recoveryServerConflict
+            WorkspaceRecoveryReason.ServerRequestFailed -> uiStrings.pairingServerRequestFailed
+            WorkspaceRecoveryReason.Unavailable -> uiStrings.recoveryUnavailable
+            WorkspaceRecoveryReason.Failed -> uiStrings.recoveryFailed
+        }
+
     private fun publishCurrentState() {
         state = buildState(
             settings = state.settings,
@@ -1238,6 +1634,7 @@ class SettingsUiController(
                 operation = currentSyncOperation,
                 issue = currentSyncIssue,
                 invitation = visibleInvitation,
+                recovery = currentWorkspaceRecovery,
             ),
         )
     }
@@ -1257,6 +1654,11 @@ private data class SyncCompletion(
 
 private data class WorkspaceJoinCompletion(
     val joined: Boolean = false,
+    val refreshProductData: Boolean = false,
+)
+
+private data class ConnectionSwitchCompletion(
+    val switched: Boolean = false,
     val refreshProductData: Boolean = false,
 )
 
@@ -1337,6 +1739,14 @@ class WorkspacePairingInvitationUi(
 
     override fun toString(): String =
         "WorkspacePairingInvitationUi(expiresAtEpochMillis=$expiresAtEpochMillis, token=<redacted>)"
+}
+
+class WorkspaceRecoveryCodeUi(
+    private val recoveryCode: WorkspaceRecoveryCode,
+) {
+    val value: String get() = recoveryCode.revealForUserConfirmation()
+
+    override fun toString(): String = "WorkspaceRecoveryCodeUi(<redacted>)"
 }
 
 data class DefaultNotebookOption(

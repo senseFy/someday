@@ -175,6 +175,20 @@ interface SelfHostedSyncTransport {
     )
 }
 
+/** Account-authenticated storage for a client-generated, opaque wrapped-key envelope. */
+interface SelfHostedWorkspaceRecoveryTransport {
+    fun getWorkspaceRecoveryEnvelope(
+        endpoint: String,
+        accessToken: String,
+    ): SelfHostedWorkspaceRecoveryEnvelopeResponse?
+
+    fun putWorkspaceRecoveryEnvelope(
+        endpoint: String,
+        accessToken: String,
+        request: SelfHostedWorkspaceRecoveryEnvelopePutRequest,
+    ): SelfHostedWorkspaceRecoveryEnvelopeResponse
+}
+
 class SelfHostedSyncHttpException(
     val status: Int,
     val safeMessage: String,
@@ -305,3 +319,32 @@ data class SelfHostedPairingInviteClaimResponse(
 data class SelfHostedPairingInviteCompleteRequest(
     val claimId: String,
 )
+
+@Serializable
+data class SelfHostedWorkspaceRecoveryEnvelopePutRequest(
+    val workspaceId: String,
+    val keyFingerprint: String,
+    val envelopeJson: String,
+    val envelopeDigest: String,
+    val expectedRevision: Long? = null,
+) {
+    override fun toString(): String =
+        "SelfHostedWorkspaceRecoveryEnvelopePutRequest(workspaceId=$workspaceId, " +
+            "keyFingerprint=$keyFingerprint, envelopeDigest=$envelopeDigest, " +
+            "expectedRevision=$expectedRevision, envelopeJson=<redacted>)"
+}
+
+@Serializable
+data class SelfHostedWorkspaceRecoveryEnvelopeResponse(
+    val workspaceId: String,
+    val keyFingerprint: String,
+    val envelopeJson: String,
+    val envelopeDigest: String,
+    val revision: Long,
+    val updatedAtEpochMillis: Long,
+) {
+    override fun toString(): String =
+        "SelfHostedWorkspaceRecoveryEnvelopeResponse(workspaceId=$workspaceId, " +
+            "keyFingerprint=$keyFingerprint, envelopeDigest=$envelopeDigest, revision=$revision, " +
+            "updatedAtEpochMillis=$updatedAtEpochMillis, envelopeJson=<redacted>)"
+}

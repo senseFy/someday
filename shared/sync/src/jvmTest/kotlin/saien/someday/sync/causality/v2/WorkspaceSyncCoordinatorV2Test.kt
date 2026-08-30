@@ -2,7 +2,14 @@
 
 package saien.someday.sync.causality.v2
 
+import app.cash.sqldelight.Transacter
+import app.cash.sqldelight.db.QueryResult
+import app.cash.sqldelight.db.SqlDriver
+import app.cash.sqldelight.db.SqlPreparedStatement
 import saien.someday.data.crypto.SodiumWorkspaceCrypto
+import saien.someday.data.local.SqlDelightLocalDataRepository
+import saien.someday.data.local.createSomedayJdbcDriver
+import saien.someday.data.local.db.SomedayDatabase
 import saien.someday.sync.WorkspaceLifecycleCoordinator
 import saien.someday.sync.causality.v2.testkit.FileBackedSyncDevice
 import kotlin.test.Test
@@ -129,6 +136,200 @@ class WorkspaceSyncCoordinatorV2Test {
             assertTrue(remote.allChanges().isEmpty())
         } finally {
             fixture.close()
+        }
+    }
+
+    @Test
+    fun orphanedOutboxTupleFailsClosedBeforeRemotePush() {
+        val key = SodiumWorkspaceCrypto().workspaceKeyFromBytes(ByteArray(32) { (it + 18).toByte() })
+        val remote = InMemoryWorkspaceSyncRemoteV2()
+        val fixture = fixture(WRITER_A)
+        try {
+            val prepared = WorkspaceCheckpointBuilderV2(key, WRITER_A).build(
+                remoteProfile = remote.remoteProfile,
+                sourceHeads = listOf(WorkspaceCheckpointSourceHeadV2(
+                    WorkspaceEntityTypeV2.WORKSPACE_PREFERENCES,
+                    WORKSPACE_PREFERENCES_ENTITY_ID_V2,
+                    WorkspacePreferencesV2(),
+                    null,
+                    "orphaned-outbox-test",
+                    null,
+                    WRITER_A,
+                    null,
+                    "orphaned-outbox-source",
+                    "orphaned-outbox-digest",
+                    T0,
+                )),
+                createdAt = T0,
+            )
+            assertIs<WorkspaceCheckpointPersistResultV2.Ready>(
+                WorkspaceCheckpointPersistenceV2(fixture.local, key, WRITER_A).persist(prepared),
+            )
+            assertIs<WorkspaceCheckpointPublishResultV2.Published>(
+                WorkspaceCheckpointPublisherV2(fixture.local, remote, {}).publish(prepared),
+            )
+            fixture.local.database.somedayQueries.insertPendingMutationSystemV2(
+                remote.remoteProfile,
+                prepared.descriptor.syncEpochId,
+                "61000000-0000-4000-8000-000000000001",
+                "62000000-0000-4000-8000-000000000001",
+                "orphaned-object-digest",
+                WRITER_A,
+                "{}",
+                T1.toEpochMilliseconds(),
+            )
+
+            val blocked = WorkspaceSyncCoordinatorV2(
+                fixture.local,
+                key,
+                WRITER_A,
+                remote,
+                beforeEntityPublication = { error("An orphaned outbox tuple must not reach publication.") },
+            ).syncOnce()
+
+            assertEquals(SyncCoordinatorStatusV2.BLOCKED, blocked.status)
+            assertEquals("local_transaction_failed", blocked.safeErrorCode)
+            assertEquals(
+                1,
+                fixture.local.database.somedayQueries.selectPendingMutationsSystemV2(
+                    remote.remoteProfile,
+                    prepared.descriptor.syncEpochId,
+                ).executeAsList().size,
+            )
+            assertTrue(remote.allChanges().isEmpty())
+        } finally {
+            fixture.close()
+        }
+    }
+
+    @Test
+    fun twoHundredOneSingleObjectPullUnitsCrossTheBatchBoundaryWithoutLosingProgress() =
+        assertSingleObjectPullBatches(
+            objectCount = 201,
+            expectedBatchSizes = listOf(200, 1),
+        )
+
+    @Test
+    fun nineHundredThirtyFourSingleObjectPullUnitsUseBoundedTransactions() =
+        assertSingleObjectPullBatches(
+            objectCount = 934,
+            expectedBatchSizes = listOf(200, 200, 100, 200, 200, 34),
+        )
+
+    private fun assertSingleObjectPullBatches(
+        objectCount: Int,
+        expectedBatchSizes: List<Int>,
+    ) {
+        val key = SodiumWorkspaceCrypto().workspaceKeyFromBytes(ByteArray(32) { (it + objectCount).toByte() })
+        val remote = InMemoryWorkspaceSyncRemoteV2()
+        val publisher = fixture(WRITER_A)
+        val transactionRecorder = RemoteCursorTransactionRecorder()
+        val joiningDriver = transactionRecorder.wrap(createSomedayJdbcDriver("jdbc:sqlite::memory:"))
+        val joining = SqlDelightLocalDataRepository(
+            SomedayDatabase(joiningDriver),
+            "sync-test-$WRITER_B",
+            clock = { T0 },
+        )
+        try {
+            val prepared = WorkspaceCheckpointBuilderV2(key, WRITER_A).build(
+                remoteProfile = remote.remoteProfile,
+                sourceHeads = listOf(
+                    WorkspaceCheckpointSourceHeadV2(
+                        WorkspaceEntityTypeV2.NOTEBOOK,
+                        NOTEBOOK_ID,
+                        NotebookContentV2("Imported", 0, T0),
+                        null,
+                        "batch-boundary-test",
+                        null,
+                        WRITER_A,
+                        null,
+                        "batch-notebook",
+                        "batch-notebook-digest",
+                        T0,
+                    ),
+                    WorkspaceCheckpointSourceHeadV2(
+                        WorkspaceEntityTypeV2.WORKSPACE_PREFERENCES,
+                        WORKSPACE_PREFERENCES_ENTITY_ID_V2,
+                        WorkspacePreferencesV2(defaultNotebookId = NOTEBOOK_ID),
+                        null,
+                        "batch-boundary-test",
+                        null,
+                        WRITER_A,
+                        null,
+                        "batch-preferences",
+                        "batch-preferences-digest",
+                        T0,
+                    ),
+                ).sortedWith(CHECKPOINT_SOURCE_COMPARATOR_SYSTEM_V2),
+                createdAt = T0,
+            )
+            assertIs<WorkspaceCheckpointPersistResultV2.Ready>(
+                WorkspaceCheckpointPersistenceV2(publisher.local, key, WRITER_A).persist(prepared),
+            )
+            assertIs<WorkspaceCheckpointPublishResultV2.Published>(
+                WorkspaceCheckpointPublisherV2(publisher.local, remote, {}).publish(prepared),
+            )
+            assertEquals(
+                SyncCoordinatorStatusV2.SUCCESS,
+                WorkspaceSyncCoordinatorV2(joining, key, WRITER_B, remote, {}).syncOnce().status,
+            )
+            val context = publisher.requireActiveContext(key, remote.remoteProfile)
+            val mutations = (1..objectCount).map { index ->
+                val version = context.factory.createGenesis(
+                    WorkspaceEntityTypeV2.NOTE,
+                    "33000000-0000-4000-8000-${index.toString().padStart(12, '0')}",
+                    NoteContentV2(NOTEBOOK_ID, "Imported $index", "body $index", T0, null, null),
+                    context.deviceActorId,
+                    T1,
+                )
+                LocalWorkspaceMutationV2(
+                    remote.remoteProfile,
+                    context.factory.newMutationId(),
+                    version,
+                    T1,
+                )
+            }
+            assertIs<WorkspaceLocalCommitResultV2.Committed>(context.store.commitLocalMutations(mutations))
+            assertEquals(
+                SyncCoordinatorStatusV2.SUCCESS,
+                WorkspaceSyncCoordinatorV2(publisher.local, key, WRITER_A, remote, {}).syncOnce().status,
+            )
+            assertEquals(objectCount, remote.allChanges().size)
+
+            transactionRecorder.reset()
+            val pulled = WorkspaceSyncCoordinatorV2(joining, key, WRITER_B, remote, {}).syncOnce()
+
+            assertEquals(SyncCoordinatorStatusV2.SUCCESS, pulled.status)
+            assertEquals(objectCount, pulled.pulledUnits)
+            assertEquals(objectCount, pulled.pulledObjects)
+            assertEquals(
+                expectedBatchSizes,
+                transactionRecorder.remoteCursorWritesByRootTransaction.filter { it > 0 },
+            )
+            val joined = WorkspaceSystemV2ContextProvider(
+                joining,
+                { key },
+                { WRITER_B },
+                { remote.remoteProfile },
+            ).requireActive()
+            val finalChange = remote.allChanges().last()
+            val finalCursor = joined.store.loadCursor(remote.remoteProfile, "global")
+            assertEquals(objectCount.toString(), finalCursor?.cursorValue)
+            assertEquals("change-$objectCount", finalCursor?.unitId)
+            assertEquals(finalChange.ciphertextDigest, finalCursor?.unitDigest)
+            assertEquals(
+                objectCount,
+                joining.database.somedayQueries
+                    .selectAllNoteProjectionsSystemV2(joined.descriptor.syncEpochId)
+                    .executeAsList()
+                    .size,
+            )
+            val converged = WorkspaceSyncCoordinatorV2(joining, key, WRITER_B, remote, {}).syncOnce()
+            assertEquals(SyncCoordinatorStatusV2.SUCCESS, converged.status)
+            assertEquals(0, converged.pulledUnits)
+        } finally {
+            publisher.close()
+            joiningDriver.close()
         }
     }
 
@@ -979,6 +1180,40 @@ class WorkspaceSyncCoordinatorV2Test {
         const val MISSING_NOTEBOOK_ID = "20000000-0000-4000-8000-000000000099"
         val T0 = Instant.parse("2026-07-19T00:00:00Z")
         val T1 = Instant.parse("2026-07-19T01:00:00Z")
+    }
+}
+
+private class RemoteCursorTransactionRecorder {
+    val remoteCursorWritesByRootTransaction = mutableListOf<Int>()
+
+    fun reset() {
+        remoteCursorWritesByRootTransaction.clear()
+    }
+
+    fun wrap(delegate: SqlDriver): SqlDriver = object : SqlDriver by delegate {
+        override fun newTransaction(): QueryResult<Transacter.Transaction> {
+            if (delegate.currentTransaction() == null) {
+                remoteCursorWritesByRootTransaction += 0
+            }
+            return delegate.newTransaction()
+        }
+
+        override fun execute(
+            identifier: Int?,
+            sql: String,
+            parameters: Int,
+            binders: (SqlPreparedStatement.() -> Unit)?,
+        ): QueryResult<Long> {
+            if (sql.contains("sync_remote_cursors_system_v2") &&
+                sql.trimStart().startsWith("INSERT", ignoreCase = true)
+            ) {
+                check(remoteCursorWritesByRootTransaction.isNotEmpty()) {
+                    "Remote cursor advancement occurred outside a root transaction."
+                }
+                remoteCursorWritesByRootTransaction[remoteCursorWritesByRootTransaction.lastIndex] += 1
+            }
+            return delegate.execute(identifier, sql, parameters, binders)
+        }
     }
 }
 

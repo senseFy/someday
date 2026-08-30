@@ -3,6 +3,9 @@
 
 package saien.someday.data.crypto
 
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
 import saien.someday.data.local.SqlDelightLocalDataRepository
 import saien.someday.data.local.createSomedayJdbcDriver
 import saien.someday.data.local.db.SomedayDatabase
@@ -21,6 +24,30 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class WorkspaceKeyRepositoryTest {
+    @Test
+    fun protocolV1RecoveryKdfProfileIsFrozenInProductionAndPortableMetadata() {
+        val policy = RecoveryKdfPolicy.protocolV1()
+
+        assertEquals(2UL, policy.opsLimit)
+        assertEquals(67_108_864, policy.memLimit)
+        assertEquals(2, policy.algorithm)
+        assertEquals(policy, SodiumWorkspaceCrypto().recoveryKdfPolicy)
+
+        withFixture(recoveryKdfPolicy = policy) { fixture ->
+            fixture.workspaceKeys.createFirstRunWorkspace("Protocol v1", "desktop")
+            val recoveryPackage = assertIs<WorkspaceJoinPackageResult.Created>(
+                fixture.workspaceKeys.createWorkspaceRecoveryPackage(),
+            )
+            val portable = Json.decodeFromString<PersistedPortableWorkspaceRecoveryEnvelope>(
+                recoveryPackage.metadataJson,
+            )
+
+            assertEquals("2", portable.recovery.opsLimit)
+            assertEquals(67_108_864, portable.recovery.memLimit)
+            assertEquals(2, portable.recovery.algorithm)
+        }
+    }
+
     @Test
     fun firstRunGeneratesWrappedWorkspaceAndRedactsSecrets() =
         withFixture { fixture ->
@@ -52,6 +79,76 @@ class WorkspaceKeyRepositoryTest {
             assertTrue(fixture.workspaceKeys.verifyRecoveryMaterial(setup.recoveryMaterial.revealForUserConfirmation()))
             assertFalse(fixture.workspaceKeys.verifyRecoveryMaterial("SOMEDAY-0000-0000-0000-0000"))
             assertEquals(metadataJson, fixture.workspaceKeys.exportRecoveryMetadataJson())
+        }
+
+    @Test
+    fun freshReplacementCommitsCallerCleanupAndRotatesWorkspaceIdentityAndKey() =
+        withFixture { fixture ->
+            val original = fixture.workspaceKeys.createFirstRunWorkspace("Mac", "desktop")
+            val originalKey = checkNotNull(fixture.workspaceKeys.unlockedKeyOrNull())
+            fixture.localRepository.putLocalOnlySetting("replacement-sentinel", "old")
+
+            val replacement = fixture.workspaceKeys.replaceWithFreshWorkspace(
+                deviceName = "Mac",
+                platform = "desktop",
+                beforeMetadataReplacement = {
+                    fixture.localRepository.putLocalOnlySetting("replacement-sentinel", "cleaned")
+                },
+                afterMetadataReplacement = { _, workspaceId ->
+                    assertEquals(workspaceId, fixture.workspaceKeys.workspaceIdOrNull())
+                    fixture.localRepository.putLocalOnlySetting("replacement-hook", workspaceId)
+                },
+            )
+            val replacementKey = checkNotNull(fixture.workspaceKeys.unlockedKeyOrNull())
+
+            assertNotEquals(original.state.workspaceId, replacement.state.workspaceId)
+            assertNotEquals(originalKey.fingerprint, replacementKey.fingerprint)
+            assertEquals("cleaned", fixture.localRepository.getSetting("replacement-sentinel")?.value)
+            assertEquals(
+                replacement.state.workspaceId,
+                fixture.localRepository.getSetting("replacement-hook")?.value,
+            )
+            assertFalse(fixture.secureKeyStore.contains(original.secureStorageAlias))
+            assertTrue(fixture.secureKeyStore.contains(replacement.secureStorageAlias))
+            assertTrue(
+                fixture.workspaceKeys.verifyRecoveryMaterial(
+                    replacement.recoveryMaterial.revealForUserConfirmation(),
+                ),
+            )
+        }
+
+    @Test
+    fun failedFreshReplacementRollsBackMetadataAndCallerCleanup() =
+        withFixture { fixture ->
+            val original = fixture.workspaceKeys.createFirstRunWorkspace("Mac", "desktop")
+            val originalMetadata = checkNotNull(fixture.workspaceKeys.exportRecoveryMetadataJson())
+            val originalKey = checkNotNull(fixture.workspaceKeys.unlockedKeyOrNull())
+            fixture.localRepository.putLocalOnlySetting("replacement-sentinel", "old")
+
+            assertFailsWith<IllegalStateException> {
+                fixture.workspaceKeys.replaceWithFreshWorkspace(
+                    deviceName = "Mac",
+                    platform = "desktop",
+                    beforeMetadataReplacement = {
+                        fixture.localRepository.putLocalOnlySetting("replacement-sentinel", "mutated")
+                    },
+                    afterMetadataReplacement = { _, _ -> error("simulated binding failure") },
+                )
+            }
+
+            assertEquals(original.state.workspaceId, fixture.workspaceKeys.workspaceIdOrNull())
+            assertEquals(originalMetadata, fixture.workspaceKeys.exportRecoveryMetadataJson())
+            assertEquals("old", fixture.localRepository.getSetting("replacement-sentinel")?.value)
+            assertContentEquals(
+                originalKey.rawBytesCopy(),
+                checkNotNull(fixture.workspaceKeys.unlockedKeyOrNull()).rawBytesCopy(),
+            )
+            assertTrue(fixture.secureKeyStore.contains(original.secureStorageAlias))
+            assertNull(
+                fixture.localRepository.getSetting(
+                    WorkspaceKeyRepository.PENDING_SECURE_STORAGE_ALIAS_DELETIONS_SETTING_KEY,
+                ),
+            )
         }
 
     @Test
@@ -117,6 +214,180 @@ class WorkspaceKeyRepositoryTest {
                 )
                 assertEquals("device-b", secondDevice.localRepository.getDevice("device-b")?.id)
                 assertIs<WorkspaceUnlockState.Unlocked>(secondDevice.workspaceKeys.startupState())
+            }
+        }
+
+    @Test
+    fun portableRecoveryPackageOmitsDeviceAliasAndRestoresTheSameWorkspaceKey() =
+        withFixture { firstDevice ->
+            val setup = firstDevice.workspaceKeys.createFirstRunWorkspace("Mac", "desktop")
+            val originalKey = checkNotNull(firstDevice.workspaceKeys.unlockedKeyOrNull())
+            val recovery = assertIs<WorkspaceJoinPackageResult.Created>(
+                firstDevice.workspaceKeys.createWorkspaceRecoveryPackage(),
+            )
+            val recoveryCode = recovery.recoveryMaterial.revealForUserConfirmation()
+
+            assertTrue(recovery.metadataJson.contains("someday.workspace-recovery-metadata"))
+            assertFalse(recovery.metadataJson.contains("secureStorageAlias"))
+            assertFalse(recovery.metadataJson.contains(setup.secureStorageAlias))
+            assertFalse(recovery.metadataJson.contains(recoveryCode))
+            assertFalse(recovery.metadataJson.contains(originalKey.rawKeyHexForTest()))
+
+            withFixture(deviceId = "device-b") { secondDevice ->
+                val temporary = secondDevice.workspaceKeys.createFirstRunWorkspace("Phone", "android")
+                val beforeKey = checkNotNull(secondDevice.workspaceKeys.unlockedKeyOrNull())
+                val normalizedInput = recoveryCode.lowercase().replace('-', ' ')
+                val restored = secondDevice.workspaceKeys.restoreWorkspaceFromRecovery(
+                    metadataJson = recovery.metadataJson,
+                    recoveryMaterial = normalizedInput,
+                    deviceName = "Phone",
+                    platform = "android",
+                    replaceExistingWorkspace = true,
+                    expectedWorkspaceId = recovery.workspaceId,
+                    expectedKeyFingerprint = recovery.keyFingerprint,
+                    beforeMetadataReplacement = {},
+                    afterMetadataReplacement = { _, _ -> },
+                )
+                val restoredKey = checkNotNull(secondDevice.workspaceKeys.unlockedKeyOrNull())
+
+                assertIs<WorkspaceRestoreResult.Restored>(restored)
+                assertNotEquals(temporary.state.workspaceId, restored.state.workspaceId)
+                assertNotEquals(beforeKey.fingerprint, restoredKey.fingerprint)
+                assertEquals(originalKey.fingerprint, restoredKey.fingerprint)
+            }
+        }
+
+    @Test
+    fun wrongCodeForPortableRecoveryPackagePreservesTheExistingWorkspace() =
+        withFixture { firstDevice ->
+            firstDevice.workspaceKeys.createFirstRunWorkspace("Mac", "desktop")
+            val recovery = assertIs<WorkspaceJoinPackageResult.Created>(
+                firstDevice.workspaceKeys.createWorkspaceRecoveryPackage(),
+            )
+
+            withFixture(deviceId = "device-b") { secondDevice ->
+                val local = secondDevice.workspaceKeys.createFirstRunWorkspace("Phone", "android")
+                val metadataBefore = checkNotNull(secondDevice.workspaceKeys.exportRecoveryMetadataJson())
+                val keyBefore = checkNotNull(secondDevice.workspaceKeys.unlockedKeyOrNull())
+                var cleanupCalled = false
+                val failed = secondDevice.workspaceKeys.restoreWorkspaceFromRecovery(
+                    metadataJson = recovery.metadataJson,
+                    recoveryMaterial = "SOMEDAY-0000-0000-0000-0000-0000-0000-0000-0000",
+                    deviceName = "Phone",
+                    platform = "android",
+                    replaceExistingWorkspace = true,
+                    expectedWorkspaceId = recovery.workspaceId,
+                    expectedKeyFingerprint = recovery.keyFingerprint,
+                    beforeMetadataReplacement = { cleanupCalled = true },
+                    afterMetadataReplacement = { _, _ -> },
+                )
+
+                assertIs<WorkspaceRestoreResult.Failed>(failed)
+                assertEquals(WorkspaceUnlockFailure.AUTHENTICATION_FAILED, failed.reason)
+                assertFalse(cleanupCalled)
+                assertEquals(local.state.workspaceId, secondDevice.workspaceKeys.workspaceIdOrNull())
+                assertEquals(metadataBefore, secondDevice.workspaceKeys.exportRecoveryMetadataJson())
+                assertContentEquals(
+                    keyBefore.rawBytesCopy(),
+                    checkNotNull(secondDevice.workspaceKeys.unlockedKeyOrNull()).rawBytesCopy(),
+                )
+            }
+        }
+
+    @Test
+    fun portableRecoveryRejectsADeclaredKeyFingerprintThatDoesNotMatchTheWrappedKey() =
+        withFixture { firstDevice ->
+            firstDevice.workspaceKeys.createFirstRunWorkspace("Mac", "desktop")
+            val recovery = assertIs<WorkspaceJoinPackageResult.Created>(
+                firstDevice.workspaceKeys.createWorkspaceRecoveryPackage(),
+            )
+            val mismatchedFingerprint =
+                (if (recovery.keyFingerprint.first() == 'f') "e" else "f").repeat(32)
+            val tamperedMetadata = recovery.metadataJson.replace(
+                recovery.keyFingerprint,
+                mismatchedFingerprint,
+            )
+
+            withFixture(deviceId = "device-b") { secondDevice ->
+                secondDevice.workspaceKeys.createFirstRunWorkspace("Phone", "android")
+                var cleanupCalled = false
+
+                val failed = secondDevice.workspaceKeys.restoreWorkspaceFromRecovery(
+                    metadataJson = tamperedMetadata,
+                    recoveryMaterial = recovery.recoveryMaterial.revealForUserConfirmation(),
+                    deviceName = "Phone",
+                    platform = "android",
+                    replaceExistingWorkspace = true,
+                    expectedWorkspaceId = recovery.workspaceId,
+                    expectedKeyFingerprint = recovery.keyFingerprint,
+                    beforeMetadataReplacement = { cleanupCalled = true },
+                    afterMetadataReplacement = { _, _ -> },
+                )
+
+                assertIs<WorkspaceRestoreResult.Failed>(failed)
+                assertEquals(WorkspaceUnlockFailure.INVALID_METADATA, failed.reason)
+                assertFalse(cleanupCalled)
+            }
+        }
+
+    @Test
+    fun portableRecoveryRejectsUnsupportedKdfAndCipherParametersBeforeReplacement() =
+        withFixture { firstDevice ->
+            firstDevice.workspaceKeys.createFirstRunWorkspace("Mac", "desktop")
+            val recovery = assertIs<WorkspaceJoinPackageResult.Created>(
+                firstDevice.workspaceKeys.createWorkspaceRecoveryPackage(),
+            )
+            val json = Json { encodeDefaults = true }
+            val metadata = json.decodeFromString<PersistedPortableWorkspaceRecoveryEnvelope>(
+                recovery.metadataJson,
+            )
+            val unsupported = listOf(
+                metadata.copy(keyAlgorithm = "unsupported"),
+                metadata.copy(recoveryKdf = "unsupported"),
+                metadata.copy(keyLengthBytes = WorkspaceMasterKey.WORKSPACE_KEY_BYTES + 1),
+                metadata.copy(
+                    recovery = metadata.recovery.copy(
+                        opsLimit = (metadata.recovery.opsLimit.toULong() + 1UL).toString(),
+                    ),
+                ),
+                metadata.copy(
+                    recovery = metadata.recovery.copy(memLimit = metadata.recovery.memLimit + 1),
+                ),
+                metadata.copy(
+                    recovery = metadata.recovery.copy(algorithm = metadata.recovery.algorithm + 1),
+                ),
+                metadata.copy(
+                    recovery = metadata.recovery.copy(salt = byteArrayOf(1).base64()),
+                ),
+                metadata.copy(
+                    recovery = metadata.recovery.copy(nonce = byteArrayOf(1).base64()),
+                ),
+                metadata.copy(
+                    recovery = metadata.recovery.copy(ciphertext = byteArrayOf(1).base64()),
+                ),
+            )
+
+            withFixture(deviceId = "device-b") { secondDevice ->
+                val local = secondDevice.workspaceKeys.createFirstRunWorkspace("Phone", "android")
+                unsupported.forEach { candidate ->
+                    var cleanupCalled = false
+                    val failed = secondDevice.workspaceKeys.restoreWorkspaceFromRecovery(
+                        metadataJson = json.encodeToString(candidate),
+                        recoveryMaterial = recovery.recoveryMaterial.revealForUserConfirmation(),
+                        deviceName = "Phone",
+                        platform = "android",
+                        replaceExistingWorkspace = true,
+                        expectedWorkspaceId = recovery.workspaceId,
+                        expectedKeyFingerprint = recovery.keyFingerprint,
+                        beforeMetadataReplacement = { cleanupCalled = true },
+                        afterMetadataReplacement = { _, _ -> },
+                    )
+
+                    assertIs<WorkspaceRestoreResult.Failed>(failed)
+                    assertEquals(WorkspaceUnlockFailure.INVALID_METADATA, failed.reason)
+                    assertFalse(cleanupCalled)
+                    assertEquals(local.state.workspaceId, secondDevice.workspaceKeys.workspaceIdOrNull())
+                }
             }
         }
 
@@ -537,6 +808,7 @@ class WorkspaceKeyRepositoryTest {
 
     private fun withFixture(
         deviceId: String = "device-a",
+        recoveryKdfPolicy: RecoveryKdfPolicy = RecoveryKdfPolicy.forTests(),
         block: (WorkspaceFixture) -> Unit,
     ) {
         val dbPath = Files.createTempFile("someday-workspace-key-", ".db")
@@ -549,7 +821,7 @@ class WorkspaceKeyRepositoryTest {
             clock = { Instant.fromEpochMilliseconds(1_000) },
         )
         val secureKeyStore = TestSecureWorkspaceKeyStore()
-        val crypto = SodiumWorkspaceCrypto(recoveryKdfPolicy = RecoveryKdfPolicy.forTests())
+        val crypto = SodiumWorkspaceCrypto(recoveryKdfPolicy = recoveryKdfPolicy)
         val workspaceKeys = WorkspaceKeyRepository(
             localRepository = localRepository,
             secureKeyStore = secureKeyStore,

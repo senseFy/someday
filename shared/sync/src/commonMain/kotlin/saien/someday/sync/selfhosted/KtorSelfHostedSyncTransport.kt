@@ -1,7 +1,6 @@
 package saien.someday.sync.selfhosted
 
 import io.ktor.client.HttpClient
-import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.request.get
 import io.ktor.client.request.header
 import io.ktor.client.request.head
@@ -24,11 +23,7 @@ import saien.someday.sync.StrictJsonV2
 
 class KtorSelfHostedSyncTransport(
     private val client: HttpClient = HttpClient {
-        followRedirects = false
-        install(HttpTimeout) {
-            connectTimeoutMillis = 10_000
-            requestTimeoutMillis = 20_000
-        }
+        configureSelfHostedHttpClient()
     },
     private val json: Json = Json {
         encodeDefaults = true
@@ -36,7 +31,10 @@ class KtorSelfHostedSyncTransport(
         explicitNulls = true
         isLenient = false
     },
-) : SelfHostedSyncTransport, SelfHostedSyncTransportV2, SelfHostedMediaTransportV3 {
+) : SelfHostedSyncTransport,
+    SelfHostedWorkspaceRecoveryTransport,
+    SelfHostedSyncTransportV2,
+    SelfHostedMediaTransportV3 {
     fun close() {
         client.close()
     }
@@ -140,6 +138,34 @@ class KtorSelfHostedSyncTransport(
         bearerToken = accessToken,
         encodedBody = "{}",
     )
+
+    override fun getWorkspaceRecoveryEnvelope(
+        endpoint: String,
+        accessToken: String,
+    ): SelfHostedWorkspaceRecoveryEnvelopeResponse? =
+        try {
+            get(
+                endpoint = endpoint,
+                path = "/workspace/recovery-envelope",
+                bearerToken = accessToken,
+                responseSerializer = SelfHostedWorkspaceRecoveryEnvelopeResponse.serializer(),
+            )
+        } catch (failure: SelfHostedSyncHttpException) {
+            if (failure.status == 404) null else throw failure
+        }
+
+    override fun putWorkspaceRecoveryEnvelope(
+        endpoint: String,
+        accessToken: String,
+        request: SelfHostedWorkspaceRecoveryEnvelopePutRequest,
+    ): SelfHostedWorkspaceRecoveryEnvelopeResponse =
+        put(
+            endpoint = endpoint,
+            path = "/workspace/recovery-envelope",
+            bearerToken = accessToken,
+            encodedBody = json.encodeToString(request),
+            responseSerializer = SelfHostedWorkspaceRecoveryEnvelopeResponse.serializer(),
+        )
 
     override fun v2Capabilities(
         endpoint: String,

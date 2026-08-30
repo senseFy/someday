@@ -107,8 +107,12 @@ https://notes.example.com/admin
 ```
 
 Configure the first Someday client with `https://notes.example.com`, the same
-email, and the same password. Enter the origin without an API path. Pair each
-additional device from an existing workspace so it receives the workspace key.
+email, and the same password. Enter the origin without an API path. The password
+authenticates the account but does not decrypt its workspace. After the first
+successful sync, set up a recovery code, save it outside Someday, and enter it
+again to publish the opaque recovery envelope. Pair another device from the
+existing workspace when possible, or recover a fresh client with the saved
+code.
 
 ## 6. Protect the data
 
