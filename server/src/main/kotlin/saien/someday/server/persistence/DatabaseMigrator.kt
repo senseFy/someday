@@ -114,6 +114,7 @@ object DatabaseMigrator {
         "someday_sync_v2_changes" to "entity_account_workspace_scope",
         "someday_sync_v2_mutations" to "entity_account_workspace_scope",
         "someday_media_v3_objects" to "media_account_workspace_scope",
+        "workspace_recovery_envelopes" to "recovery_account_workspace_scope",
     )
     private val EXPECTED_POLICY_SHAPES = EXPECTED_RLS_POLICIES.mapTo(mutableSetOf()) { (table, policy) ->
         RlsPolicyShape(

@@ -12,6 +12,7 @@ import saien.someday.server.persistence.DatabaseConnectionPool
 import saien.someday.server.persistence.DatabaseMigrator
 import saien.someday.server.persistence.SyncV2Repository
 import saien.someday.server.persistence.SystemV3MediaRepository
+import saien.someday.server.persistence.WorkspaceRecoveryEnvelopeRepository
 import java.time.Instant
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -20,6 +21,7 @@ class ServerContext(
     val repository: AuthRepository,
     val syncV2Repository: SyncV2Repository,
     val systemV3MediaRepository: SystemV3MediaRepository,
+    val workspaceRecoveryEnvelopeRepository: WorkspaceRecoveryEnvelopeRepository,
     val adminRepository: AdminRepository,
     val credentialHasher: PasswordHasher,
     val dummyPasswordHash: String,
@@ -61,6 +63,10 @@ class ServerContext(
                     systemV3MediaRepository = SystemV3MediaRepository(
                         config,
                         resolvedMediaBlobStore,
+                        activeDatabaseConnectionPool,
+                    ),
+                    workspaceRecoveryEnvelopeRepository = WorkspaceRecoveryEnvelopeRepository(
+                        config,
                         activeDatabaseConnectionPool,
                     ),
                     adminRepository = AdminRepository(config, startedAt, activeDatabaseConnectionPool),

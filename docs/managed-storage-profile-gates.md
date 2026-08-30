@@ -44,7 +44,9 @@ scripts/managed-storage-profile-gate planetscale
 Passwords stay out of PostgreSQL command arguments. Restore uses the restore
 branch's application role with `--no-owner --no-acl`, then checks every public
 relation owner. The gate also checks migrations, RLS, synchronization, Flyway
-history, media integrity, and the paired read-only recovery journey.
+history, media integrity, and the paired-client read-only recovery journey. It
+does not yet exercise a user recovery code or use the account-current envelope
+to restore a fresh client.
 
 ## Cloudflare R2
 

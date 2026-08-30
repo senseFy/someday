@@ -24,8 +24,8 @@ class DatabaseMigrationPolicyTest {
     fun migrationDirectoryContainsOnlyForwardVersionedSql() {
         validateMigrationNames(migrationSqlFiles().map(Path::getFileName).map(Path::toString))
 
-        validateMigrationNames(listOf("V9__next.sql", "V8.1__next.sql"))
-        assertFailsWith<IllegalArgumentException> { validateMigrationNames(listOf("V8__late.sql")) }
+        validateMigrationNames(listOf("V10__next.sql", "V9.1__next.sql"))
+        assertFailsWith<IllegalArgumentException> { validateMigrationNames(listOf("V9__late.sql")) }
         assertFailsWith<IllegalArgumentException> { validateMigrationNames(listOf("R__repeatable.sql")) }
         assertFailsWith<IllegalArgumentException> { validateMigrationNames(listOf("U9__undo.sql")) }
         assertFailsWith<IllegalArgumentException> { validateMigrationNames(listOf("unknown.sql")) }
@@ -59,7 +59,7 @@ class DatabaseMigrationPolicyTest {
 
     private companion object {
         val VERSIONED_MIGRATION = Regex("^V([0-9][0-9_.]*)__.+\\.sql$")
-        val FROZEN_HIGHEST_VERSION: MigrationVersion = MigrationVersion.fromVersion("8")
+        val FROZEN_HIGHEST_VERSION: MigrationVersion = MigrationVersion.fromVersion("9")
         val FROZEN_MIGRATION_SHA256 = mapOf(
             "V1__server_auth_devices.sql" to "fb9cb95a840997206bb4c561c57267cd4427475cbd04e16f8646cc3d9bf15afa",
             "V4__sync_v2_epochs_immutable_objects.sql" to
@@ -68,6 +68,8 @@ class DatabaseMigrationPolicyTest {
                 "c99e2d3149ded3f0999e4b9e14c90a97c1b4290b7e42a6660426d34d5a44c7c6",
             "V8__system_v3_media_metadata.sql" to
                 "0d4eee373fad371e5e67701c6f2d400722f825300d3e94765c1a02ec0c2ff626",
+            "V9__workspace_recovery_envelopes.sql" to
+                "b5b8c84349adbed18f78d234ffded432369b0f816dab85a13905b170adda2a65",
         )
     }
 }

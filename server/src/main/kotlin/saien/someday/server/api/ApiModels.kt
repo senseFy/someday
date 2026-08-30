@@ -99,6 +99,34 @@ data class PairingInviteCompleteRequest(
 )
 
 @Serializable
+data class WorkspaceRecoveryEnvelopePutRequest(
+    val workspaceId: String,
+    val keyFingerprint: String,
+    val envelopeJson: String,
+    val envelopeDigest: String,
+    val expectedRevision: Long? = null,
+) {
+    override fun toString(): String =
+        "WorkspaceRecoveryEnvelopePutRequest(workspaceId=$workspaceId, keyFingerprint=$keyFingerprint, " +
+            "envelopeDigest=$envelopeDigest, expectedRevision=$expectedRevision, envelopeJson=<redacted>)"
+}
+
+@Serializable
+data class WorkspaceRecoveryEnvelopeResponse(
+    val workspaceId: String,
+    val keyFingerprint: String,
+    val envelopeJson: String,
+    val envelopeDigest: String,
+    val revision: Long,
+    val updatedAtEpochMillis: Long,
+) {
+    override fun toString(): String =
+        "WorkspaceRecoveryEnvelopeResponse(workspaceId=$workspaceId, keyFingerprint=$keyFingerprint, " +
+            "envelopeDigest=$envelopeDigest, revision=$revision, updatedAtEpochMillis=$updatedAtEpochMillis, " +
+            "envelopeJson=<redacted>)"
+}
+
+@Serializable
 data class SyncV2ObjectPayload(
     val outerSchemaVersion: Int = 1,
     val contractId: String = "someday-system-v2",

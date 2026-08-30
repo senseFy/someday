@@ -1,7 +1,8 @@
 # Server backup and recovery
 
 PostgreSQL and media are one recovery unit. A usable backup needs both, plus
-the stable JWT secret and storage configuration.
+the stable JWT secret and storage configuration. PostgreSQL includes each
+account's current opaque workspace-recovery envelope.
 
 Portable client export is separate: it contains no image bytes or workspace
 keys and cannot rebuild a server.
@@ -11,9 +12,11 @@ keys and cannot rebuild a server.
 - Choose an off-host destination for database and media backups.
 - Record the exact server version and keep the matching Compose files.
 - Back up the JWT secret separately from the data copy.
-- Keep at least one paired device intact; only clients hold the workspace key.
+- Ask users to save their recovery codes outside Someday. Do not collect those
+  codes in an operator backup. An intact trusted device is an independent key
+  recovery path.
 - Restore into an isolated database and media location.
-- Run `verify-media-integrity` and complete a paired-client read check before
+- Run `verify-media-integrity` and complete a client read check before
   allowing any client write.
 
 ## Standalone backup
@@ -77,35 +80,47 @@ Also compare the restored database owner, public relation owners, and
 `flyway_schema_history` with the source. Row and media counts must be non-zero
 for a meaningful exercise.
 
-## Paired-client verification
+## Client verification
 
 Keep the restore isolated and reject content writes at the temporary ingress:
 
-- allow GET and HEAD reads;
+- allow authentication, refresh, device registration, and GET/HEAD reads for
+  the synthetic recovery account;
+- allow recovery-envelope GET but reject recovery-envelope PUT;
 - allow only the entity POST reads `checkpoint/fetch`, `pull`, and
   `frontiers`; and
 - reject media PUT and every entity mutation endpoint.
 
-Using an intact paired device with no local copy of the test content, pull one
+Using an intact device with no local copy of the test content, or a fresh client
+and the saved code for a synthetic recovery account, recover and pull one
 non-empty note and materialize one image. Confirm that an attempted entity push
-and media upload are rejected. Only then remove the temporary write block and
-make the restored server authoritative.
+and media upload are rejected. Never use or collect a real user's recovery code
+for an operator exercise. Only then remove the temporary write block and make
+the restored server authoritative.
 
-The automated equivalent is:
+Confirm that the restored account returns the expected recovery-envelope
+revision. A historical PostgreSQL recovery point may contain an older envelope
+that requires the code current at that point; the newest code is not guaranteed
+to open it. Retain the matching code only for the synthetic recovery account
+used by the exercise.
+
+The current automated gate covers the intact paired-device variant:
 
 ```bash
 scripts/server-recovery-gate
 ```
 
 It uses ordinary `pg_dump`, `pg_restore`, and a media archive. It adds no
-backup format or scheduler.
+backup format or scheduler. It does not yet publish or recover an envelope with
+a user-held code, or assert the restored envelope revision. Run the synthetic
+fresh-client check above separately until that path is automated.
 
 ## External storage
 
 Use provider-native PostgreSQL recovery points and bucket retention, but keep
 portable logical dumps and an off-provider media copy when provider/account
 loss is in scope. Restore both into isolated resources and apply the same
-integrity and paired-client checks.
+integrity and client checks.
 
 When restoring plain files to S3, verify their actual SHA-256 digests and set
 `someday-ciphertext-sha256=sha256:<digest>` on every uploaded object.

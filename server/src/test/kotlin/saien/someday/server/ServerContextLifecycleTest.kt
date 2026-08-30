@@ -17,6 +17,7 @@ import saien.someday.server.persistence.AuthRepository
 import saien.someday.server.persistence.DatabaseConnectionProvider
 import saien.someday.server.persistence.SyncV2Repository
 import saien.someday.server.persistence.SystemV3MediaRepository
+import saien.someday.server.persistence.WorkspaceRecoveryEnvelopeRepository
 
 class ServerContextLifecycleTest {
     @Test
@@ -34,6 +35,10 @@ class ServerContextLifecycleTest {
             systemV3MediaRepository = SystemV3MediaRepository(
                 config,
                 mediaBlobStore,
+                unavailableConnections,
+            ),
+            workspaceRecoveryEnvelopeRepository = WorkspaceRecoveryEnvelopeRepository(
+                config,
                 unavailableConnections,
             ),
             adminRepository = AdminRepository(config, startedAt, unavailableConnections),

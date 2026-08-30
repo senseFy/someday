@@ -1,8 +1,8 @@
 # Standalone Docker quickstart
 
 This topology runs Someday Server and PostgreSQL 17 on one Docker host. Note
-metadata and encrypted entity objects live in the PostgreSQL volume; encrypted
-images live in a separate media volume.
+metadata, opaque recovery envelopes, and encrypted entity objects live in the
+PostgreSQL volume; encrypted images live in a separate media volume.
 
 Prepare a host with Docker Engine 24 or newer, Docker Compose 2.20 or newer,
 and a stable HTTPS hostname.
@@ -120,7 +120,9 @@ docker compose run --rm --no-deps server verify-media-integrity
 
 Before storing real notes, complete
 [Backup and Recovery](server-backup-and-recovery.md). The PostgreSQL and media
-volumes are one recovery unit. Docker volumes provide persistence, not backup.
+volumes are one recovery unit, and PostgreSQL contains the account recovery
+envelopes. Docker volumes provide persistence, not backup. Never collect users'
+recovery codes as part of an operator backup.
 
 ## Operations
 

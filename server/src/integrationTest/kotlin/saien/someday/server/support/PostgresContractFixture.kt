@@ -127,6 +127,22 @@ internal class PostgresContractFixture(
         }
     }
 
+    fun holdWorkspaceRecoveryAccountAdvisoryLock(userId: UUID): HeldPostgresAdvisoryLock {
+        val connection = connection()
+        connection.autoCommit = false
+        try {
+            connection.prepareStatement("SELECT pg_advisory_xact_lock(hashtext(?))").use { statement ->
+                statement.setString(1, "workspace-recovery-account\u001f$userId")
+                statement.executeQuery().close()
+            }
+            return HeldPostgresAdvisoryLock(connection)
+        } catch (failure: Throwable) {
+            runCatching { connection.rollback() }
+            runCatching { connection.close() }
+            throw failure
+        }
+    }
+
     fun awaitAdvisoryLockWait(
         applicationName: String,
         operationCompleted: () -> Boolean,
@@ -203,7 +219,22 @@ internal class PostgresContractFixture(
 }
 
 internal class HeldPostgresAdvisoryLock(private val connection: Connection) : AutoCloseable {
+    private var closed = false
+
+    fun commit(block: (Connection) -> Unit) {
+        check(!closed) { "The held PostgreSQL advisory lock is already closed." }
+        try {
+            block(connection)
+            connection.commit()
+        } finally {
+            closed = true
+            connection.close()
+        }
+    }
+
     override fun close() {
+        if (closed) return
+        closed = true
         try {
             connection.rollback()
         } finally {

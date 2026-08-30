@@ -43,6 +43,7 @@ Published server images and deployment bundles are available from
 | Backup and recovery | [Server Backup and Recovery](docs/server-backup-and-recovery.md) |
 | System V3 synchronization | [System V3 specification](docs/sync-system-v3-spec.md) |
 | Device pairing | [Workspace pairing protocol](docs/workspace-pairing-protocol.md) |
+| Workspace recovery | [Workspace recovery protocol](docs/workspace-recovery-protocol.md) |
 | Database evolution | [Database migrations](docs/database-migrations.md) |
 
 ## Development

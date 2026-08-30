@@ -398,7 +398,12 @@ class SyncV2Repository(
         expectedCurrentDigest: String?,
         metadata: SyncV2EpochMetadataRecord,
         pointerObjectJson: String,
-    ): SyncV2PointerPublishRepositoryResult = transaction(userId, workspaceId) { connection ->
+    ): SyncV2PointerPublishRepositoryResult = transaction(
+        userId,
+        workspaceId,
+        ensureWorkspace = false,
+    ) { connection ->
+        lockWorkspaceRecoveryAccount(connection, userId)
         lockWorkspace(connection, userId, workspaceId)
         val current = loadActiveEpoch(connection, userId, workspaceId, true)
         if (current?.metadata == metadata && current.pointerObjectJson == pointerObjectJson) {
@@ -411,6 +416,14 @@ class SyncV2Repository(
             metadata.previousEpochId != null || metadata.previousEpochPointerDigest != null
         ) {
             return@transaction SyncV2PointerPublishRepositoryResult.Rejected("previous_epoch_mismatch")
+        }
+        val recoveryWorkspaceId = loadAccountRecoveryWorkspace(
+            connection = connection,
+            userId = userId,
+            restoreWorkspaceId = workspaceId,
+        )
+        if (recoveryWorkspaceId != null && recoveryWorkspaceId != workspaceId) {
+            return@transaction SyncV2PointerPublishRepositoryResult.Rejected("workspace_recovery_required")
         }
         if (!checkpointIsComplete(connection, userId, workspaceId, metadata)) {
             return@transaction SyncV2PointerPublishRepositoryResult.Rejected("checkpoint_incomplete")
@@ -970,6 +983,26 @@ class SyncV2Repository(
         }
     }
 
+    private fun loadAccountRecoveryWorkspace(
+        connection: Connection,
+        userId: UUID,
+        restoreWorkspaceId: String,
+    ): String? {
+        setWorkspaceScope(connection, "*", local = true)
+        return try {
+            connection.prepareStatement(
+                "SELECT workspace_id FROM workspace_recovery_envelopes WHERE user_id = ?",
+            ).use { statement ->
+                statement.setObject(1, userId)
+                statement.executeQuery().use { result ->
+                    if (result.next()) result.getString(1) else null
+                }
+            }
+        } finally {
+            setWorkspaceScope(connection, restoreWorkspaceId, local = true)
+        }
+    }
+
     private fun chunkRefsFingerprint(refs: List<SyncV2CheckpointChunkRefRecord>): String {
         val bytes = refs.joinToString("\u001f") {
             "${it.chunkIndex}\u001e${it.chunkId}\u001e${it.chunkDigest}\u001e${it.objectCount}\u001e${it.plaintextBytes}"
@@ -980,11 +1013,17 @@ class SyncV2Repository(
     private fun <T> transaction(
         userId: UUID,
         workspaceId: String,
+        ensureWorkspace: Boolean = true,
         block: (Connection) -> T,
     ): T = connection().use { connection ->
+        // RLS scope selection executes SQL before the account advisory lock.
+        // Pin READ COMMITTED before any statement so a waiter receives a fresh
+        // snapshot after the lock holder commits, regardless of the database
+        // or role's default transaction isolation.
+        connection.transactionIsolation = Connection.TRANSACTION_READ_COMMITTED
         connection.autoCommit = false
         try {
-            selectWorkspaceScope(connection, userId, workspaceId, local = true, ensureWorkspace = true)
+            selectWorkspaceScope(connection, userId, workspaceId, local = true, ensureWorkspace = ensureWorkspace)
             block(connection).also { connection.commit() }
         } catch (failure: Throwable) {
             connection.rollback()
@@ -1024,11 +1063,7 @@ class SyncV2Repository(
             statement.setBoolean(2, local)
             statement.executeQuery().close()
         }
-        connection.prepareStatement("SELECT set_config('someday.workspace_id', ?, ?)").use { statement ->
-            statement.setString(1, workspaceId)
-            statement.setBoolean(2, local)
-            statement.executeQuery().close()
-        }
+        setWorkspaceScope(connection, workspaceId, local)
         if (ensureWorkspace) {
             connection.prepareStatement(
                 "INSERT INTO someday_entity_workspaces(user_id, workspace_id) VALUES (?, ?) ON CONFLICT DO NOTHING",
@@ -1037,6 +1072,14 @@ class SyncV2Repository(
                 statement.setString(2, workspaceId)
                 statement.executeUpdate()
             }
+        }
+    }
+
+    private fun setWorkspaceScope(connection: Connection, workspaceId: String, local: Boolean) {
+        connection.prepareStatement("SELECT set_config('someday.workspace_id', ?, ?)").use { statement ->
+            statement.setString(1, workspaceId)
+            statement.setBoolean(2, local)
+            statement.executeQuery().close()
         }
     }
 

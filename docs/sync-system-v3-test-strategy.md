@@ -43,9 +43,12 @@ Location: `server/src/test`, `server/src/integrationTest`, and
 This layer covers HTTP validation, authentication, device revocation,
 account/workspace scope, PostgreSQL transactions and RLS, immutable object
 semantics, cursor allocation, account quota, and the database/blob publication
-boundary. Integration tests use real PostgreSQL; filesystem tests use a real
-temporary directory, and S3 tests use a pinned compatible service. Repository
-publication tests may replace the blob boundary with
+boundary. It also covers the device-bound recovery-envelope GET/PUT routes,
+`no-store`, bounds and digest checks, one current pointer per account, exact
+replay, revision compare-and-set, and concurrent replacement. Integration tests
+use real PostgreSQL; filesystem tests use a real temporary directory, and S3
+tests use a pinned compatible service. Repository publication tests may replace
+the blob boundary with
 a controllable implementation to force a precise write, corruption, or orphan
 condition. Both real backends remain covered separately.
 

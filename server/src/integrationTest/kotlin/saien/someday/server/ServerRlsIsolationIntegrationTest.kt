@@ -24,6 +24,9 @@ import saien.someday.server.persistence.SystemV3MediaObjectRecord
 import saien.someday.server.persistence.SystemV3MediaPutResult
 import saien.someday.server.persistence.SystemV3MediaReadResult
 import saien.someday.server.persistence.SystemV3MediaRepository
+import saien.someday.server.persistence.WorkspaceRecoveryEnvelopeInput
+import saien.someday.server.persistence.WorkspaceRecoveryEnvelopePutResult
+import saien.someday.server.persistence.WorkspaceRecoveryEnvelopeRepository
 
 class ServerRlsIsolationIntegrationTest {
     @get:Rule
@@ -39,7 +42,7 @@ class ServerRlsIsolationIntegrationTest {
     private val administratorDatabaseConnectionUrl = productionTestDatabaseConnectionUrl(administratorDatabaseUrl)
 
     @Test
-    fun restrictedRoleInitializesWorkspaceAndRlsIsolatesEntityAndMediaByAccountAndWorkspace() {
+    fun restrictedRoleInitializesWorkspaceAndRlsIsolatesEntityMediaAndRecoveryByAccountAndWorkspace() {
         DatabaseMigrator.migrate(applicationConfig)
         assumeTrue(
             "PostgreSQL integration account lacks CREATEROLE; restricted-role RLS verification skipped.",
@@ -98,6 +101,38 @@ class ServerRlsIsolationIntegrationTest {
             assertEquals("pointer-first-b", entityRepository.loadEpoch(firstUserId, WORKSPACE_B)?.metadata?.pointerDigest)
             assertEquals("pointer-second-a", entityRepository.loadEpoch(secondUserId, WORKSPACE_A)?.metadata?.pointerDigest)
 
+            val recoveryRepository = WorkspaceRecoveryEnvelopeRepository(restrictedConfig)
+            assertEquals(
+                1L,
+                assertIs<WorkspaceRecoveryEnvelopePutResult.Stored>(
+                    recoveryRepository.put(
+                        firstUserId,
+                        firstDeviceId,
+                        recoveryInput(WORKSPACE_A, "first-a", expectedRevision = null, digestCharacter = 'A'),
+                    ),
+                ).record.revision,
+            )
+            assertEquals(
+                1L,
+                assertIs<WorkspaceRecoveryEnvelopePutResult.Stored>(
+                    recoveryRepository.put(
+                        secondUserId,
+                        secondDeviceId,
+                        recoveryInput(WORKSPACE_A, "second-a", expectedRevision = null, digestCharacter = 'B'),
+                    ),
+                ).record.revision,
+            )
+            val rotatedRecovery = assertIs<WorkspaceRecoveryEnvelopePutResult.Stored>(
+                recoveryRepository.put(
+                    firstUserId,
+                    firstDeviceId,
+                    recoveryInput(WORKSPACE_B, "first-b", expectedRevision = 1, digestCharacter = 'C'),
+                ),
+            ).record
+            assertEquals(2L, rotatedRecovery.revision)
+            assertEquals(WORKSPACE_B, rotatedRecovery.workspaceId)
+            assertEquals(WORKSPACE_B, recoveryRepository.load(firstUserId)?.workspaceId)
+
             val mediaRepository = SystemV3MediaRepository(
                 restrictedConfig,
                 FileSystemMediaBlobStore(temporaryFolder.newFolder("rls-media").toPath()),
@@ -116,25 +151,38 @@ class ServerRlsIsolationIntegrationTest {
                     assertEquals(emptyList(), visibleScopes(connection, table), table)
                 }
                 assertEquals(emptyList(), visibleScopes(connection, MEDIA_TABLE))
+                assertEquals(emptyList(), visibleRecoveryScopes(connection))
 
                 selectScope(connection, firstUserId, WORKSPACE_A)
                 ENTITY_TABLES.forEach { table ->
                     assertEquals(listOf(Scope(firstUserId, WORKSPACE_A)), visibleScopes(connection, table), table)
                 }
                 assertEquals(listOf(Scope(firstUserId, WORKSPACE_A)), visibleScopes(connection, MEDIA_TABLE))
+                assertEquals(emptyList(), visibleRecoveryScopes(connection))
 
                 selectScope(connection, firstUserId, WORKSPACE_B)
                 ENTITY_TABLES.forEach { table ->
                     assertEquals(listOf(Scope(firstUserId, WORKSPACE_B)), visibleScopes(connection, table), table)
                 }
                 assertEquals(listOf(Scope(firstUserId, WORKSPACE_B)), visibleScopes(connection, MEDIA_TABLE))
+                assertEquals(listOf(Scope(firstUserId, WORKSPACE_B)), visibleRecoveryScopes(connection))
 
                 selectScope(connection, secondUserId, WORKSPACE_A)
                 ENTITY_TABLES.forEach { table ->
                     assertEquals(listOf(Scope(secondUserId, WORKSPACE_A)), visibleScopes(connection, table), table)
                 }
                 assertEquals(listOf(Scope(secondUserId, WORKSPACE_A)), visibleScopes(connection, MEDIA_TABLE))
+                assertEquals(listOf(Scope(secondUserId, WORKSPACE_A)), visibleRecoveryScopes(connection))
+
+                // The repository deliberately uses an account-exact/workspace-wildcard
+                // scope for this account-current pointer. It can see every workspace
+                // for the selected account, but neither read nor rewrite another one.
+                selectScope(connection, firstUserId, "*")
+                assertEquals(listOf(Scope(firstUserId, WORKSPACE_B)), visibleRecoveryScopes(connection))
+                assertEquals(0, rewriteRecoveryEnvelope(connection, secondUserId))
+                assertEquals(listOf(Scope(firstUserId, WORKSPACE_B)), visibleRecoveryScopes(connection))
             }
+            assertEquals("""{"opaque":"second-a"}""", recoveryRepository.load(secondUserId)?.envelopeJson)
         } finally {
             try {
                 cleanupAccounts(firstUserId, secondUserId)
@@ -182,6 +230,7 @@ class ServerRlsIsolationIntegrationTest {
             statement.execute("GRANT SELECT, INSERT, UPDATE ON someday_sync_v2_mutations TO $roleName")
             statement.execute("GRANT USAGE, SELECT ON SEQUENCE someday_sync_v2_global_cursor TO $roleName")
             statement.execute("GRANT SELECT, INSERT ON someday_media_v3_objects TO $roleName")
+            statement.execute("GRANT SELECT, INSERT, UPDATE ON workspace_recovery_envelopes TO $roleName")
         }
     }
 
@@ -338,6 +387,19 @@ class ServerRlsIsolationIntegrationTest {
         assertEquals(digest, assertIs<SystemV3MediaObjectRecord>(found.value).ciphertextSha256)
     }
 
+    private fun recoveryInput(
+        workspaceId: String,
+        label: String,
+        expectedRevision: Long?,
+        digestCharacter: Char,
+    ): WorkspaceRecoveryEnvelopeInput = WorkspaceRecoveryEnvelopeInput(
+        workspaceId = workspaceId,
+        keyFingerprint = digestCharacter.lowercaseChar().toString().repeat(32),
+        envelopeJson = """{"opaque":"$label"}""",
+        envelopeDigest = digestCharacter.toString().repeat(43),
+        expectedRevision = expectedRevision,
+    )
+
     private fun registryRowCount(userId: UUID, workspaceId: String): Long = applicationConnection().use { connection ->
         selectWildcardScope(connection)
         connection.prepareStatement(
@@ -354,7 +416,14 @@ class ServerRlsIsolationIntegrationTest {
 
     private fun visibleScopes(connection: Connection, table: String): List<Scope> {
         require(table in ENTITY_TABLES || table == MEDIA_TABLE)
-        return connection.createStatement().use { statement ->
+        return visibleScopesUnchecked(connection, table)
+    }
+
+    private fun visibleRecoveryScopes(connection: Connection): List<Scope> =
+        visibleScopesUnchecked(connection, RECOVERY_TABLE)
+
+    private fun visibleScopesUnchecked(connection: Connection, table: String): List<Scope> =
+        connection.createStatement().use { statement ->
             statement.executeQuery("SELECT user_id, workspace_id FROM $table ORDER BY user_id, workspace_id").use { result ->
                 buildList {
                     while (result.next()) {
@@ -363,7 +432,14 @@ class ServerRlsIsolationIntegrationTest {
                 }
             }
         }
-    }
+
+    private fun rewriteRecoveryEnvelope(connection: Connection, targetUserId: UUID): Int =
+        connection.prepareStatement(
+            "UPDATE workspace_recovery_envelopes SET envelope_json = '{\"opaque\":\"tampered\"}' WHERE user_id = ?",
+        ).use { statement ->
+            statement.setObject(1, targetUserId)
+            statement.executeUpdate()
+        }
 
     private fun selectScope(connection: Connection, userId: UUID, workspaceId: String) {
         setConfig(connection, "someday.user_id", userId.toString())
@@ -464,6 +540,7 @@ class ServerRlsIsolationIntegrationTest {
             "someday_sync_v2_mutations",
         )
         const val MEDIA_TABLE = "someday_media_v3_objects"
+        const val RECOVERY_TABLE = "workspace_recovery_envelopes"
         val ROLE_NAME = Regex("^[a-z0-9_]+$")
         val ROLE_PASSWORD = Regex("^[a-z0-9-]+$")
     }

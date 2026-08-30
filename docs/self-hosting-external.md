@@ -1,7 +1,8 @@
 # External storage Docker quickstart
 
 This topology keeps the Someday Server container disposable. Durable state
-lives in one PostgreSQL 17 database and one private S3-compatible bucket.
+lives in one PostgreSQL 17 database, including opaque recovery envelopes, and
+one private S3-compatible bucket.
 
 Before starting, prepare a Docker host, a stable HTTPS hostname, the database,
 and the bucket. A second database or bucket is not required for normal
@@ -192,8 +193,9 @@ docker compose run --rm --no-deps server verify-media-integrity
 
 Before storing real notes, complete
 [Backup and Recovery](server-backup-and-recovery.md). PostgreSQL and the bucket
-are one recovery unit; provider snapshots alone do not prove a complete
-restore.
+are one recovery unit, and PostgreSQL contains the account recovery envelopes.
+Provider snapshots alone do not prove a complete restore. Never collect users'
+recovery codes as part of an operator backup.
 
 ## PlanetScale PostgreSQL and Cloudflare R2
 

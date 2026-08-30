@@ -3,7 +3,7 @@
 Someday has two database surfaces:
 
 - Client local data uses SQLDelight in `shared:data`.
-- The self-hosted server uses Flyway migrations under `server`.
+- Someday Server uses Flyway migrations under `server`.
 
 Both surfaces evolve through versioned migrations. Platform entry points and
 feature repositories leave schema management to SQLDelight or Flyway.
@@ -60,7 +60,7 @@ The first server release supports PostgreSQL 17. Both the normal server and
 future migration, and check the exact Someday RLS table/policy catalog before
 serving or mutating data.
 
-The published server migration history through V8 is immutable. Development
+The published server migration history through V9 is immutable. Development
 databases created from earlier unpublished migrations must be recreated rather
 than patched.
 
@@ -84,6 +84,15 @@ store as one recovery unit. The standalone topology uses a filesystem store;
 the external topology uses an S3-compatible store. Backend choice
 does not alter Flyway schema or create provider-specific database migrations;
 see `server-storage-architecture.md`.
+
+`V9__workspace_recovery_envelopes.sql` adds one account-current opaque recovery
+envelope keyed by `user_id`. The row selects one already initialized
+`workspace_id`, stores its key fingerprint, exact bounded envelope JSON and
+digest, positive CAS revision, creating/updating device identities, and
+timestamps. The server never stores the user recovery code or plaintext
+workspace key. Account deletion cascades to the envelope; workspace deletion
+does the same through the account/workspace foreign key. Exact repository
+queries still predicate the authenticated user explicitly.
 
 When changing server tables, columns, indexes, or constraints:
 

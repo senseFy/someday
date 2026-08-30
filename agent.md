@@ -7,7 +7,7 @@
 - JVM tests that create a local database should use the shared schema-aware factory. A raw driver is only appropriate when reopening an already-created database to verify persisted state without owning schema lifecycle.
 - Server schema changes are owned by Flyway files in `server/src/main/resources/db/migration`. Do not patch server schema from application startup or request handling.
 - Migrations must be deterministic version-to-version transitions. Do not use `IF EXISTS` or `IF NOT EXISTS` to hide uncertain schema state; model the old state explicitly and migrate it.
-- The first-release server migration set is byte-frozen through V8. Add a version newer than V8; do not add repeatable, undo, or backfilled lower-version SQL migrations. Tenant-row DML must set transaction-local account and workspace wildcard scopes before its first write, remain transactional, and pass the non-empty previous-release upgrade gate.
+- The released server migration set is byte-frozen through V9. Add a version newer than V9; do not add repeatable, undo, or backfilled lower-version SQL migrations. Tenant-row DML must set transaction-local account and workspace wildcard scopes before its first write, remain transactional, and pass the non-empty previous-release upgrade gate.
 - After schema changes, update the SQLDelight schema snapshot and run `./gradlew :shared:data:verifySqlDelightMigration` plus relevant client/server tests. See `docs/database-migrations.md`.
 
 ## UI and Main-Thread IO
@@ -27,6 +27,9 @@
   media wire details by `docs/self-hosted-media-v3.md`.
 - `docs/workspace-pairing-protocol.md` is the frozen workspace-pairing
   capability, encryption, transport-state, and local-replacement contract.
+- `docs/workspace-recovery-protocol.md` is the frozen user recovery-code,
+  portable-envelope, account-current-pointer, CAS, and local-replacement
+  contract.
 - Any change to epoch pointers, checkpoints, entity envelopes, validation,
   encryption metadata, media objects, or authority binding must update the
   relevant V3/subsystem spec in the same change.
@@ -34,6 +37,11 @@
   authority AAD, expiry, envelope fields, remote transitions, or replacement
   ordering must update the pairing protocol and its golden/interoperability
   evidence in the same change.
+- Any change to recovery-code formatting or normalization, KDF/AAD, portable
+  metadata, envelope fields or bounds, HTTP routes, revision semantics,
+  account-current selection, setup confirmation, or replacement ordering must
+  update the recovery protocol and its golden/interoperability evidence in the
+  same change.
 - Sync changes that touch segment matching, pointer CAS, idempotent replay, or cursor advancement must include JVM protocol tests and relevant client compile checks across iOS, Android, and Desktop.
 - `scripts/sync-v3-reliability-gate` is the Linux/PostgreSQL System V3
   self-hosted acceptance gate. `scripts/sync-v3-apple-gate` owns shared
@@ -56,11 +64,27 @@
   mutations must share the workspace-lifecycle coordination boundary. Do not
   introduce a per-service lock that allows old-workspace state to be written
   after replacement.
+- Recovery must use that same workspace-lifecycle and transactional replacement
+  boundary. A wrong code, malformed or tampered envelope, authority mismatch,
+  secure-storage failure, or database failure before commit must preserve all
+  prior local workspace state.
 - Pairing secrets are 128-bit random capabilities. Domain-derived identifiers
   are opaque Base64url values; never use a human-entered token or a fast hash
   as a server lookup key, and never log QR/manual-token text.
 - Self-hosted pairing must remain account-scoped, device-bound, atomic, and
   without read/delete routes.
+- Recovery codes are 128-bit user-held secrets. They must never cross the
+  transport boundary or appear in settings, logs, diagnostics, exceptions, or
+  object string representations. The server holds one bounded opaque envelope
+  per account behind device-bound `sync` authentication, `no-store` responses,
+  and revision compare-and-set; there is no list or delete route.
+- Preparing or rotating a recovery code must not mutate remote state until the
+  user has seen and re-entered the new code. Cancellation, failed confirmation,
+  or process loss before PUT preserves the previous envelope; a CAS conflict
+  preserves the concurrent winner. Once PUT has been sent, a lost response is
+  ambiguous: retry the exact candidate while it remains in memory, or GET the
+  account-current envelope after restart. Recovery-code rotation rewraps the
+  existing master key; it is not master-key rotation.
 - Product surfaces call the protocol System V3. Frozen internal entity-DAG V2
   identifiers may remain where they are part of the wire contract or internal
   engine names; do not expose them as a selectable product mode.
@@ -122,3 +146,6 @@
   published media must treat PostgreSQL and the configured media store as
   one recovery unit. Standalone needs coordinated off-host directory backups;
   external needs PostgreSQL recovery points plus bucket versioning/retention.
+- PostgreSQL recovery includes the account-current recovery envelopes. An old
+  database recovery point may require the recovery code that matched its old
+  envelope revision; operators must not collect users' codes.

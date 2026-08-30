@@ -1,8 +1,9 @@
 # Self-hosting Someday
 
 Someday Server is the remote synchronization authority. It stores account and
-device metadata together with client-encrypted notes and images. Workspace
-keys remain on paired clients.
+device metadata together with client-encrypted notes and images. Plaintext
+workspace keys remain on clients; the server may also store one opaque,
+recovery-code-wrapped key envelope for each account.
 
 ## What you need
 
@@ -11,7 +12,7 @@ The recommended external deployment has four operator-visible resources:
 | Resource | Count | Purpose |
 | --- | ---: | --- |
 | Someday Server container | 1 | Disposable application process with no durable user data |
-| PostgreSQL 17 database | 1 | Accounts, sync state, encrypted notes, and image metadata |
+| PostgreSQL 17 database | 1 | Accounts, recovery envelopes, sync state, encrypted notes, and image metadata |
 | Private S3-compatible bucket | 1 | Encrypted image objects |
 | HTTPS origin | 1 | Stable address configured in every client |
 
@@ -147,11 +148,15 @@ the same configuration requirements.
 
 ## Storage and recovery boundary
 
-PostgreSQL contains accounts, devices, pairing state, encrypted entity DAGs,
-cursors, and media metadata. The media backend contains immutable encrypted
-image objects. Back up and restore them as one recovery unit.
+PostgreSQL contains accounts, devices, pairing state, account-current recovery
+envelopes, encrypted entity DAGs, cursors, and media metadata. The media backend
+contains immutable encrypted image objects. Back up and restore them as one
+recovery unit.
 
 Portable client export excludes image bytes and workspace keys, so it does not
-replace a server backup. Readable server recovery requires at least one intact
-paired device. The persistence and object-storage invariants are documented in
-[Server Storage Architecture](server-storage-architecture.md).
+replace a server backup. Reading a restored workspace requires either an intact
+device or the recovery code matching the restored envelope revision. Operators
+must not collect users' codes. The persistence and object-storage invariants are
+documented in [Server Storage Architecture](server-storage-architecture.md),
+and the user-key flow in
+[Workspace Recovery Protocol](workspace-recovery-protocol.md).

@@ -19,7 +19,9 @@ curl --fail http://127.0.0.1:3180/health
 ```
 
 Then run `verify-media-integrity`, sign in to `/admin`, and verify text and an
-image from a paired client.
+image from an intact client. When the release changes workspace recovery, also
+use a synthetic account to verify its current envelope revision and fresh-client
+recovery without exposing a real user's code.
 
 From the second server release onward, release acceptance includes an actual
 upgrade of non-empty data from the immediately preceding version.

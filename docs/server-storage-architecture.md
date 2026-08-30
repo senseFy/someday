@@ -34,7 +34,7 @@ Durable state is divided between:
 
 | Owner | Durable contents |
 | --- | --- |
-| PostgreSQL | Accounts, devices, sessions, workspace registry, pairing state, encrypted entity DAG, cursors, and media object metadata |
+| PostgreSQL | Accounts, devices, sessions, workspace registry, pairing state, account-current recovery envelopes, encrypted entity DAG, cursors, and media object metadata |
 | Media blob store | Immutable client-encrypted image objects and a fixed non-secret startup probe |
 | Operator secret store | Stable JWT secret and storage/database credentials |
 | Clients | Local-first workspace state and materialized images; not a complete server backup |
@@ -50,8 +50,10 @@ and separate multi-replica validation.
 
 PostgreSQL and the media store together are one logical recovery unit. Client
 encryption protects note and image contents from those services, but account,
-workspace, object-size, and access-timing metadata remain visible to the
-server and its storage operators.
+workspace, recovery-envelope existence, selected workspace, envelope size and
+revision, object-size, and access-timing metadata remain visible to the server
+and its storage operators. Recovery codes and plaintext workspace keys never
+belong to server storage.
 
 ## 3. Configuration
 
@@ -198,6 +200,12 @@ For the recommended external topology:
 - retain an off-provider copy when recovery must survive provider or account
   loss.
 
+The PostgreSQL copy includes each account's one current opaque recovery
+envelope. The envelope is useful only with the user-held code that wrapped it;
+operators must not collect those codes. A historical database recovery point
+may contain an older envelope revision and require the code that matched that
+point rather than the account's newest code.
+
 A restored bucket may be a superset of the database: unreferenced immutable
 objects are harmless. A recovery set is valid only when every PostgreSQL media
 row has an object with the exact expected key, length, and SHA-256. Capture
@@ -224,11 +232,16 @@ The executable checklist is in `server-backup-and-recovery.md`.
   upload are unsupported.
 - Automatic provider migration, failover, and garbage collection are
   unsupported.
+- Recovery selects one already initialized workspace per account. Replacing the
+  recovery code rewraps the same master key; master-key rotation is unsupported.
 
 ## 8. Verification
 
 Integration tests cover PostgreSQL, filesystem storage, and a pinned
 S3-compatible service. Recovery tests accept unreferenced objects but reject
-missing or byte-divergent referenced objects. The production gate runs the
-complete media journey against both storage backends and the non-root server
-image.
+missing or byte-divergent referenced objects. They also verify account-scoped
+opaque recovery-envelope storage and revision compare-and-set. The current
+operator gate restores content through an intact paired client; explicit
+envelope-row preservation and fresh-code recovery through PostgreSQL restore
+remain required release evidence. The production gate runs the complete media
+journey against both storage backends and the non-root server image.
