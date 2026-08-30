@@ -15,6 +15,7 @@ SYSTEM_GATE="${SOMEDAY_SERVER_RELEASE_SYSTEM_GATE:-$ROOT_DIR/scripts/sync-v3-rel
 COMPOSE_SMOKE="${SOMEDAY_SERVER_RELEASE_COMPOSE_SMOKE:-$ROOT_DIR/scripts/server-release-compose-smoke}"
 SYSTEM_REPORT="${SOMEDAY_SERVER_RELEASE_SYSTEM_REPORT:-$ROOT_DIR/build/system-v3-reliability-gate/report.json}"
 MANAGED_REPORT_ROOT="${SOMEDAY_SERVER_RELEASE_MANAGED_REPORT_ROOT:-$ROOT_DIR/build/managed-storage-profile-gate}"
+PROVIDER_SCOPE_CHECK="${SOMEDAY_SERVER_RELEASE_PROVIDER_SCOPE_CHECK:-$ROOT_DIR/scripts/server-release-provider-scope}"
 REPORT_ROOT="${SOMEDAY_SERVER_RELEASE_REPORT_ROOT:-$ROOT_DIR/build/server-release}"
 DOCKER_COMMAND="${SOMEDAY_SERVER_RELEASE_DOCKER:-docker}"
 
@@ -110,18 +111,17 @@ local_tag_commit() {
     git -C "$ROOT_DIR" rev-parse "$TAG^{commit}" 2>/dev/null
 }
 
-json_evidence_detail() {
+managed_evidence_commit() {
     local path="$1"
     local profile="$2"
-    local commit="$3"
-    python3 - "$path" "$profile" "$commit" <<'PY'
+    python3 - "$path" "$profile" <<'PY'
 import json
 import pathlib
+import re
 import sys
 
 path = pathlib.Path(sys.argv[1])
 profile = sys.argv[2]
-commit = sys.argv[3]
 if not path.is_file():
     print(f"{profile}: missing")
     raise SystemExit(2)
@@ -132,17 +132,63 @@ except (OSError, json.JSONDecodeError):
     raise SystemExit(1)
 expected = {
     "profile": profile,
-    "commit": commit,
     "treeState": "clean",
     "result": "passed",
     "releaseEligible": True,
 }
 for key, wanted in expected.items():
     if value.get(key) != wanted:
-        print(f"{profile}: {key} does not match HEAD")
+        print(f"{profile}: {key} is not release eligible")
         raise SystemExit(1)
-print(f"{profile}: passed for {commit[:12]}")
+commit = value.get("commit")
+if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit):
+    print(f"{profile}: invalid evidence commit")
+    raise SystemExit(1)
+print(commit)
 PY
+}
+
+provider_requirement() {
+    local profile="$1"
+    local commit="$2"
+    local forced="${SOMEDAY_SERVER_RELEASE_FORCE_MANAGED:-}"
+    case ",$forced," in
+        *,all,*|*,"$profile",*)
+            printf 'required\t-\tforced by SOMEDAY_SERVER_RELEASE_FORCE_MANAGED\n'
+            return 0
+            ;;
+    esac
+    "$PROVIDER_SCOPE_CHECK" requirement "$profile" "$VERSION" "$commit"
+}
+
+provider_evidence_detail() {
+    local profile="$1"
+    local commit="$2"
+    local coverage_base="$3"
+    local path="$MANAGED_REPORT_ROOT/$profile/result.json"
+    local evidence_commit detail
+    if ! evidence_commit="$(managed_evidence_commit "$path" "$profile")"; then
+        printf '%s\n' "$evidence_commit"
+        return 1
+    fi
+    if ! git -C "$ROOT_DIR" merge-base --is-ancestor "$evidence_commit" "$commit" 2>/dev/null; then
+        printf '%s: evidence commit %.12s is outside release history\n' \
+            "$profile" "$evidence_commit"
+        return 1
+    fi
+    if [[ "$coverage_base" == - && "$evidence_commit" != "$commit" ]]; then
+        printf '%s: full certification evidence must match %.12s\n' "$profile" "$commit"
+        return 1
+    fi
+    if [[ "$evidence_commit" != "$commit" ]]; then
+        if detail="$($PROVIDER_SCOPE_CHECK changes "$profile" "$evidence_commit" "$commit")"; then
+            printf '%s: relevant changes after evidence %.12s (%s)\n' \
+                "$profile" "$evidence_commit" "$(head -n 1 <<<"$detail")"
+            return 1
+        fi
+    fi
+    printf '%s: passed at %.12s; provider scope unchanged through %.12s\n' \
+        "$profile" "$evidence_commit" "$commit"
 }
 
 rehearsal_detail() {
@@ -387,6 +433,7 @@ run_status() {
     local publish_state publish_detail policy_detail ci_detail repository
     local rehearsal_path="$REPORT_ROOT/$VERSION/rehearsal.json"
     local detail code planetscale_detail r2_detail visibility
+    local planetscale_requirement r2_requirement provider_state provider_base provider_reason
 
     require_command git
     require_command python3
@@ -504,22 +551,39 @@ run_status() {
         rehearsal_ready=false
     fi
 
-    if planetscale_detail="$(
-        json_evidence_detail \
-            "$MANAGED_REPORT_ROOT/planetscale/result.json" \
-            planetscale "$commit"
-    )"; then
-        :
+    if planetscale_requirement="$(provider_requirement planetscale "$commit")"; then
+        IFS=$'\t' read -r provider_state provider_base provider_reason <<<"$planetscale_requirement"
     else
+        provider_state=error
+        provider_reason='scope classification failed'
+    fi
+    if [[ "$provider_state" == required ]]; then
+        if ! planetscale_detail="$(provider_evidence_detail planetscale "$commit" "$provider_base")"; then
+            providers_ready=false
+        fi
+        planetscale_detail+="; required: $provider_reason"
+    elif [[ "$provider_state" == skipped ]]; then
+        planetscale_detail="planetscale: not required; $provider_reason"
+    else
+        planetscale_detail="planetscale: $provider_reason"
         providers_ready=false
     fi
-    if r2_detail="$(
-        json_evidence_detail \
-            "$MANAGED_REPORT_ROOT/r2/result.json" \
-            r2 "$commit"
-    )"; then
-        :
+
+    if r2_requirement="$(provider_requirement r2 "$commit")"; then
+        IFS=$'\t' read -r provider_state provider_base provider_reason <<<"$r2_requirement"
     else
+        provider_state=error
+        provider_reason='scope classification failed'
+    fi
+    if [[ "$provider_state" == required ]]; then
+        if ! r2_detail="$(provider_evidence_detail r2 "$commit" "$provider_base")"; then
+            providers_ready=false
+        fi
+        r2_detail+="; required: $provider_reason"
+    elif [[ "$provider_state" == skipped ]]; then
+        r2_detail="r2: not required; $provider_reason"
+    else
+        r2_detail="r2: $provider_reason"
         providers_ready=false
     fi
     if [[ "$providers_ready" == true ]]; then
@@ -585,10 +649,11 @@ Someday server release $VERSION
 
 1. Confirm the one-time GitHub controls in docs/server-release.md.
 2. Merge the reviewed commit to main and wait for CI.
-3. Configure the dedicated resources in docs/managed-storage-profile-gates.md,
-   then run:
+3. Run status to classify the live managed-provider gates from the server diff.
+   Configure dedicated resources and run only the profiles reported as required:
    scripts/managed-storage-profile-gate planetscale
    scripts/managed-storage-profile-gate r2
+   Set SOMEDAY_SERVER_RELEASE_FORCE_MANAGED=all for a scheduled full certification.
 4. Run: scripts/server-release rehearse $VERSION
 5. For the second and later releases, complete the previous-version upgrade
    acceptance in docs/server-upgrades.md.

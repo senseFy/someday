@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""Classify live-provider gates from the server release diff."""
+
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+
+TAG_PATTERN = re.compile(r"^server-v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
+VERSION_PATTERN = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
+
+COMMON_EXACT = {
+    "server/build.gradle.kts",
+    "server/src/main/kotlin/saien/someday/server/Application.kt",
+    "server/src/main/kotlin/saien/someday/server/ServerConfig.kt",
+    "server/src/main/kotlin/saien/someday/server/ServerContext.kt",
+    "docker/entrypoint.sh",
+}
+
+PLANETSCALE_EXACT = COMMON_EXACT | {
+    "deploy/external/compose.yaml",
+    "deploy/external/compose.source.yaml",
+    "deploy/standalone/initdb/10-create-app-role.sh",
+    "scripts/lib/managed-storage-common.sh",
+    "scripts/lib/managed-storage-planetscale.sh",
+    "scripts/server-recovery-gate",
+}
+PLANETSCALE_PREFIXES = (
+    "server/src/main/kotlin/saien/someday/server/persistence/",
+    "server/src/main/resources/db/migration/",
+)
+
+R2_EXACT = COMMON_EXACT | {
+    "deploy/external/.env.example",
+    "deploy/external/compose.yaml",
+    "deploy/external/compose.source.yaml",
+    "scripts/lib/managed-storage-common.sh",
+    "scripts/lib/managed-storage-r2.sh",
+    "scripts/server-recovery-gate",
+    "server/src/main/kotlin/saien/someday/server/MediaBlobStoreFactory.kt",
+    "server/src/main/kotlin/saien/someday/server/MediaIntegrityVerifier.kt",
+    "server/src/main/kotlin/saien/someday/server/api/SystemV3ApiModels.kt",
+    "server/src/main/kotlin/saien/someday/server/persistence/PostgresMediaIntegrityRecordSource.kt",
+    "server/src/main/kotlin/saien/someday/server/persistence/SystemV3MediaRepository.kt",
+    "server/src/main/kotlin/saien/someday/server/routes/SystemV3Routes.kt",
+}
+R2_PREFIXES = (
+    "server/src/main/kotlin/saien/someday/server/media/",
+)
+
+DEPENDENCY_FILES = (
+    "gradle/libs.versions.toml",
+    "gradle/verification-metadata.xml",
+)
+DEPENDENCY_MARKERS = {
+    "planetscale": ("flyway", "hikari", "postgresql", "postgres"),
+    "r2": ("software.amazon.awssdk", "aws-sdk", "awssdk", "s3", "url-connection-client"),
+}
+ROOT_DIR = Path(
+    os.environ.get(
+        "SOMEDAY_SERVER_RELEASE_SCOPE_ROOT",
+        str(Path(__file__).resolve().parent.parent),
+    )
+).resolve()
+
+
+def fail(message: str) -> None:
+    raise SystemExit(f"server release provider scope error: {message}")
+
+
+def git(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        ["git", *arguments],
+        check=check,
+        cwd=ROOT_DIR,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def parse_version(value: str) -> tuple[int, int, int]:
+    match = VERSION_PATTERN.fullmatch(value)
+    if not match:
+        fail(f"invalid server version: {value}")
+    return tuple(int(part) for part in match.groups())  # type: ignore[return-value]
+
+
+def previous_tag(version: str, target: str) -> tuple[str, tuple[int, int, int]] | None:
+    current = parse_version(version)
+    output = git("tag", "--merged", target, "--list", "server-v*").stdout.decode("utf-8")
+    candidates: list[tuple[tuple[int, int, int], str]] = []
+    for raw in output.splitlines():
+        match = TAG_PATTERN.fullmatch(raw.strip())
+        if not match:
+            continue
+        parsed = tuple(int(part) for part in match.groups())
+        if parsed < current:
+            candidates.append((parsed, raw.strip()))
+    if not candidates:
+        return None
+    parsed, tag = max(candidates)
+    return tag, parsed
+
+
+def diff_paths(base: str, target: str) -> list[str]:
+    output = git("diff", "--name-only", "-z", f"{base}..{target}", "--").stdout
+    return sorted(item.decode("utf-8") for item in output.split(b"\0") if item)
+
+
+def dependency_scope_changed(profile: str, base: str, target: str) -> bool:
+    output = git(
+        "diff",
+        "--unified=0",
+        f"{base}..{target}",
+        "--",
+        *DEPENDENCY_FILES,
+    ).stdout.decode("utf-8", errors="replace").lower()
+    changed_lines = "\n".join(
+        line for line in output.splitlines() if line.startswith(("+", "-")) and not line.startswith(("+++", "---"))
+    )
+    return any(marker in changed_lines for marker in DEPENDENCY_MARKERS[profile])
+
+
+def relevant_paths(profile: str, base: str, target: str) -> list[str]:
+    if profile == "planetscale":
+        exact = PLANETSCALE_EXACT
+        prefixes = PLANETSCALE_PREFIXES
+    elif profile == "r2":
+        exact = R2_EXACT
+        prefixes = R2_PREFIXES
+    else:
+        fail(f"unknown provider profile: {profile}")
+
+    relevant = [
+        path
+        for path in diff_paths(base, target)
+        if path in exact or any(path.startswith(prefix) for prefix in prefixes)
+    ]
+    if dependency_scope_changed(profile, base, target):
+        relevant.extend(path for path in DEPENDENCY_FILES if path not in relevant)
+    return sorted(set(relevant))
+
+
+def emit_changes(profile: str, base: str, target: str) -> int:
+    paths = relevant_paths(profile, base, target)
+    if not paths:
+        return 1
+    print("\n".join(paths))
+    return 0
+
+
+def emit_requirement(profile: str, version: str, target: str) -> int:
+    current = parse_version(version)
+    previous = previous_tag(version, target)
+    if previous is None:
+        print("required\t-\tfirst server release requires full managed-provider certification")
+        return 0
+
+    tag, parsed = previous
+    if current[:2] != parsed[:2]:
+        print("required\t-\tmajor or minor server release requires full provider certification")
+        return 0
+
+    paths = relevant_paths(profile, tag, target)
+    if paths:
+        summary = ", ".join(paths[:3])
+        if len(paths) > 3:
+            summary += f", and {len(paths) - 3} more"
+        print(f"required\t{tag}\trelevant server changes: {summary}")
+    else:
+        print(f"skipped\t{tag}\tno {profile} server-scope changes since {tag}")
+    return 0
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        fail("usage: server-release-provider-scope requirement|changes ...")
+    command = sys.argv[1]
+    if command == "requirement" and len(sys.argv) == 5:
+        return emit_requirement(sys.argv[2], sys.argv[3], sys.argv[4])
+    if command == "changes" and len(sys.argv) == 5:
+        return emit_changes(sys.argv[2], sys.argv[3], sys.argv[4])
+    fail("usage: requirement PROFILE VERSION TARGET | changes PROFILE BASE TARGET")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

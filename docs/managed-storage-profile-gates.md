@@ -6,6 +6,11 @@ and S3 requirements. They require JDK 21 and retain evidence under
 `result.json` records the repository commit and source/restore resource names.
 The gate does not write this file for a dirty worktree.
 
+The server release controller decides which profiles are required from the
+server-scoped diff. It may accept passing evidence from an ancestor commit only
+when `scripts/server-release-provider-scope` proves that the corresponding
+provider implementation and deployment contract are unchanged afterward.
+
 ## PlanetScale PostgreSQL
 
 The gate drops and recreates `public` in both supplied databases. Use two

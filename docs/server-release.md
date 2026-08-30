@@ -45,7 +45,7 @@ below.
 | Stage | Owner | Result |
 | --- | --- | --- |
 | Identity | `scripts/server-release` | Public repository, clean `main`, and unused `server-vX.Y.Z` |
-| Managed storage | Maintainer | PlanetScale and R2 evidence for the same commit |
+| Managed storage | Maintainer | Live evidence for each provider affected by the server diff |
 | Rehearsal | `scripts/server-release rehearse` | Source, System V3, image, and Compose checks pass locally |
 | Upgrade acceptance | Maintainer | From the second release, non-empty data upgrades from the immediately preceding version |
 | Trigger | Maintainer | One annotated tag is pushed with an exact refspec |
@@ -54,8 +54,25 @@ below.
 
 ## Managed evidence
 
-Named providers are release-verified when both files exist, contain a
-passing result, and record the release commit:
+`scripts/server-release-provider-scope` compares the release with the newest
+reachable earlier `server-v*` tag. Patch releases require a live provider gate
+only when that provider's server, deployment, recovery, or relevant dependency
+scope changed. A major or minor server release requires both profiles. The
+classification deliberately follows the Docker server artifact and its
+operator contract; client-only media UI or local-storage changes do not require
+an R2 server certification.
+
+The normal classification is:
+
+| Change | Live profile |
+| --- | --- |
+| PostgreSQL persistence, migrations, database wiring, or recovery | PlanetScale |
+| Server S3/media adapter, external S3 deployment, or media recovery | R2 |
+| Unrelated application, UI, documentation, or release-controller code | Neither |
+
+Named providers are release-verified when each required file exists and
+contains passing evidence. Evidence from an ancestor commit remains valid when
+the provider-scope checker proves that no relevant files changed afterward:
 
 ```text
 build/managed-storage-profile-gate/planetscale/result.json
@@ -64,8 +81,19 @@ build/managed-storage-profile-gate/r2/result.json
 
 The gates reset dedicated resources, and the R2 gate writes indefinitely locked
 objects. Read [Managed storage profile gates](managed-storage-profile-gates.md),
-prepare disposable resources, then run each gate explicitly. A dirty worktree
-can pass live checks but cannot produce release evidence.
+prepare disposable resources, then run each profile reported as required by
+`scripts/server-release status`. A dirty worktree can pass live checks but
+cannot produce release evidence.
+
+Run a scheduled full certification at least quarterly or whenever provider
+behavior is in doubt:
+
+```bash
+SOMEDAY_SERVER_RELEASE_FORCE_MANAGED=all \
+  scripts/server-release status X.Y.Z
+```
+
+Then run both live gates and rerun status with the same environment variable.
 
 ## Rehearse
 

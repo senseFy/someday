@@ -384,6 +384,10 @@ fi
     die "server release bundle builder must exist and be executable"
 [[ -x "$ROOT_DIR/scripts/verify-server-release-tag" ]] ||
     die "server release tag verifier must exist and be executable"
+[[ -x "$ROOT_DIR/scripts/server-release-provider-scope" ]] ||
+    die "server release provider scope classifier must exist and be executable"
+grep -Fq 'server-release-provider-scope' "$ROOT_DIR/scripts/server-release" ||
+    die "server release controller must use the provider scope classifier"
 
 printf 'server release contract passed: %s (%s%s)\n' \
     "$TAG" "$IMAGE" "${DIGEST:+@$DIGEST}"

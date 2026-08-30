@@ -99,6 +99,9 @@ cp "$ROOT_DIR/scripts/build-server-release-bundle" \
     "$BASE_FIXTURE/scripts/build-server-release-bundle"
 cp "$ROOT_DIR/scripts/verify-server-release-tag" \
     "$BASE_FIXTURE/scripts/verify-server-release-tag"
+cp "$ROOT_DIR/scripts/server-release" "$BASE_FIXTURE/scripts/server-release"
+cp "$ROOT_DIR/scripts/server-release-provider-scope" \
+    "$BASE_FIXTURE/scripts/server-release-provider-scope"
 cp "$ROOT_DIR/.github/workflows/android.yml" "$BASE_FIXTURE/.github/workflows/android.yml"
 cp "$ROOT_DIR/.github/workflows/ci.yml" "$BASE_FIXTURE/.github/workflows/ci.yml"
 cp "$ROOT_DIR/.github/workflows/server-release.yml" \
@@ -109,7 +112,9 @@ chmod 0755 \
     "$BASE_FIXTURE/scripts/verify-server-release-contract" \
     "$BASE_FIXTURE/scripts/verify-public-history" \
     "$BASE_FIXTURE/scripts/build-server-release-bundle" \
-    "$BASE_FIXTURE/scripts/verify-server-release-tag"
+    "$BASE_FIXTURE/scripts/verify-server-release-tag" \
+    "$BASE_FIXTURE/scripts/server-release" \
+    "$BASE_FIXTURE/scripts/server-release-provider-scope"
 
 run_contract "$BASE_FIXTURE" 1.2.3 >/dev/null
 

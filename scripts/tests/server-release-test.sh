@@ -205,6 +205,29 @@ printf '{"commit":"%s","dirtyWorktree":%s,"result":"%s"}\n' \
     >"$FAKE_SYSTEM_REPORT"
 SH
 
+cat >"$STUB_BIN/provider-scope" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+command="$1"
+profile="$2"
+if [[ "$command" == requirement ]]; then
+    case "$profile" in
+        planetscale) state="${FAKE_PLANETSCALE_SCOPE:-required}" ;;
+        r2) state="${FAKE_R2_SCOPE:-required}" ;;
+        *) exit 2 ;;
+    esac
+    printf '%s\tserver-v1.2.2\ttest %s scope\n' "$state" "$profile"
+    exit 0
+fi
+if [[ "$command" == changes ]]; then
+    case ",${FAKE_PROVIDER_CHANGES:-}," in
+        *,all,*|*,"$profile",*) printf 'server/provider-change.kt\n'; exit 0 ;;
+        *) exit 1 ;;
+    esac
+fi
+exit 2
+SH
+
 chmod 0755 "$STUB_BIN"/*
 
 probe_ruleset="$(
@@ -255,17 +278,22 @@ run_release() {
     SOMEDAY_SERVER_RELEASE_COMPOSE_SMOKE="$STUB_BIN/pass" \
     SOMEDAY_SERVER_RELEASE_SYSTEM_REPORT="$SYSTEM_REPORT" \
     SOMEDAY_SERVER_RELEASE_MANAGED_REPORT_ROOT="$MANAGED_REPORT_ROOT" \
+    SOMEDAY_SERVER_RELEASE_PROVIDER_SCOPE_CHECK="$STUB_BIN/provider-scope" \
     SOMEDAY_SERVER_RELEASE_REPORT_ROOT="$REPORT_ROOT" \
+    FAKE_PLANETSCALE_SCOPE="${FAKE_PLANETSCALE_SCOPE:-required}" \
+    FAKE_R2_SCOPE="${FAKE_R2_SCOPE:-required}" \
+    FAKE_PROVIDER_CHANGES="${FAKE_PROVIDER_CHANGES:-}" \
     SOMEDAY_SERVER_RELEASE_DOCKER=docker \
         "$RELEASE_SCRIPT" "$@"
 }
 
 write_managed_report() {
     local profile="$1"
+    local commit="${2:-$SHA}"
     local path="$MANAGED_REPORT_ROOT/$profile/result.json"
     mkdir -p "$(dirname "$path")"
-    printf '{"profile":"%s","commit":"%s","treeState":"clean","result":"passed","releaseEligible":true}\n' \
-        "$profile" "$SHA" >"$path"
+    printf '{"profile":"%s","commit":"%s","completedAt":"2026-08-30T00:00:00Z","treeState":"clean","result":"passed","releaseEligible":true}\n' \
+        "$profile" "$commit" >"$path"
 }
 
 expect_failure() {
@@ -406,6 +434,27 @@ fi
 grep -Fq 'READY TO TAG' "$TEST_ROOT/status-ready.out" ||
     fail 'passing evidence did not produce READY TO TAG'
 
+rm -f "$MANAGED_REPORT_ROOT/r2/result.json"
+FAKE_R2_SCOPE=skipped \
+    run_release status "$VERSION" >"$TEST_ROOT/status-r2-skipped.out"
+grep -Fq 'r2: not required; test r2 scope' "$TEST_ROOT/status-r2-skipped.out" ||
+    fail 'status did not skip an unchanged R2 provider scope'
+grep -Fq 'READY TO TAG' "$TEST_ROOT/status-r2-skipped.out" ||
+    fail 'an unchanged R2 scope still blocked the release'
+write_managed_report r2
+
+ANCESTOR_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+write_managed_report planetscale "$ANCESTOR_SHA"
+run_release status "$VERSION" >"$TEST_ROOT/status-ancestor-evidence.out"
+grep -Fq "planetscale: passed at ${ANCESTOR_SHA:0:12}" \
+    "$TEST_ROOT/status-ancestor-evidence.out" ||
+    fail 'unchanged provider scope did not accept ancestor evidence'
+FAKE_PROVIDER_CHANGES=planetscale \
+    expect_failure changed-after-evidence run_release status "$VERSION"
+grep -Fq 'relevant changes after evidence' "$TEST_ROOT/changed-after-evidence.out" ||
+    fail 'status accepted provider changes made after live evidence'
+write_managed_report planetscale
+
 FAKE_TAG_POLICY=missing \
     expect_failure missing-tag-policy run_release status "$VERSION"
 grep -Fq 'ACTION  policy' "$TEST_ROOT/missing-tag-policy.out" ||
@@ -473,6 +522,7 @@ expect_failure missing-version run_release status
 expect_failure publish-command run_release publish "$VERSION"
 
 "$SCRIPT_DIR/server-release-interface-test.sh" >/dev/null
+"$SCRIPT_DIR/server-release-provider-scope-test.sh" >/dev/null
 "$SCRIPT_DIR/build-server-release-bundle-test.sh" >/dev/null
 "$SCRIPT_DIR/verify-public-history-test.sh" >/dev/null
 "$SCRIPT_DIR/verify-server-release-tag-test.sh" >/dev/null
