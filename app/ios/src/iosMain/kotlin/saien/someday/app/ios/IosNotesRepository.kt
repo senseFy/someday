@@ -15,7 +15,6 @@ import saien.someday.data.crypto.workspaceJoinPackageProvider
 import saien.someday.data.crypto.workspaceJoiner
 import saien.someday.data.crypto.workspaceRecoveryPackageProvider
 import saien.someday.data.export.LocalDataExporter
-import saien.someday.data.importing.dayone.DayOneImportService
 import saien.someday.data.importing.dayone.DayOneImportSummary
 import saien.someday.data.local.SqlDelightLocalDataRepository
 import saien.someday.data.local.db.SomedayDatabase
@@ -42,6 +41,7 @@ import saien.someday.sync.selfhosted.SelfHostedWorkspaceRecoveryService
 import saien.someday.sync.selfhosted.SystemV3MediaCoordinator
 import saien.someday.sync.selfhosted.WorkspaceBoundSessionCredentialStore
 import saien.someday.ui.settings.SettingsExportSummary
+import saien.someday.ui.settings.SettingsImportOutcome
 import saien.someday.ui.settings.SettingsImportSummary
 import platform.Foundation.NSFileManager
 import platform.Foundation.NSHomeDirectory
@@ -68,8 +68,7 @@ class IosClientRepositories(
     val localMediaAssetStore: AuthorityCoordinatedMediaAssetStore,
     val mediaCoordinator: SystemV3MediaCoordinator,
     private val localDataExporter: LocalDataExporter,
-    private val localDataImportProvider: (saien.someday.data.export.LocalDataExportDocument) ->
-        saien.someday.data.export.LocalDataImportSummary,
+    private val dayOneArchiveImporter: (ByteArray, String, saien.someday.data.media.MediaImageNormalizer) -> DayOneImportSummary,
     private val driver: NativeSqliteDriver,
     private val selfHostedTransport: IosSelfHostedSyncTransport,
 ) {
@@ -117,8 +116,7 @@ class IosClientRepositories(
         archiveBytes: ByteArray,
         fallbackJournalTitle: String,
     ): SettingsImportSummary =
-        DayOneImportService(localDataImportProvider)
-            .importArchive(archiveBytes, fallbackJournalTitle)
+        dayOneArchiveImporter(archiveBytes, fallbackJournalTitle, IosMediaImageNormalizer)
             .toSettingsImportSummary()
 }
 
@@ -242,7 +240,7 @@ private fun assembleIosClientRepositories(
         localDataExporter = LocalDataExporter(
             authoritativeDocumentProvider = systemV3Services.localDataExportProvider,
         ),
-        localDataImportProvider = systemV3Services.localDataImportProvider,
+        dayOneArchiveImporter = systemV3Services.dayOneArchiveImporter,
         driver = localData.driver,
         selfHostedTransport = selfHostedTransport,
     )
@@ -330,9 +328,7 @@ private fun String.toExportFileStamp(): String =
 
 private fun DayOneImportSummary.toSettingsImportSummary(): SettingsImportSummary =
     SettingsImportSummary(
-        sourceName = "Day One",
-        success = true,
-        message = toUserMessage(),
+        outcome = if (completed) SettingsImportOutcome.Completed else SettingsImportOutcome.Partial,
         journalsImported = journalsImported,
         notebooksCreated = notebooksCreated,
         notebooksReused = notebooksReused,
@@ -340,8 +336,10 @@ private fun DayOneImportSummary.toSettingsImportSummary(): SettingsImportSummary
         notesUpdated = notesUpdated,
         notesSkipped = notesSkipped,
         richTextConverted = richTextConverted,
-        mediaReferenced = photosReferenced + audiosReferenced + videosReferenced + pdfsReferenced,
+        photosImported = photosImported,
+        photosMissing = photosMissing,
+        photosUnresolved = photosUnresolved,
+        photosRejected = photosRejected,
+        otherMedia = audiosReferenced + videosReferenced + pdfsReferenced,
         unsupportedItems = unsupportedEmbeddedObjects + tagsFound + starredFound + pinnedFound + weatherFound,
-        includesMediaBytes = false,
-        assetReferencesMayBeUnresolved = true,
     )

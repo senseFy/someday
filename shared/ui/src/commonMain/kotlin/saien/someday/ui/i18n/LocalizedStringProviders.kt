@@ -242,7 +242,11 @@ fun rememberSettingsUiStrings(): SettingsUiStrings {
     val settingsSaveFailed = stringResource(Res.string.settings_fb_settings_save_failed)
     val signInBeforeSync = stringResource(Res.string.settings_fb_sign_in_before_sync)
     val chooseDayOne = stringResource(Res.string.import_choose_day_one)
+    val dayOneImportCompleted = stringResource(Res.string.import_day_one_completed)
+    val dayOneImportPartial = stringResource(Res.string.import_day_one_partial)
     val dayOneImportFailed = stringResource(Res.string.import_day_one_failed)
+    val dayOneImportCancelled = stringResource(Res.string.import_day_one_cancelled)
+    val dayOneImportUnavailable = stringResource(Res.string.import_day_one_unavailable)
     val unknownError = stringResource(Res.string.common_unknown_error)
     val strings = SettingsUiStrings(
         themeUpdated = themeUpdated,
@@ -325,7 +329,11 @@ fun rememberSettingsUiStrings(): SettingsUiStrings {
         settingsSaveFailed = settingsSaveFailed,
         signInBeforeSync = signInBeforeSync,
         chooseDayOne = chooseDayOne,
+        dayOneImportCompleted = dayOneImportCompleted,
+        dayOneImportPartial = dayOneImportPartial,
         dayOneImportFailed = dayOneImportFailed,
+        dayOneImportCancelled = dayOneImportCancelled,
+        dayOneImportUnavailable = dayOneImportUnavailable,
         unknownError = unknownError,
     )
     return remember(strings) { strings }

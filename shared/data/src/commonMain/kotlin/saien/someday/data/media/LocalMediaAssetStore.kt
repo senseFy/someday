@@ -10,6 +10,7 @@ import saien.someday.domain.media.MAX_MEDIA_ASSET_ENCODED_BYTE_COUNT
 import saien.someday.domain.media.MAX_MEDIA_ASSET_PIXEL_COUNT
 import saien.someday.domain.media.canonicalMediaTypeOrNull
 import saien.someday.domain.media.isSafeOriginalFileName
+import kotlin.coroutines.cancellation.CancellationException
 import kotlin.time.Clock
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.hours
@@ -318,16 +319,11 @@ class LocalMediaAssetStore(
                 }
             }
 
+            // Read and close the bounded staging file outside codec error translation.
+            // A codec may itself throw IOException for bad image bytes, not storage failure.
+            val encodedSource = fileSystem.read(selectedSourcePath) { Buffer().also { it.writeAll(this) } }
             val normalizedBytes = try {
-                val stagedSource = fileSystem.source(selectedSourcePath).buffer()
-                try {
-                    normalizer.normalize(
-                        stagedSource,
-                        MediaImageNormalizationRequest(sourceInspection),
-                    )
-                } finally {
-                    stagedSource.close()
-                }
+                normalizer.normalize(encodedSource, MediaImageNormalizationRequest(sourceInspection))
             } catch (failure: MediaImageNormalizationException) {
                 throw SelectedImageImportException(
                     reason = if (failure.violatesQualityBounds) {
@@ -339,6 +335,7 @@ class LocalMediaAssetStore(
                     cause = failure,
                 )
             } catch (failure: Exception) {
+                if (failure is CancellationException) throw failure
                 throw SelectedImageImportException(
                     reason = SelectedImageImportFailureReason.NormalizationFailed,
                     message = "Selected image normalization failed.",
@@ -353,7 +350,7 @@ class LocalMediaAssetStore(
             }
             return try {
                 importAsset(Buffer().write(normalizedBytes), finalRequest)
-            } catch (failure: Exception) {
+            } catch (failure: MediaAssetInspectionException) {
                 throw SelectedImageImportException(
                     reason = SelectedImageImportFailureReason.NormalizationFailed,
                     message = "Normalized image did not pass final validation.",
@@ -676,15 +673,15 @@ class LocalMediaAssetStore(
         path: Path,
         inspection: MediaAssetInspection,
     ) {
-        val source = fileSystem.source(path).buffer()
+        // The codec sees only bounded in-memory bytes; staging IO must propagate unchanged.
+        val source = fileSystem.read(path) { Buffer().also { it.writeAll(this) } }
         val decoded = try {
             decodeValidator.decode(source)
         } catch (failure: MediaAssetInspectionException) {
             throw failure
-        } catch (_: Exception) {
+        } catch (failure: Exception) {
+            if (failure is CancellationException) throw failure
             throw MediaAssetInspectionException("Encoded image could not be fully decoded.")
-        } finally {
-            source.close()
         }
         if (decoded.pixelWidth != inspection.pixelWidth || decoded.pixelHeight != inspection.pixelHeight) {
             throw MediaAssetInspectionException("Decoded image dimensions do not match its encoded metadata.")

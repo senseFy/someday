@@ -23,6 +23,7 @@ import saien.someday.ui.media.MediaPreviewLoader
 import saien.someday.ui.media.MediaUiFailureReason
 import saien.someday.ui.media.MediaUiPorts
 import saien.someday.ui.settings.DayOneImportRunner
+import saien.someday.ui.settings.SettingsImportOutcome
 import saien.someday.ui.settings.SettingsImportSummary
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -142,16 +143,13 @@ fun main() = application {
                 val selectedDirectory = dialog.directory
                 val selectedFile = dialog.file
                 if (selectedDirectory == null || selectedFile == null) {
-                    onResult(SettingsImportSummary.failure("Day One", "Day One import cancelled."))
+                    onResult(SettingsImportSummary(SettingsImportOutcome.Cancelled))
                 } else {
                     val file = File(selectedDirectory, selectedFile)
                     importCoroutineScope.launch {
                         val summary = withContext(Dispatchers.Default) {
-                            runCatching { clientRepositories.importDayOneArchive(file) }.getOrElse { failure ->
-                                SettingsImportSummary.failure(
-                                    sourceName = "Day One",
-                                    message = "Day One import failed: ${failure.message ?: "unknown error"}",
-                                )
+                            runCatching { clientRepositories.importDayOneArchive(file) }.getOrElse {
+                                SettingsImportSummary(SettingsImportOutcome.Failed)
                             }
                         }
                         onResult(summary)

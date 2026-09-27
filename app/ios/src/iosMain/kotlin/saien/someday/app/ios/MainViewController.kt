@@ -25,6 +25,7 @@ import saien.someday.ui.media.MediaPreviewLoader
 import saien.someday.ui.media.MediaUiFailureReason
 import saien.someday.ui.media.MediaUiPorts
 import saien.someday.ui.settings.DayOneImportRunner
+import saien.someday.ui.settings.SettingsImportOutcome
 import saien.someday.ui.settings.SettingsImportSummary
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -248,7 +249,7 @@ private class IosDayOneImportRunner(
     override fun start(onResult: (SettingsImportSummary) -> Unit) {
         val rootController = rootControllerProvider()
         if (rootController == null) {
-            onResult(SettingsImportSummary.failure("Day One", "Day One import is unavailable on this screen."))
+            onResult(SettingsImportSummary(SettingsImportOutcome.Unavailable))
             return
         }
         val delegate = DayOneDocumentPickerDelegate(
@@ -286,7 +287,7 @@ private class DayOneDocumentPickerDelegate(
     ) {
         val url = didPickDocumentsAtURLs.firstOrNull() as? NSURL
         if (url == null) {
-            onComplete(SettingsImportSummary.failure("Day One", "Day One import cancelled."))
+            onComplete(SettingsImportSummary(SettingsImportOutcome.Cancelled))
             return
         }
         CoroutineScope(Dispatchers.Main).launch {
@@ -296,11 +297,8 @@ private class DayOneDocumentPickerDelegate(
                         archiveBytes = url.readBytes(),
                         fallbackJournalTitle = url.lastPathComponent ?: "Day One",
                     )
-                }.getOrElse { failure ->
-                    SettingsImportSummary.failure(
-                        sourceName = "Day One",
-                        message = "Day One import failed: ${failure.message ?: "unknown error"}",
-                    )
+                }.getOrElse {
+                    SettingsImportSummary(SettingsImportOutcome.Failed)
                 }
             }
             onComplete(summary)
@@ -308,7 +306,7 @@ private class DayOneDocumentPickerDelegate(
     }
 
     override fun documentPickerWasCancelled(controller: UIDocumentPickerViewController) {
-        onComplete(SettingsImportSummary.failure("Day One", "Day One import cancelled."))
+        onComplete(SettingsImportSummary(SettingsImportOutcome.Cancelled))
     }
 }
 

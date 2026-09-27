@@ -78,7 +78,7 @@ class SettingsUiController(
     private val workspacePreferencesConflictResolver: WorkspacePreferencesConflictResolver? = null,
     private val exportProvider: () -> SettingsExportSummary = { SettingsExportSummary.unavailable() },
     private val dayOneImportRunner: DayOneImportRunner = DayOneImportRunner { onResult ->
-        onResult(SettingsImportSummary.unavailable("Day One import is unavailable in this build."))
+        onResult(SettingsImportSummary(outcome = SettingsImportOutcome.Unavailable))
     },
     private val onDataRestored: () -> Unit = {},
     private val selfHostedSetupClient: SelfHostedSetupClient = SelfHostedSetupClient {
@@ -973,6 +973,7 @@ class SettingsUiController(
             return false
         }
         importRunning = true
+        currentImportSummary = null
         state = buildState(
             settings = state.settings,
             exportSummary = state.exportSummary,
@@ -985,14 +986,15 @@ class SettingsUiController(
                 state = buildState(
                     settings = state.settings,
                     exportSummary = state.exportSummary,
-                    feedbackMessage = summary.message,
-                    feedbackSeverity = if (summary.success) {
-                        SettingsFeedbackSeverity.Success
-                    } else {
-                        SettingsFeedbackSeverity.Error
+                    feedbackMessage = summary.message(uiStrings),
+                    feedbackSeverity = when (summary.outcome) {
+                        SettingsImportOutcome.Completed -> SettingsFeedbackSeverity.Success
+                        SettingsImportOutcome.Partial -> SettingsFeedbackSeverity.Warning
+                        SettingsImportOutcome.Cancelled -> SettingsFeedbackSeverity.Info
+                        else -> SettingsFeedbackSeverity.Error
                     },
                 )
-                if (summary.success) {
+                if (summary.hasPersistenceResult) {
                     onDataRestored()
                 }
             }
@@ -1000,15 +1002,13 @@ class SettingsUiController(
             onSuccess = { true },
             onFailure = { failure ->
                 importRunning = false
-                val summary = SettingsImportSummary.failure(
-                    sourceName = "Day One",
-                    message = formatUiString(uiStrings.dayOneImportFailed, failure.message ?: uiStrings.unknownError),
-                )
+                failure.rethrowCancellation()
+                val summary = SettingsImportSummary(outcome = SettingsImportOutcome.Failed)
                 currentImportSummary = summary
                 state = buildState(
                     settings = state.settings,
                     exportSummary = state.exportSummary,
-                    feedbackMessage = summary.message,
+                    feedbackMessage = summary.message(uiStrings),
                     feedbackSeverity = SettingsFeedbackSeverity.Error,
                 )
                 false
@@ -1790,10 +1790,10 @@ fun interface DayOneImportRunner {
     fun start(onResult: (SettingsImportSummary) -> Unit)
 }
 
+enum class SettingsImportOutcome { Completed, Partial, Failed, Cancelled, Unavailable }
+
 data class SettingsImportSummary(
-    val sourceName: String,
-    val success: Boolean,
-    val message: String,
+    val outcome: SettingsImportOutcome,
     val journalsImported: Int = 0,
     val notebooksCreated: Int = 0,
     val notebooksReused: Int = 0,
@@ -1801,26 +1801,23 @@ data class SettingsImportSummary(
     val notesUpdated: Int = 0,
     val notesSkipped: Int = 0,
     val richTextConverted: Int = 0,
-    val mediaReferenced: Int = 0,
+    val photosImported: Int = 0,
+    val photosMissing: Int = 0,
+    val photosUnresolved: Int = 0,
+    val photosRejected: Int = 0,
+    val otherMedia: Int = 0,
     val unsupportedItems: Int = 0,
-    val includesMediaBytes: Boolean = false,
-    val assetReferencesMayBeUnresolved: Boolean = true,
 ) {
     val notesImported: Int = notesCreated + notesUpdated
+    val hasPersistenceResult: Boolean
+        get() = outcome == SettingsImportOutcome.Completed || outcome == SettingsImportOutcome.Partial
 
-    companion object {
-        fun unavailable(message: String): SettingsImportSummary =
-            failure(sourceName = "Day One", message = message)
-
-        fun failure(
-            sourceName: String,
-            message: String,
-        ): SettingsImportSummary =
-            SettingsImportSummary(
-                sourceName = sourceName,
-                success = false,
-                message = message,
-            )
+    fun message(strings: SettingsUiStrings): String = when (outcome) {
+        SettingsImportOutcome.Completed -> strings.dayOneImportCompleted
+        SettingsImportOutcome.Partial -> strings.dayOneImportPartial
+        SettingsImportOutcome.Failed -> strings.dayOneImportFailed
+        SettingsImportOutcome.Cancelled -> strings.dayOneImportCancelled
+        SettingsImportOutcome.Unavailable -> strings.dayOneImportUnavailable
     }
 }
 

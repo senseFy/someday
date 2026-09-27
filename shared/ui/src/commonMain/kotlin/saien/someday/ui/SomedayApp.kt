@@ -297,6 +297,7 @@ import saien.someday.ui.settings.DayOneImportRunner
 import saien.someday.ui.settings.OnThisDayNotificationStrings
 import saien.someday.ui.settings.SettingsExportSummary
 import saien.someday.ui.settings.SettingsFeedbackSeverity
+import saien.someday.ui.settings.SettingsImportOutcome
 import saien.someday.ui.settings.SettingsImportSummary
 import saien.someday.ui.settings.SettingsUiController
 import saien.someday.ui.settings.SettingsUiState
@@ -343,7 +344,7 @@ fun SomedayApp(
     onAppliedSettingsChanged: (ClientSettings) -> Unit = {},
     onLocalExport: () -> SettingsExportSummary = { SettingsExportSummary.unavailable() },
     dayOneImportRunner: DayOneImportRunner = DayOneImportRunner { onResult ->
-        onResult(SettingsImportSummary.unavailable("Day One import is unavailable in this build."))
+        onResult(SettingsImportSummary(SettingsImportOutcome.Unavailable))
     },
     selfHostedSetupClient: SelfHostedSetupClient? = null,
     selfHostedSessionCredentialStore: SelfHostedSessionCredentialStore? = null,
@@ -4307,7 +4308,7 @@ private fun SettingsMainContent(
         SettingsNavigationRow(
             icon = Lucide.Download,
             title = stringResource(Res.string.common_import),
-            subtitle = state.importSummary?.message,
+            subtitle = state.importSummary?.message(rememberSettingsUiStrings()),
             onClick = { onOpenPage(SettingsPage.Import) },
         )
         SettingsDivider()
@@ -5665,7 +5666,7 @@ private enum class WorkspacePairingMode {
 }
 
 @Composable
-private fun ImportSettingsContent(
+internal fun ImportSettingsContent(
     state: SettingsUiState,
     controller: SettingsUiController,
 ) {
@@ -5675,7 +5676,7 @@ private fun ImportSettingsContent(
         SettingsActionRow(
             icon = Lucide.Download,
             title = stringResource(Res.string.import_day_one),
-            subtitle = state.importSummary?.message,
+            subtitle = stringResource(Res.string.import_choose_day_one),
             actionText = stringResource(Res.string.common_import),
             busy = state.importRunning,
             enabled = !state.importRunning,
@@ -5686,18 +5687,33 @@ private fun ImportSettingsContent(
             },
         )
         state.importSummary?.let { summary ->
-            StatusLine(stringResource(Res.string.common_source), summary.sourceName)
-            StatusLine(stringResource(Res.string.common_journals), summary.journalsImported.toString())
-            StatusLine(stringResource(Res.string.tab_notes), "${summary.notesImported} imported, ${summary.notesSkipped} skipped")
-            StatusLine(stringResource(Res.string.nav_notebooks), "${summary.notebooksCreated} created, ${summary.notebooksReused} reused")
-            if (summary.richTextConverted > 0) {
-                StatusLine(stringResource(Res.string.common_rich_text), "${summary.richTextConverted} converted to Markdown")
+            Text(summary.message(rememberSettingsUiStrings()), style = MaterialTheme.typography.bodyMedium)
+            if (summary.hasPersistenceResult) {
+                StatusLine(stringResource(Res.string.tab_notes), stringResource(Res.string.import_notes_summary, summary.notesImported, summary.notesSkipped))
+                StatusLine(stringResource(Res.string.nav_notebooks), stringResource(Res.string.import_notebooks_summary, summary.notebooksCreated, summary.notebooksReused))
             }
-            if (summary.mediaReferenced > 0 || summary.unsupportedItems > 0) {
-                StatusLine(stringResource(Res.string.common_unsupported), "${summary.mediaReferenced} media references, ${summary.unsupportedItems} objects")
-            }
-            if (summary.success && (!summary.includesMediaBytes || summary.assetReferencesMayBeUnresolved)) {
-                Text(stringResource(Res.string.import_media_boundary), style = MaterialTheme.typography.bodySmall)
+            // Conversion totals are not counts of persisted notes after a partial failure.
+            if (summary.outcome == SettingsImportOutcome.Completed) {
+                StatusLine(stringResource(Res.string.common_journals), summary.journalsImported.toString())
+                if (summary.richTextConverted > 0) {
+                    StatusLine(stringResource(Res.string.common_rich_text), stringResource(Res.string.import_rich_text_summary, summary.richTextConverted))
+                }
+                val unavailablePhotos = summary.photosMissing + summary.photosUnresolved + summary.photosRejected
+                if (summary.photosImported + unavailablePhotos > 0) {
+                    StatusLine(stringResource(Res.string.import_photos_imported), summary.photosImported.toString())
+                    StatusLine(stringResource(Res.string.import_photos_missing), summary.photosMissing.toString())
+                    StatusLine(stringResource(Res.string.import_photos_unresolved), summary.photosUnresolved.toString())
+                    StatusLine(stringResource(Res.string.import_photos_rejected), summary.photosRejected.toString())
+                }
+                if (summary.otherMedia > 0) {
+                    StatusLine(stringResource(Res.string.import_other_media), stringResource(Res.string.import_placeholders_summary, summary.otherMedia))
+                }
+                if (summary.unsupportedItems > 0) {
+                    StatusLine(stringResource(Res.string.import_other_content), summary.unsupportedItems.toString())
+                }
+                if (unavailablePhotos + summary.otherMedia > 0) {
+                    Text(stringResource(Res.string.import_media_boundary), style = MaterialTheme.typography.bodySmall)
+                }
             }
         }
     }
@@ -5982,7 +5998,7 @@ private fun StatusLine(
     value: String,
 ) {
     Row(
-        horizontalArrangement = Arrangement.SpaceBetween,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
         verticalAlignment = Alignment.Top,
         modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
     ) {

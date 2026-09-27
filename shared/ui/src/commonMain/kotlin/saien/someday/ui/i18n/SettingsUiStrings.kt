@@ -90,6 +90,10 @@ data class SettingsUiStrings(
     val settingsSaveFailed: String = "Settings save failed: %1\$s",
     val signInBeforeSync: String = "Sign in to the self-hosted server before syncing.",
     val chooseDayOne: String = "Choose a Day One JSON export zip.",
-    val dayOneImportFailed: String = "Day One import failed: %1\$s",
+    val dayOneImportCompleted: String = "Day One import complete.",
+    val dayOneImportPartial: String = "Import stopped. Saved data has been kept; the counts below are confirmed results. Import the same file again to continue.",
+    val dayOneImportFailed: String = "Unable to import this file. Check the Day One JSON export and try a smaller selection of entries.",
+    val dayOneImportCancelled: String = "Day One import cancelled.",
+    val dayOneImportUnavailable: String = "Day One import is unavailable in this build.",
     val unknownError: String = "unknown error",
 )

@@ -35,3 +35,9 @@ data class LocalDataImportSummary(
     val noteConflictsCreated: Int = 0,
     val notesSkipped: Int,
 )
+
+/** Counts confirmed before a persistence failure; the import is not an archive-wide transaction. */
+class LocalDataImportException(
+    val completed: LocalDataImportSummary,
+    cause: Exception,
+) : Exception("Source import stopped during persistence.", cause)

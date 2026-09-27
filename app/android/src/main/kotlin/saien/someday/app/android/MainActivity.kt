@@ -41,6 +41,7 @@ import saien.someday.ui.media.MediaPreviewLoader
 import saien.someday.ui.media.MediaUiFailureReason
 import saien.someday.ui.media.MediaUiPorts
 import saien.someday.ui.settings.DayOneImportRunner
+import saien.someday.ui.settings.SettingsImportOutcome
 import saien.someday.ui.settings.SettingsImportSummary
 import saien.someday.ui.settings.WorkspacePairingScanner
 import java.util.Locale
@@ -111,7 +112,7 @@ class MainActivity : ComponentActivity() {
         val callback = pendingDayOneImportCallback ?: return@registerForActivityResult
         pendingDayOneImportCallback = null
         if (uri == null) {
-            callback(SettingsImportSummary.failure("Day One", "Day One import cancelled."))
+            callback(SettingsImportSummary(SettingsImportOutcome.Cancelled))
             return@registerForActivityResult
         }
         Thread {
@@ -122,11 +123,8 @@ class MainActivity : ComponentActivity() {
                     archiveBytes = archiveBytes,
                     fallbackJournalTitle = uri.lastPathSegment ?: "Day One",
                 )
-            }.getOrElse { failure ->
-                SettingsImportSummary.failure(
-                    sourceName = "Day One",
-                    message = "Day One import failed: ${failure.message ?: "unknown error"}",
-                )
+            }.getOrElse {
+                SettingsImportSummary(SettingsImportOutcome.Failed)
             }
             runOnUiThread { callback(summary) }
         }.start()

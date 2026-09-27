@@ -7,9 +7,11 @@ import saien.someday.data.export.ExportedLocation
 import saien.someday.data.export.ExportedNote
 import saien.someday.data.export.ExportedNotebook
 import saien.someday.data.export.LocalDataExportDocument
+import saien.someday.data.export.LocalDataImportException
 import saien.someday.data.export.LocalDataImportSummary
 import saien.someday.data.local.SqlDelightLocalDataRepository
 import saien.someday.data.settings.ClientSettingsRepository
+import kotlin.coroutines.cancellation.CancellationException
 import kotlin.time.Clock
 import kotlin.time.Instant
 
@@ -111,6 +113,40 @@ class WorkspaceLocalDataTransferV2(
         val notebookIds = document.notebooks.associate { notebook ->
             notebook.id to mappedEntityId(context, WorkspaceEntityTypeV2.NOTEBOOK, notebook.id)
         }.toMutableMap()
+        val notebooks = document.notebooks.sortedBy { it.id }.map { source ->
+            backupCandidate(
+                context, WorkspaceEntityTypeV2.NOTEBOOK, checkNotNull(notebookIds[source.id]),
+                NotebookContentV2(source.title, source.sortOrder, Instant.parse(source.createdAt)),
+                sourceProfile, "notebook:${source.id}", Instant.parse(source.updatedAt),
+            )
+        }
+        val notes = document.notes.sortedBy { it.id }.map { source ->
+            val notebookId = notebookIds.getOrPut(source.notebookId) {
+                mappedEntityId(context, WorkspaceEntityTypeV2.NOTEBOOK, source.notebookId)
+            }
+            backupCandidate(
+                context, WorkspaceEntityTypeV2.NOTE,
+                mappedEntityId(context, WorkspaceEntityTypeV2.NOTE, source.id),
+                NoteContentV2(
+                    notebookId = notebookId,
+                    title = source.title,
+                    markdownBody = source.markdownBody,
+                    noteCreatedAt = Instant.parse(source.createdAt),
+                    timeZoneId = source.timeZoneId,
+                    location = source.location?.let {
+                        NoteLocationV2(
+                            it.latitude, it.longitude, it.placeText, it.accuracyMeters,
+                            it.altitudeMeters, Instant.parse(it.capturedAt),
+                        )
+                    },
+                ),
+                sourceProfile, "note:${source.id}", Instant.parse(source.updatedAt),
+            )
+        }
+        // Use the same normalization, payload and envelope bounds as the actual commit.
+        // Reject predictable source errors before the first notebook/note write.
+        notebooks.forEach(committer::validate)
+        notes.forEach(committer::validate)
         var notebooksCreated = 0
         var notebooksReused = 0
         var notesCreated = 0
@@ -118,102 +154,69 @@ class WorkspaceLocalDataTransferV2(
         var notesMerged = 0
         var noteConflictsCreated = 0
         var notesSkipped = 0
-
-        document.notebooks.sortedBy { it.id }.forEach { source ->
-            val entityId = checkNotNull(notebookIds[source.id])
-            val content = NotebookContentV2(
-                source.title,
-                source.sortOrder,
-                Instant.parse(source.createdAt),
-            )
-            val key = WorkspaceEntityKeyV2(WorkspaceEntityTypeV2.NOTEBOOK, entityId)
-            val priorHeads = context.store.loadHeads(key)
-            if (priorHeads.any { it.hasExactState(content, null) }) {
-                notebooksReused++
-                return@forEach
-            }
-            when (val committed = committer.import(
-                backupCandidate(
-                    context, WorkspaceEntityTypeV2.NOTEBOOK, entityId, content,
-                    sourceProfile, "notebook:${source.id}", Instant.parse(source.updatedAt),
-                ),
-                verifiedParent = null,
-            )) {
-                is WorkspaceSourceCommitResultV2.Blocked -> error(committed.safeMessage)
-                is WorkspaceSourceCommitResultV2.Committed -> if (committed.value.newlyQueued) {
-                    if (priorHeads.isEmpty()) notebooksCreated++ else notebooksReused++
-                } else {
-                    notebooksReused++
-                }
-            }
-        }
-
-        document.notes.sortedBy { it.id }.forEach { source ->
-            val entityId = mappedEntityId(context, WorkspaceEntityTypeV2.NOTE, source.id)
-            val notebookId = notebookIds[source.notebookId]
-                ?: mappedEntityId(context, WorkspaceEntityTypeV2.NOTEBOOK, source.notebookId).also {
-                    notebookIds[source.notebookId] = it
-                }
-            val content = NoteContentV2(
-                notebookId = notebookId,
-                title = source.title,
-                markdownBody = source.markdownBody,
-                noteCreatedAt = Instant.parse(source.createdAt),
-                timeZoneId = source.timeZoneId,
-                location = source.location?.let {
-                    NoteLocationV2(
-                        it.latitude,
-                        it.longitude,
-                        it.placeText,
-                        it.accuracyMeters,
-                        it.altitudeMeters,
-                        Instant.parse(it.capturedAt),
-                    )
-                },
-            )
-            val key = WorkspaceEntityKeyV2(WorkspaceEntityTypeV2.NOTE, entityId)
-            val priorHeads = context.store.loadHeads(key)
-            if (priorHeads.any { it.hasExactState(content, null) }) {
-                notesSkipped++
-                return@forEach
-            }
-            val conflictsBefore = context.store.loadConflicts(key).count {
-                it.lifecycle == WorkspaceConflictLifecycleV2.ACTIVE
-            }
-            when (val committed = committer.import(
-                backupCandidate(
-                    context, WorkspaceEntityTypeV2.NOTE, entityId, content,
-                    sourceProfile, "note:${source.id}", Instant.parse(source.updatedAt),
-                ),
-                verifiedParent = null,
-            )) {
-                is WorkspaceSourceCommitResultV2.Blocked -> error(committed.safeMessage)
-                is WorkspaceSourceCommitResultV2.Committed -> if (!committed.value.newlyQueued) {
-                    notesSkipped++
-                } else if (priorHeads.isEmpty()) {
-                    notesCreated++
-                } else {
-                    val activeConflicts = context.store.loadConflicts(key).count {
-                        it.lifecycle == WorkspaceConflictLifecycleV2.ACTIVE
-                    }
-                    if (activeConflicts > conflictsBefore) {
-                        noteConflictsCreated++
-                    } else {
-                        val head = context.store.loadHeads(key).singleOrNull()
-                        if (head?.mergeAlgorithmVersion == FIELD_MERGE_ALGORITHM_V2) notesMerged++ else notesUpdated++
-                    }
-                }
-            }
-        }
-        return LocalDataImportSummary(
-            notebooksCreated,
-            notebooksReused,
-            notesCreated,
-            notesUpdated,
-            notesMerged,
-            noteConflictsCreated,
-            notesSkipped,
+        fun summary() = LocalDataImportSummary(
+            notebooksCreated, notebooksReused, notesCreated, notesUpdated,
+            notesMerged, noteConflictsCreated, notesSkipped,
         )
+
+        try {
+            notebooks.forEach { candidate ->
+                val key = WorkspaceEntityKeyV2(candidate.entityType, candidate.entityId)
+                val priorHeads = context.store.loadHeads(key)
+                if (priorHeads.any { it.hasExactState(candidate.content, null) }) {
+                    notebooksReused++
+                    return@forEach
+                }
+                when (val committed = committer.import(candidate, verifiedParent = null)) {
+                    is WorkspaceSourceCommitResultV2.Blocked -> error(committed.safeMessage)
+                    is WorkspaceSourceCommitResultV2.Committed -> if (committed.value.newlyQueued) {
+                        if (priorHeads.isEmpty()) notebooksCreated++ else notebooksReused++
+                    } else {
+                        notebooksReused++
+                    }
+                }
+            }
+
+            notes.forEach { candidate ->
+                val key = WorkspaceEntityKeyV2(candidate.entityType, candidate.entityId)
+                val priorHeads = context.store.loadHeads(key)
+                if (priorHeads.any { it.hasExactState(candidate.content, null) }) {
+                    notesSkipped++
+                    return@forEach
+                }
+                val conflictsBefore = context.store.loadConflicts(key).count {
+                    it.lifecycle == WorkspaceConflictLifecycleV2.ACTIVE
+                }
+                when (val committed = committer.import(candidate, verifiedParent = null)) {
+                    is WorkspaceSourceCommitResultV2.Blocked -> error(committed.safeMessage)
+                    is WorkspaceSourceCommitResultV2.Committed -> if (!committed.value.newlyQueued) {
+                        notesSkipped++
+                    } else if (priorHeads.isEmpty()) {
+                        notesCreated++
+                    } else {
+                        // The write is confirmed even if a subsequent classification read fails.
+                        notesUpdated++
+                        val activeConflicts = context.store.loadConflicts(key).count {
+                            it.lifecycle == WorkspaceConflictLifecycleV2.ACTIVE
+                        }
+                        if (activeConflicts > conflictsBefore) {
+                            notesUpdated--
+                            noteConflictsCreated++
+                        } else {
+                            val head = context.store.loadHeads(key).singleOrNull()
+                            if (head?.mergeAlgorithmVersion == FIELD_MERGE_ALGORITHM_V2) {
+                                notesUpdated--
+                                notesMerged++
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (failure: Exception) {
+            if (failure is CancellationException) throw failure
+            throw LocalDataImportException(summary(), failure)
+        }
+        return summary()
     }
 
     private fun activeContext(): ActiveWorkspaceSystemV2 = WorkspaceSystemV2ContextProvider(
@@ -262,6 +265,32 @@ private class WorkspaceSourceImportCommitterV2(
 ) {
     private val queries = localRepository.database.somedayQueries
 
+    fun validate(candidate: WorkspaceSourceCandidateV2) {
+        createVersion(candidate, context.factory.newMutationId(), null)
+    }
+
+    private fun createVersion(
+        candidate: WorkspaceSourceCandidateV2,
+        importRecordId: String,
+        verifiedParent: WorkspaceEntityVersionV2?,
+    ): WorkspaceEntityVersionV2 = context.factory.createSourceImport(
+        candidate.entityType,
+        candidate.entityId,
+        candidate.content,
+        candidate.deletion,
+        WorkspaceVersionProvenanceV2(
+            WorkspaceVersionProvenanceTypeV2.SOURCE_IMPORT,
+            candidate.sourceProfile,
+            candidate.sourceEpoch,
+            candidate.sourceWriterId,
+            importRecordId,
+            candidate.sourceObjectId,
+            candidate.sourceDigest,
+        ),
+        candidate.authoredAt,
+        verifiedParent,
+    )
+
     fun import(
         candidate: WorkspaceSourceCandidateV2,
         verifiedParent: WorkspaceEntityVersionV2?,
@@ -276,25 +305,8 @@ private class WorkspaceSourceImportCommitterV2(
         val importRecordId = existing?.source_mutation_id
             ?: candidate.sourceMutationId
             ?: context.factory.newMutationId()
-        val provenance = WorkspaceVersionProvenanceV2(
-            WorkspaceVersionProvenanceTypeV2.SOURCE_IMPORT,
-            candidate.sourceProfile,
-            candidate.sourceEpoch,
-            candidate.sourceWriterId,
-            importRecordId,
-            candidate.sourceObjectId,
-            candidate.sourceDigest,
-        )
         val version = runCatching {
-            context.factory.createSourceImport(
-                candidate.entityType,
-                candidate.entityId,
-                candidate.content,
-                candidate.deletion,
-                provenance,
-                candidate.authoredAt,
-                verifiedParent,
-            )
+            createVersion(candidate, importRecordId, verifiedParent)
         }.getOrElse {
             return blocked("source_import_invalid", it.message ?: "Source state violates the frozen V2 schema.")
         }

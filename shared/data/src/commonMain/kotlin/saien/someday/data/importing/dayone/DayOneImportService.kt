@@ -6,11 +6,13 @@ import saien.someday.data.export.ExportedLocation
 import saien.someday.data.export.ExportedNote
 import saien.someday.data.export.ExportedNotebook
 import saien.someday.data.export.LocalDataExportDocument
+import saien.someday.data.export.LocalDataImportException
 import saien.someday.data.export.LocalDataImportSummary
+import saien.someday.domain.media.SomedayAssetUri
 import saien.someday.domain.notes.noteCalendarDate
 import kotlin.time.Instant
 import kotlinx.datetime.LocalDate
-import kotlinx.serialization.SerialName
+import kotlinx.datetime.TimeZone
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
@@ -19,28 +21,58 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
-import kotlinx.serialization.json.doubleOrNull
 import kotlinx.serialization.json.intOrNull
-import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
 
 class DayOneImportService(
+    /** Null means text-only conversion. Production supplies the coordinated media store. */
+    private val importPhoto: ((ByteArray, String) -> SomedayAssetUri?)? = null,
     /** Parsed Day One content is written only through the System V3 workspace DAG. */
     private val authoritativeImporter: (LocalDataExportDocument) -> LocalDataImportSummary,
 ) {
     fun importArchive(
         archiveBytes: ByteArray,
         fallbackJournalTitle: String = "Day One",
-    ): DayOneImportSummary =
-        importDocuments(DayOneArchiveReader.readJsonDocuments(archiveBytes, fallbackJournalTitle))
-
-    fun importDocuments(documents: List<DayOneJsonDocument>): DayOneImportSummary {
-        require(documents.isNotEmpty()) { "Day One import requires at least one JSON document." }
-        return importThroughWorkspaceDag(documents)
+    ): DayOneImportSummary {
+        val archive = DayOneArchiveReader.open(archiveBytes)
+        return importThroughWorkspaceDag(archive.documents(fallbackJournalTitle), DayOneMediaResolver(archive, importPhoto))
     }
 
-    private fun importThroughWorkspaceDag(documents: List<DayOneJsonDocument>): DayOneImportSummary {
+    fun importDocuments(documents: List<DayOneJsonDocument>): DayOneImportSummary {
+        return importThroughWorkspaceDag(documents, DayOneMediaResolver(null, null))
+    }
+
+    private fun importThroughWorkspaceDag(
+        documents: List<DayOneJsonDocument>,
+        mediaResolver: DayOneMediaResolver,
+    ): DayOneImportSummary {
+        require(documents.isNotEmpty()) { "Day One import requires at least one JSON document." }
+        // Validate every journal before any media or note writes. Never leak source text in errors.
+        val decodedDocuments = documents.map { document ->
+            val decoded = try {
+                json.decodeFromString(DayOneExportDocument.serializer(), document.json)
+            } catch (_: Exception) {
+                throw IllegalArgumentException("Invalid Day One journal JSON.")
+            }
+            require(decoded.metadata?.version == null || decoded.metadata.version == "1.0") {
+                "Unsupported Day One export version."
+            }
+            decoded.entries.forEach { entry ->
+                require(entry.uuid.matches(Regex("[A-Za-z0-9-]{1,128}"))) { "Invalid Day One entry identifier." }
+                require(parseInstantOrNull(entry.creationDate.orEmpty()) != null) { "Invalid Day One creation date." }
+                require(entry.modifiedDate == null || parseInstantOrNull(entry.modifiedDate) != null) {
+                    "Invalid Day One modification date."
+                }
+                require(entry.timeZone.isNullOrBlank() || runCatching { TimeZone.of(entry.timeZone) }.isSuccess) {
+                    "Invalid Day One time zone."
+                }
+            }
+            decoded
+        }
+        val identifiers = decodedDocuments.flatMap { it.entries }.map { it.uuid }
+        require(identifiers.size <= 100_000 && identifiers.distinct().size == identifiers.size) {
+            "Day One export contains duplicate entry identifiers or more than 100000 entries."
+        }
         val notebooksByTitle = linkedMapOf<String, ExportedNotebook>()
         val notes = mutableListOf<ExportedNote>()
         var richTextConverted = 0
@@ -59,10 +91,10 @@ class DayOneImportService(
         documents.forEachIndexed { index, document ->
             val title = document.journalTitle.trim().ifBlank { "Day One" }
             val titleKey = notebookTitleKey(title)
-            val decoded = json.decodeFromString(DayOneExportDocument.serializer(), document.json)
-            val entryTimes = decoded.entries.map { parseInstantOrNow(it.creationDate) }
+            val decoded = decodedDocuments[index]
+            val entryTimes = decoded.entries.map { Instant.parse(it.creationDate!!) }
             val notebook = notebooksByTitle.getOrPut(titleKey) {
-                val created = entryTimes.minOrNull() ?: kotlin.time.Clock.System.now()
+                val created = entryTimes.minOrNull() ?: Instant.fromEpochMilliseconds(0)
                 ExportedNotebook(
                     id = "dayone-journal-${titleKey.hashCode().toUInt().toString(16)}",
                     title = title,
@@ -72,10 +104,11 @@ class DayOneImportService(
                 )
             }
             decoded.entries.forEach { entry ->
-                val createdAt = parseInstantOrNow(entry.creationDate)
-                val updatedAt = entry.modifiedDate?.let(::parseInstantOrNull) ?: createdAt
-                val conversion = DayOneRichTextMarkdownConverter.convert(entry.richText, entry.text.orEmpty())
-                val markdown = conversion.markdown
+                val createdAt = Instant.parse(entry.creationDate!!)
+                val updatedAt = entry.modifiedDate?.let(Instant::parse) ?: createdAt
+                val media = mediaResolver.forEntry(entry, document.archiveDirectory)
+                val conversion = DayOneRichTextMarkdownConverter.convert(entry.richText, entry.text.orEmpty(), media::render)
+                val markdown = media.finish(conversion.markdown)
                 val timeZoneId = entry.timeZone?.takeIf { it.isNotBlank() }
                 val titleValue = deriveTitle(markdown, noteCalendarDate(createdAt, timeZoneId))
                 val location = entry.location?.toExportedLocation(createdAt)
@@ -101,25 +134,31 @@ class DayOneImportService(
                 tagsFound += entry.tags.size
                 if (entry.starred) starredFound++
                 if (entry.isPinned) pinnedFound++
-                val media = entry.mediaCounts()
-                photosReferenced += media.photos.takeIf { it > 0 } ?: conversion.photosReferenced
-                audiosReferenced += media.audios.takeIf { it > 0 } ?: conversion.audiosReferenced
-                videosReferenced += media.videos.takeIf { it > 0 } ?: conversion.videosReferenced
-                pdfsReferenced += media.pdfs.takeIf { it > 0 } ?: conversion.pdfsReferenced
+                photosReferenced += media.count("photo")
+                audiosReferenced += media.count("audio")
+                videosReferenced += media.count("video")
+                pdfsReferenced += media.count("pdf")
                 if (entry.weather != null) weatherFound++
                 unsupportedEmbeddedObjects += conversion.unsupportedEmbeddedObjects
             }
         }
         val exportedAt = notes.maxOfOrNull { it.updatedAt }
-            ?: kotlin.time.Clock.System.now().toString()
-        val imported = authoritativeImporter(
-            LocalDataExportDocument(
-                exportedAt = exportedAt,
-                notebooks = notebooksByTitle.values.toList(),
-                notes = notes.distinctBy { it.id },
-            ),
-        )
+            ?: Instant.fromEpochMilliseconds(0).toString()
+        var completed = true
+        val imported = try {
+            authoritativeImporter(
+                LocalDataExportDocument(
+                    exportedAt = exportedAt,
+                    notebooks = notebooksByTitle.values.toList(),
+                    notes = notes.distinctBy { it.id },
+                ),
+            )
+        } catch (failure: LocalDataImportException) {
+            completed = false
+            failure.completed
+        }
         return DayOneImportSummary(
+            completed = completed,
             journalsImported = documents.size,
             notebooksCreated = imported.notebooksCreated,
             notebooksReused = imported.notebooksReused,
@@ -138,11 +177,12 @@ class DayOneImportService(
             pdfsReferenced = pdfsReferenced,
             weatherFound = weatherFound,
             unsupportedEmbeddedObjects = unsupportedEmbeddedObjects,
+            photosImported = mediaResolver.imported,
+            photosMissing = mediaResolver.missing,
+            photosUnresolved = mediaResolver.unresolved,
+            photosRejected = mediaResolver.rejected,
         )
     }
-
-    private fun parseInstantOrNow(value: String?): Instant =
-        value?.let(::parseInstantOrNull) ?: kotlin.time.Clock.System.now()
 
     private fun parseInstantOrNull(value: String): Instant? =
         runCatching { Instant.parse(value) }.getOrNull()
@@ -167,14 +207,6 @@ class DayOneImportService(
         )
     }
 
-    private fun DayOneEntry.mediaCounts(): DayOneMediaCounts =
-        DayOneMediaCounts(
-            photos = photos.size,
-            audios = audios.size,
-            videos = videos.size,
-            pdfs = pdfs.size,
-        )
-
     private fun deriveTitle(
         markdownBody: String,
         createdDate: LocalDate,
@@ -193,6 +225,7 @@ class DayOneImportService(
 data class DayOneJsonDocument(
     val journalTitle: String,
     val json: String,
+    val archiveDirectory: String = "",
 )
 
 data class DayOneImportSummary(
@@ -214,21 +247,26 @@ data class DayOneImportSummary(
     val pdfsReferenced: Int,
     val weatherFound: Int,
     val unsupportedEmbeddedObjects: Int,
+    val photosImported: Int = 0,
+    val photosMissing: Int = 0,
+    val photosUnresolved: Int = 0,
+    val photosRejected: Int = 0,
+    val completed: Boolean = true,
 ) {
     val importedNotes: Int = notesCreated + notesUpdated
-
-    fun toUserMessage(): String =
-        "Imported $importedNotes Day One notes across $journalsImported journals. " +
-            "Created $notebooksCreated notebooks, reused $notebooksReused, skipped $notesSkipped duplicates."
 }
 
 @Serializable
 private data class DayOneExportDocument(
-    val entries: List<DayOneEntry> = emptyList(),
+    val entries: List<DayOneEntry>,
+    val metadata: DayOneExportMetadata? = null,
 )
 
 @Serializable
-private data class DayOneEntry(
+private data class DayOneExportMetadata(val version: String? = null)
+
+@Serializable
+internal data class DayOneEntry(
     val uuid: String,
     val text: String? = null,
     val richText: String? = null,
@@ -247,7 +285,7 @@ private data class DayOneEntry(
 )
 
 @Serializable
-private data class DayOneLocation(
+internal data class DayOneLocation(
     val latitude: Double? = null,
     val longitude: Double? = null,
     val address: String? = null,
@@ -258,23 +296,23 @@ private data class DayOneLocation(
 )
 
 @Serializable
-private data class DayOneMedia(
+internal data class DayOneMedia(
     val identifier: String? = null,
     val type: String? = null,
-)
-
-private data class DayOneMediaCounts(
-    val photos: Int,
-    val audios: Int,
-    val videos: Int,
-    val pdfs: Int,
+    val md5: String? = null,
+    val orderInEntry: Int = 0,
 )
 
 private object DayOneRichTextMarkdownConverter {
     fun convert(
         richText: String?,
         fallbackText: String,
+        renderMedia: (String, String?) -> String,
     ): DayOneRichTextConversion {
+        fun fallback(): DayOneRichTextConversion {
+            require(fallbackText.isNotBlank()) { "Invalid or unsupported Day One rich text without a text fallback." }
+            return DayOneRichTextConversion(fallbackText.trim(), converted = false, fallbackUsed = true)
+        }
         if (richText.isNullOrBlank()) {
             return DayOneRichTextConversion(
                 markdown = fallbackText.trim(),
@@ -283,56 +321,39 @@ private object DayOneRichTextMarkdownConverter {
             )
         }
         val root = runCatching { json.parseToJsonElement(richText).jsonObject }.getOrNull()
-            ?: return DayOneRichTextConversion(
-                markdown = fallbackText.trim(),
-                converted = false,
-                fallbackUsed = true,
-            )
-        val contents = root["contents"] as? JsonArray
-            ?: return DayOneRichTextConversion(
-                markdown = fallbackText.trim(),
-                converted = false,
-                fallbackUsed = true,
-            )
+            ?: return fallback()
+        val meta = root["meta"]
+        if (meta != null && meta !is JsonObject) return fallback()
+        val version = meta?.get("version")
+        if (version != null && (version !is JsonPrimitive || version.isString || version.intOrNull != 1)) return fallback()
+        val contents = root["contents"] as? JsonArray ?: return fallback()
+        if (contents.any { node ->
+                node !is JsonObject || (node["text"] != null && node["text"]?.asStringOrNull() == null) ||
+                    (node["embeddedObjects"] != null &&
+                        (node["embeddedObjects"] !is JsonArray || (node["embeddedObjects"] as JsonArray).any { it !is JsonObject }))
+            }) return fallback()
 
         val builder = StringBuilder()
-        var photosReferenced = 0
-        var audiosReferenced = 0
-        var videosReferenced = 0
-        var pdfsReferenced = 0
         var unsupportedEmbeddedObjects = 0
 
         contents.forEach { element ->
             val item = element as? JsonObject ?: return@forEach
-            val text = item["text"]?.jsonPrimitive?.contentOrNull
+            val text = item["text"]?.asStringOrNull()
             if (text != null) {
                 appendText(builder, text, item["attributes"] as? JsonObject)
             }
             val embeddedObjects = item["embeddedObjects"] as? JsonArray
             embeddedObjects?.forEach { embedded ->
                 val embeddedObject = embedded as? JsonObject ?: return@forEach
-                when (val type = embeddedObject["type"]?.jsonPrimitive?.contentOrNull.orEmpty()) {
-                    "photo" -> {
-                        photosReferenced += 1
-                        appendEmbeddedPlaceholder(builder, "Photo", embeddedObject)
-                    }
-                    "audio" -> {
-                        audiosReferenced += 1
-                        appendEmbeddedPlaceholder(builder, "Audio", embeddedObject)
-                    }
-                    "video" -> {
-                        videosReferenced += 1
-                        appendEmbeddedPlaceholder(builder, "Video", embeddedObject)
-                    }
-                    "pdf" -> {
-                        pdfsReferenced += 1
-                        appendEmbeddedPlaceholder(builder, "PDF", embeddedObject)
-                    }
+                when (val type = embeddedObject["type"]?.asStringOrNull().orEmpty()) {
+                    "photo", "audio", "video", "pdf" ->
+                        appendBlock(builder, renderMedia(type, embeddedObject["identifier"]?.asStringOrNull()))
                     "markdown" -> appendMarkdownObject(builder, embeddedObject)
                     "horizontalRuleLine" -> appendBlock(builder, "---")
                     else -> {
                         unsupportedEmbeddedObjects += 1
-                        appendBlock(builder, "[Unsupported Day One object: ${type.ifBlank { "unknown" }}]")
+                        val safeType = type.takeIf { it.matches(Regex("[A-Za-z0-9-]{1,64}")) } ?: "unknown"
+                        appendBlock(builder, "[Unsupported Day One object: $safeType]")
                     }
                 }
             }
@@ -344,10 +365,6 @@ private object DayOneRichTextMarkdownConverter {
                 markdown = fallbackText.trim(),
                 converted = false,
                 fallbackUsed = true,
-                photosReferenced = photosReferenced,
-                audiosReferenced = audiosReferenced,
-                videosReferenced = videosReferenced,
-                pdfsReferenced = pdfsReferenced,
                 unsupportedEmbeddedObjects = unsupportedEmbeddedObjects,
             )
         } else {
@@ -355,10 +372,6 @@ private object DayOneRichTextMarkdownConverter {
                 markdown = converted,
                 converted = true,
                 fallbackUsed = false,
-                photosReferenced = photosReferenced,
-                audiosReferenced = audiosReferenced,
-                videosReferenced = videosReferenced,
-                pdfsReferenced = pdfsReferenced,
                 unsupportedEmbeddedObjects = unsupportedEmbeddedObjects,
             )
         }
@@ -371,23 +384,14 @@ private object DayOneRichTextMarkdownConverter {
     ) {
         val line = attributes?.get("line") as? JsonObject
         val prefix = linePrefix(line)
-        val formatted = applyInlineFormatting(text, attributes)
-        if (prefix == null) {
-            builder.append(formatted)
-            return
-        }
-
-        if (builder.isNotEmpty() && !builder.endsWithLineBreak()) {
-            builder.append('\n')
-        }
-        formatted.split('\n').forEachIndexed { index, part ->
+        text.split('\n').forEachIndexed { index, part ->
             if (index > 0) {
                 builder.append('\n')
             }
-            if (part.isNotBlank()) {
+            if (prefix != null && part.isNotBlank() && (builder.isEmpty() || builder.endsWithLineBreak())) {
                 builder.append(prefix)
             }
-            builder.append(part)
+            builder.append(applyInlineFormatting(part, attributes))
         }
     }
 
@@ -395,15 +399,15 @@ private object DayOneRichTextMarkdownConverter {
         if (line == null) {
             return null
         }
-        line["header"]?.jsonPrimitive?.intOrNull?.let { level ->
-            return "#".repeat(level.coerceIn(1, 6)) + " "
+        (line["header"] as? JsonPrimitive)?.intOrNull?.let { level ->
+            if (level in 1..6) return "#".repeat(level) + " "
         }
-        val indent = "  ".repeat((line["indentLevel"]?.jsonPrimitive?.intOrNull ?: 0).coerceAtLeast(0))
-        val checked = line["checked"]?.jsonPrimitive?.booleanOrNull
+        val indent = "  ".repeat(((line["indentLevel"] as? JsonPrimitive)?.intOrNull ?: 1).coerceIn(1, 17) - 1)
+        val checked = (line["checked"] as? JsonPrimitive)?.booleanOrNull
         if (checked != null) {
             return "$indent- [${if (checked) "x" else " "}] "
         }
-        return when (line["listStyle"]?.jsonPrimitive?.contentOrNull) {
+        return when (line["listStyle"]?.asStringOrNull()) {
             "bulleted" -> "$indent- "
             "numbered" -> "${indent}1. "
             else -> null
@@ -414,32 +418,26 @@ private object DayOneRichTextMarkdownConverter {
         text: String,
         attributes: JsonObject?,
     ): String {
-        if (attributes == null) {
+        if (attributes == null || text.isBlank()) {
             return text
         }
-        var result = text
-        if (attributes["autolink"]?.jsonPrimitive?.booleanOrNull == true && text.startsWith("http")) {
-            result = "[$text]($text)"
+        val trimmed = text.trim()
+        var result = trimmed
+        if ((attributes["autolink"] as? JsonPrimitive)?.booleanOrNull == true &&
+            (trimmed.startsWith("https://") || trimmed.startsWith("http://"))
+        ) {
+            result = "[$trimmed](${trimmed.replace("(", "%28").replace(")", "%29")})"
         }
-        if (attributes["bold"]?.jsonPrimitive?.booleanOrNull == true) {
+        if ((attributes["bold"] as? JsonPrimitive)?.booleanOrNull == true) {
             result = "**$result**"
         }
-        if (attributes["italic"]?.jsonPrimitive?.booleanOrNull == true) {
+        if ((attributes["italic"] as? JsonPrimitive)?.booleanOrNull == true) {
             result = "*$result*"
         }
-        if (attributes["underline"]?.jsonPrimitive?.booleanOrNull == true) {
+        if ((attributes["underline"] as? JsonPrimitive)?.booleanOrNull == true) {
             result = "<u>$result</u>"
         }
-        return result
-    }
-
-    private fun appendEmbeddedPlaceholder(
-        builder: StringBuilder,
-        label: String,
-        embeddedObject: JsonObject,
-    ) {
-        val identifier = embeddedObject["identifier"]?.jsonPrimitive?.contentOrNull
-        appendBlock(builder, "[$label: ${identifier ?: "missing identifier"}]")
+        return text.takeWhile(Char::isWhitespace) + result + text.takeLastWhile(Char::isWhitespace)
     }
 
     private fun appendMarkdownObject(
@@ -473,16 +471,12 @@ private data class DayOneRichTextConversion(
     val markdown: String,
     val converted: Boolean,
     val fallbackUsed: Boolean,
-    val photosReferenced: Int = 0,
-    val audiosReferenced: Int = 0,
-    val videosReferenced: Int = 0,
-    val pdfsReferenced: Int = 0,
     val unsupportedEmbeddedObjects: Int = 0,
 )
 
 private fun JsonElement.asStringOrNull(): String? =
     when (this) {
-        is JsonPrimitive -> contentOrNull
+        is JsonPrimitive -> takeIf { isString }?.contentOrNull
         else -> null
     }
 

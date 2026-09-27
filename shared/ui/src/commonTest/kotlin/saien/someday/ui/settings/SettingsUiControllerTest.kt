@@ -304,30 +304,56 @@ class SettingsUiControllerTest {
     @Test
     fun asynchronousImportPublishesOneProductSummary() = runBlocking {
         var callback: ((SettingsImportSummary) -> Unit)? = null
+        var refreshes = 0
         val controller = SettingsUiController(
             loadSettings = { ClientSettings() },
             dayOneImportRunner = DayOneImportRunner { onResult -> callback = onResult },
+            onDataRestored = { refreshes++ },
         )
 
         assertTrue(controller.startDayOneImport())
         assertTrue(controller.state.importRunning)
+        assertFalse(controller.startDayOneImport())
 
         callback?.invoke(
             SettingsImportSummary(
-                sourceName = "Day One",
-                success = true,
-                message = "Imported 2 Day One notes.",
+                outcome = SettingsImportOutcome.Completed,
                 journalsImported = 1,
                 notesCreated = 2,
-                mediaReferenced = 1,
+                photosMissing = 1,
             ),
         )
 
         val summary = assertNotNull(controller.state.importSummary)
         assertFalse(controller.state.importRunning)
         assertEquals(2, summary.notesImported)
-        assertEquals(1, summary.mediaReferenced)
-        assertFalse(summary.includesMediaBytes)
+        assertEquals(1, summary.photosMissing)
+        assertEquals(1, refreshes)
+        assertTrue(controller.startDayOneImport())
+        assertNull(controller.state.importSummary)
+    }
+
+    @Test
+    fun partialImportRefreshesDataAndCancellationIsNotAnError() = runBlocking {
+        for (outcome in listOf(SettingsImportOutcome.Partial, SettingsImportOutcome.Failed, SettingsImportOutcome.Cancelled)) {
+            var refreshes = 0
+            val controller = SettingsUiController(
+                loadSettings = { ClientSettings() },
+                dayOneImportRunner = DayOneImportRunner { it(SettingsImportSummary(outcome, notesCreated = 1)) },
+                onDataRestored = { refreshes++ },
+            )
+            assertTrue(controller.startDayOneImport())
+            assertFalse(controller.state.importRunning)
+            assertEquals(if (outcome == SettingsImportOutcome.Partial) 1 else 0, refreshes)
+            assertEquals(
+                when (outcome) {
+                    SettingsImportOutcome.Partial -> SettingsFeedbackSeverity.Warning
+                    SettingsImportOutcome.Cancelled -> SettingsFeedbackSeverity.Info
+                    else -> SettingsFeedbackSeverity.Error
+                },
+                controller.state.feedbackSeverity,
+            )
+        }
     }
 
     @Test

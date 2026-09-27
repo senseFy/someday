@@ -75,6 +75,13 @@ Portable structured export reads this same DAG product view. Import creates
 normal DAG mutations in the selected writable local generation. Media bytes
 are excluded from the current portable format.
 
+Local source imports validate all converted entities against the existing
+normalization, payload, and envelope bounds before writing notebooks or notes.
+Persistence still commits each source entity independently, not the whole file.
+A persistence failure carries confirmed counts of earlier writes; callers must
+not report a full rollback or discard those counts. Existing source identities,
+replay records, conflict rules, and the wire format remain unchanged.
+
 ## 4. Entity causality and conflicts
 
 Each immutable version identifies one entity and contains a sorted, bounded

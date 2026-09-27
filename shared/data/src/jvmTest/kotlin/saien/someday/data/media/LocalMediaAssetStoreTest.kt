@@ -20,6 +20,7 @@ import okio.buffer
 import saien.someday.data.local.createSomedayJdbcDriver
 import saien.someday.data.local.db.SomedayDatabase
 import saien.someday.domain.media.MediaAssetId
+import kotlin.coroutines.cancellation.CancellationException
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
@@ -28,6 +29,7 @@ import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertNotEquals
 import kotlin.test.assertNull
+import kotlin.test.assertSame
 import kotlin.test.assertTrue
 import kotlin.time.Instant
 
@@ -160,9 +162,73 @@ class LocalMediaAssetStoreTest {
             SelectedImageImportFailureReason.NormalizationWouldViolateQualityBounds,
             qualityLimit.reason,
         )
+        // Android's in-memory image decoder can report bad bytes with IOException.
+        val codecFailure = IOException("injected codec rejection")
+        val invalidEncoding = assertFailsWith<SelectedImageImportException> {
+            fixture.store.importSelectedImage(
+                Buffer().write(PNG_1X1), SelectedImageImportRequest(),
+                MediaImageNormalizer { source, _ ->
+                    assertContentEquals(PNG_1X1, source.readByteArray())
+                    throw codecFailure
+                },
+            )
+        }
+        assertEquals(SelectedImageImportFailureReason.NormalizationFailed, invalidEncoding.reason)
+        assertSame(codecFailure, invalidEncoding.cause)
         assertTrue(fixture.store.listAssets().isEmpty())
         assertTrue(FileSystem.SYSTEM.listOrNull(stagingRoot(fixture.root)).orEmpty().isEmpty())
         assertTrue(FileSystem.SYSTEM.listRecursivelyOrEmpty(objectsRoot(fixture.root)).none())
+    }
+
+    @Test
+    fun normalizedImageStorageFailureIsNotMisreportedAsInvalidSource() {
+        val failingFileSystem = object : ForwardingFileSystem(FileSystem.SYSTEM) {
+            override fun atomicMove(source: Path, target: Path) {
+                throw IOException("injected atomic move failure")
+            }
+        }
+        withFixture(
+            fileSystem = failingFileSystem,
+            inspector = MediaAssetInspector { source, size, type, maxPixels ->
+                if (maxPixels > MAX_DECODED_PIXEL_COUNT_BOUND) {
+                    MediaAssetInspection("image/png", 4_000, 4_000)
+                } else {
+                    StaticImageMediaAssetInspector.inspect(source, size, type, maxPixels)
+                }
+            },
+        ) { fixture ->
+            assertFailsWith<IOException> {
+                fixture.store.importSelectedImage(
+                    Buffer().write(PNG_1X1), SelectedImageImportRequest(),
+                    MediaImageNormalizer { _, _ -> PNG_1X1.copyOf() },
+                )
+            }
+            assertTrue(fixture.store.listAssets().isEmpty())
+        }
+    }
+
+    @Test
+    fun imageProcessingCancellationIsNotMisreportedAsInvalidSource() {
+        for (normalize in listOf(false, true)) {
+            val cancellation = CancellationException("Synthetic image processing cancellation")
+            withFixture(
+                inspector = MediaAssetInspector { _, _, _, _ ->
+                    val edge = if (normalize) 4000 else 1
+                    MediaAssetInspection("image/png", edge, edge)
+                },
+                decodeValidator = MediaAssetDecodeValidator { throw cancellation },
+            ) { fixture ->
+                assertSame(cancellation, assertFailsWith<CancellationException> {
+                    fixture.store.importSelectedImage(
+                        Buffer().write(PNG_1X1), SelectedImageImportRequest(),
+                        MediaImageNormalizer { _, _ -> throw cancellation },
+                    )
+                })
+                assertTrue(fixture.store.listAssets().isEmpty())
+                assertTrue(FileSystem.SYSTEM.listOrNull(stagingRoot(fixture.root)).orEmpty().isEmpty())
+                assertTrue(FileSystem.SYSTEM.listRecursivelyOrEmpty(objectsRoot(fixture.root)).none())
+            }
+        }
     }
 
     @Test

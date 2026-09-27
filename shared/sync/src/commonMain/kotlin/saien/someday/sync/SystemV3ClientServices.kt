@@ -3,8 +3,14 @@ package saien.someday.sync
 import saien.someday.data.crypto.WorkspaceMasterKey
 import saien.someday.data.export.LocalDataExportDocument
 import saien.someday.data.export.LocalDataImportSummary
+import saien.someday.data.importing.dayone.DayOneImportService
+import saien.someday.data.importing.dayone.DayOneImportSummary
 import saien.someday.data.local.SqlDelightLocalDataRepository
 import saien.someday.data.media.LocalMediaAssetStore
+import saien.someday.data.media.MediaImageNormalizer
+import saien.someday.data.media.SelectedImageImportException
+import saien.someday.data.media.SelectedImageImportRequest
+import okio.Buffer
 import saien.someday.data.settings.ClientSettingsRepository
 import saien.someday.domain.notes.NotesRepository
 import saien.someday.domain.media.findSomedayAssetIds
@@ -54,6 +60,7 @@ data class SystemV3ClientServices(
     val workspacePairingInviterReady: () -> Boolean,
     val localDataExportProvider: (kotlin.time.Instant) -> LocalDataExportDocument,
     val localDataImportProvider: (LocalDataExportDocument) -> LocalDataImportSummary,
+    val dayOneArchiveImporter: (ByteArray, String, MediaImageNormalizer) -> DayOneImportSummary,
 )
 
 fun createSystemV3ClientServices(
@@ -256,6 +263,28 @@ fun createSystemV3ClientServices(
                 workspaceLifecycleCoordinator.productAccess {
                     v2LocalDataTransfer.importDocument(document)
                 }
+            }
+        },
+        dayOneArchiveImporter = { bytes, title, normalizer ->
+            // One workspace identity from the first asset through the last note. Do not call
+            // localDataImportProvider here: the lifecycle mutex is deliberately non-reentrant.
+            workspaceLifecycleCoordinator.exclusive {
+                DayOneImportService(
+                    importPhoto = { image, fileName ->
+                        try {
+                            coordinatedMediaAssetStore.importSelectedImage(
+                                Buffer().write(image), SelectedImageImportRequest(fileName), normalizer,
+                            ).asset.metadata.uri
+                        } catch (_: SelectedImageImportException) {
+                            null
+                        }
+                    },
+                    authoritativeImporter = { document ->
+                        workspaceLifecycleCoordinator.productAccess {
+                            v2LocalDataTransfer.importDocument(document)
+                        }
+                    },
+                ).importArchive(bytes, title)
             }
         },
     )
