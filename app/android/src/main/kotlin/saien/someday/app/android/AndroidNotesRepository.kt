@@ -30,10 +30,6 @@ import saien.someday.domain.settings.WorkspacePairingInvitationCreator
 import saien.someday.domain.settings.WorkspacePairingInvitationJoiner
 import saien.someday.domain.settings.WorkspaceRecoveryManager
 import saien.someday.sync.AuthorityCoordinatedMediaAssetStore
-import saien.someday.sync.causality.v2.SyncRemoteProfileV2
-import saien.someday.sync.causality.v2.SystemV2ClientSettingsRepository
-import saien.someday.sync.causality.v2.SystemV2NotesRepository
-import saien.someday.sync.causality.v2.ensureWorkspaceLocalDraftV2
 import saien.someday.sync.createSystemV3ClientServices
 import saien.someday.sync.selfhosted.AndroidSelfHostedSyncTransport
 import saien.someday.sync.selfhosted.SelfHostedConnectionSwitchService
@@ -105,57 +101,7 @@ class AndroidClientRepositories(
             .toSettingsImportSummary()
 }
 
-internal class AndroidOnThisDayRepositories(
-    val notesRepository: NotesRepository,
-    val settingsRepository: ClientSettingsRepository,
-    private val driver: AndroidSqliteDriver,
-) : AutoCloseable {
-    override fun close() {
-        driver.close()
-    }
-}
-
-internal fun createAndroidOnThisDayRepositories(context: Context): AndroidOnThisDayRepositories {
-    val driver = AndroidSqliteDriver(
-        schema = SomedayDatabase.Schema,
-        context = context,
-        name = "someday.db",
-    )
-    return runCatching {
-        val localRepository = SqlDelightLocalDataRepository(
-            database = SomedayDatabase(driver),
-            deviceId = resolveAndroidLocalDeviceId(context),
-        )
-        val localSettings = SqlDelightClientSettingsRepository(localRepository)
-        ensureActiveDeviceId(localSettings, localRepository.localDeviceId)
-        val workspaceKeys = bootstrapAndroidWorkspaceKeys(context, localRepository)
-        val keyProvider = workspaceKeys::unlockedOrUnlock
-        keyProvider()?.let { ensureWorkspaceLocalDraftV2(localRepository, localSettings, it) }
-        val profile = { SyncRemoteProfileV2.SELF_HOSTED.wireValue }
-        val settings = SystemV2ClientSettingsRepository(
-            localRepository,
-            localSettings,
-            keyProvider,
-            { localRepository.localDeviceId },
-            profile,
-        )
-        AndroidOnThisDayRepositories(
-            notesRepository = SystemV2NotesRepository(
-                localRepository,
-                keyProvider,
-                { localRepository.localDeviceId },
-                profile,
-            ),
-            settingsRepository = settings,
-            driver = driver,
-        )
-    }.getOrElse { failure ->
-        driver.close()
-        throw failure
-    }
-}
-
-fun createAndroidClientRepositories(context: Context): AndroidClientRepositories {
+internal fun createAndroidClientRepositories(context: Context): AndroidClientRepositories {
     val localData = createAndroidLocalDataRepository(context, resolveAndroidLocalDeviceId(context))
     return runCatching {
         assembleAndroidClientRepositoriesWithOwnedTransport(context, localData)

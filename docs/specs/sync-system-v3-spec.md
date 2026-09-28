@@ -99,6 +99,15 @@ preferences through typed DAG repositories. A durable outbox records remote
 work in the same local transaction as each mutation. UI and platform workers
 do not write protocol or projection tables directly.
 
+Android foreground startup and background reminders share one application-owned
+client service graph. Its synchronized, off-main-thread initialization covers
+device identity, workspace key creation/unlock, and the initial local draft
+before publishing repositories to either caller. Workers do not bootstrap a
+second workspace or close application-owned services when they finish. They
+use the same workspace-lifecycle coordinator as product access, sync, pairing,
+and recovery. Initialization failures propagate; existing data is never reset
+and integrity checks are never bypassed to recover startup.
+
 Authentication alone does not decrypt or choose a workspace. An unbound local
 draft is not eligible for launch, foreground, or local-change automatic sync,
 so signing in cannot silently publish it as a new remote workspace. The user

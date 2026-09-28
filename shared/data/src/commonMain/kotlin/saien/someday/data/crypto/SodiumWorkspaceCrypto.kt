@@ -22,7 +22,7 @@ class SodiumWorkspaceCrypto internal constructor(
     constructor() : this(RecoveryKdfPolicy.protocolV1())
 
     init {
-        ensureInitialized()
+        initialization.value
     }
 
     fun generateWorkspaceKey(): WorkspaceMasterKey =
@@ -135,20 +135,22 @@ class SodiumWorkspaceCrypto internal constructor(
         }
     }
 
-    private fun ensureInitialized() {
-        if (LibsodiumInitializer.isInitialized()) return
-
-        var callbackCompleted = false
-        LibsodiumInitializer.initializeWithCallback {
-            callbackCompleted = true
-        }
-        check(callbackCompleted || LibsodiumInitializer.isInitialized()) {
-            "Libsodium initialization did not complete synchronously for this target."
-        }
-    }
-
     companion object {
         const val RECOVERY_ENTROPY_BYTES = 16
+
+        // Shared by foreground/background callers, not one lock per crypto instance.
+        // Failed initialization propagates and leaves the lazy value retryable.
+        private val initialization = lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+            if (!LibsodiumInitializer.isInitialized()) {
+                var callbackCompleted = false
+                LibsodiumInitializer.initializeWithCallback {
+                    callbackCompleted = true
+                }
+                check(callbackCompleted || LibsodiumInitializer.isInitialized()) {
+                    "Libsodium initialization did not complete synchronously for this target."
+                }
+            }
+        }
     }
 }
 

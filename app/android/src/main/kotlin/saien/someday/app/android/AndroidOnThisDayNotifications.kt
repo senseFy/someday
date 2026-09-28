@@ -189,37 +189,35 @@ internal fun onThisDayBroadcastKind(
     }
 
 @OptIn(ExperimentalTime::class)
-private fun handleOnThisDayBroadcast(
+internal fun handleOnThisDayBroadcast(
     context: Context,
     broadcastKind: OnThisDayBroadcastKind,
 ) {
-    val repositories = createAndroidOnThisDayRepositories(context)
+    // The application owns initialization, the lifecycle coordinator, and the driver.
+    // A receiver must neither initialize a second workspace nor close the shared services.
+    val repositories = (context.applicationContext as SomedayApplication).clientRepositories
+    val preferences = repositories.settingsRepository.load().onThisDayNotifications
+    if (!preferences.enabled) {
+        return
+    }
+
+    val scheduler = AndroidOnThisDayNotificationScheduler(context)
+    if (broadcastKind == OnThisDayBroadcastKind.Reschedule) {
+        scheduler.syncSchedule(preferences)
+        return
+    }
+
+    val today = Clock.System.now().toLocalDateTime(TimeZone.currentSystemDefault()).date
     try {
-        val preferences = repositories.settingsRepository.load().onThisDayNotifications
-        if (!preferences.enabled) {
-            return
-        }
-
-        val scheduler = AndroidOnThisDayNotificationScheduler(context)
-        if (broadcastKind == OnThisDayBroadcastKind.Reschedule) {
-            scheduler.syncSchedule(preferences)
-            return
-        }
-
-        val today = Clock.System.now().toLocalDateTime(TimeZone.currentSystemDefault()).date
-        try {
-            val priorYearNotes = repositories.notesRepository.listPriorYearNotesForDate(today)
-            if (priorYearNotes.isNotEmpty()) {
-                postOnThisDayNotification(
-                    context = context,
-                    memoryCount = priorYearNotes.size,
-                )
-            }
-        } finally {
-            scheduler.scheduleNextAlarm(preferences.hour, preferences.minute)
+        val priorYearNotes = repositories.notesRepository.listPriorYearNotesForDate(today)
+        if (priorYearNotes.isNotEmpty()) {
+            postOnThisDayNotification(
+                context = context,
+                memoryCount = priorYearNotes.size,
+            )
         }
     } finally {
-        repositories.close()
+        scheduler.scheduleNextAlarm(preferences.hour, preferences.minute)
     }
 }
 
