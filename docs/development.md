@@ -87,6 +87,16 @@ caches, and does not run `clean`. A physical iOS device requires a valid Xcode
 signing team and provisioning profile. Export `IOS_DEVELOPMENT_TEAM` or
 `IOS_TEAM_ID` when the runner should pass the team identifier to Xcode.
 
+Android debug builds, including `make run-android` and `make android-install`,
+reuse the release signing key when all four `SOMEDAY_ANDROID_*` signing
+variables from [Client release](client-release.md#android-google-play) are
+configured. They remain debuggable builds. With none of those variables set,
+Android uses the default debug keystore; partial configuration fails rather
+than falling back. To update an existing installation without uninstalling or
+clearing its data, use the same app signing key as that installation. A Play
+upload key is not necessarily the installed app's signing key. Never commit
+signing credentials or distribute release-key-signed debug builds publicly.
+
 Manual desktop and server commands are:
 
 ```bash
