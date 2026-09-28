@@ -39,7 +39,7 @@ reasonable window for assessment and fix before any public disclosure.
 - Do not attach real user databases, crash logs with personal content, or device
   exports to public issues unless you have stripped personal data.
 - Signing and store-publishing credentials stay outside the repository; see
-  [Client release](docs/client-release.md).
+  [Client release](docs/guides/client-release.md).
 
 ## Security scope and deployment
 
@@ -50,13 +50,13 @@ reasonable window for assessment and fix before any public disclosure.
 - `compose.yaml` and the server's `local` mode are development surfaces. A
   public deployment uses `production` mode, HTTPS, and the database security
   settings documented in
-  [`docs/self-hosting.md`](docs/self-hosting.md).
+  [`docs/guides/self-hosting.md`](docs/guides/self-hosting.md).
 - Workspace pairing uses a one-use 128-bit capability and an end-to-end
   encrypted invitation. Treat a pairing QR or manual token as a temporary
   workspace secret and report any path that logs it, makes it enumerable,
   accepts it across authorities, or permits a second claim. The protocol and
   threat model are documented in
-  [`docs/workspace-pairing-protocol.md`](docs/workspace-pairing-protocol.md).
+  [`docs/specs/workspace-pairing-protocol.md`](docs/specs/workspace-pairing-protocol.md).
 - Workspace recovery uses a separate user-held 128-bit code. The server stores
   one opaque wrapped-key envelope for each account and never needs the code or
   plaintext workspace key. Treat the code as a long-lived workspace secret;
@@ -65,7 +65,7 @@ reasonable window for assessment and fix before any public disclosure.
   and envelope authenticate. Recovery-control-plane failures do not revoke
   sync access from an intact, already bound workspace; the protocol and current
   denial-of-recovery boundary are documented in
-  [`docs/workspace-recovery-protocol.md`](docs/workspace-recovery-protocol.md).
+  [`docs/specs/workspace-recovery-protocol.md`](docs/specs/workspace-recovery-protocol.md).
 - Portable export/restore does not contain app-private image bytes. Operators
   must protect and consistently back up both PostgreSQL and the configured media
   store; disclosing either can expose sensitive metadata or ciphertext.

@@ -198,7 +198,7 @@ Client signing, store uploads, and release versioning are documented in
 ## Engineering constraints
 
 Database migrations, UI threading, and System V3 protocol rules are enforced
-repository-wide. Read [agent.md](../agent.md) before changing those surfaces.
+repository-wide. Read [agent.md](../../agent.md) before changing those surfaces.
 Database-specific guidance is in [Database migrations](database-migrations.md),
 and the synchronization test model is in
 [System V3 test strategy](sync-system-v3-test-strategy.md).

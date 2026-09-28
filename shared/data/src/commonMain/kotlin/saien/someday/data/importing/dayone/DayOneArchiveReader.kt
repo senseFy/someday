@@ -5,7 +5,7 @@ import okio.Inflater
 import okio.buffer
 import okio.inflate
 
-/** The supported archive profile and resource bounds are specified in docs/day-one-import.md. */
+/** The supported archive profile and resource bounds are specified in docs/specs/day-one-import.md. */
 object DayOneArchiveReader {
     fun readJsonDocuments(
         archiveBytes: ByteArray,

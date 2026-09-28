@@ -360,7 +360,7 @@ for argument_line in \
 done
 release_run="$(workflow_step_run "$github_release_section" 'Create the GitHub Release after every gate')" ||
     die "GitHub Release must define the publication step"
-grep -Fq 'docs/self-hosting.md' <<<"$(active_run_lines <<<"$release_run")" ||
+grep -Fq 'docs/guides/self-hosting.md' <<<"$(active_run_lines <<<"$release_run")" ||
     die "GitHub Release must link the deployment guide"
 for release_line in \
     'gh release create "$RELEASE_TAG" \' \

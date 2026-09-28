@@ -13,7 +13,7 @@
 - Server schema changes are owned by Flyway files in `server/src/main/resources/db/migration`. Do not patch server schema from application startup or request handling.
 - Migrations must be deterministic version-to-version transitions. Do not use `IF EXISTS` or `IF NOT EXISTS` to hide uncertain schema state; model the old state explicitly and migrate it.
 - The released server migration set is byte-frozen through V9. Add a version newer than V9; do not add repeatable, undo, or backfilled lower-version SQL migrations. Tenant-row DML must set transaction-local account and workspace wildcard scopes before its first write, remain transactional, and pass the non-empty previous-release upgrade gate.
-- After schema changes, update the SQLDelight schema snapshot and run `./gradlew :shared:data:verifySqlDelightMigration` plus relevant client/server tests. See `docs/database-migrations.md`.
+- After schema changes, update the SQLDelight schema snapshot and run `./gradlew :shared:data:verifySqlDelightMigration` plus relevant client/server tests. See `docs/guides/database-migrations.md`.
 
 ## UI and Main-Thread IO
 
@@ -27,12 +27,12 @@
 
 ## Sync Protocol
 
-- `docs/sync-system-v3-spec.md` is the product sync contract. The stable
-  entity-DAG subsystem remains specified by `docs/sync-system-v2-spec.md`, and
-  media wire details by `docs/self-hosted-media-v3.md`.
-- `docs/workspace-pairing-protocol.md` is the frozen workspace-pairing
+- `docs/specs/sync-system-v3-spec.md` is the product sync contract. The stable
+  entity-DAG subsystem remains specified by `docs/specs/sync-system-v2-spec.md`, and
+  media wire details by `docs/specs/self-hosted-media-v3.md`.
+- `docs/specs/workspace-pairing-protocol.md` is the frozen workspace-pairing
   capability, encryption, transport-state, and local-replacement contract.
-- `docs/workspace-recovery-protocol.md` is the frozen user recovery-code,
+- `docs/specs/workspace-recovery-protocol.md` is the frozen user recovery-code,
   portable-envelope, account-current-pointer, CAS, and local-replacement
   contract.
 - Any change to epoch pointers, checkpoints, entity envelopes, validation,
@@ -110,7 +110,7 @@
 
 ## Self-hosted Server
 
-- `docs/server-storage-architecture.md` is the canonical server persistence and
+- `docs/specs/server-storage-architecture.md` is the canonical server persistence and
   deployment-topology decision.
 - `local` and `production` runtime security modes, selected by
   `SOMEDAY_DEPLOYMENT_MODE`, have different explicit contracts. Production

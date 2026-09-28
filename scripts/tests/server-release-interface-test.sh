@@ -22,10 +22,10 @@ expect_failure() {
     fi
 }
 
-mkdir -p "$FIXTURE_ROOT/scripts" "$FIXTURE_ROOT/docs"
+mkdir -p "$FIXTURE_ROOT/scripts" "$FIXTURE_ROOT/docs/guides"
 cp "$ROOT_DIR/Makefile" "$FIXTURE_ROOT/Makefile"
 cp "$ROOT_DIR/scripts/server-release-tui" "$FIXTURE_ROOT/scripts/server-release-tui"
-printf '# Server release\n' >"$FIXTURE_ROOT/docs/server-release.md"
+printf '# Server release\n' >"$FIXTURE_ROOT/docs/guides/server-release.md"
 
 cat >"$FIXTURE_ROOT/scripts/server-release" <<'SH'
 #!/usr/bin/env bash

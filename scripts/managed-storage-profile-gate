@@ -29,7 +29,7 @@ usage() {
         '  SOMEDAY_MANAGED_GATE_ALLOW_RESET=YES' \
         '  SOMEDAY_R2_RESET_TARGETS=<account/source>,<account/restore>' \
         '' \
-        'See docs/managed-storage-profile-gates.md for the exact safety and evidence contract.'
+        'See docs/guides/managed-storage-profile-gates.md for the exact safety and evidence contract.'
 }
 
 [[ "$#" -eq 1 ]] || {

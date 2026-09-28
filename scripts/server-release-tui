@@ -100,7 +100,7 @@ confirm_rehearsal() {
 render_menu() {
     printf '\nSomeday Server Release\n'
     printf 'Version: %s\n' "$VERSION"
-    printf 'Runbook: docs/server-release.md\n'
+    printf 'Runbook: docs/guides/server-release.md\n'
     printf 'This assistant cannot tag, push, or publish.\n\n'
     printf '  1. Check status\n'
     printf '  2. View plan\n'

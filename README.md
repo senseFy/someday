@@ -29,12 +29,12 @@ Someday Server operated by the user or a service provider.
 
 ## Self-hosting
 
-Start with [Self-hosting Someday](docs/self-hosting.md). It explains the
+Start with [Self-hosting Someday](docs/guides/self-hosting.md). It explains the
 required resources and links to two Docker paths:
 
-- [External PostgreSQL and S3](docs/self-hosting-external.md), recommended for
+- [External PostgreSQL and S3](docs/guides/self-hosting-external.md), recommended for
   production; or
-- [Standalone Docker](docs/self-hosting-standalone.md) for a smaller
+- [Standalone Docker](docs/guides/self-hosting-standalone.md) for a smaller
   installation on one host.
 
 Published server images and deployment bundles are available from
@@ -47,15 +47,15 @@ specifications, guides and active plans.
 
 | Topic | Document |
 | --- | --- |
-| Local development and tests | [Development](docs/development.md) |
-| Client versions and store publication | [Client release](docs/client-release.md) |
-| Server deployment and operations | [Self-hosting Someday](docs/self-hosting.md) |
-| Server persistence model | [Server Storage Architecture](docs/server-storage-architecture.md) |
-| Backup and recovery | [Server Backup and Recovery](docs/server-backup-and-recovery.md) |
-| System V3 synchronization | [System V3 specification](docs/sync-system-v3-spec.md) |
-| Device pairing | [Workspace pairing protocol](docs/workspace-pairing-protocol.md) |
-| Workspace recovery | [Workspace recovery protocol](docs/workspace-recovery-protocol.md) |
-| Database evolution | [Database migrations](docs/database-migrations.md) |
+| Local development and tests | [Development](docs/guides/development.md) |
+| Client versions and store publication | [Client release](docs/guides/client-release.md) |
+| Server deployment and operations | [Self-hosting Someday](docs/guides/self-hosting.md) |
+| Server persistence model | [Server Storage Architecture](docs/specs/server-storage-architecture.md) |
+| Backup and recovery | [Server Backup and Recovery](docs/guides/server-backup-and-recovery.md) |
+| System V3 synchronization | [System V3 specification](docs/specs/sync-system-v3-spec.md) |
+| Device pairing | [Workspace pairing protocol](docs/specs/workspace-pairing-protocol.md) |
+| Workspace recovery | [Workspace recovery protocol](docs/specs/workspace-recovery-protocol.md) |
+| Database evolution | [Database migrations](docs/guides/database-migrations.md) |
 
 ## Development
 
@@ -70,7 +70,7 @@ make check
 
 Use `make run-desktop`, `make run-android`, or `make run-ios` to select a
 platform directly. The complete environment, runner, and validation reference
-is in [Development](docs/development.md).
+is in [Development](docs/guides/development.md).
 
 ## Contributing and security
 

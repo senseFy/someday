@@ -37,37 +37,34 @@ The repository root retains project entry points and policies such as
 
 ## Current specifications
 
-The index is grouped by the rules above. Existing files are still at their
-original paths until the separate directory-reorganization change.
-
 | Document | Scope |
 | --- | --- |
-| [System V3](sync-system-v3-spec.md) | Product synchronization contract and client/server lifecycle. |
-| [Entity DAG V2 subsystem](sync-system-v2-spec.md) | Active internal DAG protocol; not an obsolete product mode. |
-| [Self-hosted media V3](self-hosted-media-v3.md) | Encrypted media objects, publication and bounds. |
-| [Workspace pairing](workspace-pairing-protocol.md) | Device-to-device workspace joining and replacement. |
-| [Workspace recovery](workspace-recovery-protocol.md) | Recovery codes, envelopes and workspace replacement. |
-| [Day One import](day-one-import.md) | Supported export/import compatibility profile. |
-| [Server storage architecture](server-storage-architecture.md) | Persistence topology and storage/security boundaries. |
+| [System V3](specs/sync-system-v3-spec.md) | Product synchronization contract and client/server lifecycle. |
+| [Entity DAG V2 subsystem](specs/sync-system-v2-spec.md) | Active internal DAG protocol; not an obsolete product mode. |
+| [Self-hosted media V3](specs/self-hosted-media-v3.md) | Encrypted media objects, publication and bounds. |
+| [Workspace pairing](specs/workspace-pairing-protocol.md) | Device-to-device workspace joining and replacement. |
+| [Workspace recovery](specs/workspace-recovery-protocol.md) | Recovery codes, envelopes and workspace replacement. |
+| [Day One import](specs/day-one-import.md) | Supported export/import compatibility profile. |
+| [Server storage architecture](specs/server-storage-architecture.md) | Persistence topology and storage/security boundaries. |
 
 ## Guides
 
 | Document | Scope |
 | --- | --- |
-| [Development](development.md) | Local toolchains, application runners and checks. |
-| [Database migrations](database-migrations.md) | SQLDelight/Flyway schema evolution and verification. |
-| [System V3 test strategy](sync-system-v3-test-strategy.md) | Test layers and acceptance evidence. |
-| [Managed storage profile gates](managed-storage-profile-gates.md) | Provider-specific storage certification. |
-| [Self-hosting](self-hosting.md) | Deployment overview and production configuration. |
-| [Standalone deployment](self-hosting-standalone.md) | Single-host Docker setup. |
-| [External storage deployment](self-hosting-external.md) | External PostgreSQL and S3-compatible media. |
-| [Server backup and recovery](server-backup-and-recovery.md) | Coordinated database/media recovery. |
-| [Server upgrades](server-upgrades.md) | Upgrade and rollback procedure. |
-| [Server release](server-release.md) | Maintainer image and deployment-bundle publication. |
-| [Client release](client-release.md) | Client versions and platform publication. |
+| [Development](guides/development.md) | Local toolchains, application runners and checks. |
+| [Database migrations](guides/database-migrations.md) | SQLDelight/Flyway schema evolution and verification. |
+| [System V3 test strategy](guides/sync-system-v3-test-strategy.md) | Test layers and acceptance evidence. |
+| [Managed storage profile gates](guides/managed-storage-profile-gates.md) | Provider-specific storage certification. |
+| [Self-hosting](guides/self-hosting.md) | Deployment overview and production configuration. |
+| [Standalone deployment](guides/self-hosting-standalone.md) | Single-host Docker setup. |
+| [External storage deployment](guides/self-hosting-external.md) | External PostgreSQL and S3-compatible media. |
+| [Server backup and recovery](guides/server-backup-and-recovery.md) | Coordinated database/media recovery. |
+| [Server upgrades](guides/server-upgrades.md) | Upgrade and rollback procedure. |
+| [Server release](guides/server-release.md) | Maintainer image and deployment-bundle publication. |
+| [Client release](guides/client-release.md) | Client versions and platform publication. |
 
 ## Active plans
 
 | Document | Remaining work |
 | --- | --- |
-| [Client image support](client-image-support-plan.md) | Records implementation and automated gates as complete; real-client UI acceptance remains before release. |
+| [Client image support](plans/client-image-support-plan.md) | **Draft:** legacy acceptance status needs confirmation; implementation and automated gates are recorded complete, while real-client UI acceptance remains before release. |

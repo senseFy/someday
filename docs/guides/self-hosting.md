@@ -163,6 +163,6 @@ Portable client export excludes image bytes and workspace keys, so it does not
 replace a server backup. Reading a restored workspace requires either an intact
 device or the recovery code matching the restored envelope revision. Operators
 must not collect users' codes. The persistence and object-storage invariants are
-documented in [Server Storage Architecture](server-storage-architecture.md),
+documented in [Server Storage Architecture](../specs/server-storage-architecture.md),
 and the user-key flow in
-[Workspace Recovery Protocol](workspace-recovery-protocol.md).
+[Workspace Recovery Protocol](../specs/workspace-recovery-protocol.md).

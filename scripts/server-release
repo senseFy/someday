@@ -628,7 +628,7 @@ run_status() {
     if [[ "$identity_ready" != true ]]; then
         printf 'Next: make clean main exactly match %s/main, then rerun status.\n' "$REMOTE"
     elif [[ "$policy_ready" != true ]]; then
-        printf 'Next: configure the server-v* tag ruleset in docs/server-release.md.\n'
+        printf 'Next: configure the server-v* tag ruleset in docs/guides/server-release.md.\n'
     elif [[ "$ci_ready" != true ]]; then
         printf 'Next: wait for the main CI run to pass, then rerun status.\n'
     elif [[ "$history_ready" != true ]]; then
@@ -636,7 +636,7 @@ run_status() {
     elif [[ "$rehearsal_ready" != true ]]; then
         printf 'Next: scripts/server-release rehearse %s\n' "$VERSION"
     elif [[ "$providers_ready" != true ]]; then
-        printf 'Next: run the missing managed gate from docs/managed-storage-profile-gates.md.\n'
+        printf 'Next: run the missing managed gate from docs/guides/managed-storage-profile-gates.md.\n'
     else
         printf 'Next: inspect the Server Release workflow, fix the failure, and rerun status.\n'
     fi
@@ -647,7 +647,7 @@ run_plan() {
     cat <<EOF
 Someday server release $VERSION
 
-1. Confirm the one-time GitHub controls in docs/server-release.md.
+1. Confirm the one-time GitHub controls in docs/guides/server-release.md.
 2. Merge the reviewed commit to main and wait for CI.
 3. Run status to classify the live managed-provider gates from the server diff.
    Configure dedicated resources and run only the profiles reported as required:
@@ -656,7 +656,7 @@ Someday server release $VERSION
    Set SOMEDAY_SERVER_RELEASE_FORCE_MANAGED=all for a scheduled full certification.
 4. Run: scripts/server-release rehearse $VERSION
 5. For the second and later releases, complete the previous-version upgrade
-   acceptance in docs/server-upgrades.md.
+   acceptance in docs/guides/server-upgrades.md.
 6. Run: scripts/server-release status $VERSION
 7. Only after status prints READY TO TAG, create and push the immutable tag:
    git tag -a $TAG -m "Someday Server $VERSION"

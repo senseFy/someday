@@ -11,7 +11,7 @@ license that covers the project.
 
 ## Development setup
 
-See [Development](docs/development.md) for toolchain requirements, local
+See [Development](docs/guides/development.md) for toolchain requirements, local
 service ports, application runners, and validation targets.
 
 Typical loop:
@@ -31,8 +31,8 @@ make sync-v3-gate
 ```
 
 Platform-specific smoke targets are documented in
-[Development](docs/development.md). Signing and store publication are in
-[Client release](docs/client-release.md).
+[Development](docs/guides/development.md). Signing and store publication are in
+[Client release](docs/guides/client-release.md).
 
 ## Engineering rules
 
@@ -47,7 +47,7 @@ Important defaults:
   storage I/O. Controllers own dispatcher boundaries for suspend IO.
 - Protocol changes must update the matching `docs/` specification in the same
   change and include tests where the gate docs require them.
-- Synchronization tests follow `docs/sync-system-v3-test-strategy.md`: test each
+- Synchronization tests follow `docs/guides/sync-system-v3-test-strategy.md`: test each
   behavior at the lowest useful layer, keep end-to-end journeys few and
   complete, and use focused fixtures rather than a scenario DSL.
 - Carefully review changes to dependency verification metadata, Gradle wrapper
@@ -73,4 +73,4 @@ make server-release
 ```
 
 The menu provides planning, status, and rehearsal commands. A maintainer creates
-and pushes the release tag. See [Server release](docs/server-release.md).
+and pushes the release tag. See [Server release](docs/guides/server-release.md).

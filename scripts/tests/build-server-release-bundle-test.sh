@@ -133,7 +133,7 @@ with tarfile.open(archive_path, mode="r:gz") as archive:
     release_version = package[len("someday-server-") :]
     expected_guide = (
         "https://github.com/senseFy/someday/blob/"
-        f"server-v{release_version}/docs/self-hosting.md"
+        f"server-v{release_version}/docs/guides/self-hosting.md"
     )
     if readme_file is None or expected_guide not in readme_file.read().decode("utf-8"):
         raise SystemExit("README.md does not link the versioned deployment guide")

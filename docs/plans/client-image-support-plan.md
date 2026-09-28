@@ -1,6 +1,7 @@
 # Client Image Support Plan
 
-Status: implementation and automated gates are complete.
+Status: draft. The legacy plan's design-acceptance status still needs
+confirmation; implementation and automated gates are recorded as complete.
 Real-client UI acceptance remains before release.
 No server or wire-protocol change is expected.
 
@@ -363,7 +364,8 @@ Primary files:
 ### E. Documentation and release
 
 - Update README client image status only after the acceptance matrix passes.
-- Update `docs/sync-system-v3-spec.md` or `docs/self-hosted-media-v3.md` if the
+- Update `docs/specs/sync-system-v3-spec.md` or
+  `docs/specs/self-hosted-media-v3.md` if the
   implementation changes wire behavior.
 - Release this as a client change. `server-v0.1.0` remains compatible unless a
   separate server or protocol defect is found.

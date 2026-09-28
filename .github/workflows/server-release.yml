@@ -594,7 +594,7 @@ jobs:
             '' \
             'Platforms: `linux/amd64`, `linux/arm64`.' \
             '' \
-            "Deployment: https://github.com/$GITHUB_REPOSITORY/blob/$RELEASE_TAG/docs/self-hosting.md" \
+            "Deployment: https://github.com/$GITHUB_REPOSITORY/blob/$RELEASE_TAG/docs/guides/self-hosting.md" \
             >release-notes.md
           gh release create "$RELEASE_TAG" \
             "release/someday-server-$VERSION.tar.gz" \
