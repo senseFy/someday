@@ -1,5 +1,10 @@
 # Agent Rules
 
+## Documentation
+
+- Follow the classification, status, ownership and navigation rules in
+  [docs/README.md](docs/README.md) when adding or changing documentation.
+
 ## Database Evolution
 
 - Client local schema is owned by SQLDelight in `shared/data/src/commonMain/sqldelight/saien/someday/data/local/db/Someday.sq` and its numbered `.sqm` migrations. Do not add platform-specific schema mutation or version probing.

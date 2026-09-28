@@ -42,6 +42,9 @@ Published server images and deployment bundles are available from
 
 ## Documentation
 
+See the [complete documentation index and rules](docs/README.md) for current
+specifications, guides and active plans.
+
 | Topic | Document |
 | --- | --- |
 | Local development and tests | [Development](docs/development.md) |
