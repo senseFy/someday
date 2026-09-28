@@ -1439,6 +1439,56 @@ class SettingsUiControllerTest {
     }
 
     @Test
+    fun recoveryFailureStagesHaveDistinctPersistentMessagesAndSuccessfulRetryClearsThem() = runBlocking {
+        val strings = SettingsUiStrings(
+            recoveryCodeFormatInvalid = "input-format",
+            recoveryDataInvalid = "envelope-validation",
+            recoveryDecryptionFailed = "decryption-authentication",
+            recoveryKeyVerificationFailed = "key-verification",
+            recoveryCryptoOperationFailed = "crypto-runtime",
+            pairingServerRequestFailed = "server-request",
+            recoveryReplacementFailed = "local-replacement",
+        )
+        for ((reason, message) in listOf(
+            WorkspaceRecoveryReason.InvalidCodeFormat to "input-format",
+            WorkspaceRecoveryReason.InvalidRecoveryData to "envelope-validation",
+            WorkspaceRecoveryReason.DecryptionFailed to "decryption-authentication",
+            WorkspaceRecoveryReason.KeyVerificationFailed to "key-verification",
+            WorkspaceRecoveryReason.CryptoOperationFailed to "crypto-runtime",
+            WorkspaceRecoveryReason.ServerRequestFailed to "server-request",
+            WorkspaceRecoveryReason.ReplacementFailed to "local-replacement",
+        )) {
+            val manager = FakeWorkspaceRecoveryManager(
+                statusResult = WorkspaceRecoveryStatusResult.ready(
+                    WorkspaceRecoveryState.RecoveryAvailable,
+                    WorkspaceRecoverySyncGate.RecoveryRequired,
+                    WorkspaceRecoveryReason.RecoveryAvailable,
+                ),
+                restoreResult = WorkspaceRecoveryRestoreResult.failure(reason, "detail-not-for-display"),
+            )
+            val controller = SettingsUiController(
+                loadSettings = ::connectedSettings,
+                initialSettings = connectedSettings(),
+                selfHostedSessionCredentialStore = FakeSelfHostedSessionCredentialStore(testCredentials()),
+                workspaceRecoveryManager = manager,
+                backgroundDispatcher = Dispatchers.Unconfined,
+                uiStrings = strings,
+            )
+            controller.refresh()
+            assertFalse(controller.recoverWorkspaceWithCode(RECOVERY_CODE, replaceExistingWorkspace = true))
+            assertEquals(message, controller.state.feedbackMessage)
+            assertEquals(message, controller.state.sync.recovery.failureMessage)
+            assertEquals(WorkspaceRecoveryUiAvailability.RecoveryAvailable, controller.state.sync.recovery.availability)
+            assertTrue(controller.state.sync.recovery.blocksSync)
+
+            manager.restoreResult = WorkspaceRecoveryRestoreResult.recovered()
+            assertTrue(controller.recoverWorkspaceWithCode(RECOVERY_CODE, replaceExistingWorkspace = true))
+            assertNull(controller.state.sync.recovery.failureMessage)
+            assertEquals(WorkspaceRecoveryUiAvailability.Configured, controller.state.sync.recovery.availability)
+        }
+    }
+
+    @Test
     fun recoveryGateRetriesPendingStateAndBlocksOnlyWhenWorkspaceVerificationRequiresIt() = runBlocking {
         suspend fun assertSyncBlocked(
             controller: SettingsUiController,

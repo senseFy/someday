@@ -3,14 +3,18 @@
 
 package saien.someday.data.crypto
 
+import com.ionspin.kotlin.crypto.JnaLibsodiumInterface
+import com.ionspin.kotlin.crypto.LibsodiumInitializer
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import saien.someday.data.local.SqlDelightLocalDataRepository
 import saien.someday.data.local.createSomedayJdbcDriver
 import saien.someday.data.local.db.SomedayDatabase
+import saien.someday.domain.settings.WorkspaceJoinPackage
 import saien.someday.domain.settings.WorkspacePairingReason
 import kotlin.time.Instant
+import java.lang.reflect.Proxy
 import java.nio.file.Files
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
@@ -46,6 +50,24 @@ class WorkspaceKeyRepositoryTest {
             assertEquals(67_108_864, portable.recovery.memLimit)
             assertEquals(2, portable.recovery.algorithm)
         }
+    }
+
+    @Test
+    fun truncatedAeadTagIsRejectedButAuthenticatedEmptyPlaintextIsValid() {
+        val crypto = SodiumWorkspaceCrypto()
+        val key = ByteArray(32) { it.toByte() }
+        val aad = "ciphertext tag boundary".encodeToByteArray()
+        val encrypted = crypto.encryptAead(key, aad, byteArrayOf())
+
+        assertEquals(16, encrypted.ciphertext.size)
+        assertEquals(
+            CryptoResult.AuthenticationFailed,
+            crypto.decryptAead(key, aad, encrypted.copy(ciphertext = encrypted.ciphertext.copyOf(15))),
+        )
+        assertContentEquals(
+            byteArrayOf(),
+            assertIs<CryptoResult.Success<ByteArray>>(crypto.decryptAead(key, aad, encrypted)).value,
+        )
     }
 
     @Test
@@ -292,6 +314,105 @@ class WorkspaceKeyRepositoryTest {
                     checkNotNull(secondDevice.workspaceKeys.unlockedKeyOrNull()).rawBytesCopy(),
                 )
             }
+        }
+
+    @Test
+    fun recoveryFailureStagesSurviveTheJoinAdapterWithoutReplacingLocalState() =
+        withFixture { owner ->
+            owner.workspaceKeys.createFirstRunWorkspace("Owner", "desktop")
+            val recovery = assertIs<WorkspaceJoinPackageResult.Created>(owner.workspaceKeys.createWorkspaceRecoveryPackage())
+            val code = recovery.recoveryMaterial.revealForUserConfirmation()
+            val json = Json { encodeDefaults = true }
+            val metadata = json.decodeFromString<PersistedPortableWorkspaceRecoveryEnvelope>(recovery.metadataJson)
+            fun corrupt(value: String): String = value.decodeBase64Bytes().also {
+                it[0] = (it[0].toInt() xor 1).toByte()
+            }.base64()
+            val wrongCode = code.dropLast(1) + if (code.last() == '0') "1" else "0"
+            val cases = listOf(
+                Triple(metadata, wrongCode, WorkspacePairingReason.DecryptionFailed),
+                Triple(metadata.copy(version = 2), code, WorkspacePairingReason.InvalidMetadata),
+                Triple(
+                    metadata.copy(recovery = metadata.recovery.copy(ciphertext = corrupt(metadata.recovery.ciphertext))),
+                    code,
+                    WorkspacePairingReason.DecryptionFailed,
+                ),
+                Triple(
+                    metadata.copy(verifier = metadata.verifier.copy(ciphertext = corrupt(metadata.verifier.ciphertext))),
+                    code,
+                    WorkspacePairingReason.KeyVerificationFailed,
+                ),
+            )
+            withFixture(deviceId = "joining") { joining ->
+                joining.workspaceKeys.createFirstRunWorkspace("Joining", "desktop")
+                val before = joining.workspaceKeys.exportRecoveryMetadataJson()
+                val keyBefore = checkNotNull(joining.workspaceKeys.unlockedKeyOrNull()).rawBytesCopy()
+                val joiner = joining.workspaceKeys.workspaceJoiner(
+                    deviceName = "Joining",
+                    platform = "desktop",
+                    beforeWorkspaceReplacement = { error("Failure must precede cleanup") },
+                    afterWorkspaceReplacement = { _, _, _ -> error("Failure must precede binding") },
+                    afterWorkspaceReplacementCommitted = { error("Failure must not commit") },
+                )
+                for ((candidateMetadata, candidateCode, expected) in cases) {
+                    val result = joiner.join(
+                        WorkspaceJoinPackage(
+                            json.encodeToString(candidateMetadata), candidateCode,
+                            recovery.workspaceId, recovery.keyFingerprint,
+                        ),
+                        replaceExistingWorkspace = true,
+                    )
+                    assertFalse(result.success)
+                    assertEquals(expected, result.reason)
+                    assertNull(result.diagnosticMessage)
+                    assertFalse(result.toString().contains(code))
+                    assertEquals(before, joining.workspaceKeys.exportRecoveryMetadataJson())
+                    assertContentEquals(keyBefore, checkNotNull(joining.workspaceKeys.unlockedKeyOrNull()).rawBytesCopy())
+                }
+            }
+        }
+
+    @Test
+    fun nativeCryptoRuntimeFailureIsNotReportedAsAWrongCodeAndLeaksNoException() =
+        withFixture { fixture ->
+            fixture.workspaceKeys.createFirstRunWorkspace("Local", "desktop")
+            val recovery = assertIs<WorkspaceJoinPackageResult.Created>(fixture.workspaceKeys.createWorkspaceRecoveryPackage())
+            val code = recovery.recoveryMaterial.revealForUserConfirmation()
+            val before = fixture.workspaceKeys.exportRecoveryMetadataJson()
+            val keyBefore = checkNotNull(fixture.workspaceKeys.unlockedKeyOrNull()).rawBytesCopy()
+            val original = LibsodiumInitializer.sodiumJna
+            var injectedFailures = 0
+            try {
+                LibsodiumInitializer.sodiumJna = Proxy.newProxyInstance(
+                    JnaLibsodiumInterface::class.java.classLoader,
+                    arrayOf(JnaLibsodiumInterface::class.java),
+                ) { _, method, args ->
+                    if (method.name == "crypto_aead_xchacha20poly1305_ietf_decrypt") {
+                        injectedFailures += 1
+                        throw IllegalStateException("sensitive provider input: $code")
+                    }
+                    method.invoke(original, *(args ?: emptyArray()))
+                } as JnaLibsodiumInterface
+                val result = fixture.workspaceKeys.workspaceJoiner(
+                    deviceName = "Local",
+                    platform = "desktop",
+                    beforeWorkspaceReplacement = { error("Must not reach cleanup") },
+                    afterWorkspaceReplacement = { _, _, _ -> error("Must not reach binding") },
+                    afterWorkspaceReplacementCommitted = { error("Must not commit") },
+                ).join(
+                    WorkspaceJoinPackage(recovery.metadataJson, code, recovery.workspaceId, recovery.keyFingerprint),
+                    replaceExistingWorkspace = true,
+                )
+                assertEquals(1, injectedFailures)
+                assertFalse(result.success)
+                assertEquals(WorkspacePairingReason.CryptoOperationFailed, result.reason)
+                assertNull(result.diagnosticMessage)
+                assertFalse(result.toString().contains(code))
+                assertFalse(result.toString().contains("sensitive provider input"))
+            } finally {
+                LibsodiumInitializer.sodiumJna = original
+            }
+            assertEquals(before, fixture.workspaceKeys.exportRecoveryMetadataJson())
+            assertContentEquals(keyBefore, checkNotNull(fixture.workspaceKeys.unlockedKeyOrNull()).rawBytesCopy())
         }
 
     @Test

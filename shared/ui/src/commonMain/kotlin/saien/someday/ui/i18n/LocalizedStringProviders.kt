@@ -228,7 +228,12 @@ fun rememberSettingsUiStrings(): SettingsUiStrings {
     val recoveryCodeCreated = stringResource(Res.string.settings_fb_recovery_code_created)
     val recoveryCompleted = stringResource(Res.string.settings_fb_recovery_completed)
     val recoveryPublishRequired = stringResource(Res.string.settings_fb_recovery_publish_required)
+    val recoveryCodeFormatInvalid = stringResource(Res.string.settings_fb_recovery_code_format_invalid)
     val recoveryCodeInvalid = stringResource(Res.string.settings_fb_recovery_code_invalid)
+    val recoveryDataInvalid = stringResource(Res.string.settings_fb_recovery_data_invalid)
+    val recoveryDecryptionFailed = stringResource(Res.string.settings_fb_recovery_decryption_failed)
+    val recoveryKeyVerificationFailed = stringResource(Res.string.settings_fb_recovery_key_verification_failed)
+    val recoveryCryptoOperationFailed = stringResource(Res.string.settings_fb_recovery_crypto_operation_failed)
     val recoveryNotRequired = stringResource(Res.string.settings_fb_recovery_not_required)
     val recoveryReplacementConfirmationRequired =
         stringResource(Res.string.settings_fb_recovery_confirmation_required)
@@ -316,7 +321,12 @@ fun rememberSettingsUiStrings(): SettingsUiStrings {
         recoveryCodeCreated = recoveryCodeCreated,
         recoveryCompleted = recoveryCompleted,
         recoveryPublishRequired = recoveryPublishRequired,
+        recoveryCodeFormatInvalid = recoveryCodeFormatInvalid,
         recoveryCodeInvalid = recoveryCodeInvalid,
+        recoveryDataInvalid = recoveryDataInvalid,
+        recoveryDecryptionFailed = recoveryDecryptionFailed,
+        recoveryKeyVerificationFailed = recoveryKeyVerificationFailed,
+        recoveryCryptoOperationFailed = recoveryCryptoOperationFailed,
         recoveryNotRequired = recoveryNotRequired,
         recoveryReplacementConfirmationRequired = recoveryReplacementConfirmationRequired,
         recoveryReplacementFailed = recoveryReplacementFailed,

@@ -479,7 +479,12 @@
     <string name="settings_fb_recovery_code_created">Recovery code confirmed. Any previous code no longer works with the current server state.</string>
     <string name="settings_fb_recovery_completed">Workspace recovered. Downloading its data now.</string>
     <string name="settings_fb_recovery_publish_required">Sync this workspace successfully before setting up recovery.</string>
-    <string name="settings_fb_recovery_code_invalid">The recovery code is incorrect or the recovery envelope could not be verified.</string>
+    <string name="settings_fb_recovery_code_format_invalid">Invalid recovery-code format. After SOMEDAY, enter 8 groups of 4 characters using only 0–9 and A–F. Check O versus 0. No server request was made.</string>
+    <string name="settings_fb_recovery_code_invalid">The confirmation does not match the newly displayed recovery code. Enter that code again.</string>
+    <string name="settings_fb_recovery_data_invalid">Recovery data failed format, parameter, or workspace-binding validation. Check the client version and backup. This does not establish that the code is wrong.</string>
+    <string name="settings_fb_recovery_decryption_failed">The code could not decrypt the current recovery data. The code may not match, or the encrypted data may be damaged. Check the original code and account.</string>
+    <string name="settings_fb_recovery_key_verification_failed">Workspace-key verification failed. Recover from a trusted device or a matching backup.</string>
+    <string name="settings_fb_recovery_crypto_operation_failed">A local cryptographic operation failed; the recovery code could not be verified. Restart or update the app, then try again.</string>
     <string name="settings_fb_recovery_not_required">This device already has the workspace key. Sync it instead of replacing it.</string>
     <string name="settings_fb_recovery_confirmation_required">Confirm replacing this device's current workspace before recovery.</string>
     <string name="settings_fb_recovery_replacement_failed">The current workspace could not be replaced safely.</string>

@@ -5058,6 +5058,15 @@ internal fun WorkspaceRecoveryContent(
             },
         )
 
+        recovery.failureMessage?.let { message ->
+            Text(
+                text = message,
+                color = MaterialTheme.colorScheme.error,
+                style = MaterialTheme.typography.bodyMedium,
+                modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+            )
+        }
+
         if (preparedCode != null) {
             val copyScope = rememberCoroutineScope()
             val copyInProgress = copyState == RecoveryCodeCopyState.Copying

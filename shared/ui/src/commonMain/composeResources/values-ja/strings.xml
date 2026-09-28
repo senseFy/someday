@@ -479,7 +479,12 @@
     <string name="settings_fb_recovery_code_created">復旧コードを確認しました。以前のコードは現在のサーバー状態では使用できません。</string>
     <string name="settings_fb_recovery_completed">ワークスペースを復旧しました。データをダウンロードしています。</string>
     <string name="settings_fb_recovery_publish_required">復旧を設定する前に、このワークスペースを正常に同期してください。</string>
-    <string name="settings_fb_recovery_code_invalid">復旧コードが正しくないか、復旧エンベロープを検証できませんでした。</string>
+    <string name="settings_fb_recovery_code_format_invalid">復旧コードの形式が正しくありません。SOMEDAY の後に 0–9 と A–F のみで 4 文字ずつ 8 組を入力してください。文字 O と数字 0 に注意してください。今回はサーバーへリクエストしていません。</string>
+    <string name="settings_fb_recovery_code_invalid">確認入力が表示された新しい復旧コードと一致しません。そのコードを再入力してください。</string>
+    <string name="settings_fb_recovery_data_invalid">復旧データの形式、パラメーター、またはワークスペースの紐付けを検証できません。クライアントのバージョンとバックアップを確認してください。コードが誤っているとは限りません。</string>
+    <string name="settings_fb_recovery_decryption_failed">このコードで現在の復旧データを復号できません。コードの不一致または暗号化データの破損が考えられます。元のコードとアカウントを確認してください。</string>
+    <string name="settings_fb_recovery_key_verification_failed">ワークスペースキーの検証に失敗しました。信頼できる端末または対応するバックアップから復旧してください。</string>
+    <string name="settings_fb_recovery_crypto_operation_failed">端末内の暗号処理でエラーが発生し、復旧コードを検証できませんでした。アプリを再起動または更新して再試行してください。</string>
     <string name="settings_fb_recovery_not_required">この端末にはすでにワークスペースキーがあります。置き換えずに同期してください。</string>
     <string name="settings_fb_recovery_confirmation_required">復旧前に、この端末のワークスペース置換を確認してください。</string>
     <string name="settings_fb_recovery_replacement_failed">現在のワークスペースを安全に置き換えられませんでした。</string>

@@ -5,26 +5,38 @@
 
 package saien.someday.ui
 
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.asSkiaBitmap
 import androidx.compose.ui.platform.ClipEntry
 import androidx.compose.ui.platform.Clipboard
 import androidx.compose.ui.platform.LocalClipboard
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.test.assertCountEquals
+import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.captureToImage
 import androidx.compose.ui.test.hasSetTextAction
 import androidx.compose.ui.test.hasText
+import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performTextClearance
 import androidx.compose.ui.test.performTextInput
 import androidx.compose.ui.test.v2.runComposeUiTest
+import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
 import org.jetbrains.compose.resources.getString
+import org.jetbrains.skia.Image
 import saien.someday.domain.settings.ClientSettings
 import saien.someday.domain.settings.SelfHostedSessionCredentialStore
 import saien.someday.domain.settings.SelfHostedSessionCredentials
@@ -39,6 +51,7 @@ import saien.someday.domain.settings.WorkspaceRecoveryRestoreResult
 import saien.someday.domain.settings.WorkspaceRecoveryState
 import saien.someday.domain.settings.WorkspaceRecoveryStatusResult
 import saien.someday.domain.settings.WorkspaceRecoverySyncGate
+import saien.someday.ui.i18n.SettingsUiStrings
 import saien.someday.ui.resources.Res
 import saien.someday.ui.resources.common_cancel
 import saien.someday.ui.resources.recovery_cancel_action
@@ -50,9 +63,16 @@ import saien.someday.ui.resources.recovery_confirm_code_label
 import saien.someday.ui.resources.recovery_replace_action
 import saien.someday.ui.resources.recovery_restore_action
 import saien.someday.ui.resources.recovery_restore_dialog_confirm
+import saien.someday.ui.resources.settings_fb_recovery_code_format_invalid
+import saien.someday.ui.resources.settings_fb_recovery_data_invalid
+import saien.someday.ui.resources.settings_fb_recovery_decryption_failed
+import saien.someday.ui.resources.settings_fb_recovery_key_verification_failed
+import saien.someday.ui.resources.settings_fb_recovery_crypto_operation_failed
 import saien.someday.ui.settings.SettingsUiController
 import java.awt.datatransfer.DataFlavor
 import java.awt.datatransfer.Transferable
+import java.io.File
+import java.util.Locale
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
@@ -301,6 +321,88 @@ class WorkspaceRecoveryContentTest {
         assertEquals(emptyList(), manager.recoveryCalls)
     }
 
+    @Test
+    fun recoveryFailureMessagesRemainInTheFormAndClearAfterASuccessfulRetry() {
+        val original = Locale.getDefault()
+        try {
+            for (locale in listOf(Locale.SIMPLIFIED_CHINESE, Locale.ENGLISH)) {
+                Locale.setDefault(locale)
+                for (reason in listOf(
+                    WorkspaceRecoveryReason.InvalidCodeFormat,
+                    WorkspaceRecoveryReason.InvalidRecoveryData,
+                    WorkspaceRecoveryReason.DecryptionFailed,
+                    WorkspaceRecoveryReason.KeyVerificationFailed,
+                    WorkspaceRecoveryReason.CryptoOperationFailed,
+                )) {
+                    renderRecoveryFailure(reason, locale.language)
+                }
+            }
+        } finally {
+            Locale.setDefault(original)
+        }
+    }
+
+    private fun renderRecoveryFailure(reason: WorkspaceRecoveryReason, language: String) = runComposeUiTest {
+        val messages = mapOf(
+            WorkspaceRecoveryReason.InvalidCodeFormat to getString(Res.string.settings_fb_recovery_code_format_invalid),
+            WorkspaceRecoveryReason.InvalidRecoveryData to getString(Res.string.settings_fb_recovery_data_invalid),
+            WorkspaceRecoveryReason.DecryptionFailed to getString(Res.string.settings_fb_recovery_decryption_failed),
+            WorkspaceRecoveryReason.KeyVerificationFailed to getString(Res.string.settings_fb_recovery_key_verification_failed),
+            WorkspaceRecoveryReason.CryptoOperationFailed to getString(Res.string.settings_fb_recovery_crypto_operation_failed),
+        )
+        val manager = RecordingWorkspaceRecoveryManager(
+            recoveryState = WorkspaceRecoveryState.RecoveryAvailable,
+            restoreFailure = reason,
+        )
+        val controller = SettingsUiController(
+            loadSettings = ::connectedSettings,
+            initialSettings = connectedSettings(),
+            selfHostedSessionCredentialStore = signedInCredentialStore(),
+            workspaceRecoveryManager = manager,
+            backgroundDispatcher = Dispatchers.Unconfined,
+            uiStrings = SettingsUiStrings(
+                recoveryCodeFormatInvalid = messages.getValue(WorkspaceRecoveryReason.InvalidCodeFormat),
+                recoveryDataInvalid = messages.getValue(WorkspaceRecoveryReason.InvalidRecoveryData),
+                recoveryDecryptionFailed = messages.getValue(WorkspaceRecoveryReason.DecryptionFailed),
+                recoveryKeyVerificationFailed = messages.getValue(WorkspaceRecoveryReason.KeyVerificationFailed),
+                recoveryCryptoOperationFailed = messages.getValue(WorkspaceRecoveryReason.CryptoOperationFailed),
+            ),
+        )
+        runBlocking { controller.refresh() }
+        setContent {
+            MaterialTheme {
+                Surface {
+                    Box(Modifier.width(360.dp).padding(16.dp).testTag("recovery-review")) {
+                        WorkspaceRecoveryContent(controller.state, controller, rememberCoroutineScope())
+                    }
+                }
+            }
+        }
+        val restore = getString(Res.string.recovery_restore_action)
+        val confirm = getString(Res.string.recovery_restore_dialog_confirm)
+        onNode(hasSetTextAction()).performTextInput(RECOVERY_CODE)
+        onNodeWithText(restore).performClick()
+        onNodeWithText(confirm).performClick()
+        waitUntil { controller.state.sync.recovery.failureMessage != null }
+        mainClock.advanceTimeBy(5_000)
+        val error = onNodeWithText(messages.getValue(reason)).assertIsDisplayed().fetchSemanticsNode().boundsInRoot
+        val input = onNode(hasSetTextAction()).fetchSemanticsNode().boundsInRoot
+        assertTrue(error.bottom <= input.top, "Failure text must not overlap the recovery field")
+        System.getenv("SOMEDAY_REVIEW_ARTIFACTS")?.let { directory ->
+            val bitmap = onNodeWithTag("recovery-review").captureToImage().asSkiaBitmap()
+            Image.makeFromBitmap(bitmap).use { image ->
+                image.encodeToData()!!.use { data ->
+                    File(directory, "recovery-failure-$language-${reason.name}.png").writeBytes(data.bytes)
+                }
+            }
+        }
+        manager.restoreFailure = null
+        onNodeWithText(restore).performClick()
+        onNodeWithText(confirm).performClick()
+        waitUntil { controller.state.sync.recovery.failureMessage == null }
+        onNodeWithText(messages.getValue(reason)).assertDoesNotExist()
+    }
+
     private companion object {
         const val RECOVERY_CODE = "SOMEDAY-0123-4567-89AB-CDEF-0123-4567-89AB-CDEF"
 
@@ -397,6 +499,7 @@ private class TestSelfHostedSessionCredentialStore(
 
 private class RecordingWorkspaceRecoveryManager(
     var recoveryState: WorkspaceRecoveryState = WorkspaceRecoveryState.NotConfigured,
+    var restoreFailure: WorkspaceRecoveryReason? = null,
 ) : WorkspaceRecoveryManager {
     val confirmationCandidates = mutableListOf<String>()
     val recoveryCalls = mutableListOf<RecoveryCall>()
@@ -443,6 +546,7 @@ private class RecordingWorkspaceRecoveryManager(
         replaceExistingWorkspace: Boolean,
     ): WorkspaceRecoveryRestoreResult {
         recoveryCalls += RecoveryCall(recoveryCode, replaceExistingWorkspace)
+        restoreFailure?.let { return WorkspaceRecoveryRestoreResult.failure(it) }
         recoveryState = WorkspaceRecoveryState.Configured
         return WorkspaceRecoveryRestoreResult.recovered()
     }

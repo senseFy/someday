@@ -114,7 +114,11 @@ private fun WorkspaceUnlockFailure.workspacePairingReason(): WorkspacePairingRea
         WorkspaceUnlockFailure.SECURE_STORAGE_UNAVAILABLE ->
             WorkspacePairingReason.WorkspaceLocked
         WorkspaceUnlockFailure.AUTHENTICATION_FAILED ->
-            WorkspacePairingReason.VerificationFailed
+            WorkspacePairingReason.DecryptionFailed
+        WorkspaceUnlockFailure.KEY_VERIFICATION_FAILED ->
+            WorkspacePairingReason.KeyVerificationFailed
         WorkspaceUnlockFailure.INVALID_METADATA ->
-            WorkspacePairingReason.VerificationFailed
+            WorkspacePairingReason.InvalidMetadata
+        WorkspaceUnlockFailure.CRYPTO_OPERATION_FAILED ->
+            WorkspacePairingReason.CryptoOperationFailed
     }

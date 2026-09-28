@@ -301,6 +301,41 @@ secure-storage failure, or database failure before commit preserves the entire
 previous local workspace. Failure of the first sync after commit is retryable;
 it does not restore the discarded workspace.
 
+### Client failure classification
+
+Client results preserve the failure stage instead of treating every failure as
+an incorrect recovery code. These are local result types, not new wire fields;
+normalization, KDF/AEAD parameters, envelope bytes, and replacement ordering are
+unchanged.
+
+- `InvalidCodeFormat`: the input failed the section 2 rules before the recovery
+  GET (or confirmation PUT). The hexadecimal body does not accept `O` as `0`.
+- `InvalidCode`: confirmation input has valid syntax but does not match the
+  newly prepared code. It is not a restore/decryption result.
+- `ServerRequestFailed`: fetching or publishing the envelope failed. Missing
+  recovery state, authority mismatch, and revision conflicts retain their
+  existing separate results.
+- `InvalidRecoveryData`: a response/envelope failed framing, digest, metadata,
+  supported-parameter, or workspace/key-fingerprint binding checks. This must
+  not be presented as proof that the user mistyped the code.
+- `DecryptionFailed`: wrapped-key authentication failed. A mismatched code and
+  damaged or incompatible authenticated ciphertext cannot be distinguished
+  from that result alone.
+- `KeyVerificationFailed`: the workspace key failed its verifier. During
+  restore this is checked after successful wrapped-key decryption.
+- `CryptoOperationFailed`: an unexpected cryptographic runtime exception
+  prevented verification. Only an actual AEAD authentication exception is
+  classified as authentication failure; provider exception messages and
+  causes must not be attached to recovery results.
+- `ReplacementFailed`: safe local installation failed; the transactional
+  replacement and pre-commit preservation rules above still apply.
+
+The recovery section retains a localized failure message after the transient
+toast disappears, until another recovery operation/status refresh or a local
+account/workspace change replaces it. It is an in-memory UI message, not a
+persisted diagnostic record. Messages use fixed classifications, never input
+text, envelope contents, keys, credentials, or provider exception details.
+
 ## 6. Relationship to device pairing
 
 Pairing and recovery share authenticated workspace import and atomic local
@@ -332,6 +367,9 @@ Release evidence must cover:
 
 - 128-bit generation, user-input normalization, portable metadata without
   device aliases or plaintext secrets, KDF/AEAD authentication, and redaction;
+- no recovery GET/confirmation PUT on malformed input, distinct network,
+  metadata, decryption, key-verifier, and injected crypto-runtime failures,
+  preservation before replacement, and persistent localized error feedback;
 - account scope, device-bound authentication, rate limits, size and digest
   validation, `no-store`, missing state, exact replay, CAS conflict, and one
   current pointer per account;

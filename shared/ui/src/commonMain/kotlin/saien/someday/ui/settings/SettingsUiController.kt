@@ -728,6 +728,7 @@ class SettingsUiController(
                 else -> WorkspaceRecoveryUiAvailability.Unavailable
             },
             syncGate = result.syncGate,
+            failureMessage = if (result.success) null else workspaceRecoveryMessage(result.reason),
         )
         state = buildState(
             settings = state.settings,
@@ -749,7 +750,7 @@ class SettingsUiController(
         runCatching {
             withContext(backgroundDispatcher) { workspaceRecoveryManager?.discardPreparedCode() }
         }.exceptionOrNull()?.rethrowCancellation()
-        currentWorkspaceRecovery = currentWorkspaceRecovery.copy(preparedCode = null)
+        currentWorkspaceRecovery = currentWorkspaceRecovery.copy(preparedCode = null, failureMessage = null)
     }
 
     private fun beginSync(showFeedback: Boolean): Boolean {
@@ -1031,6 +1032,7 @@ class SettingsUiController(
             return false
         }
         currentSyncOperation = SyncUiOperation.PreparingRecoveryCode
+        currentWorkspaceRecovery = currentWorkspaceRecovery.copy(failureMessage = null)
         publishCurrentState()
         return try {
             val result = try {
@@ -1044,6 +1046,9 @@ class SettingsUiController(
             if (result.success && prepared != null) {
                 currentWorkspaceRecovery = currentWorkspaceRecovery.copy(preparedCode = prepared)
             }
+            currentWorkspaceRecovery = currentWorkspaceRecovery.copy(
+                failureMessage = if (result.success) null else workspaceRecoveryMessage(result.reason),
+            )
             state = buildState(
                 settings = state.settings,
                 exportSummary = state.exportSummary,
@@ -1064,6 +1069,7 @@ class SettingsUiController(
         val manager = workspaceRecoveryManager ?: return false
         if (currentWorkspaceRecovery.preparedCode == null || currentSyncOperation != null) return false
         currentSyncOperation = SyncUiOperation.PublishingRecoveryCode
+        currentWorkspaceRecovery = currentWorkspaceRecovery.copy(failureMessage = null)
         publishCurrentState()
         return try {
             val result = try {
@@ -1085,6 +1091,9 @@ class SettingsUiController(
             ) {
                 currentWorkspaceRecovery = currentWorkspaceRecovery.copy(preparedCode = null)
             }
+            currentWorkspaceRecovery = currentWorkspaceRecovery.copy(
+                failureMessage = if (result.success) null else workspaceRecoveryMessage(result.reason),
+            )
             state = buildState(
                 settings = state.settings,
                 exportSummary = state.exportSummary,
@@ -1124,6 +1133,7 @@ class SettingsUiController(
     ): WorkspaceJoinCompletion {
         val manager = workspaceRecoveryManager ?: return WorkspaceJoinCompletion()
         if (recoveryCode.isBlank()) {
+            currentWorkspaceRecovery = currentWorkspaceRecovery.copy(failureMessage = uiStrings.recoveryCodeRequired)
             state = buildState(
                 settings = state.settings,
                 exportSummary = state.exportSummary,
@@ -1139,6 +1149,7 @@ class SettingsUiController(
             return WorkspaceJoinCompletion()
         }
         currentSyncOperation = SyncUiOperation.RestoringWorkspace
+        currentWorkspaceRecovery = currentWorkspaceRecovery.copy(failureMessage = null)
         publishCurrentState()
         return try {
             val result = try {
@@ -1151,6 +1162,9 @@ class SettingsUiController(
                 WorkspaceRecoveryRestoreResult.failure(WorkspaceRecoveryReason.Failed)
             }
             if (!result.success) {
+                currentWorkspaceRecovery = currentWorkspaceRecovery.copy(
+                    failureMessage = workspaceRecoveryMessage(result.reason),
+                )
                 state = buildState(
                     settings = state.settings,
                     exportSummary = state.exportSummary,
@@ -1494,8 +1508,13 @@ class SettingsUiController(
                 uiStrings.pairingReplacementConfirmationRequired
             WorkspacePairingReason.ReplacementFailed -> uiStrings.pairingReplacementFailed
             WorkspacePairingReason.ServerRequestFailed -> uiStrings.pairingServerRequestFailed
-            WorkspacePairingReason.VerificationFailed -> uiStrings.pairingVerificationFailed
+            WorkspacePairingReason.VerificationFailed,
+            WorkspacePairingReason.InvalidMetadata,
+            WorkspacePairingReason.DecryptionFailed,
+            WorkspacePairingReason.KeyVerificationFailed,
+            -> uiStrings.pairingVerificationFailed
             WorkspacePairingReason.AuthorityMismatch -> uiStrings.syncAuthorityMismatch
+            WorkspacePairingReason.CryptoOperationFailed,
             WorkspacePairingReason.Unavailable,
             WorkspacePairingReason.Failed,
             -> if (invitationOperation) uiStrings.pairingInvitationFailed else uiStrings.pairingFailed
@@ -1513,7 +1532,12 @@ class SettingsUiController(
             WorkspaceRecoveryReason.SessionRequired -> uiStrings.pairingSessionRequired
             WorkspaceRecoveryReason.AuthorityMismatch -> uiStrings.syncAuthorityMismatch
             WorkspaceRecoveryReason.WorkspaceLocked -> uiStrings.pairingWorkspaceLocked
+            WorkspaceRecoveryReason.InvalidCodeFormat -> uiStrings.recoveryCodeFormatInvalid
             WorkspaceRecoveryReason.InvalidCode -> uiStrings.recoveryCodeInvalid
+            WorkspaceRecoveryReason.InvalidRecoveryData -> uiStrings.recoveryDataInvalid
+            WorkspaceRecoveryReason.DecryptionFailed -> uiStrings.recoveryDecryptionFailed
+            WorkspaceRecoveryReason.KeyVerificationFailed -> uiStrings.recoveryKeyVerificationFailed
+            WorkspaceRecoveryReason.CryptoOperationFailed -> uiStrings.recoveryCryptoOperationFailed
             WorkspaceRecoveryReason.RecoveryNotRequired -> uiStrings.recoveryNotRequired
             WorkspaceRecoveryReason.ReplacementConfirmationRequired ->
                 uiStrings.recoveryReplacementConfirmationRequired

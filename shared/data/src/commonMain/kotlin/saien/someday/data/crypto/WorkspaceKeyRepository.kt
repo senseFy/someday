@@ -158,7 +158,7 @@ class WorkspaceKeyRepository(
             ?: secureKeyStore.get(metadata.secureStorageAlias)
             ?: return WorkspaceJoinPackageResult.Failed(WorkspaceUnlockFailure.SECURE_STORAGE_UNAVAILABLE)
         if (!verifyWorkspaceKey(metadata, workspaceKey)) {
-            return WorkspaceJoinPackageResult.Failed(WorkspaceUnlockFailure.AUTHENTICATION_FAILED)
+            return WorkspaceJoinPackageResult.Failed(WorkspaceUnlockFailure.KEY_VERIFICATION_FAILED)
         }
 
         val recoveryMaterial = crypto.generateRecoveryMaterial()
@@ -186,7 +186,7 @@ class WorkspaceKeyRepository(
             ?: secureKeyStore.get(metadata.secureStorageAlias)
             ?: return WorkspaceJoinPackageResult.Failed(WorkspaceUnlockFailure.SECURE_STORAGE_UNAVAILABLE)
         if (!verifyWorkspaceKey(metadata, workspaceKey)) {
-            return WorkspaceJoinPackageResult.Failed(WorkspaceUnlockFailure.AUTHENTICATION_FAILED)
+            return WorkspaceJoinPackageResult.Failed(WorkspaceUnlockFailure.KEY_VERIFICATION_FAILED)
         }
 
         val recoveryMaterial = crypto.generateRecoveryMaterial()
@@ -274,10 +274,17 @@ class WorkspaceKeyRepository(
         if (!hasSupportedRecoveryContract(importedMetadata)) {
             return WorkspaceRestoreResult.Failed(WorkspaceUnlockFailure.INVALID_METADATA)
         }
-        val workspaceKey = unwrapRecoveryKey(importedMetadata, recoveryMaterial)
-            ?: return WorkspaceRestoreResult.Failed(WorkspaceUnlockFailure.AUTHENTICATION_FAILED)
-        if (!verifyWorkspaceKey(importedMetadata, workspaceKey)) {
-            return WorkspaceRestoreResult.Failed(WorkspaceUnlockFailure.AUTHENTICATION_FAILED)
+        // Classify crypto failures before any secure-storage or database mutation.
+        // Never attach the exception: a provider may include input material in it.
+        val workspaceKey = try {
+            val recovered = unwrapRecoveryKey(importedMetadata, recoveryMaterial)
+                ?: return WorkspaceRestoreResult.Failed(WorkspaceUnlockFailure.AUTHENTICATION_FAILED)
+            if (!verifyWorkspaceKey(importedMetadata, recovered)) {
+                return WorkspaceRestoreResult.Failed(WorkspaceUnlockFailure.KEY_VERIFICATION_FAILED)
+            }
+            recovered
+        } catch (_: RuntimeException) {
+            return WorkspaceRestoreResult.Failed(WorkspaceUnlockFailure.CRYPTO_OPERATION_FAILED)
         }
         if (portableMetadata != null && portableMetadata.keyFingerprint != workspaceKey.fingerprint) {
             return WorkspaceRestoreResult.Failed(WorkspaceUnlockFailure.INVALID_METADATA)
@@ -424,7 +431,7 @@ class WorkspaceKeyRepository(
                 ciphertext = wrapper,
             )
         ) {
-            is CryptoResult.Success -> runCatching { crypto.workspaceKeyFromBytes(decrypted.value) }.getOrNull()
+            is CryptoResult.Success -> crypto.workspaceKeyFromBytes(decrypted.value)
             CryptoResult.AuthenticationFailed,
             CryptoResult.InvalidCiphertext,
             -> null

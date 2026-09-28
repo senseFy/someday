@@ -94,7 +94,7 @@ class SelfHostedWorkspaceRecoveryService(
             }
             val normalizedRecoveryCode = recoveryCode.normalizedRecoveryCodeOrNull()
             if (normalizedRecoveryCode == null) {
-                return WorkspaceRecoveryRestoreResult.failure(WorkspaceRecoveryReason.InvalidCode)
+                return WorkspaceRecoveryRestoreResult.failure(WorkspaceRecoveryReason.InvalidCodeFormat)
             }
             workspaceLifecycleCoordinator.exclusive {
                 recoverLocked(normalizedRecoveryCode)
@@ -212,6 +212,9 @@ class SelfHostedWorkspaceRecoveryService(
     private fun confirmPreparedCodeLocked(candidate: String): WorkspaceRecoveryCodeResult {
         val pending = pendingSetup
             ?: return WorkspaceRecoveryCodeResult.failure(WorkspaceRecoveryReason.Failed)
+        if (!candidate.isRecoveryCodeInput()) {
+            return WorkspaceRecoveryCodeResult.failure(WorkspaceRecoveryReason.InvalidCodeFormat)
+        }
         if (!candidate.matchesRecoveryCode(pending.packageData.recoveryCode)) {
             return WorkspaceRecoveryCodeResult.failure(WorkspaceRecoveryReason.InvalidCode)
         }
@@ -253,7 +256,7 @@ class SelfHostedWorkspaceRecoveryService(
             )
         }
         if (!stored.matches(pending.request) || WorkspaceRecoveryEnvelopeCodec.decode(stored) == null) {
-            return WorkspaceRecoveryCodeResult.failure(WorkspaceRecoveryReason.ServerRequestFailed)
+            return WorkspaceRecoveryCodeResult.failure(WorkspaceRecoveryReason.InvalidRecoveryData)
         }
         pendingSetup = null
         return WorkspaceRecoveryCodeResult.created()
@@ -319,7 +322,7 @@ class SelfHostedWorkspaceRecoveryService(
             )
         } ?: return RecoveryEnvelopeLoadResult.Missing
         val decoded = WorkspaceRecoveryEnvelopeCodec.decode(response)
-            ?: return RecoveryEnvelopeLoadResult.Failed(WorkspaceRecoveryReason.ServerRequestFailed)
+            ?: return RecoveryEnvelopeLoadResult.Failed(WorkspaceRecoveryReason.InvalidRecoveryData)
         return RecoveryEnvelopeLoadResult.Ready(
             StoredRecoveryEnvelope(
                 packageData = decoded,
@@ -573,9 +576,10 @@ private fun WorkspacePairingReason.toRecoveryReason(): WorkspaceRecoveryReason =
         WorkspacePairingReason.SessionRequired -> WorkspaceRecoveryReason.SessionRequired
         WorkspacePairingReason.AuthorityMismatch -> WorkspaceRecoveryReason.AuthorityMismatch
         WorkspacePairingReason.WorkspaceLocked -> WorkspaceRecoveryReason.WorkspaceLocked
-        WorkspacePairingReason.VerificationFailed,
-        WorkspacePairingReason.InvalidToken,
-        -> WorkspaceRecoveryReason.InvalidCode
+        WorkspacePairingReason.InvalidMetadata -> WorkspaceRecoveryReason.InvalidRecoveryData
+        WorkspacePairingReason.DecryptionFailed -> WorkspaceRecoveryReason.DecryptionFailed
+        WorkspacePairingReason.KeyVerificationFailed -> WorkspaceRecoveryReason.KeyVerificationFailed
+        WorkspacePairingReason.CryptoOperationFailed -> WorkspaceRecoveryReason.CryptoOperationFailed
         WorkspacePairingReason.ReplacementConfirmationRequired ->
             WorkspaceRecoveryReason.ReplacementConfirmationRequired
         WorkspacePairingReason.ReplacementFailed -> WorkspaceRecoveryReason.ReplacementFailed

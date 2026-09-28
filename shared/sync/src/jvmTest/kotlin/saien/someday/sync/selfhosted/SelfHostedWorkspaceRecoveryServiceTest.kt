@@ -48,7 +48,10 @@ class SelfHostedWorkspaceRecoveryServiceTest {
 
         val wrong = fixture.service.confirmPreparedCode("SOMEDAY-WRONG")
         assertFalse(wrong.success)
-        assertEquals(WorkspaceRecoveryReason.InvalidCode, wrong.reason)
+        assertEquals(WorkspaceRecoveryReason.InvalidCodeFormat, wrong.reason)
+        val mismatched = fixture.service.confirmPreparedCode(code.dropLast(1) + "F")
+        assertFalse(mismatched.success)
+        assertEquals(WorkspaceRecoveryReason.InvalidCode, mismatched.reason)
         assertEquals(0, fixture.transport.putCount)
 
         val confirmed = fixture.service.confirmPreparedCode(
@@ -328,7 +331,7 @@ class SelfHostedWorkspaceRecoveryServiceTest {
                 if (packageData.recoveryCode == code.replace("-", "")) {
                     WorkspaceJoinResult.success(WorkspacePairingReason.Joined)
                 } else {
-                    WorkspaceJoinResult.failure(WorkspacePairingReason.VerificationFailed)
+                    WorkspaceJoinResult.failure(WorkspacePairingReason.DecryptionFailed)
                 }
             },
         )
@@ -340,11 +343,61 @@ class SelfHostedWorkspaceRecoveryServiceTest {
         )
 
         assertFalse(wrong.success)
-        assertEquals(WorkspaceRecoveryReason.InvalidCode, wrong.reason)
+        assertEquals(WorkspaceRecoveryReason.InvalidCodeFormat, wrong.reason)
         assertTrue(recovered.success, recovered.diagnosticMessage)
         assertEquals(WorkspaceRecoveryReason.Recovered, recovered.reason)
         assertEquals(code.replace("-", ""), received?.recoveryCode)
         assertEquals(WORKSPACE_ID, received?.workspaceId)
+    }
+
+    @Test
+    fun malformedCodeStopsBeforeTransportAndValidCodeKeepsTheJoinFailureStage() {
+        val owner = fixture()
+        val code = assertNotNull(owner.service.prepareCode().recoveryCode).revealForUserConfirmation()
+        assertTrue(owner.service.confirmPreparedCode(code).success)
+        var joins = 0
+        var failure = WorkspacePairingReason.DecryptionFailed
+        val fresh = fixture(
+            transport = owner.transport,
+            requirement = null,
+            publisherReady = false,
+            joiner = WorkspaceJoiner { _, _ ->
+                joins += 1
+                WorkspaceJoinResult.failure(failure)
+            },
+        )
+        val loadsBefore = owner.transport.getCount
+        for (malformed in listOf(code.dropLast(1), code + "0", code.dropLast(1) + "O", "X".repeat(97))) {
+            val result = fresh.service.recover(malformed, replaceExistingWorkspace = true)
+            assertEquals(WorkspaceRecoveryReason.InvalidCodeFormat, result.reason)
+            assertFalse(result.success)
+        }
+        assertEquals(loadsBefore, owner.transport.getCount)
+        assertEquals(0, joins)
+
+        val failures = listOf(
+            WorkspacePairingReason.DecryptionFailed to WorkspaceRecoveryReason.DecryptionFailed,
+            WorkspacePairingReason.InvalidMetadata to WorkspaceRecoveryReason.InvalidRecoveryData,
+            WorkspacePairingReason.KeyVerificationFailed to WorkspaceRecoveryReason.KeyVerificationFailed,
+            WorkspacePairingReason.CryptoOperationFailed to WorkspaceRecoveryReason.CryptoOperationFailed,
+            WorkspacePairingReason.ReplacementFailed to WorkspaceRecoveryReason.ReplacementFailed,
+        )
+        for ((joinFailure, expected) in failures) {
+            failure = joinFailure
+            val result = fresh.service.recover(code.lowercase().replace('-', ' '), replaceExistingWorkspace = true)
+            assertFalse(result.success)
+            assertEquals(expected, result.reason)
+            assertNull(result.diagnosticMessage)
+            assertFalse(result.toString().contains(code))
+        }
+        assertEquals(failures.size, joins)
+        assertEquals(loadsBefore + failures.size, owner.transport.getCount)
+        assertEquals(1, owner.transport.putCount)
+
+        owner.transport.failLoads()
+        val networkFailure = fresh.service.recover(code, replaceExistingWorkspace = true)
+        assertEquals(WorkspaceRecoveryReason.ServerRequestFailed, networkFailure.reason)
+        assertEquals(failures.size, joins)
     }
 
     @Test
@@ -403,7 +456,7 @@ class SelfHostedWorkspaceRecoveryServiceTest {
         val result = fresh.service.recover(code, replaceExistingWorkspace = true)
 
         assertFalse(result.success)
-        assertEquals(WorkspaceRecoveryReason.ServerRequestFailed, result.reason)
+        assertEquals(WorkspaceRecoveryReason.InvalidRecoveryData, result.reason)
         assertEquals(0, joins)
 
         val boundElsewhere = fixture(
@@ -451,7 +504,7 @@ class SelfHostedWorkspaceRecoveryServiceTest {
             val result = fresh.service.recover(code, replaceExistingWorkspace = true)
 
             assertFalse(result.success)
-            assertEquals(WorkspaceRecoveryReason.ServerRequestFailed, result.reason)
+            assertEquals(WorkspaceRecoveryReason.InvalidRecoveryData, result.reason)
             assertEquals(0, joins)
         }
     }
@@ -587,6 +640,8 @@ private class MemoryRecoveryTransport(
         private set
     var putCount: Int = 0
         private set
+    var getCount: Int = 0
+        private set
     private var failAfterStore: Boolean = false
     private var loadFailuresEnabled: Boolean = false
 
@@ -594,6 +649,7 @@ private class MemoryRecoveryTransport(
         endpoint: String,
         accessToken: String,
     ): SelfHostedWorkspaceRecoveryEnvelopeResponse? {
+        getCount += 1
         if (loadFailuresEnabled) throw SelfHostedSyncHttpException(429, "recovery status rate limited")
         return current
     }

@@ -49,6 +49,7 @@ data class WorkspaceRecoveryUiState(
     val availability: WorkspaceRecoveryUiAvailability = WorkspaceRecoveryUiAvailability.Unknown,
     val syncGate: WorkspaceRecoverySyncGate = WorkspaceRecoverySyncGate.Pending,
     val preparedCode: WorkspaceRecoveryCodeUi? = null,
+    val failureMessage: String? = null,
 ) {
     val blocksSync: Boolean
         get() = syncGate != WorkspaceRecoverySyncGate.Allowed

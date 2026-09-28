@@ -479,7 +479,12 @@
     <string name="settings_fb_recovery_code_created">복구 코드를 확인했습니다. 이전 코드는 현재 서버 상태에서 더 이상 작동하지 않습니다.</string>
     <string name="settings_fb_recovery_completed">작업 공간을 복구했습니다. 데이터를 다운로드하고 있습니다.</string>
     <string name="settings_fb_recovery_publish_required">복구를 설정하기 전에 이 작업 공간을 성공적으로 동기화하세요.</string>
-    <string name="settings_fb_recovery_code_invalid">복구 코드가 올바르지 않거나 복구 봉투를 확인할 수 없습니다.</string>
+    <string name="settings_fb_recovery_code_format_invalid">복구 코드 형식이 올바르지 않습니다. SOMEDAY 뒤에 0–9와 A–F만 사용하여 4자씩 8개 그룹을 입력하세요. 문자 O와 숫자 0을 확인하세요. 이번에는 서버에 요청하지 않았습니다.</string>
+    <string name="settings_fb_recovery_code_invalid">확인 입력이 방금 표시된 새 복구 코드와 일치하지 않습니다. 해당 코드를 다시 입력하세요.</string>
+    <string name="settings_fb_recovery_data_invalid">복구 데이터의 형식, 매개변수 또는 작업 공간 연결을 검증하지 못했습니다. 클라이언트 버전과 백업을 확인하세요. 코드가 틀렸다는 뜻은 아닙니다.</string>
+    <string name="settings_fb_recovery_decryption_failed">이 코드로 현재 복구 데이터를 복호화할 수 없습니다. 코드가 일치하지 않거나 암호화된 데이터가 손상되었을 수 있습니다. 원본 코드와 계정을 확인하세요.</string>
+    <string name="settings_fb_recovery_key_verification_failed">작업 공간 키 검증에 실패했습니다. 신뢰할 수 있는 기기나 일치하는 백업에서 복구하세요.</string>
+    <string name="settings_fb_recovery_crypto_operation_failed">기기의 암호화 연산에 오류가 발생하여 복구 코드를 검증하지 못했습니다. 앱을 재시작하거나 업데이트한 후 다시 시도하세요.</string>
     <string name="settings_fb_recovery_not_required">이 기기에 이미 작업 공간 키가 있습니다. 교체하지 말고 동기화하세요.</string>
     <string name="settings_fb_recovery_confirmation_required">복구 전에 이 기기의 현재 작업 공간 교체를 확인하세요.</string>
     <string name="settings_fb_recovery_replacement_failed">현재 작업 공간을 안전하게 교체할 수 없습니다.</string>

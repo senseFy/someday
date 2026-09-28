@@ -5,6 +5,7 @@ package saien.someday.data.crypto
 import com.ionspin.kotlin.crypto.LibsodiumInitializer
 import com.ionspin.kotlin.crypto.aead.AeadCorrupedOrTamperedDataException
 import com.ionspin.kotlin.crypto.aead.AuthenticatedEncryptionWithAssociatedData
+import com.ionspin.kotlin.crypto.aead.crypto_aead_xchacha20poly1305_ietf_ABYTES
 import com.ionspin.kotlin.crypto.aead.crypto_aead_xchacha20poly1305_ietf_NPUBBYTES
 import com.ionspin.kotlin.crypto.hash.Hash
 import com.ionspin.kotlin.crypto.kdf.Kdf
@@ -119,6 +120,9 @@ class SodiumWorkspaceCrypto internal constructor(
         if (ciphertext.nonce.size != crypto_aead_xchacha20poly1305_ietf_NPUBBYTES) {
             return CryptoResult.AuthenticationFailed
         }
+        if (ciphertext.ciphertext.size < crypto_aead_xchacha20poly1305_ietf_ABYTES) {
+            return CryptoResult.AuthenticationFailed
+        }
         return try {
             CryptoResult.Success(
                 AuthenticatedEncryptionWithAssociatedData.xChaCha20Poly1305IetfDecrypt(
@@ -129,8 +133,6 @@ class SodiumWorkspaceCrypto internal constructor(
                 ).toByteArrayCopy(),
             )
         } catch (_: AeadCorrupedOrTamperedDataException) {
-            CryptoResult.AuthenticationFailed
-        } catch (_: RuntimeException) {
             CryptoResult.AuthenticationFailed
         }
     }
