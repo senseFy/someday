@@ -66,7 +66,7 @@ class SyncV2EpochContractIntegrationTest {
             async(Dispatchers.IO) {
                 startGate.awaitRelease()
                 repository.compareAndSetEpoch(
-                    identity.userId,
+                    identity.request,
                     WORKSPACE_ID,
                     expectedCurrentDigest = null,
                     metadata = candidate.metadata,
@@ -90,7 +90,7 @@ class SyncV2EpochContractIntegrationTest {
         val winner = candidates[winnerIndex]
         val replay = assertIs<SyncV2PointerPublishRepositoryResult.Published>(
             repository.compareAndSetEpoch(
-                identity.userId,
+                identity.request,
                 WORKSPACE_ID,
                 expectedCurrentDigest = null,
                 metadata = winner.metadata,
@@ -98,7 +98,7 @@ class SyncV2EpochContractIntegrationTest {
             ),
         )
         assertTrue(replay.idempotentReplay)
-        assertEquals(winner.metadata, repository.loadEpoch(identity.userId, WORKSPACE_ID)?.metadata)
+        assertEquals(winner.metadata, repository.loadEpoch(identity.request, WORKSPACE_ID)?.metadata)
         assertFalse(
             results.filterIsInstance<SyncV2PointerPublishRepositoryResult.Published>()
                 .any { it.idempotentReplay },
@@ -117,7 +117,7 @@ class SyncV2EpochContractIntegrationTest {
             val future = database.holdWorkspaceAdvisoryLock(identity.userId, WORKSPACE_ID).use {
                 val pending = executor.submit<SyncV2PointerPublishRepositoryResult> {
                     waitingRepository.compareAndSetEpoch(
-                        identity.userId,
+                        identity.request,
                         WORKSPACE_ID,
                         expectedCurrentDigest = null,
                         metadata = candidate.metadata,
@@ -152,7 +152,7 @@ class SyncV2EpochContractIntegrationTest {
             "recovery-b",
         )
         val stored = assertIs<WorkspaceRecoveryEnvelopePutResult.Stored>(
-            recoveryRepository.put(identity.userId, identity.deviceId, recoveryInput()),
+            recoveryRepository.put(identity.request, recoveryInput()),
         )
         assertTrue(stored.created)
         val competing = SyncV2ContractFixture.genesis("competing-c")
@@ -160,7 +160,7 @@ class SyncV2EpochContractIntegrationTest {
 
         val rejected = assertIs<SyncV2PointerPublishRepositoryResult.Rejected>(
             repository.compareAndSetEpoch(
-                identity.userId,
+                identity.request,
                 COMPETING_WORKSPACE_ID,
                 expectedCurrentDigest = null,
                 metadata = competing.metadata,
@@ -169,7 +169,7 @@ class SyncV2EpochContractIntegrationTest {
         )
         val existingReplay = assertIs<SyncV2PointerPublishRepositoryResult.Published>(
             repository.compareAndSetEpoch(
-                identity.userId,
+                identity.request,
                 WORKSPACE_ID,
                 expectedCurrentDigest = null,
                 metadata = existingA.metadata,
@@ -178,7 +178,7 @@ class SyncV2EpochContractIntegrationTest {
         )
 
         assertEquals("workspace_recovery_required", rejected.error)
-        assertEquals(null, repository.loadEpoch(identity.userId, COMPETING_WORKSPACE_ID))
+        assertEquals(null, repository.loadEpoch(identity.request, COMPETING_WORKSPACE_ID))
         assertTrue(existingReplay.idempotentReplay)
     }
 
@@ -194,7 +194,7 @@ class SyncV2EpochContractIntegrationTest {
             val casFuture = database.holdWorkspaceRecoveryAccountAdvisoryLock(identity.userId).use {
                 val pending = executor.submit<SyncV2PointerPublishRepositoryResult> {
                     waitingCasRepository.compareAndSetEpoch(
-                        identity.userId,
+                        identity.request,
                         WORKSPACE_ID,
                         expectedCurrentDigest = null,
                         metadata = candidate.metadata,
@@ -216,8 +216,7 @@ class SyncV2EpochContractIntegrationTest {
             val recoveryFuture = database.holdWorkspaceRecoveryAccountAdvisoryLock(identity.userId).use {
                 val pending = executor.submit<WorkspaceRecoveryEnvelopePutResult> {
                     waitingRecoveryRepository.put(
-                        identity.userId,
-                        identity.deviceId,
+                        identity.request,
                         recoveryInput(workspaceId = WORKSPACE_ID),
                     )
                 }
@@ -254,7 +253,7 @@ class SyncV2EpochContractIntegrationTest {
             val casFuture = database.holdWorkspaceRecoveryAccountAdvisoryLock(identity.userId).use { held ->
                 val pending = executor.submit<SyncV2PointerPublishRepositoryResult> {
                     waitingCasRepository.compareAndSetEpoch(
-                        identity.userId,
+                        identity.request,
                         COMPETING_WORKSPACE_ID,
                         expectedCurrentDigest = null,
                         metadata = competing.metadata,
@@ -271,7 +270,7 @@ class SyncV2EpochContractIntegrationTest {
                 casFuture.get(30, TimeUnit.SECONDS),
             )
             assertEquals("workspace_recovery_required", rejected.error)
-            assertEquals(null, repository.loadEpoch(identity.userId, COMPETING_WORKSPACE_ID))
+            assertEquals(null, repository.loadEpoch(identity.request, COMPETING_WORKSPACE_ID))
 
             val secondIdentity = database.seedIdentity("repeatable-read-epoch")
             val initialized = SyncV2ContractFixture.genesis("repeatable-read-epoch")
@@ -286,8 +285,7 @@ class SyncV2EpochContractIntegrationTest {
             val recoveryFuture = database.holdWorkspaceRecoveryAccountAdvisoryLock(secondIdentity.userId).use { held ->
                 val pending = executor.submit<WorkspaceRecoveryEnvelopePutResult> {
                     waitingRecoveryRepository.put(
-                        secondIdentity.userId,
-                        secondIdentity.deviceId,
+                        secondIdentity.request,
                         recoveryInput(workspaceId = WORKSPACE_ID),
                     )
                 }

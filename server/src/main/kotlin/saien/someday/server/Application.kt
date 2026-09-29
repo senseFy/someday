@@ -1,6 +1,8 @@
 package saien.someday.server
 
-import saien.someday.server.api.ErrorResponse
+import saien.someday.server.auth.AccountProtocolFailure
+import saien.someday.server.routes.accountDataRoutes
+import saien.someday.server.routes.respondError
 import saien.someday.server.routes.adminRoutes
 import saien.someday.server.routes.authRoutes
 import saien.someday.server.routes.deviceRoutes
@@ -54,9 +56,12 @@ fun Application.somedayServerModule(context: ServerContext = ServerContext.creat
         )
     }
     install(StatusPages) {
+        exception<AccountProtocolFailure> { call, failure ->
+            call.respondError(HttpStatusCode.fromValue(failure.error.status), failure.error.code)
+        }
         exception<Exception> { call, failure ->
             SERVER_LOGGER.error("Unhandled server request failure", failure)
-            call.respond(HttpStatusCode.InternalServerError, ErrorResponse("internal_error"))
+            call.respondError(HttpStatusCode.InternalServerError, "internal_error")
         }
     }
 
@@ -68,6 +73,7 @@ fun Application.somedayServerModule(context: ServerContext = ServerContext.creat
             )
         }
         authRoutes(context)
+        accountDataRoutes(context)
         deviceRoutes(context)
         pairingRoutes(context)
         workspaceRecoveryEnvelopeRoutes(context)

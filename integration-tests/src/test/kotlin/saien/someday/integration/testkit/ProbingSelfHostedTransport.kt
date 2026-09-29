@@ -1,6 +1,8 @@
 package saien.someday.integration.testkit
 
 import saien.someday.sync.selfhosted.JdkSelfHostedSyncTransport
+import saien.someday.sync.selfhosted.SelfHostedAccountControlTransport
+import saien.someday.sync.selfhosted.SelfHostedAccountRequestContext
 import saien.someday.sync.selfhosted.SelfHostedMediaTransportV3
 import saien.someday.sync.selfhosted.SelfHostedSyncTransport
 import saien.someday.sync.selfhosted.SelfHostedSyncTransportV2
@@ -9,6 +11,7 @@ import saien.someday.sync.selfhosted.SelfHostedV2CheckpointManifestRequest
 import saien.someday.sync.selfhosted.SelfHostedV2ImmutablePutResponse
 import saien.someday.sync.selfhosted.SelfHostedV2PushRequest
 import saien.someday.sync.selfhosted.SelfHostedV2PushResponse
+import saien.someday.sync.selfhosted.SelfHostedWorkspaceRecoveryTransport
 
 /**
  * Real transport with one explicit cross-plane observation point. The media
@@ -19,6 +22,8 @@ internal class ProbingSelfHostedTransport(
     private val delegate: JdkSelfHostedSyncTransport = JdkSelfHostedSyncTransport(),
 ) : SelfHostedSyncTransport by delegate,
     SelfHostedSyncTransportV2 by delegate,
+    SelfHostedAccountControlTransport by delegate,
+    SelfHostedWorkspaceRecoveryTransport by delegate,
     SelfHostedMediaTransportV3 by delegate {
     @Volatile
     var beforeEntityPublication: ((endpoint: String, accessToken: String, workspaceId: String) -> Unit)? = null
@@ -27,26 +32,29 @@ internal class ProbingSelfHostedTransport(
         endpoint: String,
         accessToken: String,
         request: SelfHostedV2CheckpointChunkRequest,
+        accountContext: SelfHostedAccountRequestContext,
     ): SelfHostedV2ImmutablePutResponse {
         beforeEntityPublication?.invoke(endpoint, accessToken, request.workspaceId)
-        return delegate.v2PutCheckpointChunk(endpoint, accessToken, request)
+        return delegate.v2PutCheckpointChunk(endpoint, accessToken, request, accountContext)
     }
 
     override fun v2PutCheckpointManifest(
         endpoint: String,
         accessToken: String,
         request: SelfHostedV2CheckpointManifestRequest,
+        accountContext: SelfHostedAccountRequestContext,
     ): SelfHostedV2ImmutablePutResponse {
         beforeEntityPublication?.invoke(endpoint, accessToken, request.workspaceId)
-        return delegate.v2PutCheckpointManifest(endpoint, accessToken, request)
+        return delegate.v2PutCheckpointManifest(endpoint, accessToken, request, accountContext)
     }
 
     override fun v2Push(
         endpoint: String,
         accessToken: String,
         request: SelfHostedV2PushRequest,
+        accountContext: SelfHostedAccountRequestContext,
     ): SelfHostedV2PushResponse {
         beforeEntityPublication?.invoke(endpoint, accessToken, request.workspaceId)
-        return delegate.v2Push(endpoint, accessToken, request)
+        return delegate.v2Push(endpoint, accessToken, request, accountContext)
     }
 }

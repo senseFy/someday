@@ -12,10 +12,25 @@ feature repositories leave schema management to SQLDelight or Flyway.
 
 The local schema is owned by SQLDelight files under `shared/data/src/commonMain/sqldelight/saien/someday/data/local/db`.
 
-The client currently has one squashed System V3 snapshot, `databases/1.db`, and
-no `.sqm` files. Development installations created before this baseline must
-clear local app data. Once a client release ships the snapshot, later changes
-use numbered migrations and retain its history.
+The squashed baseline phase has ended. `databases/1.db`, `1.sqm`, and
+`databases/2.db` are frozen. `1.sqm` upgrades installed schema 1 to schema 2;
+`2.sqm` upgrades schema 2 to schema 3, recorded in `databases/3.db`. Development
+installations created before the schema-1 baseline must still clear local app
+data; schema-1 and schema-2 installations upgrade in place. Retain numbered
+migrations and their snapshots for all subsequent changes.
+
+Schema 2 adds account incarnation to the published local workspace authority,
+backfilling every existing binding to G0 without changing its workspace or
+writer. Separate installation tables retain reset intent, workspace network
+gates, and monotonic endpoint/user protocol-1 evidence across workspace
+replacement. Reset submission persists uncertainty before sending the request.
+The media publication proof remains the existing authority/workspace/digest
+tuple; this migration neither rebuilds `media_assets` nor changes its data.
+
+Schema 3 adds nullable `discard_target_incarnation` to workspace gates. It
+records explicit replacement consent for a discovered current incarnation,
+including devices that did not initiate the reset. Existing gates receive no
+consent; an upgrade cannot grant permission to discard a local workspace.
 
 `workspace_entity_versions_v2`, its parent/head tables, and typed projections
 store notes, notebooks, deletions, and synchronized workspace preferences.
@@ -49,6 +64,34 @@ Platform modules may construct or provide a `SqlDriver`, but must not call `Some
 
 JVM and Desktop code should use `createSomedayJdbcDriver(...)` from `shared:data` when opening a local database that may need creation or migration. Tests that create a fresh local database should use the same factory so migration behavior is exercised consistently.
 
+The shared JVM factory checks the stored version, creates or migrates, and
+updates `user_version` inside one driver transaction. It rejects a database
+newer than its supported schema before exposing the connection to repositories.
+SQLDelight 2.1.0's default schema-taking JDBC constructor does not reject newer
+schemas, so existing older binaries cannot acquire this protection retroactively.
+Opening a newer schema with an older released Desktop binary remains a
+separate release-compatibility acceptance check.
+
+`verifySqlDelightMigration` keeps the public Gradle gate name but now runs
+`SomedayDatabaseMigrationTest`: copy the frozen schema-1 and schema-2 snapshots,
+seed all 23 original tables and all 26 schema-2 tables respectively with valid
+related data, stamp the installed version, and open each through the shared
+driver. The tests compare every old column and value, G0 backfill, preservation
+of pending reset intent and network gates, and absence of implicit discard
+consent. They compare `sqlite_master`, columns, foreign keys, and indexes against
+a newly created database and the schema-3 snapshot. They also check repeated
+opens and future-schema refusal without modifying the file. SQLDelight snapshots carry
+their version in the filename; the fixture sets installation `user_version`
+explicitly rather than opening the empty snapshot as an uninitialized file.
+
+Native `verifyMigrations` remains disabled because SQLDelight 2.1.0's
+`ObjectDiffer` does not terminate on this schema's foreign-key graph. The real
+shared-driver test replaces that verifier; the retained
+`scripts/verify-sqldelight-v2-baseline` entry point now verifies frozen history,
+executes `1.sqm` and `2.sqm`, and compares both intermediate and final
+migrated/fresh/snapshot catalogs. It no longer
+rejects numbered migrations or requires a single snapshot.
+
 SQLDelight migrations should be deterministic version-to-version transitions. Do not use conditional DDL such as `IF EXISTS` or `IF NOT EXISTS` to hide unknown schema state. If an old shipped schema had a real defect, model that old state explicitly and migrate from it in the shared SQLDelight migration chain.
 
 ## Server Database
@@ -79,7 +122,7 @@ records so ciphertext and claim identity exist only in valid states.
 `V8__system_v3_media_metadata.sql` adds one immutable media-object record keyed
 by `(user_id, workspace_id, media_id)`, with a foreign key to the workspace
 registry. Ciphertext bytes remain in the configured media blob store; account
-quota is summed across workspaces. Operators must back up PostgreSQL and that
+quota is summed across workspaces of the active account incarnation. Operators must back up PostgreSQL and that
 store as one recovery unit. The standalone topology uses a filesystem store;
 the external topology uses an S3-compatible store. Backend choice
 does not alter Flyway schema or create provider-specific database migrations;
@@ -93,6 +136,23 @@ timestamps. The server never stores the user recovery code or plaintext
 workspace key. Account deletion cascades to the envelope; workspace deletion
 does the same through the account/workspace foreign key. Exact repository
 queries still predicate the authenticated user explicitly.
+
+`V10__account_data_incarnations.sql` installs account incarnation admission
+metadata and committed-receipt storage. It preserves existing rows as G0, adds
+account-owned device foreign keys, and creates G0 atomically through a user
+insert trigger. New incarnation/receipt tables follow authentication-table
+conventions without RLS; existing forced workspace policies remain unchanged.
+`AccountIncarnationMigrationIntegrationTest` creates a separate database,
+applies V9, seeds nonempty account/entity/media/pairing/recovery data, applies
+V10, and verifies unchanged legacy values, backfills and constraints. It also
+checks rollback on invalid legacy ownership and the account-creation trigger.
+Run it with the existing PostgreSQL integration suite and test-only admin
+credentials that can create/drop its disposable databases.
+
+`V11__retired_media_maintenance_context.sql` adds a database verification epoch,
+per-incarnation audit IDs and persistent reclamation/revalidation evidence.
+Restore rotates that context before any reset or maintenance resumes. These are
+operator verification records, not a pending-reset state machine.
 
 When changing server tables, columns, indexes, or constraints:
 

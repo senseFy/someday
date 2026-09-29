@@ -72,14 +72,14 @@ internal object SyncV2ContractFixture {
     ) {
         check(
             repository.putCheckpointChunk(
-                identity.userId,
+                identity.request,
                 workspaceId,
                 candidate.chunk,
             ) is SyncV2ImmutablePutRepositoryResult.Stored,
         )
         check(
             repository.putCheckpointManifest(
-                identity.userId,
+                identity.request,
                 workspaceId,
                 candidate.manifest,
             ) is SyncV2ImmutablePutRepositoryResult.Stored,
@@ -95,7 +95,7 @@ internal object SyncV2ContractFixture {
         prepareGenesis(repository, identity, workspaceId, candidate)
         check(
             repository.compareAndSetEpoch(
-                identity.userId,
+                identity.request,
                 workspaceId,
                 expectedCurrentDigest = null,
                 metadata = candidate.metadata,

@@ -56,6 +56,16 @@ val verifyMediaIntegrityStartScripts = registerLauncher(
     launcherName = "verify-media-integrity",
     entryPoint = "saien.someday.server.MediaIntegrityVerifierKt",
 )
+val purgeRetiredAccountDataStartScripts = registerLauncher(
+    taskName = "purgeRetiredAccountDataStartScripts",
+    launcherName = "purge-retired-account-data",
+    entryPoint = "saien.someday.server.PurgeRetiredAccountDataCommandKt",
+)
+val invalidateReclamationAttestationsStartScripts = registerLauncher(
+    taskName = "invalidateReclamationAttestationsStartScripts",
+    launcherName = "invalidate-reclamation-attestations",
+    entryPoint = "saien.someday.server.InvalidateReclamationAttestationsKt",
+)
 
 fun launcherFiles(
     launcherName: String,
@@ -81,6 +91,14 @@ distributions {
                 filePermissions {
                     unix("rwxr-xr-x")
                 }
+            }
+            from(launcherFiles("purge-retired-account-data", purgeRetiredAccountDataStartScripts)) {
+                into("bin")
+                filePermissions { unix("rwxr-xr-x") }
+            }
+            from(launcherFiles("invalidate-reclamation-attestations", invalidateReclamationAttestationsStartScripts)) {
+                into("bin")
+                filePermissions { unix("rwxr-xr-x") }
             }
         }
     }

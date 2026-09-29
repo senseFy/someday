@@ -2,6 +2,9 @@
 
 package saien.someday.ui
 
+import saien.someday.domain.settings.AccountDataResetManager
+import saien.someday.domain.workspace.WorkspaceProductAccess
+import saien.someday.domain.workspace.UnrestrictedWorkspaceProductAccess
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.EnterTransition
 import androidx.compose.animation.ExitTransition
@@ -355,6 +358,8 @@ fun SomedayApp(
     workspacePairingInvitationJoiner: WorkspacePairingInvitationJoiner? = null,
     workspacePairingInvitationCanceller: WorkspacePairingInvitationCanceller? = null,
     workspaceRecoveryManager: WorkspaceRecoveryManager? = null,
+    accountDataResetManager: AccountDataResetManager? = null,
+    workspaceProductAccess: WorkspaceProductAccess = UnrestrictedWorkspaceProductAccess,
     workspacePairingScanner: WorkspacePairingScanner = UnavailableWorkspacePairingScanner,
     appDispatchers: AppDispatchers = AppDispatchers(),
     foregroundSyncSignal: Int = 0,
@@ -373,10 +378,11 @@ fun SomedayApp(
         val notesUiStrings = rememberNotesUiStrings()
         val memoriesUiStrings = rememberMemoriesUiStrings()
         val settingsUiStrings = rememberSettingsUiStrings()
-        val notesController = remember(effectiveNotesRepository, locationCaptureAdapter) {
+        val notesController = remember(effectiveNotesRepository, locationCaptureAdapter, workspaceProductAccess) {
             startupTrace?.invoke("SomedayApp.notesController.start")
             NotesUiController(
                 repository = effectiveNotesRepository,
+                workspaceProductAccess = workspaceProductAccess,
                 strings = notesUiStrings,
                 locationCaptureAdapter = locationCaptureAdapter,
                 initialNotebookId = initialSelectedNotebookId(appSettings),
@@ -386,10 +392,11 @@ fun SomedayApp(
                 startupTrace?.invoke("SomedayApp.notesController.end")
             }
         }
-        val memoriesController = remember(effectiveNotesRepository) {
+        val memoriesController = remember(effectiveNotesRepository, workspaceProductAccess) {
             startupTrace?.invoke("SomedayApp.memoriesController.start")
             MemoriesUiController(
                 repository = effectiveNotesRepository,
+                workspaceProductAccess = workspaceProductAccess,
                 strings = memoriesUiStrings,
                 backgroundDispatcher = appDispatchers.background,
             ).also {
@@ -428,6 +435,8 @@ fun SomedayApp(
             workspacePairingInvitationCanceller,
             selfHostedConnectionSwitcher,
             workspaceRecoveryManager,
+            accountDataResetManager,
+            workspaceProductAccess,
             automaticSyncEligible,
             loadSettings,
         ) {
@@ -480,6 +489,8 @@ fun SomedayApp(
                         WorkspaceJoinResult.failure(WorkspacePairingReason.Unavailable)
                     },
                 workspaceRecoveryManager = workspaceRecoveryManager,
+                accountDataResetManager = accountDataResetManager,
+                workspaceProductAccess = workspaceProductAccess,
                 onThisDayNotificationScheduler = onThisDayNotificationScheduler,
                 onThisDayNotificationStrings = onThisDayNotificationStrings,
                 uiStrings = settingsUiStrings,
@@ -490,6 +501,13 @@ fun SomedayApp(
         }
         SideEffect {
             notesController.updateLocalizedStrings(notesUiStrings)
+            notesController.updateProductReadOnly(
+                settingsController.state.sync.accountReset.snapshot?.productReadOnly == true ||
+                    settingsController.state.sync.accountReset.operation in setOf(
+                        saien.someday.ui.settings.AccountResetUiOperation.Submitting,
+                        saien.someday.ui.settings.AccountResetUiOperation.Replacing,
+                    ),
+            )
             memoriesController.updateLocalizedStrings(memoriesUiStrings)
             settingsController.updateLocalizedStrings(
                 settings = settingsUiStrings,
@@ -658,6 +676,7 @@ fun SomedayApp(
         }
 
         fun openNewNote() {
+            if (notesState.productReadOnly) return
             val targetNotebookId = notesState.selectedNotebookId ?: appSettings.defaultNotebookId
             if (notesController.canNavigateToNewNote(targetNotebookId)) {
                 navController.navigate(
@@ -2282,6 +2301,7 @@ private fun NoteConflictResolutionRouteContent(
             )
             Spacer(modifier = Modifier.width(100.dp))
         }
+        if (notesState.productReadOnly) AccountCopyReadOnlyBanner()
         if (details == null) {
             EmptyState(
                 icon = Lucide.History,
@@ -2310,6 +2330,7 @@ private fun NoteConflictResolutionRouteContent(
                     ConflictHistoryPanel(
                         title = stringResource(Res.string.conflict_branch_n, index + 1),
                         history = branch.history,
+                        actionEnabled = !notesState.productReadOnly,
                         metadata = buildString {
                             append(if (branch.deleted) stringResource(Res.string.common_deletion) else stringResource(Res.string.common_content))
                             append(" · ")
@@ -2489,13 +2510,14 @@ private fun NotesListPane(
         )
         if (selectedTab == PrimaryTab.Notes && notesState.noteSelectionActive) {
             NotesBatchActionBar(
-                operationInProgress = notesState.batchOperationInProgress,
+                operationInProgress = notesState.batchOperationInProgress || notesState.productReadOnly,
                 onAction = { batchDialog = it },
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = SomedayDesignDefaults.CompactPageHorizontalPadding),
             )
         }
+        if (notesState.productReadOnly) AccountCopyReadOnlyBanner()
         SomedaySyncPullToRefresh(
             pullRefresh = pullRefresh.takeUnless { notesSearchActive },
             modifier = Modifier.fillMaxWidth().weight(1f),
@@ -2539,7 +2561,7 @@ private fun NotesListPane(
         }
         NotesBatchUndoBar(
             deletedCount = notesState.batchDeleteUndoItems.size,
-            operationInProgress = notesState.batchOperationInProgress,
+            operationInProgress = notesState.batchOperationInProgress || notesState.productReadOnly,
             onUndo = { coroutineScope.launch { notesController.undoLastBatchDelete() } },
             onDismiss = notesController::dismissBatchDeleteUndo,
         )
@@ -2570,7 +2592,7 @@ private fun NotesDetailPlaceholder(
             icon = Lucide.BookOpenText,
             title = if (notesState.notes.isEmpty()) stringResource(Res.string.notes_no_notes) else stringResource(Res.string.notes_select_a_note),
         ) {
-            Button(onClick = onCreateNote, enabled = notesState.notebooks.isNotEmpty()) {
+            Button(onClick = onCreateNote, enabled = notesState.notebooks.isNotEmpty() && !notesState.productReadOnly) {
                 Icon(Lucide.Plus, contentDescription = null, modifier = Modifier.size(18.dp))
                 Spacer(modifier = Modifier.width(8.dp))
                 Text(stringResource(Res.string.nav_new_note))
@@ -2697,6 +2719,7 @@ private fun shouldShowCreateNoteAction(
     notesState: NotesUiState,
 ): Boolean =
     selectedTab != PrimaryTab.Settings &&
+        !notesState.productReadOnly &&
         !notesState.noteSelectionActive &&
         notesState.editor == null &&
         currentRouteKind != SomedayRouteKind.NotesSearch &&
@@ -2898,6 +2921,7 @@ private fun NotesTabLazyContent(
                 .background(MaterialTheme.colorScheme.background)
                 .padding(horizontal = SomedayDesignDefaults.PageHorizontalPadding),
         )
+        if (notesState.productReadOnly) AccountCopyReadOnlyBanner()
         SomedaySyncPullToRefresh(
             pullRefresh = pullRefresh.takeUnless { notesSearchActive },
             modifier = Modifier.fillMaxWidth().weight(1f),
@@ -2941,13 +2965,13 @@ private fun NotesTabLazyContent(
         }
         NotesBatchUndoBar(
             deletedCount = notesState.batchDeleteUndoItems.size,
-            operationInProgress = notesState.batchOperationInProgress,
+            operationInProgress = notesState.batchOperationInProgress || notesState.productReadOnly,
             onUndo = { coroutineScope.launch { notesController.undoLastBatchDelete() } },
             onDismiss = notesController::dismissBatchDeleteUndo,
         )
         if (selectedTab == PrimaryTab.Notes && notesState.noteSelectionActive) {
             NotesBatchActionBar(
-                operationInProgress = notesState.batchOperationInProgress,
+                operationInProgress = notesState.batchOperationInProgress || notesState.productReadOnly,
                 onAction = { batchDialog = it },
                 modifier = Modifier
                     .fillMaxWidth()
@@ -3802,6 +3826,7 @@ private fun NotesBatchDialogs(
     onChangeTimeZone: (String?) -> Unit,
     onClearLocation: () -> Unit,
 ) {
+    if (state.productReadOnly) return
     val selectedNotes = state.visibleNotes.filter { it.id in state.selectedNoteIds }
     when (dialog) {
         NotesBatchDialog.Move -> AlertDialog(
@@ -4855,7 +4880,7 @@ internal fun SyncSettingsContent(
                     subtitle = if (state.sync.syncing) stringResource(Res.string.sync_in_progress) else null,
                     actionText = if (retrying) stringResource(Res.string.sync_retry) else stringResource(Res.string.common_sync),
                     busy = actionBusy,
-                    enabled = !state.sync.busy,
+                    enabled = !state.sync.busy && !state.sync.accountReset.blocksSync,
                     onClick = {
                         actionScope.launch {
                             if (retrying) controller.recoverSyncIssue() else controller.runUserSync()
@@ -4998,7 +5023,9 @@ internal fun SyncSettingsContent(
         }
     }
 
-    if (signedIn) {
+    AccountDataResetContent(state, controller, actionScope)
+
+    if (signedIn && !state.sync.accountReset.blocksSync) {
         WorkspaceRecoveryContent(
             state = state,
             controller = controller,
@@ -5392,6 +5419,7 @@ private fun DefaultNotebookSelectionDialog(
 private fun DialogOptionRow(
     title: String,
     selected: Boolean,
+    enabled: Boolean = true,
     onClick: () -> Unit,
 ) {
     Row(
@@ -5399,7 +5427,7 @@ private fun DialogOptionRow(
         verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick)
+            .clickable(enabled = enabled, onClick = onClick)
             .padding(vertical = 12.dp),
     ) {
         Text(title, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
@@ -6071,7 +6099,8 @@ private fun NoteEditorContent(
     var bodyFocused by remember(editor.sessionId) { mutableStateOf(false) }
     var mediaImportInProgress by remember(editor.sessionId) { mutableStateOf(false) }
     val imagePickerTitle = stringResource(Res.string.image_picker_title)
-    val onMarkdownToolbarAction: (MarkdownToolbarAction) -> Unit = { action ->
+    val onMarkdownToolbarAction: (MarkdownToolbarAction) -> Unit = action@{ action ->
+        if (state.productReadOnly) return@action
         if (action == MarkdownToolbarAction.Image) {
             if (!mediaImportInProgress) {
                 mediaImportInProgress = true
@@ -6112,8 +6141,8 @@ private fun NoteEditorContent(
     ) {
         markdownFieldValue = markdownFieldValue.syncedWithEditorMarkdown(editor)
     }
-    LaunchedEffect(autoFocusBody, editor.noteId, editor.markdownPreviewVisible) {
-        if (autoFocusBody && !editor.markdownPreviewVisible) {
+    LaunchedEffect(autoFocusBody, editor.noteId, editor.markdownPreviewVisible, state.productReadOnly) {
+        if (autoFocusBody && !editor.markdownPreviewVisible && !state.productReadOnly) {
             bodyFocusRequester.requestFocus()
         }
     }
@@ -6146,6 +6175,7 @@ private fun NoteEditorContent(
                         .fillMaxSize()
                         .padding(top = 64.dp),
                 ) {
+                    if (state.productReadOnly) AccountCopyReadOnlyBanner()
                     state.conflictDetails?.let { details ->
                         NoteConflictBanner(
                             details = details,
@@ -6198,6 +6228,7 @@ private fun NoteEditorContent(
                             if (state.versionHistory?.visible == true) {
                                 VersionHistoryContent(
                                     versions = state.versionHistory.versions,
+                                    mutationEnabled = !state.productReadOnly,
                                     onRestoreVersion = { versionId ->
                                         coroutineScope.launch { controller.restoreVersion(versionId) }
                                     },
@@ -6205,12 +6236,13 @@ private fun NoteEditorContent(
                             }
                             EditorTitleInput(
                                 value = editor.title,
+                                readOnly = state.productReadOnly,
                                 onValueChange = { controller.updateDraft(title = it) },
                             )
                             if (inlineToolbarVisible) {
                                 MarkdownToolbar(
-                                    inputActionsEnabled = markdownFieldValue.composition == null,
-                                    imageActionEnabled = !mediaImportInProgress,
+                                    inputActionsEnabled = markdownFieldValue.composition == null && !state.productReadOnly,
+                                    imageActionEnabled = !mediaImportInProgress && !state.productReadOnly,
                                     onToolbarAction = onMarkdownToolbarAction,
                                 )
                             }
@@ -6222,9 +6254,10 @@ private fun NoteEditorContent(
                             } else {
                                 EditorBodyInput(
                                     value = markdownFieldValue,
+                                    readOnly = state.productReadOnly,
                                     onValueChange = { value ->
                                         markdownFieldValue = value
-                                        controller.updateDraft(markdownBody = value.text)
+                                        if (!state.productReadOnly) controller.updateDraft(markdownBody = value.text)
                                         controller.updateMarkdownSelection(value.selection.start, value.selection.end)
                                     },
                                     focusRequester = bodyFocusRequester,
@@ -6241,15 +6274,15 @@ private fun NoteEditorContent(
                 onClose = onClose,
                 onSave = onSave,
                 onMore = { moreSheetVisible = true },
-                mutationEnabled = state.conflictDetails == null,
+                mutationEnabled = state.conflictDetails == null && !state.productReadOnly,
                 modifier = Modifier
                     .align(Alignment.TopCenter)
                     .padding(horizontal = contentHorizontalPadding),
             )
             if (keyboardToolbarVisible) {
                 MarkdownKeyboardAccessoryBar(
-                    inputActionsEnabled = markdownFieldValue.composition == null,
-                    imageActionEnabled = !mediaImportInProgress,
+                    inputActionsEnabled = markdownFieldValue.composition == null && !state.productReadOnly,
+                    imageActionEnabled = !mediaImportInProgress && !state.productReadOnly,
                     onToolbarAction = onMarkdownToolbarAction,
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
@@ -6263,6 +6296,7 @@ private fun NoteEditorContent(
         NoteEditorMoreSheet(
             editor = editor,
             historyVisible = state.versionHistory?.visible == true,
+            mutationEnabled = !state.productReadOnly,
             onDismiss = { moreSheetVisible = false },
             onShowDetails = {
                 moreSheetVisible = false
@@ -6289,7 +6323,7 @@ private fun NoteEditorContent(
     }
 
     val deleteNoteId = editor.noteId
-    if (deleteDialogVisible && deleteNoteId != null) {
+    if (deleteDialogVisible && deleteNoteId != null && !state.productReadOnly) {
         ConfirmActionDialog(
             title = stringResource(Res.string.note_delete_title),
             text = stringResource(Res.string.note_delete_message),
@@ -6372,6 +6406,7 @@ private fun NoteEditorTopBar(
 private fun NoteEditorMoreSheet(
     editor: NoteEditorState,
     historyVisible: Boolean,
+    mutationEnabled: Boolean,
     onDismiss: () -> Unit,
     onShowDetails: () -> Unit,
     onToggleHistory: () -> Unit,
@@ -6417,6 +6452,7 @@ private fun NoteEditorMoreSheet(
                     title = stringResource(Res.string.note_delete_title),
                     subtitle = stringResource(Res.string.note_remove_from_syncs),
                     destructive = true,
+                    enabled = mutationEnabled,
                     onClick = onDelete,
                 )
             }
@@ -6430,15 +6466,16 @@ private fun NoteEditorSheetActionRow(
     title: String,
     subtitle: String,
     destructive: Boolean = false,
+    enabled: Boolean = true,
     onClick: () -> Unit,
 ) {
-    val contentColor = if (destructive) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface
+    val contentColor = (if (destructive) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface).copy(alpha = if (enabled) 1f else 0.38f)
     Row(
         horizontalArrangement = Arrangement.spacedBy(14.dp),
         verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick)
+            .clickable(enabled = enabled, onClick = onClick)
             .padding(vertical = 14.dp),
     ) {
         Icon(
@@ -6470,10 +6507,12 @@ private fun NoteEditorSheetActionRow(
 @Composable
 private fun EditorTitleInput(
     value: String,
+    readOnly: Boolean = false,
     onValueChange: (String) -> Unit,
 ) {
     BasicTextField(
         value = value,
+        readOnly = readOnly,
         onValueChange = onValueChange,
         singleLine = true,
         textStyle = MaterialTheme.typography.headlineSmall.copy(
@@ -6500,6 +6539,7 @@ private fun EditorTitleInput(
 @Composable
 private fun EditorBodyInput(
     value: TextFieldValue,
+    readOnly: Boolean = false,
     onValueChange: (TextFieldValue) -> Unit,
     focusRequester: FocusRequester,
     onFocusChanged: (Boolean) -> Unit,
@@ -6507,6 +6547,7 @@ private fun EditorBodyInput(
     val markdownEditPreviewTransformation = rememberMarkdownEditPreviewTransformation()
     BasicTextField(
         value = value,
+        readOnly = readOnly,
         onValueChange = onValueChange,
         textStyle = MaterialTheme.typography.bodyLarge.copy(
             color = MaterialTheme.colorScheme.onSurface,
@@ -6646,7 +6687,7 @@ private fun NoteDetailsDialog(
     AlertDialog(
         onDismissRequest = onDismiss,
         confirmButton = {
-            TextButton(onClick = onConfirm) {
+            TextButton(onClick = onConfirm, enabled = !state.productReadOnly) {
                 Text(stringResource(Res.string.common_done))
             }
         },
@@ -6727,6 +6768,7 @@ private fun NoteDetailsDialog(
                     DialogOptionRow(
                         title = notebook.title,
                         selected = notebook.id == editor.notebookId,
+                        enabled = !state.productReadOnly,
                         onClick = { onSelectNotebook(notebook.id) },
                     )
                 }
@@ -6735,12 +6777,13 @@ private fun NoteDetailsDialog(
                 NoteDetailsSectionTitle(stringResource(Res.string.common_location))
                 OutlinedTextField(
                     value = placeDraft,
+                    readOnly = state.productReadOnly,
                     onValueChange = onPlaceDraftChange,
                     label = { Text(stringResource(Res.string.common_place)) },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                 )
-                TextButton(onClick = { onCaptureCurrentLocation() }) {
+                TextButton(onClick = { onCaptureCurrentLocation() }, enabled = !state.productReadOnly) {
                     Icon(Lucide.MapPin, contentDescription = null, modifier = Modifier.size(18.dp))
                     Spacer(modifier = Modifier.width(6.dp))
                     Text(
@@ -6908,6 +6951,7 @@ private fun NoteSyncIssueBanner(
 @Composable
 private fun VersionHistoryContent(
     versions: List<NoteVersionSummary>,
+    mutationEnabled: Boolean = true,
     onRestoreVersion: (String) -> Unit,
 ) {
     SomedayPanel(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
@@ -6930,7 +6974,7 @@ private fun VersionHistoryContent(
                         version.markdownBody.lineSequence().joinToString(" ").trim().take(160).ifBlank { stringResource(Res.string.note_no_body_yet) },
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
-                    TextButton(onClick = { onRestoreVersion(version.versionId) }) {
+                    TextButton(onClick = { onRestoreVersion(version.versionId) }, enabled = mutationEnabled) {
                         Text(stringResource(Res.string.common_restore))
                     }
                 }
@@ -6945,6 +6989,7 @@ private fun ConflictHistoryPanel(
     history: ConflictHistory,
     metadata: String? = null,
     actionLabel: String? = null,
+    actionEnabled: Boolean = true,
     onAction: (() -> Unit)? = null,
 ) {
     SomedayPanel(modifier = Modifier.fillMaxWidth()) {
@@ -6995,6 +7040,7 @@ private fun ConflictHistoryPanel(
         if (actionLabel != null && onAction != null) {
             Button(
                 onClick = onAction,
+                enabled = actionEnabled,
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(top = 14.dp),
@@ -7436,11 +7482,12 @@ private fun NotebookSheet(
                 IconButton(onClick = onShowRecentlyDeleted) {
                     Icon(Lucide.Trash, contentDescription = stringResource(Res.string.deleted_title))
                 }
-                IconButton(onClick = { creatingNotebook = true }) {
+                IconButton(onClick = { creatingNotebook = true }, enabled = !state.productReadOnly) {
                     Icon(Lucide.Plus, contentDescription = stringResource(Res.string.nav_new_notebook))
                 }
             }
         }
+        if (state.productReadOnly) AccountCopyReadOnlyBanner()
         AnimatedVisibility(visible = creatingNotebook) {
             Column(
                 verticalArrangement = Arrangement.spacedBy(8.dp),
@@ -7460,7 +7507,7 @@ private fun NotebookSheet(
                             newNotebookTitle = ""
                             creatingNotebook = false
                         },
-                        enabled = newNotebookTitle.isNotBlank(),
+                        enabled = newNotebookTitle.isNotBlank() && !state.productReadOnly,
                     ) {
                         Text(stringResource(Res.string.common_create))
                     }
@@ -7482,7 +7529,7 @@ private fun NotebookSheet(
                 icon = Lucide.NotebookText,
                 title = stringResource(Res.string.nav_no_notebooks),
             ) {
-                Button(onClick = { creatingNotebook = true }) {
+                Button(onClick = { creatingNotebook = true }, enabled = !state.productReadOnly) {
                     Text(stringResource(Res.string.nav_create_notebook))
                 }
             }
@@ -7500,7 +7547,7 @@ private fun NotebookSheet(
                         renameTitle = notebook.title
                     },
                     onDelete = { deleteNotebookId = notebook.id },
-                    mutationEnabled = conflict == null,
+                    mutationEnabled = conflict == null && !state.productReadOnly,
                 )
                 if (conflict != null) {
                     Column(
@@ -7515,6 +7562,7 @@ private fun NotebookSheet(
                         conflict.branches.forEachIndexed { index, branch ->
                             Button(
                                 onClick = { onResolveNotebookConflict(notebook.id, branch.versionId) },
+                                enabled = !state.productReadOnly,
                                 modifier = Modifier.fillMaxWidth(),
                             ) {
                                 Text(
@@ -7543,7 +7591,7 @@ private fun NotebookSheet(
                                     onRenameNotebook(notebook.id, renameTitle)
                                     renamingNotebookId = null
                                 },
-                                enabled = renameTitle.isNotBlank(),
+                                enabled = renameTitle.isNotBlank() && !state.productReadOnly,
                             ) {
                                 Text(stringResource(Res.string.common_save))
                             }
@@ -7558,7 +7606,7 @@ private fun NotebookSheet(
         }
     }
 
-    if (deleteNotebook != null) {
+    if (deleteNotebook != null && !state.productReadOnly) {
         ConfirmActionDialog(
             title = stringResource(Res.string.notebook_delete_title, deleteNotebook.title),
             text = stringResource(Res.string.notebook_delete_message),
@@ -7612,12 +7660,14 @@ private fun RecentlyDeletedSheet(
                     title = Res.string.deleted_notes_section,
                     items = deletedNotes,
                     onRestoreDeletedItem = onRestoreDeletedItem,
+                    mutationEnabled = !state.productReadOnly,
                 )
                 deletedWorkspaceSection(
                     key = "notebooks",
                     title = Res.string.deleted_notebooks_section,
                     items = deletedNotebooks,
                     onRestoreDeletedItem = onRestoreDeletedItem,
+                    mutationEnabled = !state.productReadOnly,
                 )
             }
         }
@@ -7629,6 +7679,7 @@ private fun LazyListScope.deletedWorkspaceSection(
     title: StringResource,
     items: List<DeletedWorkspaceItem>,
     onRestoreDeletedItem: (String) -> Unit,
+    mutationEnabled: Boolean = true,
 ) {
     if (items.isEmpty()) return
     item(key = "deleted-section-$key", contentType = "section-label") {
@@ -7661,7 +7712,7 @@ private fun LazyListScope.deletedWorkspaceSection(
                 )
             }
             TextButton(
-                enabled = item.canRestore,
+                enabled = item.canRestore && mutationEnabled,
                 onClick = { onRestoreDeletedItem(item.entityId) },
             ) {
                 Text(
@@ -7804,3 +7855,13 @@ private fun syncBadgeIcon(syncBadge: NoteSyncBadge): ImageVector =
         is NoteSyncBadge.Error -> Lucide.X
         is NoteSyncBadge.Conflict -> Lucide.History
     }
+
+@Composable
+private fun AccountCopyReadOnlyBanner() {
+    Text(
+        text = stringResource(Res.string.account_reset_readonly_note),
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        style = MaterialTheme.typography.bodySmall,
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp),
+    )
+}

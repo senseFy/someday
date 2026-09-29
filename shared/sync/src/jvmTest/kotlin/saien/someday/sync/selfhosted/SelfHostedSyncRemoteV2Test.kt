@@ -152,6 +152,7 @@ class SelfHostedSyncRemoteV2Test {
             endpoint: String,
             accessToken: String,
             request: SelfHostedV2CheckpointFetchRequest,
+            accountContext: saien.someday.sync.selfhosted.SelfHostedAccountRequestContext,
         ): SelfHostedV2CheckpointFetchResponse {
             requestedIndexes += request.chunkIndex
             return if (request.chunkIndex == null) {
@@ -165,27 +166,35 @@ class SelfHostedSyncRemoteV2Test {
             }
         }
 
-        override fun v2Capabilities(endpoint: String, accessToken: String): SelfHostedV2CapabilitiesResponse = unused()
-        override fun v2Epoch(endpoint: String, accessToken: String, workspaceId: String): SelfHostedV2EpochResponse = unused()
+        override fun v2Capabilities(endpoint: String, accessToken: String,
+            accountContext: saien.someday.sync.selfhosted.SelfHostedAccountRequestContext,
+        ): SelfHostedV2CapabilitiesResponse = unused()
+        override fun v2Epoch(endpoint: String, accessToken: String, workspaceId: String,
+            accountContext: saien.someday.sync.selfhosted.SelfHostedAccountRequestContext,
+        ): SelfHostedV2EpochResponse = unused()
         override fun v2PutCheckpointChunk(
             endpoint: String,
             accessToken: String,
             request: SelfHostedV2CheckpointChunkRequest,
+            accountContext: saien.someday.sync.selfhosted.SelfHostedAccountRequestContext,
         ): SelfHostedV2ImmutablePutResponse = unused()
         override fun v2PutCheckpointManifest(
             endpoint: String,
             accessToken: String,
             request: SelfHostedV2CheckpointManifestRequest,
+            accountContext: saien.someday.sync.selfhosted.SelfHostedAccountRequestContext,
         ): SelfHostedV2ImmutablePutResponse = unused()
         override fun v2CompareAndSetEpoch(
             endpoint: String,
             accessToken: String,
             request: SelfHostedV2EpochCompareAndSetRequest,
+            accountContext: saien.someday.sync.selfhosted.SelfHostedAccountRequestContext,
         ): SelfHostedV2EpochCompareAndSetResponse = unused()
         override fun v2CleanupCheckpointDraft(
             endpoint: String,
             accessToken: String,
             request: SelfHostedV2CheckpointCleanupRequest,
+            accountContext: saien.someday.sync.selfhosted.SelfHostedAccountRequestContext,
         ): SelfHostedV2CheckpointCleanupResponse {
             cleanupRequest = request
             return SelfHostedV2CheckpointCleanupResponse(deleted = true)
@@ -194,16 +203,19 @@ class SelfHostedSyncRemoteV2Test {
             endpoint: String,
             accessToken: String,
             request: SelfHostedV2PushRequest,
+            accountContext: saien.someday.sync.selfhosted.SelfHostedAccountRequestContext,
         ): SelfHostedV2PushResponse = unused()
         override fun v2Pull(
             endpoint: String,
             accessToken: String,
             request: SelfHostedV2PullRequest,
+            accountContext: saien.someday.sync.selfhosted.SelfHostedAccountRequestContext,
         ): SelfHostedV2PullResponse = unused()
         override fun v2Frontiers(
             endpoint: String,
             accessToken: String,
             request: SelfHostedV2FrontierRequest,
+            accountContext: saien.someday.sync.selfhosted.SelfHostedAccountRequestContext,
         ): SelfHostedV2FrontierResponse = unused()
 
         private fun <T> unused(): T = error("Unexpected transport operation")

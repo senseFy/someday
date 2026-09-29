@@ -14,6 +14,7 @@ import io.ktor.server.routing.head
 import io.ktor.server.routing.put
 import io.ktor.server.routing.route
 import saien.someday.server.ServerContext
+import saien.someday.server.auth.AccountAccess
 import saien.someday.server.api.SystemV3CapabilitiesResponse
 import saien.someday.server.api.SystemV3MediaPutResponse
 import saien.someday.server.persistence.MAX_MEDIA_OBJECT_CIPHERTEXT_BYTES
@@ -28,6 +29,7 @@ fun Route.systemV3Routes(context: ServerContext) {
             val auth = call.requireAuthenticated(context, requiredScope = "sync", requireDevice = true) ?: return@get
             val deviceId = auth.tokenDeviceId ?: return@get call.respondError(HttpStatusCode.Forbidden, "device_required")
             if (!call.requireSystemV3RateLimit(context, deviceId)) return@get
+            context.repository.admitRequest(auth.requestContext, AccountAccess.SYNC)
             call.respond(SystemV3CapabilitiesResponse())
         }
         route("/workspaces/{workspaceId}") {
@@ -60,9 +62,8 @@ fun Route.systemV3Routes(context: ServerContext) {
                     ) return@put call.respondError(HttpStatusCode.BadRequest, "invalid_media_object")
                     call.respondMediaPut(
                         context.systemV3MediaRepository.putObject(
-                            auth.userId,
+                            auth.requestContext,
                             workspaceId,
-                            deviceId,
                             mediaId,
                             digest,
                             bytes,
@@ -79,7 +80,7 @@ fun Route.systemV3Routes(context: ServerContext) {
                         ?: return@head call.respondError(HttpStatusCode.BadRequest, "invalid_workspace_id")
                     val mediaId = call.mediaIdOrNull()
                         ?: return@head call.respondError(HttpStatusCode.BadRequest, "invalid_media_id")
-                    when (val result = context.systemV3MediaRepository.headObject(auth.userId, workspaceId, mediaId)) {
+                    when (val result = context.systemV3MediaRepository.headObject(auth.requestContext, workspaceId, mediaId)) {
                         is SystemV3MediaReadResult.Found -> call.respondMediaHead(result.value)
                         SystemV3MediaReadResult.Missing -> call.respondError(HttpStatusCode.NotFound, "media_object_not_found")
                         SystemV3MediaReadResult.Corrupt -> call.respondError(HttpStatusCode.NotFound, "media_object_unavailable")
@@ -95,7 +96,7 @@ fun Route.systemV3Routes(context: ServerContext) {
                         ?: return@get call.respondError(HttpStatusCode.BadRequest, "invalid_workspace_id")
                     val mediaId = call.mediaIdOrNull()
                         ?: return@get call.respondError(HttpStatusCode.BadRequest, "invalid_media_id")
-                    when (val result = context.systemV3MediaRepository.readObject(auth.userId, workspaceId, mediaId)) {
+                    when (val result = context.systemV3MediaRepository.readObject(auth.requestContext, workspaceId, mediaId)) {
                         is SystemV3MediaReadResult.Found -> {
                             call.mediaHeaders(result.value.record)
                             call.respondBytes(

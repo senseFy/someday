@@ -11,6 +11,11 @@ Implementations accept the complete token format below. Short numeric tokens,
 alternate remote paths, and lookup identifiers derived with a fast enumerable
 hash are invalid.
 
+All four server transitions apply [account incarnation admission](account-data-reset-protocol.md)
+before replay or state handling. Invitations retain their incarnation. The
+eight-active-invitation budget counts only unexpired active rows in the current
+incarnation, with count and insert serialized under a separate invitation lock.
+
 ## 1. Security boundary
 
 The protocol is designed for these conditions:
@@ -115,14 +120,21 @@ on the inviting and joining devices. Separately, each published local
 workspace has a publication-session binding:
 
 ```text
-canonical endpoint + authenticated userId + workspaceId + local writer deviceId
+canonical endpoint + authenticated userId + accountIncarnation + workspaceId + local writer deviceId
 ```
 
-The shared session guard enforces all four values before an already published
+The shared session guard enforces these values and durable network gates before an already published
 workspace creates or cancels pairing state. An inviter must have an `ACTIVE`
 published pointer; a merely local `PREPARING` draft is not an invitation
 authority. A wrong account, workspace, or device fails before join-package
 creation and before an invite request.
+
+The incarnation comes from the issuing session and persisted workspace binding,
+not from later discovery. It is local attempt metadata and does not change the
+authority AAD or encrypted envelope. Generic typed failures take precedence over
+business status handling: an incarnation 409 cannot trigger an invite-ID retry
+or become `InvitationAlreadyUsed`. Completion remains best-effort, but persists
+a stale/incarnation gate before swallowing a cleanup failure.
 
 A joining installation claims with its own registered device session. Successful
 local replacement binds that stable installation device id as the new DAG writer.
@@ -268,6 +280,12 @@ discarded workspace.
 Pairing and durable recovery share authenticated workspace import and this
 atomic local replacement. A pairing invitation remains a separate, short-lived
 capability; it is not a disaster-recovery credential.
+
+Before installation, a protocol-1 join revalidates the captured account,
+incarnation and previous local workspace. A pending unknown reset blocks
+replacement. After remote reset is confirmed, fresh discard consent for the
+original copy permits this same replacement path; intent reconciliation and
+authority installation commit together. See the [shared reset state contract](account-data-reset-protocol.md#durable-local-reset-state).
 
 ## 8. UI and release rules
 

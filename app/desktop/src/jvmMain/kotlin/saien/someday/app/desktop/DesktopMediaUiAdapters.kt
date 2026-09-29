@@ -6,6 +6,7 @@ import okio.source
 import saien.someday.data.media.SelectedImageImportException
 import saien.someday.data.media.SelectedImageImportFailureReason
 import saien.someday.data.media.SelectedImageImportRequest
+import saien.someday.domain.workspace.WorkspaceProductSnapshot
 import saien.someday.domain.media.MediaAssetId
 import saien.someday.domain.media.isSafeOriginalFileName
 import saien.someday.sync.AuthorityCoordinatedMediaAssetStore
@@ -16,6 +17,7 @@ import saien.someday.ui.media.MediaUiFailureReason
 
 internal fun File.importSelectedImage(
     store: AuthorityCoordinatedMediaAssetStore,
+    expectedWorkspace: WorkspaceProductSnapshot,
 ): MediaImportUiResult {
     val originalName = name.takeIf(::isSafeOriginalFileName)
     return try {
@@ -24,6 +26,7 @@ internal fun File.importSelectedImage(
                 source = source,
                 request = SelectedImageImportRequest(originalFileName = originalName),
                 normalizer = DesktopMediaImageNormalizer,
+                    expectedWorkspace = expectedWorkspace,
             )
         }
         MediaImportUiResult.Imported(

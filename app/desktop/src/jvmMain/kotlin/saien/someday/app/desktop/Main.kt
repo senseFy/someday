@@ -11,6 +11,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
 import androidx.compose.ui.window.rememberWindowState
+import saien.someday.domain.settings.AccountDataResetManager
 import saien.someday.domain.settings.ClientSettings
 import saien.someday.domain.settings.WorkspacePreferencesConflictResolver
 import saien.someday.ui.SomedayApp
@@ -19,6 +20,7 @@ import saien.someday.ui.media.MediaImportRunner
 import saien.someday.ui.media.MediaImportUiResult
 import saien.someday.ui.media.MediaMaterializationRunner
 import saien.someday.ui.media.MediaMaterializationUiResult
+import saien.someday.ui.media.MediaPreviewUiResult
 import saien.someday.ui.media.MediaPreviewLoader
 import saien.someday.ui.media.MediaUiFailureReason
 import saien.someday.ui.media.MediaUiPorts
@@ -31,7 +33,12 @@ import kotlinx.coroutines.withContext
 import java.awt.FileDialog
 import java.io.File
 
-fun main() = application {
+fun main() = launchDesktopApp()
+
+internal fun launchDesktopApp(
+    accountDataResetManagerOverride: AccountDataResetManager? = null,
+    repositoryFactory: () -> DesktopClientRepositories = ::createDesktopClientRepositories,
+) = application {
     println(DesktopShellEntrypoint.startupLog())
     val windowState = rememberWindowState(width = 1220.dp, height = 820.dp)
     val usesImmersiveMacChrome = isMacOs()
@@ -53,7 +60,7 @@ fun main() = application {
         LaunchedEffect(Unit) {
             bootstrap = runCatching {
                 withContext(Dispatchers.Default) {
-                    val repositories = createDesktopClientRepositories()
+                    val repositories = repositoryFactory()
                     try {
                         val initialSettings = repositories.settingsRepository.load()
                         DesktopAppBootstrap(
@@ -84,28 +91,36 @@ fun main() = application {
         val mediaUiPorts = remember(clientRepositories, window) {
             MediaUiPorts(
                 importRunner = MediaImportRunner { pickerTitle, onResult ->
-                    val dialog = FileDialog(window, pickerTitle, FileDialog.LOAD).apply {
-                        isMultipleMode = false
-                        isVisible = true
-                    }
-                    val selectedDirectory = dialog.directory
-                    val selectedFile = dialog.file
-                    if (selectedDirectory == null || selectedFile == null) {
-                        onResult(MediaImportUiResult.Cancelled)
-                    } else {
-                        val file = File(selectedDirectory, selectedFile)
-                        importCoroutineScope.launch {
+                    importCoroutineScope.launch {
+                        val captured = withContext(Dispatchers.IO) {
+                            runCatching { clientRepositories.localMediaAssetStore.captureWorkspace() }
+                        }.getOrElse {
+                            onResult(MediaImportUiResult.Failed(MediaUiFailureReason.ImportFailed))
+                            return@launch
+                        }
+                        val dialog = FileDialog(window, pickerTitle, FileDialog.LOAD).apply {
+                            isMultipleMode = false
+                            isVisible = true
+                        }
+                        val selectedDirectory = dialog.directory
+                        val selectedFile = dialog.file
+                        if (selectedDirectory == null || selectedFile == null) {
+                            onResult(MediaImportUiResult.Cancelled)
+                        } else {
+                            val file = File(selectedDirectory, selectedFile)
                             val result = withContext(Dispatchers.IO) {
-                                file.importSelectedImage(clientRepositories.localMediaAssetStore)
+                                file.importSelectedImage(clientRepositories.localMediaAssetStore, captured)
                             }
                             onResult(result)
                         }
                     }
                 },
                 previewLoader = MediaPreviewLoader { assetId ->
-                    withContext(Dispatchers.IO) {
-                        clientRepositories.localMediaAssetStore.loadMediaPreview(assetId)
+                    val (snapshot, preview) = withContext(Dispatchers.IO) {
+                        clientRepositories.localMediaAssetStore.captureWorkspace() to
+                            clientRepositories.localMediaAssetStore.loadMediaPreview(assetId)
                     }
+                    if (clientRepositories.workspaceProductAccess.isCurrent(snapshot)) preview else MediaPreviewUiResult.Missing
                 },
                 materializationRunner = MediaMaterializationRunner { assetId, onResult ->
                     importCoroutineScope.launch {
@@ -136,19 +151,25 @@ fun main() = application {
                 clientRepositories.settingsRepository as? WorkspacePreferencesConflictResolver,
             onLocalExport = clientRepositories::exportLocalDataSummary,
             dayOneImportRunner = DayOneImportRunner { onResult ->
-                val dialog = FileDialog(window, "Import Day One export", FileDialog.LOAD).apply {
-                    file = "*.zip"
-                    isVisible = true
-                }
-                val selectedDirectory = dialog.directory
-                val selectedFile = dialog.file
-                if (selectedDirectory == null || selectedFile == null) {
-                    onResult(SettingsImportSummary(SettingsImportOutcome.Cancelled))
-                } else {
-                    val file = File(selectedDirectory, selectedFile)
-                    importCoroutineScope.launch {
+                importCoroutineScope.launch {
+                    val captured = withContext(Dispatchers.IO) {
+                        runCatching { clientRepositories.workspaceProductAccess.capture() }
+                    }.getOrElse {
+                        onResult(SettingsImportSummary(SettingsImportOutcome.Failed))
+                        return@launch
+                    }
+                    val dialog = FileDialog(window, "Import Day One export", FileDialog.LOAD).apply {
+                        file = "*.zip"
+                        isVisible = true
+                    }
+                    val selectedDirectory = dialog.directory
+                    val selectedFile = dialog.file
+                    if (selectedDirectory == null || selectedFile == null) {
+                        onResult(SettingsImportSummary(SettingsImportOutcome.Cancelled))
+                    } else {
+                        val file = File(selectedDirectory, selectedFile)
                         val summary = withContext(Dispatchers.Default) {
-                            runCatching { clientRepositories.importDayOneArchive(file) }.getOrElse {
+                            runCatching { clientRepositories.importDayOneArchive(file, captured) }.getOrElse {
                                 SettingsImportSummary(SettingsImportOutcome.Failed)
                             }
                         }
@@ -166,6 +187,8 @@ fun main() = application {
             workspacePairingInvitationJoiner = clientRepositories.workspacePairingInvitationJoiner,
             workspacePairingInvitationCanceller = clientRepositories.workspacePairingInvitationCanceller,
             workspaceRecoveryManager = clientRepositories.workspaceRecoveryManager,
+            accountDataResetManager = accountDataResetManagerOverride ?: clientRepositories.accountDataResetManager,
+            workspaceProductAccess = clientRepositories.workspaceProductAccess,
             pullToRefreshSyncEnabled = false,
         )
     }

@@ -266,6 +266,7 @@ class WorkspaceCheckpointPersistenceV2(
     private val writerDeviceId: String,
     private val protocolStore: SqlDelightSyncProtocolStoreV2 = SqlDelightSyncProtocolStoreV2(localRepository.database),
     private val authorityBindingId: String? = null,
+    private val accountIncarnation: String = saien.someday.domain.settings.INITIAL_ACCOUNT_INCARNATION,
 ) {
     fun persist(prepared: PreparedWorkspaceEpochCheckpointV2): WorkspaceCheckpointPersistResultV2 {
         val descriptor = prepared.descriptor
@@ -280,6 +281,7 @@ class WorkspaceCheckpointPersistenceV2(
                     prepared.pointerObject.objectDigest,
                     authorityBindingId,
                     authorityBindingId?.let { writerDeviceId },
+                    accountIncarnation,
                 )) {
                     is SyncEpochPersistResultV2.ImmutableMismatch -> error(epoch.safeMessage)
                     is SyncEpochPersistResultV2.AlreadyStored,
@@ -771,6 +773,8 @@ class WorkspaceCheckpointPublisherV2(
     private val commitPointerBarrier: (
         (() -> WorkspaceCheckpointPublishResultV2) -> WorkspaceCheckpointPublishResultV2
     ) = { commit -> commit() },
+    /** Only local upload bookkeeping; pointer activation already holds commitPointerBarrier. */
+    private val localMutationBarrier: ((() -> Unit) -> Unit) = { mutation -> mutation() },
 ) {
     init {
         require(chunkPublishParallelism in 1..MAX_CHECKPOINT_CHUNK_PUBLISH_PARALLELISM_V2) {
@@ -799,15 +803,19 @@ class WorkspaceCheckpointPublisherV2(
             ChunkPublishBatchResultV2.Ok -> Unit
         }
         // Local control marks stay single-threaded (SQLDelight); remote PUTs already finished.
-        prepared.chunks.forEach { chunk ->
-            markControl(prepared, chunk.encryptedObject, "published")
+        localMutationBarrier {
+            prepared.chunks.forEach { chunk ->
+                markControl(prepared, chunk.encryptedObject, "published")
+            }
         }
         emitProgress(WorkspaceCheckpointPublishProgressV2.UploadingManifest)
         when (val result = remote.putCheckpointManifest(descriptor, prepared.manifestObject)) {
             is WorkspaceImmutablePutResultV2.Rejected -> return WorkspaceCheckpointPublishResultV2.Rejected(
                 result.safeErrorCode, result.safeMessage,
             )
-            is WorkspaceImmutablePutResultV2.Stored -> markControl(prepared, prepared.manifestObject, "published")
+            is WorkspaceImmutablePutResultV2.Stored -> localMutationBarrier {
+                markControl(prepared, prepared.manifestObject, "published")
+            }
         }
         emitProgress(WorkspaceCheckpointPublishProgressV2.VerifyingRemote)
         val fetched = runCatching { remote.fetchCheckpoint(prepared.pointerObject, descriptor) }.getOrElse {
@@ -861,6 +869,7 @@ class WorkspaceCheckpointPublisherV2(
                         now,
                         descriptor.createdByDeviceId,
                         remote.authorityBindingId,
+                        remote.accountIncarnation,
                     )
                     prepared.entities.filter {
                         it.version.provenance?.type == WorkspaceVersionProvenanceTypeV2.SOURCE_IMPORT

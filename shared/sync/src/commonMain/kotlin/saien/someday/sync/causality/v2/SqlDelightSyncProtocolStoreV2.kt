@@ -11,6 +11,8 @@ import kotlin.uuid.Uuid
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import saien.someday.domain.settings.INITIAL_ACCOUNT_INCARNATION
+import saien.someday.domain.settings.isCanonicalAccountIncarnation
 
 enum class SyncEpochLifecycleV2(val storageValue: String) {
     PREPARING("preparing"),
@@ -43,7 +45,10 @@ data class StoredLocalAuthorityV2(
     val authorityBindingId: String,
     val pointerDigest: String,
     val updatedAtEpochMilliseconds: Long,
-)
+    val accountIncarnation: String = INITIAL_ACCOUNT_INCARNATION,
+) {
+    init { require(isCanonicalAccountIncarnation(accountIncarnation)) }
+}
 
 sealed interface SyncEpochPersistResultV2 {
     data class Stored(val epoch: StoredSyncEpochV2) : SyncEpochPersistResultV2
@@ -139,6 +144,7 @@ class SqlDelightSyncProtocolStoreV2(
         descriptorDigest: String,
         authorityBindingId: String? = null,
         localWriterDeviceId: String? = null,
+        accountIncarnation: String = INITIAL_ACCOUNT_INCARNATION,
     ): SyncEpochPersistResultV2 {
         require((authorityBindingId == null) == (localWriterDeviceId == null)) {
             "A prepared authority binding and its local writer must be persisted together."
@@ -155,6 +161,7 @@ class SqlDelightSyncProtocolStoreV2(
                 descriptorDigest = descriptorDigest,
                 authorityBindingId = authorityBindingId,
                 localWriterDeviceId = localWriterDeviceId,
+                accountIncarnation = accountIncarnation,
             )
             if (outcome is SyncEpochPersistResultV2.ImmutableMismatch) {
                 rollback()
@@ -170,7 +177,9 @@ class SqlDelightSyncProtocolStoreV2(
         descriptorDigest: String,
         authorityBindingId: String?,
         localWriterDeviceId: String?,
+        accountIncarnation: String,
     ): SyncEpochPersistResultV2 {
+        require(isCanonicalAccountIncarnation(accountIncarnation))
         val existing = loadEpoch(remoteProfile, descriptor.syncEpochId)
         if (existing != null) {
             if (existing.descriptor != descriptor || existing.descriptorDigest != descriptorDigest) {
@@ -198,6 +207,7 @@ class SqlDelightSyncProtocolStoreV2(
                 descriptorDigest,
                 authorityBindingId,
                 localWriterDeviceId,
+                accountIncarnation,
             )
             return if (bindingError == null) {
                 SyncEpochPersistResultV2.AlreadyStored(
@@ -234,6 +244,7 @@ class SqlDelightSyncProtocolStoreV2(
             descriptorDigest,
             authorityBindingId,
             localWriterDeviceId,
+            accountIncarnation,
         )?.let { bindingError ->
             return SyncEpochPersistResultV2.ImmutableMismatch(bindingError)
         }
@@ -255,6 +266,7 @@ class SqlDelightSyncProtocolStoreV2(
         descriptorDigest: String,
         authorityBindingId: String,
         localWriterDeviceId: String,
+        accountIncarnation: String = INITIAL_ACCOUNT_INCARNATION,
     ): SyncEpochPersistResultV2 {
         val current = loadLocalAuthority()
         if (current == null ||
@@ -269,6 +281,7 @@ class SqlDelightSyncProtocolStoreV2(
                 descriptorDigest,
                 authorityBindingId,
                 localWriterDeviceId,
+                accountIncarnation,
             )
         }
 
@@ -285,6 +298,7 @@ class SqlDelightSyncProtocolStoreV2(
                 lockedAuthority.epochId != descriptor.syncEpochId &&
                 lockedAuthority.authorityBindingId == authorityBindingId &&
                 lockedAuthority.localWriterDeviceId == localWriterDeviceId &&
+                lockedAuthority.accountIncarnation == accountIncarnation &&
                 losingEpoch != null &&
                 losingEpoch.lifecycle == SyncEpochLifecycleV2.PREPARING &&
                 losingEpoch.activatedAtEpochMilliseconds == null &&
@@ -326,6 +340,7 @@ class SqlDelightSyncProtocolStoreV2(
                 descriptorDigest,
                 authorityBindingId,
                 localWriterDeviceId,
+                accountIncarnation,
             ).also { persisted ->
                 check(persisted !is SyncEpochPersistResultV2.ImmutableMismatch) {
                     "The authenticated first-epoch handoff could not be committed atomically."
@@ -346,6 +361,7 @@ class SqlDelightSyncProtocolStoreV2(
         pointerDigest: String,
         authorityBindingId: String?,
         localWriterDeviceId: String?,
+        accountIncarnation: String,
     ): String? {
         if (authorityBindingId == null || localWriterDeviceId == null || loadAuthoritativeEpoch() != null) {
             return null
@@ -355,7 +371,8 @@ class SqlDelightSyncProtocolStoreV2(
             (current.remoteProfile != remoteProfile || current.epochId != epochId ||
                 current.pointerDigest != pointerDigest ||
                 current.authorityBindingId != authorityBindingId ||
-                current.localWriterDeviceId != localWriterDeviceId)
+                current.localWriterDeviceId != localWriterDeviceId ||
+                current.accountIncarnation != accountIncarnation)
         ) {
             return "A different first-epoch authority is already prepared on this device."
         }
@@ -366,6 +383,7 @@ class SqlDelightSyncProtocolStoreV2(
             authority_binding_id = authorityBindingId,
             pointer_digest = pointerDigest,
             updated_at = kotlin.time.Clock.System.now().toEpochMilliseconds(),
+            account_incarnation = accountIncarnation,
         )
         return null
     }
@@ -376,6 +394,7 @@ class SqlDelightSyncProtocolStoreV2(
         activatedAt: Instant,
         localWriterDeviceId: String? = null,
         authorityBindingId: String? = null,
+        accountIncarnation: String? = null,
     ): StoredSyncEpochV2 {
         database.transaction {
             val target = requireNotNull(loadEpoch(remoteProfile, epochId)) { "Cannot activate an unknown v2 epoch." }
@@ -409,6 +428,11 @@ class SqlDelightSyncProtocolStoreV2(
                 }?.localWriterDeviceId
                 ?: target.descriptor.createdByDeviceId
             require(UUID_V4_PATTERN_SYSTEM_V2.matches(writer))
+            val incarnation = accountIncarnation ?: loadLocalAuthority()?.accountIncarnation ?: INITIAL_ACCOUNT_INCARNATION
+            require(isCanonicalAccountIncarnation(incarnation))
+            loadLocalAuthority()?.let { existing ->
+                require(existing.accountIncarnation == incarnation) { "Activation cannot change the workspace account incarnation." }
+            }
             queries.upsertLocalAuthoritySystemV2(
                 remote_profile = remoteProfile,
                 epoch_id = epochId,
@@ -416,6 +440,7 @@ class SqlDelightSyncProtocolStoreV2(
                 authority_binding_id = binding,
                 pointer_digest = target.descriptorDigest,
                 updated_at = activatedAtMillis,
+                account_incarnation = incarnation,
             )
         }
         return checkNotNull(loadEpoch(remoteProfile, epochId))
@@ -482,6 +507,7 @@ class SqlDelightSyncProtocolStoreV2(
 
     fun loadLocalAuthority(): StoredLocalAuthorityV2? =
         queries.selectLocalAuthoritySystemV2().executeAsOneOrNull()?.let { row ->
+            require(isCanonicalAccountIncarnation(row.account_incarnation)) { "The bound account incarnation is invalid." }
             StoredLocalAuthorityV2(
                 row.remote_profile,
                 row.epoch_id,
@@ -489,6 +515,7 @@ class SqlDelightSyncProtocolStoreV2(
                 row.authority_binding_id,
                 row.pointer_digest,
                 row.updated_at,
+                row.account_incarnation,
             )
         }
 
@@ -498,9 +525,13 @@ class SqlDelightSyncProtocolStoreV2(
         pointerDigest: String,
         authorityBindingId: String,
         updatedAt: Instant,
+        accountIncarnation: String? = null,
     ): StoredLocalAuthorityV2 {
         require(authorityBindingId.isNotBlank() && authorityBindingId.length <= 2_048)
         val current = requireNotNull(loadLocalAuthority())
+        require(accountIncarnation == null || accountIncarnation == current.accountIncarnation) {
+            "An endpoint change cannot change the workspace account incarnation."
+        }
         require(current.remoteProfile == remoteProfile && current.epochId == epochId &&
             current.pointerDigest == pointerDigest
         ) { "Only an endpoint exposing the exact authenticated authority may be rebound." }
@@ -511,6 +542,7 @@ class SqlDelightSyncProtocolStoreV2(
             authority_binding_id = authorityBindingId,
             pointer_digest = current.pointerDigest,
             updated_at = updatedAt.toEpochMilliseconds(),
+            account_incarnation = current.accountIncarnation,
         )
         return checkNotNull(loadLocalAuthority())
     }

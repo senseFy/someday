@@ -100,13 +100,14 @@ class SyncV2RuntimeService(
                     )
                 }
                 is WorkspacePreparedCheckpointLoadResultV2.Loaded -> {
-                    when (val bound = protocolStore.persistPreparingEpoch(
+                    when (val bound = workspaceLifecycleCoordinator.productAccess { protocolStore.persistPreparingEpoch(
                         recovered.prepared.remoteProfile,
                         recovered.prepared.descriptor,
                         recovered.prepared.pointerObject.objectDigest,
                         remote.authorityBindingId,
                         writerDeviceId,
-                    )) {
+                        remote.accountIncarnation,
+                    ) }) {
                         is SyncEpochPersistResultV2.ImmutableMismatch ->
                             return failedInitialization(bound.safeMessage)
                         is SyncEpochPersistResultV2.AlreadyStored,
@@ -503,6 +504,7 @@ class SyncV2RuntimeService(
             commitPointerBarrier = { commit ->
                 workspaceLifecycleCoordinator.productAccess(commit)
             },
+            localMutationBarrier = { mutation -> workspaceLifecycleCoordinator.productAccess(mutation) },
         )
     }
 
@@ -523,13 +525,16 @@ class SyncV2RuntimeService(
                 FirstEpochPublishAttemptV2.Failed(prepared.safeMessage)
             is WorkspaceGenesisCheckpointResultV2.Prepared -> {
                 when (
-                    val persisted = WorkspaceCheckpointPersistenceV2(
-                        localRepository,
-                        workspaceKey,
-                        writerDeviceId,
-                        protocolStore,
-                        remote.authorityBindingId,
-                    ).persist(prepared.checkpoint)
+                    val persisted = workspaceLifecycleCoordinator.productAccess {
+                        WorkspaceCheckpointPersistenceV2(
+                            localRepository,
+                            workspaceKey,
+                            writerDeviceId,
+                            protocolStore,
+                            remote.authorityBindingId,
+                            remote.accountIncarnation,
+                        ).persist(prepared.checkpoint)
+                    }
                 ) {
                     is WorkspaceCheckpointPersistResultV2.Rejected ->
                         FirstEpochPublishAttemptV2.Failed(persisted.safeMessage)
@@ -684,12 +689,12 @@ class SyncV2RuntimeService(
             epoch.lifecycle == SyncEpochLifecycleV2.ABANDONED
         ) {
             if (epoch.lifecycle == SyncEpochLifecycleV2.PREPARING) {
-                protocolStore.abandonPreparingEpoch(
+                workspaceLifecycleCoordinator.productAccess { protocolStore.abandonPreparingEpoch(
                     remoteProfile,
                     epochId,
                     safeErrorCode,
                     safeErrorMessage,
-                )
+                ) }
             }
         }
     }
@@ -712,17 +717,17 @@ class SyncV2RuntimeService(
                 val draft = loader.load(epoch).getOrNull() ?: return@forEach
                 if (draft.pointer.previousPointerDigest == active.descriptorDigest) return@forEach
                 if (epoch.lifecycle == SyncEpochLifecycleV2.PREPARING) {
-                    protocolStore.abandonPreparingEpoch(
+                    workspaceLifecycleCoordinator.productAccess { protocolStore.abandonPreparingEpoch(
                         remote.remoteProfile,
                         epoch.descriptor.syncEpochId,
                         "epoch_pointer_compare_and_set_lost",
                         "Another authenticated checkpoint won the pointer compare-and-set.",
-                    )
+                    ) }
                 }
                 if (runCatching { remote.cleanupCheckpointDraft(draft) }.getOrNull()
                     is WorkspaceCheckpointDraftCleanupResultV2.Deleted
                 ) {
-                    checkpointCleanup.collect(remote.remoteProfile, epoch.descriptor.syncEpochId)
+                    workspaceLifecycleCoordinator.productAccess { checkpointCleanup.collect(remote.remoteProfile, epoch.descriptor.syncEpochId) }
                 }
             }
     }

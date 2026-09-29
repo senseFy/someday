@@ -37,6 +37,11 @@ import saien.someday.domain.notes.NotesLocationInput
 import saien.someday.domain.notes.NotesRepository
 import saien.someday.domain.notes.noteCalendarDate
 import saien.someday.domain.settings.EditorPreferences
+import saien.someday.domain.workspace.UnrestrictedWorkspaceProductAccess
+import saien.someday.domain.workspace.WorkspaceProductAccess
+import saien.someday.domain.workspace.WorkspaceProductChangedException
+import saien.someday.domain.workspace.WorkspaceProductReadOnlyException
+import saien.someday.domain.workspace.WorkspaceProductSnapshot
 import saien.someday.ui.i18n.NotesUiStrings
 import saien.someday.ui.i18n.formatUiString
 import saien.someday.ui.media.MediaImportUiResult
@@ -52,11 +57,24 @@ class NotesUiController(
     private var editorPreferences: EditorPreferences = EditorPreferences(),
     private val currentDateProvider: () -> LocalDate = { currentLocalDate() },
     private val backgroundDispatcher: CoroutineDispatcher = Dispatchers.Default,
+    private val workspaceProductAccess: WorkspaceProductAccess = UnrestrictedWorkspaceProductAccess,
 ) {
     private var strings = strings
     var state: NotesUiState by mutableStateOf(NotesUiState(selectedNotebookId = initialNotebookId))
         private set
     private var nextEditorSessionIdSeed: Long = 1L
+    private var workspaceSnapshot: WorkspaceProductSnapshot? = null
+    private var productReadOnly: Boolean = false
+    private var activeBatchOperation: Any? = null
+
+    /** The reset UI supplies its already-loaded durable gate; this setter does no database work. */
+    fun updateProductReadOnly(readOnly: Boolean) {
+        productReadOnly = readOnly
+        if (state.productReadOnly != readOnly) state = state.copy(productReadOnly = readOnly)
+    }
+
+    private fun canEditCurrentWorkspace(): Boolean = !productReadOnly &&
+        (workspaceSnapshot?.let(workspaceProductAccess::isCurrent) != false)
 
     fun updateEditorPreferences(preferences: EditorPreferences) {
         editorPreferences = preferences
@@ -70,17 +88,37 @@ class NotesUiController(
         applyRepositoryData(
             loadRepositoryData(
                 preferredNotebookId = preferredNotebookId,
-                searchQuery = state.searchQuery,
+                searchQuery = if (workspaceSnapshot?.let(workspaceProductAccess::isCurrent) == false) "" else state.searchQuery,
+                adoptCurrentWorkspace = true,
             ),
         )
     }
 
     suspend fun refreshAfterSync(preferredNotebookId: String? = state.selectedNotebookId) {
+        val previous = workspaceSnapshot
+        val latest = withContext(backgroundDispatcher) { workspaceProductAccess.capture() }
+        if (!workspaceProductAccess.isCurrent(latest)) {
+            throw CancellationException("Discarded work from a replaced workspace.")
+        }
+        if (previous != null && previous != latest) {
+            val firstPublicationOfSameWorkspace = previous.authorityBindingId == null &&
+                latest.authorityBindingId != null && previous.workspaceId == latest.workspaceId &&
+                previous.accountIncarnation == latest.accountIncarnation &&
+                previous.writerDeviceId == latest.writerDeviceId &&
+                latest.localRevision == previous.localRevision + 1
+            if (!firstPublicationOfSameWorkspace) {
+                refresh(preferredNotebookId = null)
+                return
+            }
+            // The same local copy was published for the first time. Its unsaved editor is still
+            // local work; this exception never accepts another workspace, writer, or incarnation.
+        }
+        workspaceSnapshot = latest
         val editorBeforeRefresh = state.editor
         val currentVersionHistory = state.versionHistory
         val activeConflictNoteId = state.conflictDetails?.conflictNoteId
         val searchQuery = state.searchQuery
-        val refreshed = withContext(backgroundDispatcher) {
+        val refreshed = repositoryWork() {
             val repositoryData = loadRepositoryDataBlocking(
                 preferredNotebookId = preferredNotebookId,
                 searchQuery = searchQuery,
@@ -179,7 +217,7 @@ class NotesUiController(
             noteSelectionAnchorId = null,
             feedbackMessage = null,
         )
-        val results = withContext(backgroundDispatcher) {
+        val results = repositoryWork() {
             query
                 .takeIf { it.isNotBlank() }
                 ?.let(repository::searchNotes)
@@ -294,48 +332,49 @@ class NotesUiController(
         if (noteIds.isEmpty() || !beginBatchOperation()) return false
         val selectedNotebookId = state.selectedNotebookId
         val searchQuery = state.searchQuery
-        return runCatching {
-            withContext(backgroundDispatcher) {
-                val details = noteIds.map { noteId ->
-                    requireNotNull(repository.getNoteDetails(noteId)) { "Note no longer exists: $noteId" }
+        return withBatchCleanup {
+            runCatching {
+                repositoryWork(mutation = true) {
+                    val details = noteIds.map { noteId ->
+                        requireNotNull(repository.getNoteDetails(noteId)) { "Note no longer exists: $noteId" }
+                    }
+                    repository.deleteNotes(details.map { detail ->
+                        NoteBatchDeletion(noteId = detail.id, causalToken = detail.causalToken)
+                    })
+                    val repositoryData = loadRepositoryDataBlocking(selectedNotebookId, searchQuery)
+                    val undoItems = repositoryData.deletedWorkspaceItems
+                        .filter { it.type == DeletedWorkspaceItemType.Note && it.entityId in noteIds && it.canRestore }
+                    BatchDeleteResult(repositoryData, undoItems)
                 }
-                repository.deleteNotes(details.map { detail ->
-                    NoteBatchDeletion(noteId = detail.id, causalToken = detail.causalToken)
-                })
-                val repositoryData = loadRepositoryDataBlocking(selectedNotebookId, searchQuery)
-                val undoItems = repositoryData.deletedWorkspaceItems
-                    .filter { it.type == DeletedWorkspaceItemType.Note && it.entityId in noteIds && it.canRestore }
-                BatchDeleteResult(repositoryData, undoItems)
-            }
-        }.fold(
-            onSuccess = { result ->
-                applyRepositoryData(result.repositoryData)
-                state = state.copy(
-                    editor = state.editor?.takeUnless { it.noteId in noteIds },
-                    versionHistory = state.versionHistory?.takeUnless { it.noteId in noteIds },
-                    conflictDetails = state.conflictDetails?.takeUnless { details ->
-                        noteIds.any(details::referencesNote)
-                    },
-                    selectedNoteIds = emptySet(),
-                    noteSelectionAnchorId = null,
-                    batchOperationInProgress = false,
-                    batchDeleteUndoItems = result.undoItems,
-                    feedbackMessage = formatUiString(strings.notesDeleted, noteIds.size),
-                    localChangeEventId = state.localChangeEventId + 1,
-                )
-                true
-            },
-            onFailure = { failure ->
-                state = state.copy(
-                    batchOperationInProgress = false,
-                    feedbackMessage = formatUiString(
-                        strings.cannotEditNotes,
-                        failure.message ?: strings.unknownError,
-                    ),
-                )
-                false
-            },
-        )
+            }.fold(
+                onSuccess = { result ->
+                    applyRepositoryData(result.repositoryData)
+                    state = state.copy(
+                        editor = state.editor?.takeUnless { it.noteId in noteIds },
+                        versionHistory = state.versionHistory?.takeUnless { it.noteId in noteIds },
+                        conflictDetails = state.conflictDetails?.takeUnless { details ->
+                            noteIds.any(details::referencesNote)
+                        },
+                        selectedNoteIds = emptySet(),
+                        noteSelectionAnchorId = null,
+                        batchDeleteUndoItems = result.undoItems,
+                        feedbackMessage = formatUiString(strings.notesDeleted, noteIds.size),
+                        localChangeEventId = state.localChangeEventId + 1,
+                    )
+                    true
+                },
+                onFailure = { failure ->
+                    if (failure is CancellationException) throw failure
+                    state = state.copy(
+                        feedbackMessage = formatUiString(
+                            strings.cannotEditNotes,
+                            failure.message ?: strings.unknownError,
+                        ),
+                    )
+                    false
+                },
+            )
+        }
     }
 
     suspend fun undoLastBatchDelete(): Boolean {
@@ -344,39 +383,40 @@ class NotesUiController(
         state = state.copy(batchOperationInProgress = true)
         val selectedNotebookId = state.selectedNotebookId
         val searchQuery = state.searchQuery
-        return runCatching {
-            withContext(backgroundDispatcher) {
-                repository.undeleteNotes(items.map { item ->
-                    NoteBatchUndelete(
-                        noteId = item.entityId,
-                        retainedContentVersionId = requireNotNull(item.retainedContentVersionId),
-                        causalToken = item.causalToken,
+        return withBatchCleanup {
+            runCatching {
+                repositoryWork(mutation = true) {
+                    repository.undeleteNotes(items.map { item ->
+                        NoteBatchUndelete(
+                            noteId = item.entityId,
+                            retainedContentVersionId = requireNotNull(item.retainedContentVersionId),
+                            causalToken = item.causalToken,
+                        )
+                    })
+                    loadRepositoryDataBlocking(selectedNotebookId, searchQuery)
+                }
+            }.fold(
+                onSuccess = { repositoryData ->
+                    applyRepositoryData(repositoryData)
+                    state = state.copy(
+                        batchDeleteUndoItems = emptyList(),
+                        feedbackMessage = formatUiString(strings.notesRestored, items.size),
+                        localChangeEventId = state.localChangeEventId + 1,
                     )
-                })
-                loadRepositoryDataBlocking(selectedNotebookId, searchQuery)
-            }
-        }.fold(
-            onSuccess = { repositoryData ->
-                applyRepositoryData(repositoryData)
-                state = state.copy(
-                    batchOperationInProgress = false,
-                    batchDeleteUndoItems = emptyList(),
-                    feedbackMessage = formatUiString(strings.notesRestored, items.size),
-                    localChangeEventId = state.localChangeEventId + 1,
-                )
-                true
-            },
-            onFailure = { failure ->
-                state = state.copy(
-                    batchOperationInProgress = false,
-                    feedbackMessage = formatUiString(
-                        strings.cannotEditNotes,
-                        failure.message ?: strings.unknownError,
-                    ),
-                )
-                false
-            },
-        )
+                    true
+                },
+                onFailure = { failure ->
+                    if (failure is CancellationException) throw failure
+                    state = state.copy(
+                        feedbackMessage = formatUiString(
+                            strings.cannotEditNotes,
+                            failure.message ?: strings.unknownError,
+                        ),
+                    )
+                    false
+                },
+            )
+        }
     }
 
     fun dismissBatchDeleteUndo() {
@@ -391,65 +431,81 @@ class NotesUiController(
         if (noteIds.isEmpty() || !beginBatchOperation()) return false
         val selectedNotebookId = state.selectedNotebookId
         val searchQuery = state.searchQuery
-        return runCatching {
-            withContext(backgroundDispatcher) {
-                val edits = noteIds.map { noteId ->
-                    val details = requireNotNull(repository.getNoteDetails(noteId)) {
-                        "Note no longer exists: $noteId"
+        return withBatchCleanup {
+            runCatching {
+                repositoryWork(mutation = true) {
+                    val edits = noteIds.map { noteId ->
+                        val details = requireNotNull(repository.getNoteDetails(noteId)) {
+                            "Note no longer exists: $noteId"
+                        }
+                        NoteBatchUpdate(noteId, transform(details))
                     }
-                    NoteBatchUpdate(noteId, transform(details))
+                    val updated = repository.updateNotes(edits)
+                    BatchUpdateResult(
+                        repositoryData = loadRepositoryDataBlocking(selectedNotebookId, searchQuery),
+                        updated = updated.associateBy { it.id },
+                    )
                 }
-                val updated = repository.updateNotes(edits)
-                BatchUpdateResult(
-                    repositoryData = loadRepositoryDataBlocking(selectedNotebookId, searchQuery),
-                    updated = updated.associateBy { it.id },
-                )
-            }
-        }.fold(
-            onSuccess = { result ->
-                val previousEditor = state.editor
-                applyRepositoryData(result.repositoryData)
-                val refreshedEditor = previousEditor
-                    ?.noteId
-                    ?.let(result.updated::get)
-                    ?.let { details ->
-                        NoteEditorState.fromDetails(
-                            details = details,
-                            markdownPreviewVisible = previousEditor.markdownPreviewVisible,
-                            sessionId = previousEditor.sessionId,
-                        )
-                    }
-                    ?: previousEditor
-                state = state.copy(
-                    editor = refreshedEditor,
-                    selectedNoteIds = emptySet(),
-                    noteSelectionAnchorId = null,
-                    batchOperationInProgress = false,
-                    feedbackMessage = formatUiString(
-                        if (kind == BatchUpdateKind.Moved) strings.notesMoved else strings.notesUpdated,
-                        noteIds.size,
-                    ),
-                    localChangeEventId = state.localChangeEventId + 1,
-                )
-                true
-            },
-            onFailure = { failure ->
-                state = state.copy(
-                    batchOperationInProgress = false,
-                    feedbackMessage = formatUiString(
-                        strings.cannotEditNotes,
-                        failure.message ?: strings.unknownError,
-                    ),
-                )
-                false
-            },
-        )
+            }.fold(
+                onSuccess = { result ->
+                    val previousEditor = state.editor
+                    applyRepositoryData(result.repositoryData)
+                    val refreshedEditor = previousEditor
+                        ?.noteId
+                        ?.let(result.updated::get)
+                        ?.let { details ->
+                            NoteEditorState.fromDetails(
+                                details = details,
+                                markdownPreviewVisible = previousEditor.markdownPreviewVisible,
+                                sessionId = previousEditor.sessionId,
+                            )
+                        }
+                        ?: previousEditor
+                    state = state.copy(
+                        editor = refreshedEditor,
+                        selectedNoteIds = emptySet(),
+                        noteSelectionAnchorId = null,
+                        feedbackMessage = formatUiString(
+                            if (kind == BatchUpdateKind.Moved) strings.notesMoved else strings.notesUpdated,
+                            noteIds.size,
+                        ),
+                        localChangeEventId = state.localChangeEventId + 1,
+                    )
+                    true
+                },
+                onFailure = { failure ->
+                    if (failure is CancellationException) throw failure
+                    state = state.copy(
+                        feedbackMessage = formatUiString(
+                            strings.cannotEditNotes,
+                            failure.message ?: strings.unknownError,
+                        ),
+                    )
+                    false
+                },
+            )
+        }
     }
 
     private fun selectedNoteIdsInVisibleOrder(): List<String> =
         state.visibleNotes.map { it.id }.filter { it in state.selectedNoteIds }
 
+    private suspend fun <T> withBatchCleanup(block: suspend () -> T): T {
+        val operation = Any().also { activeBatchOperation = it }
+        return try {
+            block()
+        } finally {
+            // Cleanup stays on the caller's UI dispatcher. A replacement may already have
+            // started another batch; an old completion must not clear that operation's state.
+            if (activeBatchOperation === operation) {
+                activeBatchOperation = null
+                state = state.copy(batchOperationInProgress = false)
+            }
+        }
+    }
+
     private fun beginBatchOperation(): Boolean {
+        if (state.batchOperationInProgress) return false
         val editor = state.editor
         if (editor?.hasUnsavedChanges == true && editor.noteId in state.selectedNoteIds) {
             state = state.copy(feedbackMessage = strings.resolveBeforeBatchUpdate)
@@ -470,6 +526,7 @@ class NotesUiController(
     }
 
     fun canNavigateToNewNote(notebookId: String? = state.selectedNotebookId): Boolean {
+        if (!canEditCurrentWorkspace()) return false
         if (state.editor?.hasUnsavedChanges == true) {
             state = state.copy(
                 unsavedChangesDialogVisible = true,
@@ -500,7 +557,7 @@ class NotesUiController(
 
     suspend fun createNotebook(title: String): NotebookSummary {
         val searchQuery = state.searchQuery
-        val created = withContext(backgroundDispatcher) {
+        val created = notebookMutation {
             repository.createNotebook(title.trim())
         }
         applyRepositoryData(
@@ -522,7 +579,7 @@ class NotesUiController(
     ): NotebookSummary {
         val preferredNotebookId = state.selectedNotebookId
         val searchQuery = state.searchQuery
-        val renamed = withContext(backgroundDispatcher) {
+        val renamed = notebookMutation {
             state.notebooks.firstOrNull { it.id == notebookId }?.causalToken?.let { token ->
                 repository.renameNotebook(notebookId, title.trim(), token)
             } ?: repository.renameNotebook(notebookId, title.trim())
@@ -544,7 +601,7 @@ class NotesUiController(
         val preferredNotebookId = state.selectedNotebookId
         val searchQuery = state.searchQuery
         return runCatching {
-            withContext(backgroundDispatcher) {
+            repositoryWork(mutation = true) {
                 state.notebooks.firstOrNull { it.id == notebookId }?.causalToken?.let { token ->
                     repository.deleteNotebook(notebookId, token)
                 } ?: repository.deleteNotebook(notebookId)
@@ -564,6 +621,7 @@ class NotesUiController(
                 true
             },
             onFailure = { failure ->
+                if (failure is CancellationException) throw failure
                 applyRepositoryData(
                     loadRepositoryData(
                         preferredNotebookId = preferredNotebookId,
@@ -583,7 +641,7 @@ class NotesUiController(
         val preferredNotebookId = state.selectedNotebookId
         val searchQuery = state.searchQuery
         return runCatching {
-            withContext(backgroundDispatcher) {
+            repositoryWork(mutation = true) {
                 repository.resolveNotebookConflictBranch(
                     conflict.conflictId,
                     versionId,
@@ -601,6 +659,7 @@ class NotesUiController(
                 true
             },
             onFailure = { failure ->
+                if (failure is CancellationException) throw failure
                 state = state.copy(feedbackMessage = formatUiString(strings.cannotResolveNotebookConflict, failure.message ?: strings.unknownError))
                 false
             },
@@ -617,7 +676,7 @@ class NotesUiController(
             return false
         }
         return runCatching {
-            withContext(backgroundDispatcher) {
+            repositoryWork(mutation = true) {
                 when (item.type) {
                     DeletedWorkspaceItemType.Note -> repository.undeleteNote(
                         item.entityId,
@@ -646,6 +705,7 @@ class NotesUiController(
                 true
             },
             onFailure = { failure ->
+                if (failure is CancellationException) throw failure
                 state = state.copy(feedbackMessage = formatUiString(strings.cannotRestoreDeleted, failure.message ?: strings.unknownError))
                 false
             },
@@ -653,6 +713,7 @@ class NotesUiController(
     }
 
     fun openNewNote(notebookId: String? = state.selectedNotebookId): Boolean {
+        if (!canEditCurrentWorkspace()) return false
         if (state.editor?.hasUnsavedChanges == true) {
             state = state.copy(
                 unsavedChangesDialogVisible = true,
@@ -693,7 +754,7 @@ class NotesUiController(
         }
         val fallbackNotebookId = state.selectedNotebookId
         val searchQuery = state.searchQuery
-        val loaded = withContext(backgroundDispatcher) {
+        val loaded = repositoryWork() {
             val details = repository.getNoteDetails(noteId)
             if (details == null) {
                 ExistingNoteLoadResult.Missing(
@@ -749,7 +810,7 @@ class NotesUiController(
     suspend fun openConflictResolution(conflictNoteId: String): Boolean {
         val preferredNotebookId = state.selectedNotebookId
         val searchQuery = state.searchQuery
-        val loaded = withContext(backgroundDispatcher) {
+        val loaded = repositoryWork() {
             val details = repository.getConflictDetails(conflictNoteId)
             if (details == null) {
                 ConflictResolutionLoadResult.Missing(
@@ -801,6 +862,7 @@ class NotesUiController(
         altitudeMetersText: String? = null,
         capturedAtText: String? = null,
     ) {
+        if (!canEditCurrentWorkspace()) return
         val editor = state.editor ?: return
         val updatedMarkdownBody = markdownBody ?: editor.markdownBody
         val updated = editor.copy(
@@ -822,6 +884,7 @@ class NotesUiController(
     }
 
     fun captureCurrentLocation(): Boolean {
+        if (!canEditCurrentWorkspace()) return false
         val editor = state.editor ?: return false
         return when (val result = locationCaptureAdapter.captureCurrentLocation()) {
             is LocationCaptureResult.Captured -> {
@@ -891,6 +954,7 @@ class NotesUiController(
     }
 
     fun applyMarkdownToolbarAction(action: MarkdownToolbarAction) {
+        if (!canEditCurrentWorkspace()) return
         val editor = state.editor ?: return
         val edit = applyMarkdownToolbarAction(
             source = editor.markdownBody,
@@ -918,6 +982,7 @@ class NotesUiController(
         editorSessionId: Long,
         result: MediaImportUiResult,
     ): Boolean {
+        if (!canEditCurrentWorkspace()) return false
         val editor = state.editor?.takeIf { it.sessionId == editorSessionId } ?: return false
         return when (result) {
             is MediaImportUiResult.Imported -> {
@@ -988,7 +1053,7 @@ class NotesUiController(
         val currentConflictDetails = state.conflictDetails
 
         return runCatching {
-            withContext(backgroundDispatcher) {
+            repositoryWork(mutation = true) {
                 val saved = if (editor.noteId == null) {
                     repository.createNote(input)
                 } else {
@@ -1005,6 +1070,7 @@ class NotesUiController(
             }
         }.fold(
             onSuccess = { savedData ->
+                if (state.editor?.sessionId != editor.sessionId) return@fold false
                 val saved = savedData.saved
                 val summary = saved.toListSummary()
                 state = state.copy(
@@ -1037,6 +1103,7 @@ class NotesUiController(
                 true
             },
             onFailure = { failure ->
+                if (failure is CancellationException) throw failure
                 state = state.copy(
                     editor = editor.copy(validationMessage = formatUiString(strings.saveFailed, failure.message ?: strings.unknownError)),
                     unsavedChangesDialogVisible = false,
@@ -1103,7 +1170,7 @@ class NotesUiController(
         val selectedNotebookId = state.selectedNotebookId
         val searchQuery = state.searchQuery
         return runCatching {
-            withContext(backgroundDispatcher) {
+            repositoryWork(mutation = true) {
                 val token = state.editor?.takeIf { it.noteId == noteId }?.causalToken
                     ?: repository.getNoteDetails(noteId)?.causalToken
                 if (token != null) repository.deleteNote(noteId, token) else repository.deleteNote(noteId)
@@ -1125,6 +1192,7 @@ class NotesUiController(
                 true
             },
             onFailure = { failure ->
+                if (failure is CancellationException) throw failure
                 state = state.copy(feedbackMessage = formatUiString(strings.cannotDeleteNote, failure.message ?: strings.unknownError))
                 false
             },
@@ -1136,7 +1204,7 @@ class NotesUiController(
         val selectedNotebookId = state.selectedNotebookId
         val searchQuery = state.searchQuery
         return runCatching {
-            withContext(backgroundDispatcher) {
+            repositoryWork(mutation = true) {
                 val token = editorBeforeDelete?.takeIf { it.noteId == noteId }?.causalToken
                     ?: repository.getNoteDetails(noteId)?.causalToken
                 if (token != null) repository.deleteNote(noteId, token) else repository.deleteNote(noteId)
@@ -1166,6 +1234,7 @@ class NotesUiController(
                 true
             },
             onFailure = { failure ->
+                if (failure is CancellationException) throw failure
                 state = state.copy(feedbackMessage = formatUiString(strings.cannotDeleteNote, failure.message ?: strings.unknownError))
                 false
             },
@@ -1179,7 +1248,7 @@ class NotesUiController(
             state = state.copy(feedbackMessage = strings.saveBeforeHistory)
             return
         }
-        val versions = withContext(backgroundDispatcher) { repository.listNoteVersions(noteId) }
+        val versions = repositoryWork() { repository.listNoteVersions(noteId) }
         state = state.copy(
             versionHistory = NoteVersionHistoryState(
                 noteId = noteId,
@@ -1210,7 +1279,7 @@ class NotesUiController(
         val selectedNotebookId = state.selectedNotebookId
         val searchQuery = state.searchQuery
         return runCatching {
-            withContext(backgroundDispatcher) {
+            repositoryWork(mutation = true) {
                 val resolved = when (val result = resolver(conflictNoteId)) {
                     is ConflictBranchResolutionResult.Content -> result.note
                     ConflictBranchResolutionResult.Deletion -> null
@@ -1275,7 +1344,7 @@ class NotesUiController(
         val searchQuery = state.searchQuery
 
         return runCatching {
-            withContext(backgroundDispatcher) {
+            repositoryWork(mutation = true) {
                 val restored = editor.causalToken?.let { token ->
                     repository.restoreNoteVersion(noteId, versionId, token)
                 } ?: repository.restoreNoteVersion(noteId, versionId)
@@ -1311,6 +1380,7 @@ class NotesUiController(
                 true
             },
             onFailure = { failure ->
+                if (failure is CancellationException) throw failure
                 state = state.copy(feedbackMessage = formatUiString(strings.cannotRestoreVersion, failure.message ?: strings.unknownError))
                 false
             },
@@ -1320,7 +1390,7 @@ class NotesUiController(
     suspend fun createMockContent(): MockContentResult =
         runCatching {
             val searchQuery = state.searchQuery
-            withContext(backgroundDispatcher) {
+            repositoryWork(mutation = true) {
                 clearMockContentBlocking()
                 val today = currentDateProvider()
                 var noteCount = 0
@@ -1355,6 +1425,7 @@ class NotesUiController(
                 operation.result
             },
             onFailure = { failure ->
+                if (failure is CancellationException) throw failure
                 refresh()
                 state = state.copy(feedbackMessage = formatUiString(strings.cannotCreateDemo, failure.message ?: strings.unknownError))
                 MockContentResult(errorMessage = failure.message ?: "unknown error")
@@ -1365,7 +1436,7 @@ class NotesUiController(
         runCatching {
             val selectedNotebookId = state.selectedNotebookId
             val searchQuery = state.searchQuery
-            withContext(backgroundDispatcher) {
+            repositoryWork(mutation = true) {
                 val result = clearMockContentBlocking()
                 MockContentOperation(
                     result = result,
@@ -1392,6 +1463,7 @@ class NotesUiController(
                 operation.result
             },
             onFailure = { failure ->
+                if (failure is CancellationException) throw failure
                 refresh()
                 state = state.copy(feedbackMessage = formatUiString(strings.cannotClearDemo, failure.message ?: strings.unknownError))
                 MockContentResult(errorMessage = failure.message ?: "unknown error")
@@ -1427,10 +1499,50 @@ class NotesUiController(
     private suspend fun loadRepositoryData(
         preferredNotebookId: String?,
         searchQuery: String,
+        adoptCurrentWorkspace: Boolean = false,
     ): NotesRepositoryData =
-        withContext(backgroundDispatcher) {
+        repositoryWork(adoptCurrentWorkspace = adoptCurrentWorkspace) {
             loadRepositoryDataBlocking(preferredNotebookId, searchQuery)
         }
+
+    private suspend fun <T> notebookMutation(block: () -> T): T = try {
+        repositoryWork(mutation = true, block = block)
+    } catch (_: WorkspaceProductReadOnlyException) {
+        // These creation APIs have non-null results. A gate racing a sheet click cancels that
+        // action; it must not become an uncaught exception in the UI coroutine scope.
+        throw CancellationException("Cancelled a write to a frozen local workspace.")
+    }
+
+    private suspend fun <T> repositoryWork(
+        mutation: Boolean = false,
+        adoptCurrentWorkspace: Boolean = false,
+        block: () -> T,
+    ): T {
+        val requested = if (adoptCurrentWorkspace) null else workspaceSnapshot
+        if (mutation && productReadOnly) throw WorkspaceProductReadOnlyException()
+        val completed = try {
+            withContext(backgroundDispatcher) {
+                val captured = requested ?: workspaceProductAccess.capture()
+                val result = if (mutation) {
+                    workspaceProductAccess.mutate(captured, block)
+                } else {
+                    workspaceProductAccess.read(captured, block)
+                }
+                captured to result
+            }
+        } catch (_: WorkspaceProductChangedException) {
+            throw CancellationException("Discarded work from a replaced workspace.")
+        }
+        if (!workspaceProductAccess.isCurrent(completed.first)) {
+            throw CancellationException("Discarded work from a replaced workspace.")
+        }
+        if (adoptCurrentWorkspace && workspaceSnapshot != null && workspaceSnapshot != completed.first) {
+            activeBatchOperation = null
+            state = NotesUiState(localChangeEventId = state.localChangeEventId, productReadOnly = productReadOnly)
+        }
+        if (adoptCurrentWorkspace || workspaceSnapshot == null) workspaceSnapshot = completed.first
+        return completed.second
+    }
 
     private fun applyRepositoryData(data: NotesRepositoryData) {
         state = state.withRepositoryData(data)
@@ -2264,6 +2376,7 @@ data class NotesUiState(
     val unsavedChangesDialogVisible: Boolean = false,
     val feedbackMessage: String? = null,
     val localChangeEventId: Long = 0L,
+    val productReadOnly: Boolean = false,
 ) {
     val selectedNotebook: NotebookSummary? =
         notebooks.firstOrNull { it.id == selectedNotebookId }

@@ -151,7 +151,13 @@ class SystemV3MediaCoordinator(
             }
             return
         }
-        val verified = local?.let(::requireVerifiedLocal) ?: throw fetched.exceptionOrNull()!!
+        val failure = checkNotNull(fetched.exceptionOrNull())
+        if (activeWorkspaceSessionGuard.recordAccountFailure(connection.credentials, failure) ||
+            failure is SelfHostedProtocolException ||
+            failure is saien.someday.data.account.AccountNetworkBlockedException ||
+            (failure is SelfHostedSyncHttpException && failure.status != 404)
+        ) throw failure
+        val verified = local?.let(::requireVerifiedLocal) ?: throw failure
         publishLocalAsset(verified, connection)
     }
 
@@ -171,7 +177,10 @@ class SystemV3MediaCoordinator(
             credentials,
             workspaceId,
             workspaceKey.fingerprint,
-            SelfHostedMediaServiceV3(authenticatedTransport, SelfHostedMediaCipherV3(workspaceKey)),
+            SelfHostedMediaServiceV3(
+                authenticatedTransport, SelfHostedMediaCipherV3(workspaceKey), credentials.accountRequestContext(),
+                beforeRequest = { activeWorkspaceSessionGuard.requireCompatible(credentials, workspaceId) },
+            ),
         )
     }
 
@@ -255,6 +264,9 @@ class SystemV3MediaCoordinator(
             ?: error("Self-hosted session changed while synchronizing media; credentials redacted.")
         require(currentCredentials.authorityBindingId == connection.credentials.authorityBindingId) {
             "The self-hosted account changed while synchronizing media."
+        }
+        require(currentCredentials.accountIncarnation == connection.credentials.accountIncarnation) {
+            "The account incarnation changed while synchronizing media."
         }
         require(currentCredentials.deviceId == connection.credentials.deviceId) {
             "The self-hosted writer device changed while synchronizing media."

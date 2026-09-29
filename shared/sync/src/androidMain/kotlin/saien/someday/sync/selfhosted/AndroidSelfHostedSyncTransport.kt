@@ -12,7 +12,8 @@ class AndroidSelfHostedSyncTransport(
 ) : SelfHostedSyncTransport by delegate,
     SelfHostedWorkspaceRecoveryTransport by delegate,
     SelfHostedSyncTransportV2 by delegate,
-    SelfHostedMediaTransportV3 by delegate {
+    SelfHostedMediaTransportV3 by delegate,
+    SelfHostedAccountControlTransport by delegate {
     fun close() {
         delegate.close()
     }

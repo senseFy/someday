@@ -6,6 +6,8 @@ import java.time.Instant
 import java.time.OffsetDateTime
 import java.util.UUID
 import saien.someday.server.ServerConfig
+import saien.someday.server.auth.AccountAccess
+import saien.someday.server.auth.AccountRequestContext
 
 data class WorkspaceRecoveryEnvelopeRecord(
     val userId: UUID,
@@ -49,16 +51,19 @@ class WorkspaceRecoveryEnvelopeRepository(
     config: ServerConfig,
     private val connections: DatabaseConnectionProvider = directDatabaseConnectionProvider(config),
 ) {
-    fun load(userId: UUID): WorkspaceRecoveryEnvelopeRecord? =
-        scopedConnection(userId).use { connection ->
-            select(connection, userId, forUpdate = false)
+    fun load(request: AccountRequestContext): WorkspaceRecoveryEnvelopeRecord? =
+        transaction(request) { connection, account ->
+            select(connection, account.userId, forUpdate = false)?.also { record ->
+                AccountAdmission.admit(connection, request, AccountAccess.SYNC, record.workspaceId)
+            }
         }
 
     fun put(
-        userId: UUID,
-        deviceId: UUID,
+        request: AccountRequestContext,
         input: WorkspaceRecoveryEnvelopeInput,
-    ): WorkspaceRecoveryEnvelopePutResult = transaction(userId) { connection ->
+    ): WorkspaceRecoveryEnvelopePutResult = transaction(request, input.workspaceId) { connection, account ->
+        val userId = account.userId
+        val deviceId = checkNotNull(account.deviceId)
         lockWorkspaceRecoveryAccount(connection, userId)
         if (!workspaceHasActiveEpoch(connection, userId, input.workspaceId)) {
             return@transaction WorkspaceRecoveryEnvelopePutResult.WorkspaceNotInitialized
@@ -198,36 +203,18 @@ class WorkspaceRecoveryEnvelopeRepository(
         }
     }
 
-    private fun <T> transaction(userId: UUID, block: (Connection) -> T): T =
-        connection().use { connection ->
-            // selectAccountScope executes SQL before the account advisory
-            // lock. READ COMMITTED guarantees that a waiter sees the lock
-            // holder's committed epoch or recovery pointer afterward even if
-            // the database default is REPEATABLE READ.
-            connection.transactionIsolation = Connection.TRANSACTION_READ_COMMITTED
-            connection.autoCommit = false
-            try {
-                selectAccountScope(connection, userId, local = true)
-                val result = block(connection)
-                connection.commit()
-                result
-            } catch (failure: Throwable) {
-                connection.rollback()
-                throw failure
-            }
-        }
-
-    private fun connection(): Connection = connections.connection()
-
-    private fun scopedConnection(userId: UUID): Connection =
-        connection().also { connection ->
-            try {
-                selectAccountScope(connection, userId, local = false)
-            } catch (failure: Throwable) {
-                runCatching { connection.close() }
-                throw failure
-            }
-        }
+    private fun <T> transaction(
+        request: AccountRequestContext,
+        workspaceId: String? = null,
+        block: (Connection, AdmittedAccount) -> T,
+    ): T = AccountAdmission.transaction(
+        connections,
+        listOf(request.userId),
+        scope = { connection -> selectAccountScope(connection, request.userId, local = true) },
+    ) { connection ->
+        val account = AccountAdmission.admit(connection, request, AccountAccess.SYNC, workspaceId)
+        block(connection, account)
+    }
 
     /**
      * Selects the account's single current recovery pointer. Workspace is

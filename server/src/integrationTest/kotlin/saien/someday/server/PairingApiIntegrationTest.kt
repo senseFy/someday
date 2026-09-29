@@ -63,6 +63,7 @@ class PairingApiIntegrationTest {
 
         val created = putInvite(creator.accessToken, inviteId, createRequest)
         assertEquals(HttpStatusCode.Created, created.status)
+        assertNull(created.errorCode)
         assertEquals("created", json.decodeFromString<PairingInviteCreateResponse>(created.body).status)
 
         val replay = putInvite(creator.accessToken, inviteId, createRequest)
@@ -72,6 +73,7 @@ class PairingApiIntegrationTest {
         val conflictingEnvelope = """{"format":"opaque","ciphertext":"different"}"""
         val conflict = putInvite(creator.accessToken, inviteId, createRequest(conflictingEnvelope))
         assertEquals(HttpStatusCode.Conflict, conflict.status, conflict.body)
+        assertEquals("pairing_conflict", conflict.errorCode)
 
         val outsiderClaim = postJson(
             "/pairing/invites/$inviteId/claim",
@@ -79,6 +81,7 @@ class PairingApiIntegrationTest {
             PairingInviteClaimRequest(identifier('x')),
         )
         assertEquals(HttpStatusCode.NotFound, outsiderClaim.status, outsiderClaim.body)
+        assertEquals("not_found", outsiderClaim.errorCode)
 
         val claimId = identifier('c')
         val claimed = postJson(
@@ -102,6 +105,7 @@ class PairingApiIntegrationTest {
             PairingInviteClaimRequest(identifier('d')),
         )
         assertEquals(HttpStatusCode.Conflict, competingClaim.status, competingClaim.body)
+        assertEquals("pairing_conflict", competingClaim.errorCode)
 
         val completed = postJson(
             "/pairing/invites/$inviteId/complete",
@@ -159,6 +163,7 @@ class PairingApiIntegrationTest {
 
         val denied = postEmpty("/pairing/invites/$inviteId/cancel", other.accessToken)
         assertEquals(HttpStatusCode.Conflict, denied.status, denied.body)
+        assertEquals("pairing_conflict", denied.errorCode)
         assertEquals("available", inviteState(account.user.id, inviteId))
 
         assertEquals(HttpStatusCode.NoContent, postEmpty("/pairing/invites/$inviteId/cancel", creator.accessToken).status)
@@ -190,6 +195,7 @@ class PairingApiIntegrationTest {
             PairingInviteClaimRequest(identifier('r')),
         )
         assertEquals(HttpStatusCode.Gone, claim.status, claim.body)
+        assertEquals("expired", claim.errorCode)
         assertNull(inviteState(account.user.id, inviteId))
     }
 
@@ -230,7 +236,7 @@ class PairingApiIntegrationTest {
             contentType(ContentType.Application.Json)
             setBody(json.encodeToString(request))
         }
-        return HttpResult(response.status, response.bodyAsText())
+        return HttpResult(response.status, response.bodyAsText(), response.headers["X-Someday-Error-Code"])
     }
 
     private suspend inline fun <reified T> ApplicationTestBuilder.postJson(
@@ -243,7 +249,7 @@ class PairingApiIntegrationTest {
             contentType(ContentType.Application.Json)
             setBody(json.encodeToString(body))
         }
-        return HttpResult(response.status, response.bodyAsText())
+        return HttpResult(response.status, response.bodyAsText(), response.headers["X-Someday-Error-Code"])
     }
 
     private suspend fun ApplicationTestBuilder.postEmpty(path: String, accessToken: String): HttpResult {
@@ -252,7 +258,7 @@ class PairingApiIntegrationTest {
             contentType(ContentType.Application.Json)
             setBody("{}")
         }
-        return HttpResult(response.status, response.bodyAsText())
+        return HttpResult(response.status, response.bodyAsText(), response.headers["X-Someday-Error-Code"])
     }
 
     private fun createRequest(envelope: String): PairingInviteCreateRequest =
@@ -316,7 +322,7 @@ class PairingApiIntegrationTest {
         }
     }
 
-    private data class HttpResult(val status: HttpStatusCode, val body: String)
+    private data class HttpResult(val status: HttpStatusCode, val body: String, val errorCode: String?)
 }
 
 private fun identifier(character: Char): String = character.toString().repeat(22)

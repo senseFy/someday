@@ -2,11 +2,14 @@ package saien.someday.server.routes
 
 import saien.someday.server.ServerContext
 import saien.someday.server.api.ErrorResponse
+import saien.someday.server.auth.AccountRequestContext
 import io.ktor.http.HttpHeaders
+import io.ktor.http.HttpMethod
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.ApplicationCall
 import io.ktor.server.plugins.origin
 import io.ktor.server.request.receiveChannel
+import io.ktor.server.request.httpMethod
 import io.ktor.server.response.respond
 import io.ktor.utils.io.cancel
 import io.ktor.utils.io.readAvailable
@@ -24,10 +27,12 @@ data class AuthenticatedCall(
     val deviceId: UUID?,
     val tokenDeviceId: UUID?,
     val scopes: Set<String>,
+    val requestContext: AccountRequestContext,
 )
 
 suspend fun ApplicationCall.respondError(status: HttpStatusCode, error: String) {
-    respond(status, ErrorResponse(error))
+    response.headers.append(ACCOUNT_ERROR_HEADER, error)
+    if (request.httpMethod == HttpMethod.Head) respond(status) else respond(status, ErrorResponse(error))
 }
 
 suspend inline fun <reified T : Any> ApplicationCall.receiveJsonOrNull(
@@ -208,7 +213,6 @@ suspend fun ApplicationCall.requireAuthenticated(
     if (
         snapshot.userDisabledAt != null ||
         snapshot.sessionRevokedAt != null ||
-        snapshot.deviceRevokedAt != null ||
         !snapshot.sessionExpiresAt.isAfter(now)
     ) {
         return unauthorized()
@@ -232,6 +236,13 @@ suspend fun ApplicationCall.requireAuthenticated(
         deviceId = claims.deviceId ?: snapshot.sessionDeviceId,
         tokenDeviceId = claims.deviceId,
         scopes = claims.scopes,
+        requestContext = AccountRequestContext(
+            claims.userId,
+            claims.sessionId,
+            claims.deviceId,
+            claims.scopes,
+            accountProtocolExpectation(),
+        ),
     )
 }
 

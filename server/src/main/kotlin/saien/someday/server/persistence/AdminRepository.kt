@@ -1,6 +1,8 @@
 package saien.someday.server.persistence
 
 import saien.someday.server.ServerConfig
+import saien.someday.server.auth.AccountAccess
+import saien.someday.server.auth.AccountRequestContext
 import java.sql.Connection
 import java.sql.ResultSet
 import java.time.Instant
@@ -44,6 +46,7 @@ data class AdminSessionSummary(
     val revokedAt: Instant?,
     val createdAt: Instant,
     val activeRefreshTokens: Long,
+    val isCurrentIncarnation: Boolean,
 )
 
 data class AdminDeviceSummary(
@@ -57,6 +60,7 @@ data class AdminDeviceSummary(
     val createdAt: Instant,
     val objectCount: Long,
     val lastSyncCursor: Long?,
+    val isCurrentIncarnation: Boolean,
 )
 
 data class AdminStorageSummary(
@@ -109,8 +113,8 @@ class AdminRepository(
     private val startedAt: Instant,
     private val connections: DatabaseConnectionProvider = directDatabaseConnectionProvider(config),
 ) {
-    fun dashboard(): AdminDashboardSnapshot =
-        connection().use { connection ->
+    fun dashboard(actor: AccountRequestContext): AdminDashboardSnapshot =
+        adminRead(actor) { connection ->
             val userCounts = connection.prepareStatement(
                 """
                 SELECT COUNT(*) AS total_users,
@@ -140,7 +144,7 @@ class AdminRepository(
                     result.getLong("total_devices") to result.getLong("revoked_devices")
                 }
             }
-            val encryptedObjects = connection.count("SELECT COUNT(*) FROM someday_sync_v2_objects")
+            val encryptedObjects = connection.count("SELECT COUNT(*) FROM someday_sync_v2_objects o WHERE $ACTIVE_OBJECT_SCOPE")
             AdminDashboardSnapshot(
                 totalUsers = userCounts.first,
                 activeUsers = userCounts.second,
@@ -148,12 +152,12 @@ class AdminRepository(
                 totalDevices = deviceCounts.first,
                 revokedDevices = deviceCounts.second,
                 encryptedObjects = encryptedObjects,
-                acceptedChanges = connection.count("SELECT COUNT(*) FROM someday_sync_v2_changes"),
+                acceptedChanges = connection.count("SELECT COUNT(*) FROM someday_sync_v2_changes c WHERE $ACTIVE_CHANGE_SCOPE"),
             )
         }
 
-    fun listUsers(): List<AdminUserSummary> =
-        connection().use { connection ->
+    fun listUsers(actor: AccountRequestContext): List<AdminUserSummary> =
+        adminRead(actor) { connection ->
             connection.prepareStatement(USER_SUMMARY_SQL + "\nORDER BY u.created_at, u.email").use { statement ->
                 statement.executeQuery().use { result ->
                     buildList {
@@ -165,8 +169,8 @@ class AdminRepository(
             }
         }
 
-    fun userDetail(userId: UUID): AdminUserDetail? =
-        connection().use { connection ->
+    fun userDetail(actor: AccountRequestContext, userId: UUID): AdminUserDetail? =
+        adminRead(actor) { connection ->
             val user = connection.prepareStatement(
                 USER_SUMMARY_SQL + "\nWHERE u.id = ?",
             ).use { statement ->
@@ -174,7 +178,7 @@ class AdminRepository(
                 statement.executeQuery().use { result ->
                     if (result.next()) result.toAdminUserSummary() else null
                 }
-            } ?: return@use null
+            } ?: return@adminRead null
             AdminUserDetail(
                 user = user,
                 devices = listDevices(connection, userId),
@@ -182,18 +186,19 @@ class AdminRepository(
             )
         }
 
-    fun listDevices(): List<AdminDeviceSummary> =
-        connection().use { connection ->
+    fun listDevices(actor: AccountRequestContext): List<AdminDeviceSummary> =
+        adminRead(actor) { connection ->
             listDevices(connection, userId = null)
         }
 
-    fun storage(): AdminStorageSummary =
-        connection().use { connection ->
+    fun storage(actor: AccountRequestContext): AdminStorageSummary =
+        adminRead(actor) { connection ->
             val totals = connection.prepareStatement(
                 """
                 SELECT COUNT(*) AS encrypted_objects,
                        COALESCE(SUM(octet_length(o.encrypted_object_json)), 0) AS encrypted_bytes
                 FROM someday_sync_v2_objects o
+                WHERE $ACTIVE_OBJECT_SCOPE
                 """.trimIndent(),
             ).use { statement ->
                 statement.executeQuery().use { result ->
@@ -204,14 +209,14 @@ class AdminRepository(
             AdminStorageSummary(
                 encryptedObjects = totals.first,
                 encryptedBytes = totals.second,
-                changes = connection.count("SELECT COUNT(*) FROM someday_sync_v2_changes"),
+                changes = connection.count("SELECT COUNT(*) FROM someday_sync_v2_changes c WHERE $ACTIVE_CHANGE_SCOPE"),
                 byType = listStorageByType(connection),
                 byUser = listStorageByUser(connection),
             )
         }
 
-    fun syncActivity(limit: Int = 100): AdminSyncActivitySummary =
-        connection().use { connection ->
+    fun syncActivity(actor: AccountRequestContext, limit: Int = 100): AdminSyncActivitySummary =
+        adminRead(actor) { connection ->
             val entries = connection.prepareStatement(
                 """
                 SELECT c.cursor,
@@ -224,10 +229,12 @@ class AdminRepository(
                 FROM someday_sync_v2_changes c
                 JOIN someday_sync_v2_objects o
                   ON o.user_id = c.user_id
+                 AND o.workspace_id = c.workspace_id
                  AND o.epoch_id = c.epoch_id
                  AND o.object_id = c.object_id
                 LEFT JOIN someday_users u ON u.id = c.user_id
-                LEFT JOIN someday_devices d ON d.id = o.first_writer_device_id
+                LEFT JOIN someday_devices d ON d.id = o.first_writer_device_id AND d.user_id = o.user_id
+                WHERE $ACTIVE_CHANGE_SCOPE
                 ORDER BY c.cursor DESC
                 LIMIT ?
                 """.trimIndent(),
@@ -252,13 +259,13 @@ class AdminRepository(
                 }
             }
             AdminSyncActivitySummary(
-                acceptedChanges = connection.count("SELECT COUNT(*) FROM someday_sync_v2_changes"),
+                acceptedChanges = connection.count("SELECT COUNT(*) FROM someday_sync_v2_changes c WHERE $ACTIVE_CHANGE_SCOPE"),
                 entries = entries,
             )
         }
 
-    fun health(): AdminHealthSnapshot =
-        connection().use { connection ->
+    fun health(actor: AccountRequestContext): AdminHealthSnapshot =
+        adminRead(actor) { connection ->
             connection.prepareStatement("SELECT 1").use { statement ->
                 statement.executeQuery().use { result ->
                     result.next()
@@ -292,109 +299,87 @@ class AdminRepository(
             )
         }
 
-    fun disableUser(userId: UUID): Boolean =
-        transaction { connection ->
+    fun disableUser(actor: AccountRequestContext, userId: UUID): Boolean =
+        adminMutation(actor, userId, "SELECT id FROM someday_users WHERE id = ?") { connection, owner ->
             val updated = connection.prepareStatement(
-                """
-                UPDATE someday_users
-                SET disabled_at = COALESCE(disabled_at, NOW())
-                WHERE id = ?
-                """.trimIndent(),
+                "UPDATE someday_users SET disabled_at = COALESCE(disabled_at, NOW()) WHERE id = ?",
             ).use { statement ->
-                statement.setObject(1, userId)
+                statement.setObject(1, owner)
                 statement.executeUpdate()
             }
-            if (updated == 0) {
-                return@transaction false
-            }
+            if (updated == 0) return@adminMutation false
             connection.prepareStatement(
-                """
-                UPDATE someday_sessions
-                SET revoked_at = COALESCE(revoked_at, NOW())
-                WHERE user_id = ? AND revoked_at IS NULL
-                """.trimIndent(),
+                "UPDATE someday_sessions SET revoked_at = COALESCE(revoked_at, NOW()) WHERE user_id = ? AND revoked_at IS NULL",
             ).use { statement ->
-                statement.setObject(1, userId)
+                statement.setObject(1, owner)
                 statement.executeUpdate()
             }
             connection.prepareStatement(
                 """
-                UPDATE someday_refresh_tokens
-                SET revoked_at = COALESCE(revoked_at, NOW())
-                WHERE session_id IN (
-                    SELECT id FROM someday_sessions WHERE user_id = ?
-                ) AND revoked_at IS NULL
+                UPDATE someday_refresh_tokens SET revoked_at = COALESCE(revoked_at, NOW())
+                WHERE session_id IN (SELECT id FROM someday_sessions WHERE user_id = ?)
+                  AND revoked_at IS NULL
                 """.trimIndent(),
             ).use { statement ->
-                statement.setObject(1, userId)
+                statement.setObject(1, owner)
                 statement.executeUpdate()
             }
             true
         }
 
-    fun revokeSession(sessionId: UUID): Boolean =
-        transaction { connection ->
+    fun revokeSession(actor: AccountRequestContext, sessionId: UUID): Boolean =
+        adminMutation(actor, sessionId, "SELECT user_id FROM someday_sessions WHERE id = ?") { connection, owner ->
             val updated = connection.prepareStatement(
-                """
-                UPDATE someday_sessions
-                SET revoked_at = COALESCE(revoked_at, NOW())
-                WHERE id = ?
-                """.trimIndent(),
+                "UPDATE someday_sessions SET revoked_at = COALESCE(revoked_at, NOW()) WHERE id = ? AND user_id = ?",
             ).use { statement ->
                 statement.setObject(1, sessionId)
+                statement.setObject(2, owner)
                 statement.executeUpdate()
             }
-            if (updated == 0) {
-                return@transaction false
-            }
+            if (updated == 0) return@adminMutation false
             connection.prepareStatement(
                 """
-                UPDATE someday_refresh_tokens
-                SET revoked_at = COALESCE(revoked_at, NOW())
-                WHERE session_id = ? AND revoked_at IS NULL
+                UPDATE someday_refresh_tokens SET revoked_at = COALESCE(revoked_at, NOW())
+                WHERE session_id IN (SELECT id FROM someday_sessions WHERE id = ? AND user_id = ?)
+                  AND revoked_at IS NULL
                 """.trimIndent(),
             ).use { statement ->
                 statement.setObject(1, sessionId)
+                statement.setObject(2, owner)
                 statement.executeUpdate()
             }
             true
         }
 
-    fun revokeDevice(deviceId: UUID): Boolean =
-        transaction { connection ->
+    fun revokeDevice(actor: AccountRequestContext, deviceId: UUID): Boolean =
+        adminMutation(actor, deviceId, "SELECT user_id FROM someday_devices WHERE id = ?") { connection, owner ->
             val updated = connection.prepareStatement(
-                """
-                UPDATE someday_devices
-                SET revoked_at = COALESCE(revoked_at, NOW())
-                WHERE id = ?
-                """.trimIndent(),
+                "UPDATE someday_devices SET revoked_at = COALESCE(revoked_at, NOW()) WHERE id = ? AND user_id = ?",
             ).use { statement ->
                 statement.setObject(1, deviceId)
+                statement.setObject(2, owner)
                 statement.executeUpdate()
             }
-            if (updated == 0) {
-                return@transaction false
-            }
+            if (updated == 0) return@adminMutation false
             connection.prepareStatement(
                 """
-                UPDATE someday_sessions
-                SET revoked_at = COALESCE(revoked_at, NOW())
-                WHERE device_id = ? AND revoked_at IS NULL
+                UPDATE someday_sessions SET revoked_at = COALESCE(revoked_at, NOW())
+                WHERE device_id = ? AND user_id = ? AND revoked_at IS NULL
                 """.trimIndent(),
             ).use { statement ->
                 statement.setObject(1, deviceId)
+                statement.setObject(2, owner)
                 statement.executeUpdate()
             }
             connection.prepareStatement(
                 """
-                UPDATE someday_refresh_tokens
-                SET revoked_at = COALESCE(revoked_at, NOW())
-                WHERE session_id IN (
-                    SELECT id FROM someday_sessions WHERE device_id = ?
-                ) AND revoked_at IS NULL
+                UPDATE someday_refresh_tokens SET revoked_at = COALESCE(revoked_at, NOW())
+                WHERE session_id IN (SELECT id FROM someday_sessions WHERE device_id = ? AND user_id = ?)
+                  AND revoked_at IS NULL
                 """.trimIndent(),
             ).use { statement ->
                 statement.setObject(1, deviceId)
+                statement.setObject(2, owner)
                 statement.executeUpdate()
             }
             true
@@ -430,12 +415,14 @@ class AdminRepository(
                    s.expires_at,
                    s.revoked_at,
                    s.created_at,
-                   COUNT(rt.id) FILTER (WHERE rt.revoked_at IS NULL AND rt.expires_at > NOW()) AS active_refresh_tokens
+                   s.data_incarnation = i.incarnation AS is_current_incarnation,
+                   COUNT(rt.id) FILTER (WHERE rt.revoked_at IS NULL AND rt.expires_at > NOW() AND s.data_incarnation = i.incarnation) AS active_refresh_tokens
             FROM someday_sessions s
-            LEFT JOIN someday_devices d ON d.id = s.device_id
+            JOIN someday_account_data_incarnations i ON i.user_id = s.user_id AND i.state = 'active'
+            LEFT JOIN someday_devices d ON d.id = s.device_id AND d.user_id = s.user_id
             LEFT JOIN someday_refresh_tokens rt ON rt.session_id = s.id
             WHERE s.user_id = ?
-            GROUP BY s.id, d.name
+            GROUP BY s.id, d.name, i.incarnation
             ORDER BY s.created_at DESC, s.id
             """.trimIndent(),
         ).use { statement ->
@@ -453,6 +440,7 @@ class AdminRepository(
                                 revokedAt = result.optionalInstant("revoked_at"),
                                 createdAt = result.requiredInstant("created_at"),
                                 activeRefreshTokens = result.getLong("active_refresh_tokens"),
+                                isCurrentIncarnation = result.getBoolean("is_current_incarnation"),
                             ),
                         )
                     }
@@ -468,6 +456,7 @@ class AdminRepository(
                    COALESCE(SUM(octet_length(o.encrypted_object_json)), 0) AS encrypted_bytes,
                    MAX(o.cursor) AS latest_cursor
             FROM someday_sync_v2_objects o
+            WHERE $ACTIVE_OBJECT_SCOPE
             GROUP BY o.object_type
             ORDER BY o.object_type
             """.trimIndent(),
@@ -493,10 +482,10 @@ class AdminRepository(
             """
             SELECT u.id AS user_id,
                    u.email,
-                   COUNT(DISTINCT (o.workspace_id, o.epoch_id, o.object_id)) AS objects,
+                   COUNT(o.object_id) AS objects,
                    COALESCE(SUM(octet_length(o.encrypted_object_json)), 0) AS encrypted_bytes
             FROM someday_users u
-            LEFT JOIN someday_sync_v2_objects o ON o.user_id = u.id
+            LEFT JOIN someday_sync_v2_objects o ON o.user_id = u.id AND $ACTIVE_OBJECT_SCOPE
             GROUP BY u.id
             ORDER BY objects DESC, u.email
             """.trimIndent(),
@@ -525,33 +514,37 @@ class AdminRepository(
             }
         }
 
-    private fun <T> transaction(block: (Connection) -> T): T =
-        connection().use { connection ->
-            connection.autoCommit = false
-            try {
-                val result = block(connection)
-                connection.commit()
-                result
-            } catch (error: Throwable) {
-                connection.rollback()
-                throw error
-            }
+    private fun <T> adminRead(actor: AccountRequestContext, block: (Connection) -> T): T =
+        AccountAdmission.transaction(connections, listOf(actor.userId), scope = ::selectAdminScope) { connection ->
+            AccountAdmission.admit(connection, actor, AccountAccess.ADMIN)
+            block(connection)
         }
 
-    private fun connection(): Connection {
-        val connection = connections.connection()
-        try {
-            connection.prepareStatement("SELECT set_config('someday.user_id', '*', false)").use { statement ->
-                statement.execute()
+    private fun adminMutation(
+        actor: AccountRequestContext,
+        targetId: UUID,
+        ownerQuery: String,
+        block: (Connection, UUID) -> Boolean,
+    ): Boolean = AccountAdmission.transaction(connections, emptyList(), scope = ::selectAdminScope) { connection ->
+        fun owner(): UUID? = connection.prepareStatement(ownerQuery).use { statement ->
+            statement.setObject(1, targetId)
+            statement.executeQuery().use { result ->
+                if (result.next()) result.getObject(1, UUID::class.java) else null
             }
-            connection.prepareStatement("SELECT set_config('someday.workspace_id', '*', false)").use { statement ->
-                statement.execute()
-            }
-            return connection
-        } catch (failure: Throwable) {
-            runCatching { connection.close() }
-            throw failure
         }
+        // Resolve without row locks, then acquire the complete ordered actor/target set.
+        val targetOwner = owner()
+        AccountAdmission.lockAccounts(connection, listOfNotNull(actor.userId, targetOwner), AccountLockMode.SHARED)
+        AccountAdmission.admit(connection, actor, AccountAccess.ADMIN)
+        if (targetOwner == null || owner() != targetOwner) return@transaction false
+        block(connection, targetOwner)
+    }
+
+    private fun selectAdminScope(connection: Connection) {
+        // This is the explicitly authorized cross-account administrative path.
+        connection.prepareStatement(
+            "SELECT set_config('someday.user_id', '*', true), set_config('someday.workspace_id', '*', true)",
+        ).use { statement -> statement.executeQuery().close() }
     }
 
     private fun ResultSet.toAdminUserSummary(): AdminUserSummary =
@@ -579,6 +572,7 @@ class AdminRepository(
             createdAt = requiredInstant("created_at"),
             objectCount = getLong("object_count"),
             lastSyncCursor = optionalLong("last_sync_cursor"),
+            isCurrentIncarnation = getBoolean("is_current_incarnation"),
         )
 
     private fun ResultSet.requiredInstant(column: String): Instant =
@@ -596,6 +590,13 @@ class AdminRepository(
         getObject(column)?.let { it as UUID }
 
     private companion object {
+        val ACTIVE_OBJECT_SCOPE = """
+            EXISTS (SELECT 1 FROM someday_entity_workspaces w
+                    JOIN someday_account_data_incarnations i ON i.user_id = w.user_id AND i.incarnation = w.data_incarnation
+                    WHERE w.user_id = o.user_id AND w.workspace_id = o.workspace_id AND i.state = 'active')
+        """.trimIndent()
+        val ACTIVE_CHANGE_SCOPE = ACTIVE_OBJECT_SCOPE.replace("o.user_id", "c.user_id").replace("o.workspace_id", "c.workspace_id")
+
         val USER_SUMMARY_SQL = """
             SELECT u.id,
                    u.email,
@@ -615,11 +616,12 @@ class AdminRepository(
                 GROUP BY user_id
             ) d ON d.user_id = u.id
             LEFT JOIN (
-                SELECT user_id,
+                SELECT o.user_id,
                        COUNT(*) AS object_count,
-                       MAX(cursor) AS latest_cursor
-                FROM someday_sync_v2_objects
-                GROUP BY user_id
+                       MAX(o.cursor) AS latest_cursor
+                FROM someday_sync_v2_objects o
+                WHERE $ACTIVE_OBJECT_SCOPE
+                GROUP BY o.user_id
             ) o ON o.user_id = u.id
         """.trimIndent()
 
@@ -633,16 +635,19 @@ class AdminRepository(
                    d.last_seen_at,
                    d.created_at,
                    COALESCE(o.object_count, 0) AS object_count,
-                   o.last_sync_cursor
+                   o.last_sync_cursor,
+                   d.data_incarnation = i.incarnation AS is_current_incarnation
             FROM someday_devices d
             JOIN someday_users u ON u.id = d.user_id
+            JOIN someday_account_data_incarnations i ON i.user_id = d.user_id AND i.state = 'active'
             LEFT JOIN (
-                SELECT first_writer_device_id AS device_id,
+                SELECT o.user_id, o.first_writer_device_id AS device_id,
                        COUNT(*) AS object_count,
-                       MAX(cursor) AS last_sync_cursor
-                FROM someday_sync_v2_objects
-                GROUP BY first_writer_device_id
-            ) o ON o.device_id = d.id
+                       MAX(o.cursor) AS last_sync_cursor
+                FROM someday_sync_v2_objects o
+                WHERE $ACTIVE_OBJECT_SCOPE
+                GROUP BY o.user_id, o.first_writer_device_id
+            ) o ON o.device_id = d.id AND o.user_id = d.user_id
         """.trimIndent()
     }
 }

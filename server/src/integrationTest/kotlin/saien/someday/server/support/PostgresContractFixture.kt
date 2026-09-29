@@ -7,6 +7,8 @@ import java.time.Duration
 import java.util.UUID
 import saien.someday.server.ServerConfig
 import saien.someday.server.ServerMediaStorage
+import saien.someday.server.auth.ACCOUNT_INITIAL_INCARNATION
+import saien.someday.server.auth.AccountRequestContext
 import saien.someday.server.persistence.DatabaseMigrator
 import saien.someday.server.productionTestServerConfig
 
@@ -53,6 +55,7 @@ internal class PostgresContractFixture(
     fun seedIdentity(label: String = UUID.randomUUID().toString()): TestServerIdentity {
         val userId = UUID.randomUUID()
         val deviceId = UUID.randomUUID()
+        val sessionId = UUID.randomUUID()
         connection().use { connection ->
             connection.prepareStatement(
                 "INSERT INTO someday_users(id, email, password_hash) VALUES (?, ?, ?)",
@@ -63,16 +66,29 @@ internal class PostgresContractFixture(
                 statement.executeUpdate()
             }
             connection.prepareStatement(
-                "INSERT INTO someday_devices(id, user_id, name, platform) VALUES (?, ?, ?, ?)",
+                "INSERT INTO someday_devices(id, user_id, name, platform, data_incarnation) VALUES (?, ?, ?, ?, ?)",
             ).use { statement ->
                 statement.setObject(1, deviceId)
                 statement.setObject(2, userId)
                 statement.setString(3, "Contract device")
                 statement.setString(4, "integration")
+                statement.setObject(5, ACCOUNT_INITIAL_INCARNATION)
+                statement.executeUpdate()
+            }
+            connection.prepareStatement(
+                """
+                INSERT INTO someday_sessions(id, user_id, device_id, expires_at, data_incarnation)
+                VALUES (?, ?, ?, NOW() + INTERVAL '1 hour', ?)
+                """.trimIndent(),
+            ).use { statement ->
+                statement.setObject(1, sessionId)
+                statement.setObject(2, userId)
+                statement.setObject(3, deviceId)
+                statement.setObject(4, ACCOUNT_INITIAL_INCARNATION)
                 statement.executeUpdate()
             }
         }
-        return TestServerIdentity(userId, deviceId)
+        return TestServerIdentity(userId, deviceId, sessionId)
     }
 
     fun countRows(table: String, userId: UUID, workspaceId: String): Long {
@@ -187,6 +203,42 @@ internal class PostgresContractFixture(
         error("Timed out observing PostgreSQL advisory-lock contention for $applicationName.")
     }
 
+    fun awaitTransactionLockWait(
+        applicationName: String,
+        blockingBackendId: Int,
+        operationCompleted: () -> Boolean,
+        timeout: Duration = Duration.ofSeconds(30),
+    ) {
+        require(APPLICATION_NAME.matches(applicationName))
+        val deadline = System.nanoTime() + timeout.toNanos()
+        connection().use { observer ->
+            observer.prepareStatement(
+                """
+                SELECT EXISTS (
+                    SELECT 1 FROM pg_stat_activity activity
+                    WHERE activity.application_name = ?
+                      AND activity.wait_event_type = 'Lock'
+                      AND ? = ANY(pg_blocking_pids(activity.pid))
+                )
+                """.trimIndent(),
+            ).use { statement ->
+                statement.setString(1, applicationName)
+                statement.setInt(2, blockingBackendId)
+                while (System.nanoTime() < deadline) {
+                    statement.executeQuery().use { result ->
+                        check(result.next())
+                        if (result.getBoolean(1)) return
+                    }
+                    check(!operationCompleted()) {
+                        "Operation completed without waiting on the held PostgreSQL transaction."
+                    }
+                    Thread.yield()
+                }
+            }
+        }
+        error("Timed out observing PostgreSQL transaction-lock contention for $applicationName.")
+    }
+
     private fun connection(): Connection =
         DriverManager.getConnection(config.databaseConnectionUrl, databaseUser, databasePassword)
 
@@ -246,4 +298,8 @@ internal class HeldPostgresAdvisoryLock(private val connection: Connection) : Au
 internal data class TestServerIdentity(
     val userId: UUID,
     val deviceId: UUID,
-)
+    val sessionId: UUID,
+) {
+    val request: AccountRequestContext
+        get() = AccountRequestContext(userId, sessionId, deviceId, setOf("auth", "devices", "sync"))
+}

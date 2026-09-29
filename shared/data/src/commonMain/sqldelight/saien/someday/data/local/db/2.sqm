@@ -1,0 +1,3 @@
+ALTER TABLE account_workspace_gates
+ADD COLUMN discard_target_incarnation TEXT
+  CHECK (discard_target_incarnation IS NULL OR length(discard_target_incarnation) = 36);

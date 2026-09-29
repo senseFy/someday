@@ -65,7 +65,15 @@ docker compose -p someday-restore run --rm --no-deps \
    chown -R 10001:10001 /var/lib/someday/media'
 ```
 
-Validate before starting normal service traffic:
+Keep ingress and all maintenance stopped. For schema V11 and newer, invalidate
+reclamation attestations and discard old deletion plans before starting normal
+service traffic, using the dedicated credentials and exact database identity in
+the [account reset maintenance guide](account-data-reset-maintenance.md).
+Historical restore can restore old incarnations, content and authorizations,
+and remove later reset receipts. It does not preserve account reset across a
+recovery-point rollback.
+
+Then validate before starting normal service traffic:
 
 ```bash
 docker compose -p someday-restore run --rm --no-deps \

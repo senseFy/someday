@@ -3,224 +3,52 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-SCHEMA_DIR="$ROOT_DIR/shared/data/src/commonMain/sqldelight/databases"
-MIGRATION_DIR="$ROOT_DIR/shared/data/src/commonMain/sqldelight/saien/someday/data/local/db"
-BASELINE="$SCHEMA_DIR/1.db"
 
-# GitHub's Ubuntu image puts Android platform-tools on PATH. That sqlite3 is a
-# reduced build and can omit CHECK-constraint literals from sqlite_master.sql,
-# which made this verifier fail while the committed baseline was valid.
-if [[ -x /usr/bin/sqlite3 ]]; then
-    SQLITE3=/usr/bin/sqlite3
-elif command -v sqlite3 >/dev/null 2>&1; then
-    SQLITE3="$(command -v sqlite3)"
-else
-    printf 'error: sqlite3 is required for schema verification.\n' >&2
-    exit 1
-fi
+# Retain this entry point for existing callers. The squashed-baseline phase has
+# ended: validate immutable history and execute the actual numbered migration.
+# The Gradle verifySqlDelightMigration gate additionally runs the nonempty JVM
+# upgrade test through the same shared driver used by Desktop.
+python3 - "$ROOT_DIR" <<'PY'
+import hashlib
+import pathlib
+import re
+import sqlite3
+import sys
+import tempfile
 
-[[ -f "$BASELINE" ]] || {
-    printf 'error: missing squashed System V3 SQLDelight baseline: %s\n' "$BASELINE" >&2
-    exit 1
-}
+root = pathlib.Path(sys.argv[1]) / 'shared/data/src/commonMain/sqldelight'
+snapshots = root / 'databases'
+sources = root / 'saien/someday/data/local/db'
+assert sorted(p.name for p in snapshots.glob('*.db')) == ['1.db', '2.db', '3.db'], 'Unexpected snapshot history'
+assert sorted(p.name for p in sources.glob('*.sqm')) == ['1.sqm', '2.sqm'], 'Unexpected migration history'
+assert hashlib.sha256((snapshots / '1.db').read_bytes()).hexdigest() == 'dc072bc31201875d4f186398757c8e5c67dbb7c17b99edd2af12bf88a8e8fd59', 'Frozen schema 1 changed'
+assert hashlib.sha256((snapshots / '2.db').read_bytes()).hexdigest() == '24c701ce5fc555a86e29ae99970d62c0718aff48d88a261e1aadc4ff097117ef', 'Frozen schema 2 changed'
+assert hashlib.sha256((sources / '1.sqm').read_bytes()).hexdigest() == '2b3c3ff66d6b915c704ffdce4dd8c53b80e3e0f03f2221eb7f9af17c3eda1725', 'Frozen migration 1 changed'
 
-snapshot_count="$(find "$SCHEMA_DIR" -maxdepth 1 -type f -name '*.db' | wc -l | tr -d '[:space:]')"
-[[ "$snapshot_count" == "1" ]] || {
-    printf 'error: expected one squashed schema snapshot, found %s.\n' "$snapshot_count" >&2
-    exit 1
-}
+# Tokenize rather than deleting whitespace inside CHECK string literals.
+def normalized(sql):
+    return [token if token.startswith("'") else token.lower().strip('"') for token in
+            re.findall(r"'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|[A-Za-z_][A-Za-z_0-9]*|[0-9]+|\S", sql or '')]
 
-if find "$MIGRATION_DIR" -maxdepth 1 -type f -name '*.sqm' | grep -q .; then
-    find "$MIGRATION_DIR" -maxdepth 1 -type f -name '*.sqm' >&2
-    printf 'error: pre-release migration history must remain squashed.\n' >&2
-    exit 1
-fi
+def catalog(db):
+    assert db.execute('PRAGMA integrity_check').fetchall() == [('ok',)]
+    assert db.execute('PRAGMA foreign_key_check').fetchall() == []
+    return [(kind, name, table, normalized(sql)) for kind, name, table, sql in db.execute(
+        "SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name")]
 
-[[ "$("$SQLITE3" "$BASELINE" 'PRAGMA integrity_check;')" == "ok" ]] || {
-    printf 'error: baseline failed SQLite integrity_check.\n' >&2
-    exit 1
-}
-[[ -z "$("$SQLITE3" "$BASELINE" 'PRAGMA foreign_key_check;')" ]] || {
-    printf 'error: baseline failed SQLite foreign_key_check.\n' >&2
-    exit 1
-}
-
-expected_tables="$(
-    printf '%s\n' \
-        devices \
-        media_assets \
-        note_projections_system_v2 \
-        notebook_projections_v2 \
-        projection_warnings_v2 \
-        settings \
-        sync_applied_mutations_system_v2 \
-        sync_checkpoint_objects_system_v2 \
-        sync_checkpoints_system_v2 \
-        sync_control_objects_system_v2 \
-        sync_dead_letters_v2 \
-        sync_epochs_v2 \
-        sync_local_authority_system_v2 \
-        sync_pending_mutations_system_v2 \
-        sync_remote_cursors_system_v2 \
-        sync_run_history_v2 \
-        sync_source_imports_system_v2 \
-        workspace_entity_conflict_heads_v2 \
-        workspace_entity_conflicts_v2 \
-        workspace_entity_heads_v2 \
-        workspace_entity_version_parents_v2 \
-        workspace_entity_versions_v2 \
-        workspace_preferences_projection_v2 |
-        sort
-)"
-actual_tables="$(
-    "$SQLITE3" "$BASELINE" \
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name;"
-)"
-[[ "$actual_tables" == "$expected_tables" ]] || {
-    diff -u <(printf '%s\n' "$expected_tables") <(printf '%s\n' "$actual_tables") >&2 || true
-    printf 'error: baseline table inventory differs from the System V3 contract.\n' >&2
-    exit 1
-}
-
-for required in \
-    someday-system-v2 \
-    workspace-entity-schema-set-v2 \
-    equivalent-v2 \
-    deletion-v2 \
-    field-merge-v2 \
-    manual-resolution-v2 \
-    source_import; do
-    count="$("$SQLITE3" "$BASELINE" "SELECT COUNT(*) FROM sqlite_master WHERE sql IS NOT NULL AND instr(sql, '${required}') > 0;")"
-    [[ "$count" != "0" ]] || {
-        printf 'error: baseline is missing required V2 wire value: %s\n' "$required" >&2
-        exit 1
-    }
-done
-
-retired_major='v''1'
-retired_history='leg''acy'
-retired_count="$("$SQLITE3" "$BASELINE" "SELECT COUNT(*) FROM sqlite_master WHERE sql IS NOT NULL AND (instr(lower(sql), '${retired_major}') > 0 OR instr(lower(sql), '${retired_history}') > 0);")"
-if [[ "$retired_count" != "0" ]]; then
-    printf 'error: baseline contains a retired sync wire value.\n' >&2
-    exit 1
-fi
-
-for required_media_value in available missing corrupt; do
-    count="$("$SQLITE3" "$BASELINE" "SELECT COUNT(*) FROM sqlite_master WHERE name = 'media_assets' AND sql IS NOT NULL AND instr(sql, '${required_media_value}') > 0;")"
-    [[ "$count" != "0" ]] || {
-        printf 'error: media baseline is missing required state: %s\n' "$required_media_value" >&2
-        exit 1
-    }
-done
-
-publication_state_column_count="$($SQLITE3 "$BASELINE" \
-    "SELECT COUNT(*) FROM pragma_table_info('media_assets') WHERE name = 'publication_state';")"
-[[ "$publication_state_column_count" == "0" ]] || {
-    printf 'error: media baseline retains a redundant publication state column.\n' >&2
-    exit 1
-}
-
-for retired_local_table in notebooks notes note_versions tombstones locations sync_metadata; do
-    retired_count="$($SQLITE3 "$BASELINE" \
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '${retired_local_table}';")"
-    [[ "$retired_count" == "0" ]] || {
-        printf 'error: baseline retains retired normal-row table: %s\n' "$retired_local_table" >&2
-        exit 1
-    }
-done
-
-for retired_protocol_table in sync_reconciliation_state_system_v2 sync_transport_units_system_v2; do
-    retired_count="$($SQLITE3 "$BASELINE" \
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '${retired_protocol_table}';")"
-    [[ "$retired_count" == "0" ]] || {
-        printf 'error: baseline retains retired protocol table: %s\n' "$retired_protocol_table" >&2
-        exit 1
-    }
-done
-
-for retired_epoch_health in degraded; do
-    retired_count="$($SQLITE3 "$BASELINE" \
-        "SELECT COUNT(*) FROM sqlite_master WHERE name = 'sync_epochs_v2' AND sql IS NOT NULL AND instr(sql, '''${retired_epoch_health}''') > 0;")"
-    [[ "$retired_count" == "0" ]] || {
-        printf 'error: epoch health CHECK retains retired state: %s\n' "$retired_epoch_health" >&2
-        exit 1
-    }
-done
-
-for retired_control_value in sync_writer_manifest_v2 sync_log_segment_v2 superseded; do
-    retired_count="$($SQLITE3 "$BASELINE" \
-        "SELECT COUNT(*) FROM sqlite_master WHERE name = 'sync_control_objects_system_v2' AND sql IS NOT NULL AND instr(sql, '${retired_control_value}') > 0;")"
-    [[ "$retired_count" == "0" ]] || {
-        printf 'error: control-object CHECK retains retired value: %s\n' "$retired_control_value" >&2
-        exit 1
-    }
-done
-
-for retired_checkpoint_state in expired; do
-    retired_count="$($SQLITE3 "$BASELINE" \
-        "SELECT COUNT(*) FROM sqlite_master WHERE name = 'sync_checkpoints_system_v2' AND sql IS NOT NULL AND instr(sql, '''${retired_checkpoint_state}''') > 0;")"
-    [[ "$retired_count" == "0" ]] || {
-        printf 'error: checkpoint CHECK retains retired state: %s\n' "$retired_checkpoint_state" >&2
-        exit 1
-    }
-done
-
-for retired_import_state in prepared queued recovery_required; do
-    retired_count="$($SQLITE3 "$BASELINE" \
-        "SELECT COUNT(*) FROM sqlite_master WHERE name = 'sync_source_imports_system_v2' AND sql IS NOT NULL AND instr(sql, '''${retired_import_state}''') > 0;")"
-    [[ "$retired_count" == "0" ]] || {
-        printf 'error: source-import CHECK retains retired state: %s\n' "$retired_import_state" >&2
-        exit 1
-    }
-done
-
-dead_letter_lifecycle_count="$($SQLITE3 "$BASELINE" \
-    "SELECT COUNT(*) FROM pragma_table_info('sync_dead_letters_v2') WHERE name = 'lifecycle';")"
-[[ "$dead_letter_lifecycle_count" == "0" ]] || {
-    printf 'error: unresolved dead-letter evidence retains lifecycle state.\n' >&2
-    exit 1
-}
-
-checkpoint_horizon_count="$($SQLITE3 "$BASELINE" \
-    "SELECT COUNT(*) FROM pragma_table_info('sync_run_history_v2') WHERE name = 'checkpoint_horizon';")"
-[[ "$checkpoint_horizon_count" == "0" ]] || {
-    printf 'error: run history retains a checkpoint retention horizon.\n' >&2
-    exit 1
-}
-
-published_authority_column_count="$($SQLITE3 "$BASELINE" \
-    "SELECT COUNT(*) FROM pragma_table_info('media_assets') WHERE name = 'published_authority_binding_id' AND \"notnull\" = 0;")"
-[[ "$published_authority_column_count" == "1" ]] || {
-    printf 'error: media baseline is missing authority-scoped publication evidence.\n' >&2
-    exit 1
-}
-
-published_workspace_column_count="$($SQLITE3 "$BASELINE" \
-    "SELECT COUNT(*) FROM pragma_table_info('media_assets') WHERE name = 'published_workspace_id' AND \"notnull\" = 0;")"
-[[ "$published_workspace_column_count" == "1" ]] || {
-    printf 'error: media baseline is missing workspace-scoped publication evidence.\n' >&2
-    exit 1
-}
-
-published_workspace_check_count="$($SQLITE3 "$BASELINE" \
-    "SELECT COUNT(*) FROM sqlite_master WHERE name = 'media_assets' AND sql IS NOT NULL AND instr(sql, 'substr(published_workspace_id, 11) NOT GLOB ''*[^0-9a-f]*''') > 0;")"
-[[ "$published_workspace_check_count" == "1" ]] || {
-    printf 'error: media baseline does not strictly validate workspace id hex.\n' >&2
-    exit 1
-}
-
-authority_check_count="$($SQLITE3 "$BASELINE" \
-    "SELECT COUNT(*) FROM sqlite_master WHERE name = 'media_assets' AND sql IS NOT NULL AND instr(sql, '(published_authority_binding_id IS NULL) = (published_object_digest IS NULL)') > 0;")"
-[[ "$authority_check_count" == "1" ]] || {
-    printf 'error: media baseline permits object evidence without an authority/workspace binding.\n' >&2
-    exit 1
-}
-
-published_authority_index_count="$($SQLITE3 "$BASELINE" \
-    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'media_assets_published_authority_idx';")"
-[[ "$published_authority_index_count" == "1" ]] || {
-    printf 'error: media baseline is missing its authority-scoped publication index.\n' >&2
-    exit 1
-}
-
-printf 'SQLDelight System V3 baseline verified: %s\n' "$BASELINE"
+with tempfile.TemporaryDirectory(prefix='someday-migration-') as directory:
+    upgraded_path = pathlib.Path(directory) / 'upgraded.db'
+    upgraded_path.write_bytes((snapshots / '1.db').read_bytes())
+    with sqlite3.connect(upgraded_path) as upgraded, sqlite3.connect(':memory:') as fresh, sqlite3.connect(
+            f'file:{snapshots / "3.db"}?mode=ro', uri=True) as snapshot:
+        upgraded.execute('PRAGMA foreign_keys=ON')
+        upgraded.executescript((sources / '1.sqm').read_text())
+        with sqlite3.connect(f'file:{snapshots / "2.db"}?mode=ro', uri=True) as schema_two:
+            assert catalog(upgraded) == catalog(schema_two), 'Migration 1 differs from frozen schema 2'
+        upgraded.executescript((sources / '2.sqm').read_text())
+        schema = re.split(r'^\w+:\s*$', (sources / 'Someday.sq').read_text(), maxsplit=1, flags=re.MULTILINE)[0]
+        fresh.executescript(schema)
+        assert catalog(upgraded) == catalog(fresh), 'Migrated catalog differs from fresh schema'
+        assert catalog(snapshot) == catalog(fresh), 'Schema 3 snapshot differs from fresh schema'
+print('SQLDelight v1→v2→v3 migration and frozen snapshots verified; Gradle also runs the nonempty shared-driver upgrade test.')
+PY

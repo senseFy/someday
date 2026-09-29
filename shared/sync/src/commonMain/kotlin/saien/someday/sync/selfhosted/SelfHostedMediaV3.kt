@@ -201,7 +201,7 @@ data class SelfHostedMediaRemoteHeadV3(
 }
 
 interface SelfHostedMediaTransportV3 {
-    fun systemV3Capabilities(endpoint: String, accessToken: String): SelfHostedSystemV3CapabilitiesResponse
+    fun systemV3Capabilities(endpoint: String, accessToken: String, accountContext: SelfHostedAccountRequestContext = SelfHostedAccountRequestContext()): SelfHostedSystemV3CapabilitiesResponse
 
     fun putMediaObject(
         endpoint: String,
@@ -209,6 +209,7 @@ interface SelfHostedMediaTransportV3 {
         workspaceId: String,
         mediaId: String,
         prepared: SelfHostedPreparedMediaObjectV3,
+        accountContext: SelfHostedAccountRequestContext = SelfHostedAccountRequestContext(),
     ): SelfHostedMediaPutResponseV3
 
     fun headMediaObject(
@@ -216,6 +217,7 @@ interface SelfHostedMediaTransportV3 {
         accessToken: String,
         workspaceId: String,
         mediaId: String,
+        accountContext: SelfHostedAccountRequestContext = SelfHostedAccountRequestContext(),
     ): SelfHostedMediaRemoteHeadV3?
 
     fun getMediaObject(
@@ -223,6 +225,7 @@ interface SelfHostedMediaTransportV3 {
         accessToken: String,
         workspaceId: String,
         mediaId: String,
+        accountContext: SelfHostedAccountRequestContext = SelfHostedAccountRequestContext(),
     ): SelfHostedMediaRemoteObjectV3
 }
 
@@ -231,8 +234,8 @@ class RefreshingSelfHostedMediaTransportV3(
     private val sessionExecutor: RefreshingSelfHostedSessionExecutor,
     private val authenticatedUserId: String,
 ) : SelfHostedMediaTransportV3 {
-    override fun systemV3Capabilities(endpoint: String, accessToken: String) =
-        authorized(endpoint, accessToken) { delegate.systemV3Capabilities(endpoint, it) }
+    override fun systemV3Capabilities(endpoint: String, accessToken: String, accountContext: SelfHostedAccountRequestContext) =
+        authorized(endpoint, accessToken, accountContext) { token, context -> delegate.systemV3Capabilities(endpoint, token, context) }
 
     override fun putMediaObject(
         endpoint: String,
@@ -240,18 +243,24 @@ class RefreshingSelfHostedMediaTransportV3(
         workspaceId: String,
         mediaId: String,
         prepared: SelfHostedPreparedMediaObjectV3,
-    ) = authorized(endpoint, accessToken) {
-        delegate.putMediaObject(endpoint, it, workspaceId, mediaId, prepared)
+        accountContext: SelfHostedAccountRequestContext,
+    ) = authorized(endpoint, accessToken, accountContext) { token, context ->
+        delegate.putMediaObject(endpoint, token, workspaceId, mediaId, prepared, context)
     }
 
-    override fun headMediaObject(endpoint: String, accessToken: String, workspaceId: String, mediaId: String) =
-        authorized(endpoint, accessToken) { delegate.headMediaObject(endpoint, it, workspaceId, mediaId) }
+    override fun headMediaObject(endpoint: String, accessToken: String, workspaceId: String, mediaId: String, accountContext: SelfHostedAccountRequestContext) =
+        authorized(endpoint, accessToken, accountContext) { token, context -> delegate.headMediaObject(endpoint, token, workspaceId, mediaId, context) }
 
-    override fun getMediaObject(endpoint: String, accessToken: String, workspaceId: String, mediaId: String) =
-        authorized(endpoint, accessToken) { delegate.getMediaObject(endpoint, it, workspaceId, mediaId) }
+    override fun getMediaObject(endpoint: String, accessToken: String, workspaceId: String, mediaId: String, accountContext: SelfHostedAccountRequestContext) =
+        authorized(endpoint, accessToken, accountContext) { token, context -> delegate.getMediaObject(endpoint, token, workspaceId, mediaId, context) }
 
-    private fun <T> authorized(endpoint: String, suppliedToken: String, request: (String) -> T): T =
-        sessionExecutor.authorized(endpoint, authenticatedUserId, suppliedToken, request)
+    private fun <T> authorized(
+        endpoint: String,
+        suppliedToken: String,
+        accountContext: SelfHostedAccountRequestContext,
+        request: (String, SelfHostedAccountRequestContext) -> T,
+    ): T = sessionExecutor.authorized(endpoint, authenticatedUserId, suppliedToken, accountContext, request)
+
 }
 
 class SelfHostedMediaCipherV3(
@@ -354,6 +363,8 @@ data class SelfHostedMediaSourceUploadResultV3(
 class SelfHostedMediaServiceV3(
     private val transport: SelfHostedMediaTransportV3,
     private val cipher: SelfHostedMediaCipherV3,
+    private val accountContext: SelfHostedAccountRequestContext = SelfHostedAccountRequestContext(),
+    private val beforeRequest: () -> Unit = {},
 ) {
     fun uploadSource(
         endpoint: String,
@@ -381,8 +392,10 @@ class SelfHostedMediaServiceV3(
             plaintext,
             originalFileName,
         )
-        transport.systemV3Capabilities(endpoint, accessToken).also(SelfHostedSystemV3CapabilitiesResponse::validate)
-        val existing = transport.headMediaObject(endpoint, accessToken, workspaceId, mediaId.value)
+        beforeRequest()
+        transport.systemV3Capabilities(endpoint, accessToken, accountContext).also(SelfHostedSystemV3CapabilitiesResponse::validate)
+        beforeRequest()
+        val existing = transport.headMediaObject(endpoint, accessToken, workspaceId, mediaId.value, accountContext)
         if (existing != null) {
             require(existing.ciphertextBytes == prepared.encryptedBytes.size &&
                 existing.ciphertextSha256 == prepared.encryptedSha256
@@ -392,9 +405,11 @@ class SelfHostedMediaServiceV3(
                 SelfHostedMediaUploadSummaryV3(uploadedObjects = 0, reusedObjects = 1),
             )
         }
-        val result = transport.putMediaObject(endpoint, accessToken, workspaceId, mediaId.value, prepared)
+        beforeRequest()
+        val result = transport.putMediaObject(endpoint, accessToken, workspaceId, mediaId.value, prepared, accountContext)
         require(result.stored) { result.error ?: "Media object upload was rejected." }
-        val confirmed = transport.headMediaObject(endpoint, accessToken, workspaceId, mediaId.value)
+        beforeRequest()
+        val confirmed = transport.headMediaObject(endpoint, accessToken, workspaceId, mediaId.value, accountContext)
             ?: error("Uploaded media object is not remotely reachable.")
         require(confirmed.ciphertextBytes == prepared.encryptedBytes.size &&
             confirmed.ciphertextSha256 == prepared.encryptedSha256
@@ -415,8 +430,10 @@ class SelfHostedMediaServiceV3(
         mediaId: MediaAssetId,
     ): SelfHostedMediaRemoteHeadV3? {
         requireSystemV3WorkspaceId(workspaceId)
-        transport.systemV3Capabilities(endpoint, accessToken).also(SelfHostedSystemV3CapabilitiesResponse::validate)
-        return transport.headMediaObject(endpoint, accessToken, workspaceId, mediaId.value)
+        beforeRequest()
+        transport.systemV3Capabilities(endpoint, accessToken, accountContext).also(SelfHostedSystemV3CapabilitiesResponse::validate)
+        beforeRequest()
+        return transport.headMediaObject(endpoint, accessToken, workspaceId, mediaId.value, accountContext)
     }
 
     fun fetchObject(
@@ -426,8 +443,10 @@ class SelfHostedMediaServiceV3(
         mediaId: MediaAssetId,
     ): SelfHostedDecryptedMediaObjectV3 {
         requireSystemV3WorkspaceId(workspaceId)
-        transport.systemV3Capabilities(endpoint, accessToken).also(SelfHostedSystemV3CapabilitiesResponse::validate)
-        val remote = transport.getMediaObject(endpoint, accessToken, workspaceId, mediaId.value)
+        beforeRequest()
+        transport.systemV3Capabilities(endpoint, accessToken, accountContext).also(SelfHostedSystemV3CapabilitiesResponse::validate)
+        beforeRequest()
+        val remote = transport.getMediaObject(endpoint, accessToken, workspaceId, mediaId.value, accountContext)
         return cipher.decrypt(workspaceId, mediaId, remote.bytes).getOrThrow().also {
             require(it.encryptedSha256 == remote.ciphertextSha256)
         }

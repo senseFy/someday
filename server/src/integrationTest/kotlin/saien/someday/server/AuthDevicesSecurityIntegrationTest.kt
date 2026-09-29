@@ -60,6 +60,7 @@ class AuthDevicesSecurityIntegrationTest {
         }
 
         assertEquals(HttpStatusCode.OK, response.status, response.bodyAsText())
+        assertEquals(INITIAL_INCARNATION, response.headers[INCARNATION_HEADER])
         val tokens = json.decodeFromString<AuthTokensResponse>(response.bodyAsText())
         assertTrue(tokens.accessToken.isNotBlank())
         assertTrue(tokens.refreshToken.length >= 43, "Refresh token must be high-entropy and opaque.")
@@ -119,6 +120,7 @@ class AuthDevicesSecurityIntegrationTest {
 
         val valid = login(email = email, password = "valid-password")
         assertEquals(HttpStatusCode.OK, valid.status, valid.bodyAsText())
+        assertEquals(INITIAL_INCARNATION, valid.headers[INCARNATION_HEADER])
         assertTrue(json.decodeFromString<AuthTokensResponse>(valid.bodyAsText()).accessToken.isNotBlank())
 
         val wrongPassword = login(email = email, password = "wrong-password")
@@ -150,6 +152,7 @@ class AuthDevicesSecurityIntegrationTest {
             setBody(json.encodeToString(RefreshRequest(firstSession.refreshToken)))
         }
         assertEquals(HttpStatusCode.OK, rotated.status, rotated.bodyAsText())
+        assertEquals(INITIAL_INCARNATION, rotated.headers[INCARNATION_HEADER])
         val rotatedTokens = json.decodeFromString<AuthTokensResponse>(rotated.bodyAsText())
         assertNotEquals(firstSession.refreshToken, rotatedTokens.refreshToken)
 
@@ -158,6 +161,7 @@ class AuthDevicesSecurityIntegrationTest {
             setBody(json.encodeToString(RefreshRequest(firstSession.refreshToken)))
         }
         assertEquals(HttpStatusCode.Unauthorized, replayOld.status, replayOld.bodyAsText())
+        assertEquals("unauthorized", replayOld.headers["X-Someday-Error-Code"])
 
         val logout = client.post("/auth/logout") {
             bearerAuth(rotatedTokens.accessToken)
@@ -419,7 +423,13 @@ class AuthDevicesSecurityIntegrationTest {
             setBody(json.encodeToString(DeviceRegistrationRequest(name, platform, deviceId)))
         }
         assertEquals(HttpStatusCode.OK, response.status, response.bodyAsText())
+        assertEquals(INITIAL_INCARNATION, response.headers[INCARNATION_HEADER])
         return json.decodeFromString(response.bodyAsText())
+    }
+
+    private companion object {
+        const val INCARNATION_HEADER = "X-Someday-Account-Incarnation"
+        const val INITIAL_INCARNATION = "00000000-0000-0000-0000-000000000000"
     }
 
     private fun clearServerTables() {

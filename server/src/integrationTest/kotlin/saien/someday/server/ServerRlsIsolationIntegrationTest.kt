@@ -1,5 +1,7 @@
 package saien.someday.server
 
+import saien.someday.server.auth.ACCOUNT_INITIAL_INCARNATION
+import saien.someday.server.auth.AccountRequestContext
 import java.security.MessageDigest
 import java.sql.Connection
 import java.sql.DriverManager
@@ -56,6 +58,8 @@ class ServerRlsIsolationIntegrationTest {
         val secondUserId = UUID.randomUUID()
         val firstDeviceId = UUID.randomUUID()
         val secondDeviceId = UUID.randomUUID()
+        val firstRequest = AccountRequestContext(firstUserId, UUID.randomUUID(), firstDeviceId, setOf("sync"))
+        val secondRequest = AccountRequestContext(secondUserId, UUID.randomUUID(), secondDeviceId, setOf("sync"))
         var roleCreated = false
 
         try {
@@ -64,6 +68,8 @@ class ServerRlsIsolationIntegrationTest {
                 roleCreated = true
                 grantRestrictedRoleAccess(connection, roleName)
                 seedAccounts(connection, firstUserId, firstDeviceId, secondUserId, secondDeviceId, suffix)
+                seedSession(connection, firstRequest)
+                seedSession(connection, secondRequest)
             }
 
             val restrictedConfig = applicationConfig.copy(
@@ -74,17 +80,17 @@ class ServerRlsIsolationIntegrationTest {
             val entityRepository = SyncV2Repository(restrictedConfig)
 
             // Reads select an RLS scope without manufacturing an empty workspace.
-            assertNull(entityRepository.loadEpoch(firstUserId, WORKSPACE_A))
+            assertNull(entityRepository.loadEpoch(firstRequest, WORKSPACE_A))
             assertEquals(0L, registryRowCount(firstUserId, WORKSPACE_A))
 
             // The first real write must set both RLS settings before creating the
             // registry row. Regressing that order makes this restricted INSERT fail.
-            initializeWorkspace(entityRepository, firstUserId, WORKSPACE_A, "first-a")
+            initializeWorkspace(entityRepository, firstRequest, WORKSPACE_A, "first-a")
             assertEquals(1L, registryRowCount(firstUserId, WORKSPACE_A))
-            assertNull(entityRepository.loadEpoch(firstUserId, WORKSPACE_B))
-            assertNull(entityRepository.loadEpoch(secondUserId, WORKSPACE_A))
-            initializeWorkspace(entityRepository, firstUserId, WORKSPACE_B, "first-b")
-            initializeWorkspace(entityRepository, secondUserId, WORKSPACE_A, "second-a")
+            assertNull(entityRepository.loadEpoch(firstRequest, WORKSPACE_B))
+            assertNull(entityRepository.loadEpoch(secondRequest, WORKSPACE_A))
+            initializeWorkspace(entityRepository, firstRequest, WORKSPACE_B, "first-b")
+            initializeWorkspace(entityRepository, secondRequest, WORKSPACE_A, "second-a")
 
             administratorConnection().use { connection ->
                 selectWildcardScope(connection)
@@ -93,21 +99,20 @@ class ServerRlsIsolationIntegrationTest {
                 seedEpoch(connection, secondUserId, WORKSPACE_A, "second-a")
             }
 
-            pushEntity(entityRepository, firstUserId, WORKSPACE_A, firstDeviceId, "first-a")
-            pushEntity(entityRepository, firstUserId, WORKSPACE_B, firstDeviceId, "first-b")
-            pushEntity(entityRepository, secondUserId, WORKSPACE_A, secondDeviceId, "second-a")
+            pushEntity(entityRepository, firstRequest, WORKSPACE_A, "first-a")
+            pushEntity(entityRepository, firstRequest, WORKSPACE_B, "first-b")
+            pushEntity(entityRepository, secondRequest, WORKSPACE_A, "second-a")
 
-            assertEquals("pointer-first-a", entityRepository.loadEpoch(firstUserId, WORKSPACE_A)?.metadata?.pointerDigest)
-            assertEquals("pointer-first-b", entityRepository.loadEpoch(firstUserId, WORKSPACE_B)?.metadata?.pointerDigest)
-            assertEquals("pointer-second-a", entityRepository.loadEpoch(secondUserId, WORKSPACE_A)?.metadata?.pointerDigest)
+            assertEquals("pointer-first-a", entityRepository.loadEpoch(firstRequest, WORKSPACE_A)?.metadata?.pointerDigest)
+            assertEquals("pointer-first-b", entityRepository.loadEpoch(firstRequest, WORKSPACE_B)?.metadata?.pointerDigest)
+            assertEquals("pointer-second-a", entityRepository.loadEpoch(secondRequest, WORKSPACE_A)?.metadata?.pointerDigest)
 
             val recoveryRepository = WorkspaceRecoveryEnvelopeRepository(restrictedConfig)
             assertEquals(
                 1L,
                 assertIs<WorkspaceRecoveryEnvelopePutResult.Stored>(
                     recoveryRepository.put(
-                        firstUserId,
-                        firstDeviceId,
+                        firstRequest,
                         recoveryInput(WORKSPACE_A, "first-a", expectedRevision = null, digestCharacter = 'A'),
                     ),
                 ).record.revision,
@@ -116,22 +121,20 @@ class ServerRlsIsolationIntegrationTest {
                 1L,
                 assertIs<WorkspaceRecoveryEnvelopePutResult.Stored>(
                     recoveryRepository.put(
-                        secondUserId,
-                        secondDeviceId,
+                        secondRequest,
                         recoveryInput(WORKSPACE_A, "second-a", expectedRevision = null, digestCharacter = 'B'),
                     ),
                 ).record.revision,
             )
             val rotatedRecovery = assertIs<WorkspaceRecoveryEnvelopePutResult.Stored>(
                 recoveryRepository.put(
-                    firstUserId,
-                    firstDeviceId,
+                    firstRequest,
                     recoveryInput(WORKSPACE_B, "first-b", expectedRevision = 1, digestCharacter = 'C'),
                 ),
             ).record
             assertEquals(2L, rotatedRecovery.revision)
             assertEquals(WORKSPACE_B, rotatedRecovery.workspaceId)
-            assertEquals(WORKSPACE_B, recoveryRepository.load(firstUserId)?.workspaceId)
+            assertEquals(WORKSPACE_B, recoveryRepository.load(firstRequest)?.workspaceId)
 
             val mediaRepository = SystemV3MediaRepository(
                 restrictedConfig,
@@ -140,9 +143,9 @@ class ServerRlsIsolationIntegrationTest {
             val firstABytes = ByteArray(64) { 1 }
             val firstBBytes = ByteArray(65) { 2 }
             val secondABytes = ByteArray(66) { 3 }
-            putAndVerifyMedia(mediaRepository, firstUserId, WORKSPACE_A, firstDeviceId, firstABytes)
-            putAndVerifyMedia(mediaRepository, firstUserId, WORKSPACE_B, firstDeviceId, firstBBytes)
-            putAndVerifyMedia(mediaRepository, secondUserId, WORKSPACE_A, secondDeviceId, secondABytes)
+            putAndVerifyMedia(mediaRepository, firstRequest, WORKSPACE_A, firstABytes)
+            putAndVerifyMedia(mediaRepository, firstRequest, WORKSPACE_B, firstBBytes)
+            putAndVerifyMedia(mediaRepository, secondRequest, WORKSPACE_A, secondABytes)
 
             restrictedConnection(roleName, rolePassword).use { connection ->
                 // Missing GUCs fail closed. Each unqualified query below relies
@@ -182,7 +185,7 @@ class ServerRlsIsolationIntegrationTest {
                 assertEquals(0, rewriteRecoveryEnvelope(connection, secondUserId))
                 assertEquals(listOf(Scope(firstUserId, WORKSPACE_B)), visibleRecoveryScopes(connection))
             }
-            assertEquals("""{"opaque":"second-a"}""", recoveryRepository.load(secondUserId)?.envelopeJson)
+            assertEquals("""{"opaque":"second-a"}""", recoveryRepository.load(secondRequest)?.envelopeJson)
         } finally {
             try {
                 cleanupAccounts(firstUserId, secondUserId)
@@ -221,6 +224,7 @@ class ServerRlsIsolationIntegrationTest {
             statement.execute("GRANT $roleName TO CURRENT_USER WITH ADMIN OPTION")
             statement.execute("GRANT CONNECT ON DATABASE ${quoteIdentifier(databaseName)} TO $roleName")
             statement.execute("GRANT USAGE ON SCHEMA public TO $roleName")
+            statement.execute("GRANT SELECT ON someday_users, someday_sessions, someday_devices, someday_account_data_incarnations TO $roleName")
             statement.execute("GRANT SELECT, INSERT ON someday_entity_workspaces TO $roleName")
             statement.execute("GRANT SELECT, UPDATE ON someday_sync_v2_epochs TO $roleName")
             statement.execute("GRANT SELECT, INSERT, UPDATE ON someday_sync_v2_checkpoint_chunks TO $roleName")
@@ -254,7 +258,8 @@ class ServerRlsIsolationIntegrationTest {
             statement.executeUpdate()
         }
         connection.prepareStatement(
-            "INSERT INTO someday_devices(id, user_id, name, platform) VALUES (?, ?, ?, ?), (?, ?, ?, ?)",
+            "INSERT INTO someday_devices(id, user_id, name, platform, data_incarnation) " +
+                "VALUES (?, ?, ?, ?, '$ACCOUNT_INITIAL_INCARNATION'), (?, ?, ?, ?, '$ACCOUNT_INITIAL_INCARNATION')",
         ).use { statement ->
             statement.setObject(1, firstDeviceId)
             statement.setObject(2, firstUserId)
@@ -264,6 +269,21 @@ class ServerRlsIsolationIntegrationTest {
             statement.setObject(6, secondUserId)
             statement.setString(7, "RLS second device")
             statement.setString(8, "integration")
+            statement.executeUpdate()
+        }
+    }
+
+    private fun seedSession(connection: Connection, request: AccountRequestContext) {
+        connection.prepareStatement(
+            """
+            INSERT INTO someday_sessions(id, user_id, device_id, expires_at, data_incarnation)
+            VALUES (?, ?, ?, NOW() + INTERVAL '1 hour', ?)
+            """.trimIndent(),
+        ).use { statement ->
+            statement.setObject(1, request.sessionId)
+            statement.setObject(2, request.userId)
+            statement.setObject(3, request.tokenDeviceId)
+            statement.setObject(4, ACCOUNT_INITIAL_INCARNATION)
             statement.executeUpdate()
         }
     }
@@ -301,7 +321,7 @@ class ServerRlsIsolationIntegrationTest {
 
     private fun initializeWorkspace(
         repository: SyncV2Repository,
-        userId: UUID,
+        request: AccountRequestContext,
         workspaceId: String,
         label: String,
     ) {
@@ -314,7 +334,7 @@ class ServerRlsIsolationIntegrationTest {
         )
         assertIs<SyncV2ImmutablePutRepositoryResult.Stored>(
             repository.putCheckpointChunk(
-                userId,
+                request,
                 workspaceId,
                 SyncV2CheckpointChunkInput(
                     epochId = SHARED_EPOCH_ID,
@@ -326,7 +346,7 @@ class ServerRlsIsolationIntegrationTest {
         )
         assertIs<SyncV2ImmutablePutRepositoryResult.Stored>(
             repository.putCheckpointManifest(
-                userId,
+                request,
                 workspaceId,
                 SyncV2CheckpointManifestInput(
                     epochId = SHARED_EPOCH_ID,
@@ -342,16 +362,14 @@ class ServerRlsIsolationIntegrationTest {
 
     private fun pushEntity(
         repository: SyncV2Repository,
-        userId: UUID,
+        request: AccountRequestContext,
         workspaceId: String,
-        deviceId: UUID,
         label: String,
     ) {
         assertIs<SyncV2PushRepositoryResult.Accepted>(
             repository.push(
-                userId,
+                request,
                 workspaceId,
-                deviceId,
                 SHARED_EPOCH_ID,
                 writerProtocolVersion = 2,
                 objects = listOf(
@@ -361,7 +379,7 @@ class ServerRlsIsolationIntegrationTest {
                         objectType = "workspace_entity_version_v2",
                         objectDigest = "od2:hmac-sha256:${digestHex("object-$label")}",
                         mutationId = SHARED_MUTATION_ID,
-                        writerDeviceId = deviceId,
+                        writerDeviceId = checkNotNull(request.tokenDeviceId),
                         ciphertextDigest = "ct2:sha256:${digestHex("ciphertext-$label")}",
                         encodedObjectJson = """{"entityScope":"$label"}""",
                     ),
@@ -372,17 +390,16 @@ class ServerRlsIsolationIntegrationTest {
 
     private fun putAndVerifyMedia(
         repository: SystemV3MediaRepository,
-        userId: UUID,
+        request: AccountRequestContext,
         workspaceId: String,
-        deviceId: UUID,
         bytes: ByteArray,
     ) {
         val digest = sha256(bytes)
         assertIs<SystemV3MediaPutResult.Stored>(
-            repository.putObject(userId, workspaceId, deviceId, MEDIA_ID, digest, bytes),
+            repository.putObject(request, workspaceId, MEDIA_ID, digest, bytes),
         )
         val found = assertIs<SystemV3MediaReadResult.Found<*>>(
-            repository.headObject(userId, workspaceId, MEDIA_ID),
+            repository.headObject(request, workspaceId, MEDIA_ID),
         )
         assertEquals(digest, assertIs<SystemV3MediaObjectRecord>(found.value).ciphertextSha256)
     }

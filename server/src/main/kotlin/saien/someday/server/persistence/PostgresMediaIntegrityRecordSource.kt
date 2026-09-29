@@ -56,6 +56,7 @@ class PostgresMediaIntegrityRecordSource(
             userId = getObject("user_id", UUID::class.java),
             workspaceId = getString("workspace_id"),
             mediaId = getString("media_id"),
+            incarnation = getObject("data_incarnation", UUID::class.java),
         ),
         expected = MediaBlobMetadata(
             bytes = getLong("ciphertext_bytes"),
@@ -67,9 +68,12 @@ class PostgresMediaIntegrityRecordSource(
         const val RECORD_FETCH_SIZE = 256
         val SELECT_MEDIA_RECORDS =
             """
-            SELECT user_id, workspace_id, media_id, ciphertext_bytes, ciphertext_sha256
-            FROM someday_media_v3_objects
-            ORDER BY user_id, workspace_id, media_id
+            SELECT media.user_id, media.workspace_id, media.media_id,
+                   media.ciphertext_bytes, media.ciphertext_sha256, workspace.data_incarnation
+            FROM someday_media_v3_objects media
+            JOIN someday_entity_workspaces workspace
+              ON workspace.user_id = media.user_id AND workspace.workspace_id = media.workspace_id
+            ORDER BY media.user_id, media.workspace_id, media.media_id
             """.trimIndent()
     }
 }

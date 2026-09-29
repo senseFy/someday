@@ -7,6 +7,7 @@ import saien.someday.server.auth.TokenService
 import saien.someday.server.media.MediaBlobStore
 import saien.someday.server.media.verifyMediaBlobStoreStartup
 import saien.someday.server.persistence.AdminRepository
+import saien.someday.server.persistence.AccountDataRepository
 import saien.someday.server.persistence.AuthRepository
 import saien.someday.server.persistence.DatabaseConnectionPool
 import saien.someday.server.persistence.DatabaseMigrator
@@ -14,6 +15,7 @@ import saien.someday.server.persistence.SyncV2Repository
 import saien.someday.server.persistence.SystemV3MediaRepository
 import saien.someday.server.persistence.WorkspaceRecoveryEnvelopeRepository
 import java.time.Instant
+import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 
 class ServerContext(
@@ -31,6 +33,7 @@ class ServerContext(
     val startedAt: Instant,
     private val mediaBlobStoreLifecycle: AutoCloseable? = null,
     private val databaseConnectionPool: AutoCloseable = AutoCloseable {},
+    val accountDataRepository: AccountDataRepository = AccountDataRepository(config),
 ) : AutoCloseable {
     private val closed = AtomicBoolean(false)
 
@@ -49,7 +52,34 @@ class ServerContext(
             var databaseConnectionPool: DatabaseConnectionPool? = null
             try {
                 DatabaseMigrator.migrate(config)
-                if (mediaBlobStore == null) verifyMediaBlobStoreStartup(resolvedMediaBlobStore)
+                if (mediaBlobStore == null) {
+                    verifyMediaBlobStoreStartup(resolvedMediaBlobStore)
+                    if (config.accountResetEnabled || AccountDataRepository(config).hasNonInitialIncarnations()) {
+                        verifyMediaBlobStoreStartup(
+                            resolvedMediaBlobStore,
+                            incarnation = UUID.fromString("00000000-0000-4000-8000-000000000001"),
+                        )
+                    }
+                }
+                val resetStorageReady = AtomicBoolean(config.accountResetEnabled)
+                val verifyResetStorage = {
+                    if (!config.accountResetEnabled) false else {
+                        try {
+                            if (mediaBlobStore == null) {
+                                verifyMediaBlobStoreStartup(resolvedMediaBlobStore)
+                                verifyMediaBlobStoreStartup(
+                                    resolvedMediaBlobStore,
+                                    incarnation = UUID.fromString("00000000-0000-4000-8000-000000000001"),
+                                )
+                            }
+                            resetStorageReady.set(true)
+                            true
+                        } catch (_: Exception) {
+                            resetStorageReady.set(false)
+                            false
+                        }
+                    }
+                }
                 val activeDatabaseConnectionPool = DatabaseConnectionPool.create(config)
                 databaseConnectionPool = activeDatabaseConnectionPool
                 val startedAt = Instant.now()
@@ -70,6 +100,11 @@ class ServerContext(
                         activeDatabaseConnectionPool,
                     ),
                     adminRepository = AdminRepository(config, startedAt, activeDatabaseConnectionPool),
+                    accountDataRepository = AccountDataRepository(
+                        config, activeDatabaseConnectionPool,
+                        readiness = resetStorageReady::get,
+                        verifyReadiness = verifyResetStorage,
+                    ),
                     credentialHasher = credentialHasher,
                     // Unknown accounts verify against the same Argon2 parameters as
                     // real accounts so login timing does not disclose registration.

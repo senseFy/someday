@@ -23,6 +23,9 @@ import saien.someday.data.settings.ClientSettingsRepository
 import saien.someday.data.settings.SqlDelightClientSettingsRepository
 import saien.someday.domain.notes.NotesRepository
 import saien.someday.domain.settings.ClientSettings
+import saien.someday.domain.settings.AccountDataResetManager
+import saien.someday.domain.workspace.WorkspaceProductSnapshot
+import saien.someday.domain.workspace.WorkspaceProductAccess
 import saien.someday.domain.settings.ManualSyncRunner
 import saien.someday.domain.settings.SelfHostedConnectionSwitcher
 import saien.someday.domain.settings.SelfHostedSessionCredentialStore
@@ -36,6 +39,7 @@ import saien.someday.sync.createSystemV3ClientServices
 import saien.someday.sync.selfhosted.IosSelfHostedSyncTransport
 import saien.someday.sync.selfhosted.SelfHostedConnectionSwitchService
 import saien.someday.sync.selfhosted.SelfHostedSetupService
+import saien.someday.sync.selfhosted.SelfHostedAccountResetManager
 import saien.someday.sync.selfhosted.SelfHostedWorkspacePairingService
 import saien.someday.sync.selfhosted.SelfHostedWorkspaceRecoveryService
 import saien.someday.sync.selfhosted.SystemV3MediaCoordinator
@@ -65,10 +69,12 @@ class IosClientRepositories(
     val workspacePairingInvitationJoiner: WorkspacePairingInvitationJoiner,
     val workspacePairingInvitationCanceller: WorkspacePairingInvitationCanceller,
     val workspaceRecoveryManager: WorkspaceRecoveryManager,
+    val accountDataResetManager: AccountDataResetManager,
+    val workspaceProductAccess: WorkspaceProductAccess,
     val localMediaAssetStore: AuthorityCoordinatedMediaAssetStore,
     val mediaCoordinator: SystemV3MediaCoordinator,
     private val localDataExporter: LocalDataExporter,
-    private val dayOneArchiveImporter: (ByteArray, String, saien.someday.data.media.MediaImageNormalizer) -> DayOneImportSummary,
+    private val dayOneArchiveImporter: (ByteArray, String, saien.someday.data.media.MediaImageNormalizer, WorkspaceProductSnapshot?) -> DayOneImportSummary,
     private val driver: NativeSqliteDriver,
     private val selfHostedTransport: IosSelfHostedSyncTransport,
 ) {
@@ -115,8 +121,9 @@ class IosClientRepositories(
     fun importDayOneArchive(
         archiveBytes: ByteArray,
         fallbackJournalTitle: String,
+        expectedWorkspace: WorkspaceProductSnapshot,
     ): SettingsImportSummary =
-        dayOneArchiveImporter(archiveBytes, fallbackJournalTitle, IosMediaImageNormalizer)
+        dayOneArchiveImporter(archiveBytes, fallbackJournalTitle, IosMediaImageNormalizer, expectedWorkspace)
             .toSettingsImportSummary()
 }
 
@@ -235,6 +242,29 @@ private fun assembleIosClientRepositories(
         workspacePairingInvitationJoiner = selfHostedPairingService,
         workspacePairingInvitationCanceller = selfHostedPairingService,
         workspaceRecoveryManager = selfHostedRecoveryService,
+        accountDataResetManager = SelfHostedAccountResetManager(
+            services = systemV3Services,
+            sessionStore = selfHostedSessionCredentialStore,
+            transport = selfHostedTransport,
+            settingsRepository = settingsRepository,
+            workspaceIdProvider = workspaceKeys::workspaceIdOrNull,
+            localDeviceIdProvider = { localRepository.localDeviceId },
+            deviceName = "iOS device",
+            platform = "ios",
+            freshWorkspaceReplacement = { before, after ->
+                workspaceKeys.replaceWithFreshWorkspace(
+                    deviceName = "iOS device",
+                    platform = "ios",
+                    beforeMetadataReplacement = before,
+                    afterMetadataReplacement = after,
+                )
+                Unit
+            },
+            pairing = selfHostedPairingService,
+            recovery = selfHostedRecoveryService,
+            canExportProvider = { workspaceKeys.unlockedOrUnlock() != null },
+        ),
+        workspaceProductAccess = systemV3Services.workspaceProductAccess,
         localMediaAssetStore = systemV3Services.localMediaAssetStore,
         mediaCoordinator = systemV3Services.mediaCoordinator,
         localDataExporter = LocalDataExporter(

@@ -57,12 +57,12 @@ class DayOneWorkspaceImportTest {
             "Place" to ",\"location\":{\"placeName\":\"${"x".repeat(1025)}\"}",
         )) withServices { services ->
             assertFailsWith<IllegalArgumentException> {
-                services.dayOneArchiveImporter(twoNotes(body, extra), "Day One", noNormalization)
+                services.dayOneArchiveImporter(twoNotes(body, extra), "Day One", noNormalization, null)
             }
             assertTrue(services.notesRepository.listNotebooks().isEmpty())
         }
         withServices { services ->
-            val result = services.dayOneArchiveImporter(twoNotes("中".repeat(307200)), "Day One", noNormalization)
+            val result = services.dayOneArchiveImporter(twoNotes("中".repeat(307200)), "Day One", noNormalization, null)
             assertTrue(result.completed)
             assertEquals(2, result.notesCreated)
         }
@@ -85,7 +85,7 @@ class DayOneWorkspaceImportTest {
             }
         }) { services ->
             val archive = twoNotes("Second")
-            val partial = services.dayOneArchiveImporter(archive, "Day One", noNormalization)
+            val partial = services.dayOneArchiveImporter(archive, "Day One", noNormalization, null)
             assertFalse(partial.completed)
             assertEquals(1, partial.notebooksCreated)
             assertEquals(1, partial.notesCreated)
@@ -94,7 +94,7 @@ class DayOneWorkspaceImportTest {
             val note = services.notesRepository.listNotes(notebook.id).single()
             assertEquals("First", services.notesRepository.getNoteDetails(note.id)?.markdownBody)
 
-            val retry = services.dayOneArchiveImporter(archive, "Day One", noNormalization)
+            val retry = services.dayOneArchiveImporter(archive, "Day One", noNormalization, null)
             assertTrue(retry.completed)
             assertEquals(0, retry.notebooksCreated)
             assertEquals(1, retry.notebooksReused)
@@ -106,7 +106,7 @@ class DayOneWorkspaceImportTest {
 
     @Test
     fun productionCompositionImportsAssetsAndDagNotesAndReplaysWithoutDuplicates() = withServices { services ->
-        val first = services.dayOneArchiveImporter(archive(), "Day One", noNormalization)
+        val first = services.dayOneArchiveImporter(archive(), "Day One", noNormalization, null)
         assertEquals(1, first.notesCreated)
         assertEquals(1, first.photosImported)
         val notebook = services.notesRepository.listNotebooks().single { it.title == "Journal" }
@@ -124,7 +124,7 @@ class DayOneWorkspaceImportTest {
         assertTrue(details.markdownBody.startsWith("# Travel\n\nBefore\n\n![Photo](someday-asset://"))
         assertTrue(details.markdownBody.endsWith("\n\nAfter"))
 
-        val replay = services.dayOneArchiveImporter(archive(), "Day One", noNormalization)
+        val replay = services.dayOneArchiveImporter(archive(), "Day One", noNormalization, null)
         assertEquals(0, replay.notesCreated)
         assertEquals(1, replay.notesSkipped)
         assertEquals(1, services.notesRepository.listNotes(notebook.id).size)
@@ -143,7 +143,7 @@ class DayOneWorkspaceImportTest {
     fun corruptImagePayloadStillImportsTextWithARejectedPhoto() = withServices { services ->
         // Valid container and matching export MD5, but invalid compressed image data.
         val corrupt = png.copyOf().also { it[45] = (it[45].toInt() xor 0x7f).toByte() }
-        val result = services.dayOneArchiveImporter(archive(corrupt), "Day One", noNormalization)
+        val result = services.dayOneArchiveImporter(archive(corrupt), "Day One", noNormalization, null)
         assertTrue(result.completed)
         assertEquals(1, result.notesCreated)
         assertEquals(0, result.photosImported)
@@ -200,12 +200,12 @@ class DayOneWorkspaceImportTest {
             }
             withServices(fileSystem = fileSystem) { services ->
                 assertSame(failure, assertFailsWith<IOException>(operation) {
-                    services.dayOneArchiveImporter(zip, "Day One", normalizer)
+                    services.dayOneArchiveImporter(zip, "Day One", normalizer, null)
                 })
                 assertEquals(1, injected)
                 assertTrue(services.notesRepository.listNotebooks().isEmpty())
 
-                val retry = services.dayOneArchiveImporter(zip, "Day One", normalizer)
+                val retry = services.dayOneArchiveImporter(zip, "Day One", normalizer, null)
                 assertTrue(retry.completed)
                 assertEquals(1, retry.notesCreated)
                 assertEquals(1, retry.photosImported)
@@ -232,7 +232,7 @@ class DayOneWorkspaceImportTest {
             val executor = Executors.newFixedThreadPool(2)
             try {
                 val importing = executor.submit {
-                    services.dayOneArchiveImporter(archive(), "Day One", noNormalization)
+                    services.dayOneArchiveImporter(archive(), "Day One", noNormalization, null)
                 }
                 assertTrue(reading.await(5, TimeUnit.SECONDS))
                 val attempted = CountDownLatch(1)

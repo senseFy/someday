@@ -1,6 +1,10 @@
 package saien.someday.server
 
+import java.lang.reflect.InvocationTargetException
+import java.lang.reflect.Proxy
 import java.security.MessageDigest
+import java.sql.Connection
+import java.sql.DriverManager
 import java.sql.SQLException
 import java.util.UUID
 import java.util.concurrent.Executors
@@ -20,6 +24,7 @@ import kotlinx.coroutines.runBlocking
 import org.junit.Rule
 import org.junit.rules.TemporaryFolder
 import saien.someday.server.media.MediaBlobKey
+import saien.someday.server.persistence.DatabaseConnectionProvider
 import saien.someday.server.persistence.SystemV3MediaObjectRecord
 import saien.someday.server.persistence.SystemV3MediaObjectValue
 import saien.someday.server.persistence.SystemV3MediaPutResult
@@ -30,6 +35,7 @@ import saien.someday.server.support.ConcurrentStartGate
 import saien.someday.server.support.ControllableMediaBlobStore
 import saien.someday.server.support.InjectedBlobWriteFailure
 import saien.someday.server.support.PostgresContractFixture
+import saien.someday.server.support.RepeatableReadConnectionProvider
 import saien.someday.server.support.TestServerIdentity
 
 class SystemV3MediaPersistenceContractIntegrationTest {
@@ -64,7 +70,7 @@ class SystemV3MediaPersistenceContractIntegrationTest {
         val missingKey = key(MEDIA_MISSING)
         assertIs<SystemV3MediaPutResult.Stored>(put(MEDIA_MISSING, missingBytes))
         blobStore.drop(missingKey)
-        assertEquals(SystemV3MediaReadResult.Corrupt, repository.headObject(identity.userId, WORKSPACE_ID, MEDIA_MISSING))
+        assertEquals(SystemV3MediaReadResult.Corrupt, repository.headObject(identity.request, WORKSPACE_ID, MEDIA_MISSING))
 
         val missingRepair = assertIs<SystemV3MediaPutResult.Stored>(put(MEDIA_MISSING, missingBytes))
         assertTrue(missingRepair.idempotentReplay)
@@ -74,11 +80,11 @@ class SystemV3MediaPersistenceContractIntegrationTest {
         val corruptKey = key(MEDIA_CORRUPT)
         assertIs<SystemV3MediaPutResult.Stored>(put(MEDIA_CORRUPT, corruptBytes))
         blobStore.replaceWithCorruption(corruptKey, ByteArray(corruptBytes.size) { 99 })
-        assertEquals(SystemV3MediaReadResult.Corrupt, repository.headObject(identity.userId, WORKSPACE_ID, MEDIA_CORRUPT))
+        assertEquals(SystemV3MediaReadResult.Corrupt, repository.headObject(identity.request, WORKSPACE_ID, MEDIA_CORRUPT))
 
         val corruptRepair = assertIs<SystemV3MediaPutResult.Rejected>(put(MEDIA_CORRUPT, corruptBytes))
         assertEquals("immutable_media_mismatch", corruptRepair.error)
-        assertEquals(SystemV3MediaReadResult.Corrupt, repository.headObject(identity.userId, WORKSPACE_ID, MEDIA_CORRUPT))
+        assertEquals(SystemV3MediaReadResult.Corrupt, repository.headObject(identity.request, WORKSPACE_ID, MEDIA_CORRUPT))
         assertContentEquals(ByteArray(corruptBytes.size) { 99 }, blobStore.bytes(corruptKey))
         assertEquals(2L, database.countRows("someday_media_v3_objects", identity.userId, WORKSPACE_ID))
     }
@@ -88,11 +94,15 @@ class SystemV3MediaPersistenceContractIntegrationTest {
         val expected = ByteArray(67) { 7 }
         val mediaKey = key(MEDIA_ORPHAN)
 
+        val failingRepository = SystemV3MediaRepository(
+            database.config,
+            blobStore,
+            failMediaInsertConnections(),
+        )
         assertFailsWith<SQLException> {
-            repository.putObject(
-                identity.userId,
+            failingRepository.putObject(
+                identity.request,
                 WORKSPACE_ID,
-                UUID.randomUUID(),
                 MEDIA_ORPHAN,
                 sha256(expected),
                 expected,
@@ -154,7 +164,7 @@ class SystemV3MediaPersistenceContractIntegrationTest {
         assertEquals("immutable_media_mismatch", rejection.error)
 
         val found = assertIs<SystemV3MediaReadResult.Found<SystemV3MediaObjectValue<SystemV3MediaObjectRecord>>>(
-            repository.readObject(identity.userId, WORKSPACE_ID, MEDIA_CONCURRENT_MISMATCH),
+            repository.readObject(identity.request, WORKSPACE_ID, MEDIA_CONCURRENT_MISMATCH),
         )
         assertTrue(candidates.any { it.contentEquals(found.value.bytes) })
         assertEquals(2L, database.countRows("someday_media_v3_objects", identity.userId, WORKSPACE_ID))
@@ -173,9 +183,8 @@ class SystemV3MediaPersistenceContractIntegrationTest {
         val secondBytes = ByteArray(73) { 9 }
         val first = executor.submit<SystemV3MediaPutResult> {
             lockRepository.putObject(
-                identity.userId,
+                identity.request,
                 WORKSPACE_ID,
-                identity.deviceId,
                 MEDIA_QUOTA_LOCK_FIRST,
                 sha256(firstBytes),
                 firstBytes,
@@ -185,9 +194,8 @@ class SystemV3MediaPersistenceContractIntegrationTest {
             blockingBlobStore.awaitFirstPut()
             val second = executor.submit<SystemV3MediaPutResult> {
                 lockRepository.putObject(
-                    identity.userId,
+                    identity.request,
                     OTHER_WORKSPACE_ID,
-                    identity.deviceId,
                     MEDIA_QUOTA_LOCK_SECOND,
                     sha256(secondBytes),
                     secondBytes,
@@ -204,10 +212,87 @@ class SystemV3MediaPersistenceContractIntegrationTest {
         }
     }
 
+    @Test
+    fun quotaWaiterSeesCommittedUploadDespiteRepeatableReadConnectionDefault() {
+        val applicationName = "rr_quota_${UUID.randomUUID().toString().replace("-", "").take(12)}"
+        val config = database.configWithApplicationName(applicationName)
+        val blockingBlobStore = BlockingFirstPutMediaBlobStore(blobStore)
+        val waitingRepository = SystemV3MediaRepository(
+            config,
+            blockingBlobStore,
+            RepeatableReadConnectionProvider(config),
+        )
+        val firstBytes = ByteArray(600) { 10 }
+        val secondBytes = ByteArray(600) { 11 }
+        val executor = Executors.newFixedThreadPool(2)
+        try {
+            val first = executor.submit<SystemV3MediaPutResult> {
+                waitingRepository.putObject(
+                    identity.request,
+                    WORKSPACE_ID,
+                    MEDIA_QUOTA_LOCK_FIRST,
+                    sha256(firstBytes),
+                    firstBytes,
+                )
+            }
+            blockingBlobStore.awaitFirstPut()
+            val second = executor.submit<SystemV3MediaPutResult> {
+                waitingRepository.putObject(
+                    identity.request,
+                    OTHER_WORKSPACE_ID,
+                    MEDIA_QUOTA_LOCK_SECOND,
+                    sha256(secondBytes),
+                    secondBytes,
+                )
+            }
+
+            // Scope SQL has already run when the waiter reaches its account lock.
+            // A leaked REPEATABLE READ snapshot therefore predates the first commit.
+            database.awaitAdvisoryLockWait(applicationName, second::isDone)
+            blockingBlobStore.releaseFirstPut()
+            assertIs<SystemV3MediaPutResult.Stored>(first.get(30, TimeUnit.SECONDS))
+            val rejected = assertIs<SystemV3MediaPutResult.Rejected>(second.get(30, TimeUnit.SECONDS))
+            assertEquals("media_quota_exceeded", rejected.error)
+            assertEquals(firstBytes.size.toLong(), database.mediaBytes(identity.userId))
+            assertEquals(1L, database.countRows("someday_media_v3_objects", identity.userId, WORKSPACE_ID))
+            assertEquals(0L, database.countRows("someday_media_v3_objects", identity.userId, OTHER_WORKSPACE_ID))
+            assertContentEquals(firstBytes, blobStore.bytes(key(MEDIA_QUOTA_LOCK_FIRST)))
+            assertEquals(
+                null,
+                blobStore.bytes(MediaBlobKey(identity.userId, OTHER_WORKSPACE_ID, MEDIA_QUOTA_LOCK_SECOND)),
+            )
+        } finally {
+            blockingBlobStore.releaseFirstPut()
+            executor.shutdownNow()
+            check(executor.awaitTermination(30, TimeUnit.SECONDS)) { "Quota test workers did not stop." }
+        }
+    }
+
+    private fun failMediaInsertConnections(): DatabaseConnectionProvider = DatabaseConnectionProvider {
+        val delegate = DriverManager.getConnection(
+            database.config.databaseConnectionUrl,
+            database.config.databaseUser,
+            database.config.databasePassword,
+        )
+        Connection::class.java.cast(
+            Proxy.newProxyInstance(Connection::class.java.classLoader, arrayOf(Connection::class.java)) { _, method, args ->
+                if (method.name == "prepareStatement" &&
+                    (args?.firstOrNull() as? String)?.contains("INSERT INTO someday_media_v3_objects") == true
+                ) {
+                    throw SQLException("Injected media metadata failure", "XX000")
+                }
+                try {
+                    method.invoke(delegate, *(args ?: emptyArray()))
+                } catch (failure: InvocationTargetException) {
+                    throw failure.targetException
+                }
+            },
+        )
+    }
+
     private fun put(mediaId: String, bytes: ByteArray) = repository.putObject(
-        identity.userId,
+        identity.request,
         WORKSPACE_ID,
-        identity.deviceId,
         mediaId,
         sha256(bytes),
         bytes,
@@ -217,7 +302,7 @@ class SystemV3MediaPersistenceContractIntegrationTest {
 
     private fun assertReadEquals(mediaId: String, expected: ByteArray) {
         val found = assertIs<SystemV3MediaReadResult.Found<SystemV3MediaObjectValue<SystemV3MediaObjectRecord>>>(
-            repository.readObject(identity.userId, WORKSPACE_ID, mediaId),
+            repository.readObject(identity.request, WORKSPACE_ID, mediaId),
         )
         assertContentEquals(expected, found.value.bytes)
         assertEquals(sha256(expected), found.value.record.ciphertextSha256)

@@ -38,6 +38,23 @@ import saien.someday.sync.WorkspaceLifecycleCoordinator
 
 class SystemV3MediaCoordinatorTest {
     @Test
+    fun incarnationFailureFromGetNeverFallsThroughToPublishLocalBytes() = withStore { fixture ->
+        val imported = fixture.import(IMAGE_BYTES)
+        val backing = InMemoryMediaTransportV3()
+        val transport = object : SelfHostedMediaTransportV3 by backing {
+            override fun getMediaObject(endpoint: String, accessToken: String, workspaceId: String, mediaId: String,
+                accountContext: SelfHostedAccountRequestContext): SelfHostedMediaRemoteObjectV3 =
+                throw SelfHostedSyncHttpException(409, "retired", SelfHostedErrorCode.WORKSPACE_INCARNATION_RETIRED, true)
+        }
+        val failure = assertFailsWith<SelfHostedSyncHttpException> {
+            fixture.coordinator(transport).ensurePublished(setOf(imported.metadata.id))
+        }
+        assertEquals(SelfHostedErrorCode.WORKSPACE_INCARNATION_RETIRED, failure.errorCode)
+        assertEquals(0, backing.puts)
+        assertNull(fixture.store.getAsset(imported.metadata.id)?.publishedObjectDigest)
+    }
+
+    @Test
     fun pendingAssetPublishesOneObjectAndRecordsScopedProof() = withStore { fixture ->
         val imported = fixture.import(IMAGE_BYTES)
         val transport = InMemoryMediaTransportV3()
@@ -105,7 +122,8 @@ class SystemV3MediaCoordinatorTest {
                     accessToken: String,
                     workspaceId: String,
                     mediaId: String,
-                ): SelfHostedMediaRemoteObjectV3 {
+            accountContext: saien.someday.sync.selfhosted.SelfHostedAccountRequestContext,
+        ): SelfHostedMediaRemoteObjectV3 {
                     fetchEntered.countDown()
                     assertTrue(releaseFetch.await(5, TimeUnit.SECONDS))
                     return remote.getMediaObject(endpoint, accessToken, workspaceId, mediaId)

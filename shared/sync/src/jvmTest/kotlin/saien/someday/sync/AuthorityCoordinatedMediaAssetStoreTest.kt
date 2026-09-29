@@ -8,6 +8,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
 import kotlin.test.assertTrue
 import saien.someday.data.local.createSomedayJdbcDriver
@@ -21,6 +23,9 @@ import saien.someday.data.media.MediaAssetInspection
 import saien.someday.data.media.MediaAssetInspector
 import saien.someday.data.media.MediaAssetVerificationResult
 import saien.someday.domain.media.MediaAssetId
+import saien.someday.domain.workspace.WorkspaceProductChangedException
+import saien.someday.domain.workspace.WorkspaceProductReadOnlyException
+import saien.someday.domain.workspace.WorkspaceProductSnapshot
 import okio.Buffer
 import okio.FileSystem
 import okio.ForwardingFileSystem
@@ -166,6 +171,50 @@ class AuthorityCoordinatedMediaAssetStoreTest {
         } finally {
             releaseImport.countDown()
             executor.shutdownNow()
+            driver.close()
+            directory.toFile().deleteRecursively()
+        }
+    }
+
+    @Test
+    fun frozenMediaRemainsReadableButLatePickerAndCleanupCannotMutateIt() {
+        val directory = Files.createTempDirectory("someday-media-product-gate-")
+        val driver = createSomedayJdbcDriver("jdbc:sqlite::memory:")
+        try {
+            val rawStore = LocalMediaAssetStore(
+                database = SomedayDatabase(driver),
+                appPrivateRoot = directory.resolve("private").toString().toPath(),
+                addressingStrategy = MediaAssetAddressingStrategy(MediaAssetId::fromCanonicalValue),
+                inspector = MediaAssetInspector { _, _, declared, _ ->
+                    MediaAssetInspection(checkNotNull(declared), 32, 32)
+                },
+                decodeValidator = MediaAssetDecodeValidator { DecodedMediaAsset(32, 32) },
+            )
+            val lifecycle = WorkspaceLifecycleCoordinator()
+            var frozen = false
+            var identity = WorkspaceProductSnapshot("old", "incarnation", "authority", "writer")
+            val access = CoordinatedWorkspaceProductAccess(lifecycle, { identity }, { frozen })
+            val store = AuthorityCoordinatedMediaAssetStore(rawStore, lifecycle, access)
+            val pickerSnapshot = store.captureWorkspace()
+            val imported = store.importAsset(Buffer().write(IMAGE_BYTES), MediaAssetImportRequest("image/png"), pickerSnapshot)
+            frozen = true
+            assertFailsWith<WorkspaceProductReadOnlyException> {
+                store.importAsset(Buffer().write(IMAGE_BYTES), MediaAssetImportRequest("image/png"), pickerSnapshot)
+            }
+            assertFailsWith<WorkspaceProductReadOnlyException> { store.cleanupOrphans() }
+            assertIs<CoordinatedMediaPreviewReadResult.Loaded>(store.readVerifiedPreview(imported.asset.metadata.id))
+            assertEquals(1, rawStore.listAssets().size)
+
+            // Choosing offline editing unlocks local imports; publication has a separate network gate.
+            frozen = false
+            store.importAsset(Buffer().write(IMAGE_BYTES), MediaAssetImportRequest("image/png"), pickerSnapshot)
+            identity = identity.copy(workspaceId = "replacement")
+            access.invalidate()
+            assertFailsWith<WorkspaceProductChangedException> {
+                store.importAsset(Buffer().write(IMAGE_BYTES), MediaAssetImportRequest("image/png"), pickerSnapshot)
+            }
+            assertEquals(1, rawStore.listAssets().size)
+        } finally {
             driver.close()
             directory.toFile().deleteRecursively()
         }

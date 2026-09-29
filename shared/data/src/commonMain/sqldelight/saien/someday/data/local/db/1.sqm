@@ -1,0 +1,42 @@
+ALTER TABLE sync_local_authority_system_v2
+ADD COLUMN account_incarnation TEXT NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000'
+  CHECK (length(account_incarnation) = 36);
+
+CREATE TABLE account_reset_intents (
+  singleton_id INTEGER NOT NULL PRIMARY KEY CHECK (singleton_id = 1),
+  operation_id TEXT NOT NULL UNIQUE CHECK (length(operation_id) = 36),
+  endpoint TEXT NOT NULL CHECK (length(endpoint) BETWEEN 1 AND 2048),
+  user_id TEXT NOT NULL CHECK (length(user_id) BETWEEN 1 AND 255),
+  expected_incarnation TEXT NOT NULL CHECK (length(expected_incarnation) = 36),
+  original_incarnation TEXT NOT NULL CHECK (length(original_incarnation) = 36),
+  original_workspace_id TEXT NOT NULL,
+  original_writer_id TEXT NOT NULL,
+  consent_target_incarnation TEXT CHECK (consent_target_incarnation IS NULL OR length(consent_target_incarnation) = 36),
+  state TEXT NOT NULL CHECK (state IN ('intent_persisted', 'outcome_unknown', 'remote_committed_local_pending')),
+  earlier_outcome_unknown INTEGER NOT NULL CHECK (earlier_outcome_unknown IN (0, 1)),
+  submission_number INTEGER NOT NULL CHECK (submission_number >= 0),
+  receipt_incarnation TEXT CHECK (receipt_incarnation IS NULL OR length(receipt_incarnation) = 36),
+  receipt_committed_at INTEGER,
+  updated_at INTEGER NOT NULL,
+  CHECK ((receipt_incarnation IS NULL) = (receipt_committed_at IS NULL)),
+  CHECK (state <> 'remote_committed_local_pending' OR receipt_incarnation IS NOT NULL)
+);
+
+CREATE TABLE account_workspace_gates (
+  endpoint TEXT NOT NULL CHECK (length(endpoint) BETWEEN 1 AND 2048),
+  user_id TEXT NOT NULL CHECK (length(user_id) BETWEEN 1 AND 255),
+  workspace_id TEXT NOT NULL,
+  expected_incarnation TEXT NOT NULL CHECK (length(expected_incarnation) = 36),
+  reason TEXT NOT NULL CHECK (reason IN ('reset_required', 'reset_pending', 'outcome_unknown', 'remote_committed')),
+  offline_editing INTEGER NOT NULL CHECK (offline_editing IN (0, 1)),
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY(endpoint, user_id, workspace_id)
+);
+
+CREATE TABLE account_protocol_capabilities (
+  endpoint TEXT NOT NULL CHECK (length(endpoint) BETWEEN 1 AND 2048),
+  user_id TEXT NOT NULL CHECK (length(user_id) BETWEEN 1 AND 255),
+  protocol_version INTEGER NOT NULL CHECK (protocol_version = 1),
+  observed_at INTEGER NOT NULL,
+  PRIMARY KEY(endpoint, user_id)
+);

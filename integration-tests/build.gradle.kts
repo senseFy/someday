@@ -21,6 +21,7 @@ dependencies {
     testImplementation(libs.kotlin.test.junit)
     testImplementation(libs.kotlinx.datetime)
     testImplementation(libs.kotlinx.serialization.json)
+    testImplementation(libs.ktor.client.okhttp)
     testImplementation(libs.postgresql)
     testImplementation(libs.sqldelight.sqlite.driver)
 }
@@ -38,13 +39,25 @@ tasks.named<Test>("test") {
 }
 
 tasks.register<Test>("realRemoteTest") {
-    description = "Runs every real System V3 self-hosted journey; explicit service environment is required."
+    description = "Runs ordinary System V3 self-hosted journeys; reset and restore have separate explicit tasks."
     group = "verification"
     val testSourceSet = sourceSets.test.get()
     testClassesDirs = testSourceSet.output.classesDirs
     classpath = testSourceSet.runtimeClasspath
     include("**/*JourneyTest.class")
     exclude("**/ServerRecoveryJourneyTest.class")
+    exclude("**/AccountResetJourneyTest.class")
+    shouldRunAfter(tasks.test)
+}
+
+tasks.register<Test>("accountResetJourneyTest") {
+    description = "Runs real account-reset clients against an explicitly reset-enabled isolated HTTP server and PostgreSQL."
+    group = "verification"
+    val testSourceSet = sourceSets.test.get()
+    testClassesDirs = testSourceSet.output.classesDirs
+    classpath = testSourceSet.runtimeClasspath
+    include("**/AccountResetJourneyTest.class")
+    outputs.upToDateWhen { false }
     shouldRunAfter(tasks.test)
 }
 

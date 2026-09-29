@@ -1,6 +1,10 @@
 package saien.someday.server.persistence
 
 import saien.someday.server.ServerConfig
+import saien.someday.server.auth.AccountAccess
+import saien.someday.server.auth.AccountError
+import saien.someday.server.auth.AccountProtocolFailure
+import saien.someday.server.auth.AccountRequestContext
 import java.sql.Connection
 import java.sql.PreparedStatement
 import java.sql.ResultSet
@@ -25,6 +29,23 @@ data class DeviceRecord(
     val name: String,
     val platform: String,
     val revokedAt: Instant?,
+    val incarnation: UUID,
+)
+
+class VerifiedPasswordAccount(
+    val userId: UUID,
+    internal val passwordHashSnapshot: String,
+) {
+    override fun toString(): String = "VerifiedPasswordAccount(userId=$userId, passwordHashSnapshot=<redacted>)"
+}
+
+data class SessionIssuanceSnapshot(
+    val userId: UUID,
+    val sessionId: UUID,
+    val deviceId: UUID?,
+    val email: String,
+    val isAdmin: Boolean,
+    val incarnation: UUID,
 )
 
 class DeviceIdAlreadyClaimedException : RuntimeException("Device id is already claimed.")
@@ -49,11 +70,12 @@ data class RefreshSessionSnapshot(
     val email: String,
     val isAdmin: Boolean,
     val deviceId: UUID?,
+    val incarnation: UUID,
 )
 
 data class DeviceSessionRecord(
     val device: DeviceRecord,
-    val sessionId: UUID,
+    val issuance: SessionIssuanceSnapshot,
 )
 
 data class PairingInviteRecord(
@@ -66,6 +88,7 @@ data class PairingInviteRecord(
     val expiresAt: Instant,
     val claimId: String?,
     val claimDeviceId: UUID?,
+    val incarnation: UUID,
 )
 
 sealed interface PairingInviteCreateResult {
@@ -152,18 +175,27 @@ class AuthRepository(
             }
         }
 
-    fun createSessionWithRefreshToken(
+    fun issuePasswordSession(
+        verified: VerifiedPasswordAccount,
         sessionId: UUID = UUID.randomUUID(),
-        userId: UUID,
-        deviceId: UUID?,
         refreshTokenHash: String,
         sessionExpiresAt: Instant,
         refreshExpiresAt: Instant,
-    ): UUID =
-        transaction { connection ->
-            insertSession(connection, sessionId, userId, deviceId, sessionExpiresAt)
+    ): SessionIssuanceSnapshot =
+        AccountAdmission.transaction(connections, listOf(verified.userId)) { connection ->
+            val user = connection.prepareStatement(
+                "SELECT id, email, password_hash, is_admin, disabled_at FROM someday_users WHERE id = ?",
+            ).use { statement ->
+                statement.setObject(1, verified.userId)
+                statement.executeQuery().use { result -> if (result.next()) result.toUserRecord() else null }
+            }
+            if (user == null || user.disabledAt != null || user.passwordHash != verified.passwordHashSnapshot) {
+                throw AccountProtocolFailure(AccountError.UNAUTHORIZED)
+            }
+            val incarnation = AccountAdmission.currentIncarnation(connection, user.id)
+            insertSession(connection, sessionId, user.id, null, incarnation, sessionExpiresAt)
             insertRefreshToken(connection, sessionId, refreshTokenHash, refreshExpiresAt)
-            sessionId
+            SessionIssuanceSnapshot(user.id, sessionId, null, user.email, user.isAdmin, incarnation)
         }
 
     fun rotateRefreshToken(
@@ -171,8 +203,43 @@ class AuthRepository(
         newRefreshTokenHash: String,
         refreshExpiresAt: Instant,
         now: Instant = Instant.now(),
-    ): RefreshSessionSnapshot? =
-        transaction { connection ->
+    ): RefreshSessionSnapshot? {
+        // Resolve only immutable ownership here. The token and authority are
+        // re-read after account admission, before rotating the locked token.
+        val owner = connection().use { connection ->
+            connection.prepareStatement(
+                """
+                SELECT s.user_id
+                FROM someday_refresh_tokens rt
+                JOIN someday_sessions s ON s.id = rt.session_id
+                WHERE rt.token_hash = ?
+                """.trimIndent(),
+            ).use { statement ->
+                statement.setString(1, oldRefreshTokenHash)
+                statement.executeQuery().use { result ->
+                    if (result.next()) result.getObject("user_id", UUID::class.java) else null
+                }
+            }
+        } ?: return null
+        return AccountAdmission.transaction(connections, listOf(owner)) { connection ->
+            val refreshTokenId = connection.prepareStatement(
+                """
+                SELECT rt.id
+                FROM someday_refresh_tokens rt
+                JOIN someday_sessions s ON s.id = rt.session_id
+                WHERE rt.token_hash = ? AND s.user_id = ?
+                FOR UPDATE OF rt
+                """.trimIndent(),
+            ).use { statement ->
+                statement.setString(1, oldRefreshTokenHash)
+                statement.setObject(2, owner)
+                statement.executeQuery().use { result ->
+                    if (result.next()) result.getObject("id", UUID::class.java) else null
+                }
+            } ?: return@transaction null
+            // Use a new READ COMMITTED statement after the token-row wait.
+            // FOR UPDATE refreshes its locked row, not the other joined rows'
+            // statement snapshot; a session/user/device may change while waiting.
             val snapshot = connection.prepareStatement(
                 """
                 SELECT
@@ -184,19 +251,21 @@ class AuthRepository(
                     s.device_id AS device_id,
                     s.expires_at AS session_expires_at,
                     s.revoked_at AS session_revoked_at,
+                    s.data_incarnation AS session_incarnation,
                     u.email AS email,
                     u.is_admin AS is_admin,
                     u.disabled_at AS user_disabled_at,
-                    d.revoked_at AS device_revoked_at
+                    d.revoked_at AS device_revoked_at,
+                    d.data_incarnation AS device_incarnation
                 FROM someday_refresh_tokens rt
                 JOIN someday_sessions s ON s.id = rt.session_id
                 JOIN someday_users u ON u.id = s.user_id
-                LEFT JOIN someday_devices d ON d.id = s.device_id
-                WHERE rt.token_hash = ?
-                FOR UPDATE OF rt
+                LEFT JOIN someday_devices d ON d.id = s.device_id AND d.user_id = s.user_id
+                WHERE rt.id = ? AND s.user_id = ?
                 """.trimIndent(),
             ).use { statement ->
-                statement.setString(1, oldRefreshTokenHash)
+                statement.setObject(1, refreshTokenId)
+                statement.setObject(2, owner)
                 statement.executeQuery().use { result ->
                     if (result.next()) {
                         val refreshExpiresAtCurrent = result.requiredInstant("refresh_expires_at")
@@ -205,21 +274,34 @@ class AuthRepository(
                         val sessionRevokedAt = result.optionalInstant("session_revoked_at")
                         val userDisabledAt = result.optionalInstant("user_disabled_at")
                         val deviceRevokedAt = result.optionalInstant("device_revoked_at")
+                        // Token-row waits can outlast the short account-lock
+                        // budget; expiry must be checked after that wait too.
+                        val checkedAt = maxOf(now, Instant.now())
                         if (
                             refreshRevokedAt == null &&
                             sessionRevokedAt == null &&
                             userDisabledAt == null &&
                             deviceRevokedAt == null &&
-                            refreshExpiresAtCurrent.isAfter(now) &&
-                            sessionExpiresAt.isAfter(now)
+                            refreshExpiresAtCurrent.isAfter(checkedAt) &&
+                            sessionExpiresAt.isAfter(checkedAt)
                         ) {
+                            val incarnation = result.getObject("session_incarnation", UUID::class.java)
+                            val currentIncarnation = AccountAdmission.currentIncarnation(connection, owner)
+                            if (incarnation != currentIncarnation) {
+                                throw AccountProtocolFailure(AccountError.ACCOUNT_SESSION_STALE)
+                            }
+                            val deviceId = result.getObject("device_id") as UUID?
+                            if (deviceId != null && result.getObject("device_incarnation") != currentIncarnation) {
+                                throw AccountProtocolFailure(AccountError.ACCOUNT_INCARNATION_MISMATCH)
+                            }
                             RefreshSessionSnapshot(
                                 refreshTokenId = result.getObject("refresh_token_id", UUID::class.java),
                                 sessionId = result.getObject("session_id", UUID::class.java),
                                 userId = result.getObject("user_id", UUID::class.java),
                                 email = result.getString("email"),
                                 isAdmin = result.getBoolean("is_admin"),
-                                deviceId = result.getObject("device_id") as UUID?,
+                                deviceId = deviceId,
+                                incarnation = incarnation,
                             )
                         } else {
                             null
@@ -240,7 +322,7 @@ class AuthRepository(
             ).use { statement ->
                 statement.setObject(1, replacementId)
                 statement.setObject(2, snapshot.refreshTokenId)
-                statement.executeUpdate()
+                check(statement.executeUpdate() == 1) { "Locked refresh token changed before rotation." }
             }
             insertRefreshToken(
                 connection = connection,
@@ -251,20 +333,23 @@ class AuthRepository(
             )
             snapshot
         }
+    }
 
-    fun revokeSession(sessionId: UUID) {
-        transaction { connection ->
+    fun logout(request: AccountRequestContext) {
+        AccountAdmission.transaction(connections, listOf(request.userId)) { connection ->
+            val admitted = AccountAdmission.admit(connection, request, AccountAccess.ACCOUNT)
             connection.prepareStatement(
                 """
                 UPDATE someday_sessions
                 SET revoked_at = COALESCE(revoked_at, NOW())
-                WHERE id = ?
+                WHERE id = ? AND user_id = ?
                 """.trimIndent(),
             ).use { statement ->
-                statement.setObject(1, sessionId)
+                statement.setObject(1, admitted.sessionId)
+                statement.setObject(2, admitted.userId)
                 statement.executeUpdate()
             }
-            revokeRefreshTokensForSession(connection, sessionId)
+            revokeRefreshTokensForSession(connection, admitted.sessionId)
         }
     }
 
@@ -310,8 +395,15 @@ class AuthRepository(
             }
         }
 
+    fun admitRequest(
+        request: AccountRequestContext,
+        access: AccountAccess = AccountAccess.ACCOUNT,
+    ): AdmittedAccount = AccountAdmission.transaction(connections, listOf(request.userId)) { connection ->
+        AccountAdmission.admit(connection, request, access)
+    }
+
     fun registerDevice(
-        userId: UUID,
+        request: AccountRequestContext,
         deviceId: UUID,
         name: String,
         platform: String,
@@ -319,28 +411,56 @@ class AuthRepository(
         sessionExpiresAt: Instant,
         refreshExpiresAt: Instant,
     ): DeviceSessionRecord =
-        transaction { connection ->
-            val device = claimOrRecoverDevice(connection, deviceId, userId, name, platform)
+        AccountAdmission.transaction(connections, listOf(request.userId)) { connection ->
+            val admitted = AccountAdmission.admit(connection, request, AccountAccess.DEVICES)
+            var device = claimOrRecoverDevice(
+                connection, deviceId, admitted.userId, name, platform, admitted.incarnation,
+            )
+            if (device.incarnation != admitted.incarnation) {
+                if (admitted.deviceId != null) throw AccountProtocolFailure(AccountError.FORBIDDEN)
+                connection.prepareStatement(
+                    """
+                    UPDATE someday_devices SET data_incarnation = ?, name = ?, platform = ?
+                    WHERE id = ? AND user_id = ? AND revoked_at IS NULL
+                    """.trimIndent(),
+                ).use { statement ->
+                    statement.setObject(1, admitted.incarnation)
+                    statement.setString(2, name)
+                    statement.setString(3, platform)
+                    statement.setObject(4, device.id)
+                    statement.setObject(5, admitted.userId)
+                    check(statement.executeUpdate() == 1) { "Locked device enrollment changed." }
+                }
+                device = device.copy(name = name, platform = platform, incarnation = admitted.incarnation)
+            }
             revokeDeviceSessions(
                 connection = connection,
                 deviceId = device.id,
             )
-            val sessionId = insertSession(connection, UUID.randomUUID(), userId, device.id, sessionExpiresAt)
+            val sessionId = insertSession(
+                connection, UUID.randomUUID(), admitted.userId, device.id, admitted.incarnation, sessionExpiresAt,
+            )
             insertRefreshToken(connection, sessionId, refreshTokenHash, refreshExpiresAt)
-            DeviceSessionRecord(device = device, sessionId = sessionId)
+            DeviceSessionRecord(
+                device = device,
+                issuance = SessionIssuanceSnapshot(
+                    admitted.userId, sessionId, device.id, admitted.email, admitted.isAdmin, admitted.incarnation,
+                ),
+            )
         }
 
-    fun listDevices(userId: UUID): List<DeviceRecord> =
-        connection().use { connection ->
+    fun listDevices(request: AccountRequestContext): List<DeviceRecord> =
+        AccountAdmission.transaction(connections, listOf(request.userId)) { connection ->
+            val admitted = AccountAdmission.admit(connection, request, AccountAccess.DEVICES)
             connection.prepareStatement(
                 """
-                SELECT id, user_id, name, platform, revoked_at
+                SELECT id, user_id, name, platform, revoked_at, data_incarnation
                 FROM someday_devices
                 WHERE user_id = ?
                 ORDER BY created_at, id
                 """.trimIndent(),
             ).use { statement ->
-                statement.setObject(1, userId)
+                statement.setObject(1, admitted.userId)
                 statement.executeQuery().use { result ->
                     buildList {
                         while (result.next()) {
@@ -351,8 +471,9 @@ class AuthRepository(
             }
         }
 
-    fun revokeDevice(userId: UUID, deviceId: UUID): Boolean =
-        transaction { connection ->
+    fun revokeDevice(request: AccountRequestContext, deviceId: UUID): Boolean =
+        AccountAdmission.transaction(connections, listOf(request.userId)) { connection ->
+            val admitted = AccountAdmission.admit(connection, request, AccountAccess.DEVICES)
             val updated = connection.prepareStatement(
                 """
                 UPDATE someday_devices
@@ -361,7 +482,7 @@ class AuthRepository(
                 """.trimIndent(),
             ).use { statement ->
                 statement.setObject(1, deviceId)
-                statement.setObject(2, userId)
+                statement.setObject(2, admitted.userId)
                 statement.executeUpdate()
             }
             if (updated == 0) {
@@ -392,32 +513,18 @@ class AuthRepository(
             true
         }
 
-    fun touchDevice(deviceId: UUID) {
-        connection().use { connection ->
-            connection.prepareStatement(
-                """
-                UPDATE someday_devices
-                SET last_seen_at = NOW()
-                WHERE id = ? AND revoked_at IS NULL
-                """.trimIndent(),
-            ).use { statement ->
-                statement.setObject(1, deviceId)
-                statement.executeUpdate()
-            }
-        }
-    }
-
     private fun claimOrRecoverDevice(
         connection: Connection,
         deviceId: UUID,
         userId: UUID,
         name: String,
         platform: String,
+        incarnation: UUID,
     ): DeviceRecord {
         connection.prepareStatement(
             """
-            INSERT INTO someday_devices (id, user_id, name, platform)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO someday_devices (id, user_id, name, platform, data_incarnation)
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT (id) DO NOTHING
             """.trimIndent(),
         ).use { statement ->
@@ -425,11 +532,12 @@ class AuthRepository(
             statement.setObject(2, userId)
             statement.setString(3, name)
             statement.setString(4, platform)
+            statement.setObject(5, incarnation)
             statement.executeUpdate()
         }
         return connection.prepareStatement(
             """
-            SELECT id, user_id, name, platform, revoked_at
+            SELECT id, user_id, name, platform, revoked_at, data_incarnation
             FROM someday_devices
             WHERE id = ?
             FOR UPDATE
@@ -480,18 +588,20 @@ class AuthRepository(
         sessionId: UUID,
         userId: UUID,
         deviceId: UUID?,
+        incarnation: UUID,
         expiresAt: Instant,
     ): UUID {
         connection.prepareStatement(
             """
-            INSERT INTO someday_sessions (id, user_id, device_id, expires_at)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO someday_sessions (id, user_id, device_id, data_incarnation, expires_at)
+            VALUES (?, ?, ?, ?, ?)
             """.trimIndent(),
         ).use { statement ->
             statement.setObject(1, sessionId)
             statement.setObject(2, userId)
             statement.setUuidOrNull(3, deviceId)
-            statement.setInstant(4, expiresAt)
+            statement.setObject(4, incarnation)
+            statement.setInstant(5, expiresAt)
             statement.executeUpdate()
         }
         return sessionId
@@ -543,17 +653,21 @@ class AuthRepository(
     }
 
     fun createWorkspacePairingInvite(
-        userId: UUID,
+        request: AccountRequestContext,
         inviteId: String,
-        creatorDeviceId: UUID,
         envelopeJson: String,
         envelopeDigest: String,
         expiresAt: Instant,
         activeLimit: Int,
     ): PairingInviteCreateResult =
-        transaction { connection ->
-            purgeExpiredWorkspacePairingInvites(connection, userId)
+        AccountAdmission.transaction(connections, listOf(request.userId)) { connection ->
+            val admitted = AccountAdmission.admit(connection, request, AccountAccess.SYNC)
+            val userId = admitted.userId
+            val creatorDeviceId = checkNotNull(admitted.deviceId)
+            lockPairingInvitationCount(connection, userId)
+            purgeExpiredWorkspacePairingInvites(connection, userId, admitted.incarnation)
             selectWorkspacePairingInvite(connection, userId, inviteId, forUpdate = true)?.let { existing ->
+                existing.requireIncarnation(admitted.incarnation)
                 return@transaction existing.asCreateReplayOrConflict(
                     creatorDeviceId = creatorDeviceId,
                     envelopeJson = envelopeJson,
@@ -564,10 +678,12 @@ class AuthRepository(
                 """
                 SELECT COUNT(*)
                 FROM workspace_pairing_invites
-                WHERE user_id = ? AND state IN ('available', 'claimed') AND expires_at > NOW()
+                WHERE user_id = ? AND data_incarnation = ?
+                  AND state IN ('available', 'claimed') AND expires_at > NOW()
                 """.trimIndent(),
             ).use { statement ->
                 statement.setObject(1, userId)
+                statement.setObject(2, admitted.incarnation)
                 statement.executeQuery().use { result ->
                     check(result.next())
                     result.getInt(1)
@@ -579,9 +695,10 @@ class AuthRepository(
             val inserted = connection.prepareStatement(
                 """
                 INSERT INTO workspace_pairing_invites (
-                    user_id, invite_id, creator_device_id, envelope_json, envelope_digest, state, expires_at
+                    user_id, invite_id, creator_device_id, envelope_json, envelope_digest, state, expires_at,
+                    data_incarnation
                 )
-                VALUES (?, ?, ?, ?, ?, 'available', ?)
+                VALUES (?, ?, ?, ?, ?, 'available', ?, ?)
                 ON CONFLICT (user_id, invite_id) DO NOTHING
                 """.trimIndent(),
             ).use { statement ->
@@ -591,6 +708,7 @@ class AuthRepository(
                 statement.setString(4, envelopeJson)
                 statement.setString(5, envelopeDigest)
                 statement.setObject(6, expiresAt.atOffset(ZoneOffset.UTC))
+                statement.setObject(7, admitted.incarnation)
                 statement.executeUpdate()
             }
             if (inserted == 1) {
@@ -598,6 +716,7 @@ class AuthRepository(
             }
             val existing = selectWorkspacePairingInvite(connection, userId, inviteId, forUpdate = true)
                 ?: return@transaction PairingInviteCreateResult.Conflict
+            existing.requireIncarnation(admitted.incarnation)
             existing.asCreateReplayOrConflict(
                 creatorDeviceId = creatorDeviceId,
                 envelopeJson = envelopeJson,
@@ -621,15 +740,18 @@ class AuthRepository(
         }
 
     fun claimWorkspacePairingInvite(
-        userId: UUID,
+        request: AccountRequestContext,
         inviteId: String,
         claimId: String,
-        claimDeviceId: UUID,
         now: Instant,
     ): PairingInviteClaimResult =
-        transaction { connection ->
+        AccountAdmission.transaction(connections, listOf(request.userId)) { connection ->
+            val admitted = AccountAdmission.admit(connection, request, AccountAccess.SYNC)
+            val userId = admitted.userId
+            val claimDeviceId = checkNotNull(admitted.deviceId)
             val existing = selectWorkspacePairingInvite(connection, userId, inviteId, forUpdate = true)
                 ?: return@transaction PairingInviteClaimResult.NotFound
+            existing.requireIncarnation(admitted.incarnation)
             if (!existing.expiresAt.isAfter(now)) {
                 deleteWorkspacePairingInvite(connection, userId, inviteId)
                 return@transaction PairingInviteClaimResult.Expired
@@ -665,15 +787,18 @@ class AuthRepository(
         }
 
     fun completeWorkspacePairingInvite(
-        userId: UUID,
+        request: AccountRequestContext,
         inviteId: String,
         claimId: String,
-        claimDeviceId: UUID,
         now: Instant,
     ): PairingInviteMutationResult =
-        transaction { connection ->
+        AccountAdmission.transaction(connections, listOf(request.userId)) { connection ->
+            val admitted = AccountAdmission.admit(connection, request, AccountAccess.SYNC)
+            val userId = admitted.userId
+            val claimDeviceId = checkNotNull(admitted.deviceId)
             val existing = selectWorkspacePairingInvite(connection, userId, inviteId, forUpdate = true)
                 ?: return@transaction PairingInviteMutationResult.NotFound
+            existing.requireIncarnation(admitted.incarnation)
             if (!existing.expiresAt.isAfter(now)) {
                 deleteWorkspacePairingInvite(connection, userId, inviteId)
                 return@transaction PairingInviteMutationResult.Expired
@@ -702,14 +827,17 @@ class AuthRepository(
         }
 
     fun cancelWorkspacePairingInvite(
-        userId: UUID,
+        request: AccountRequestContext,
         inviteId: String,
-        creatorDeviceId: UUID,
         now: Instant,
     ): PairingInviteMutationResult =
-        transaction { connection ->
+        AccountAdmission.transaction(connections, listOf(request.userId)) { connection ->
+            val admitted = AccountAdmission.admit(connection, request, AccountAccess.SYNC)
+            val userId = admitted.userId
+            val creatorDeviceId = checkNotNull(admitted.deviceId)
             val existing = selectWorkspacePairingInvite(connection, userId, inviteId, forUpdate = true)
                 ?: return@transaction PairingInviteMutationResult.NotFound
+            existing.requireIncarnation(admitted.incarnation)
             if (!existing.expiresAt.isAfter(now)) {
                 deleteWorkspacePairingInvite(connection, userId, inviteId)
                 return@transaction PairingInviteMutationResult.Expired
@@ -747,7 +875,7 @@ class AuthRepository(
         return connection.prepareStatement(
             """
             SELECT user_id, invite_id, creator_device_id, envelope_json, envelope_digest,
-                   state, expires_at, claim_id, claim_device_id
+                   state, expires_at, claim_id, claim_device_id, data_incarnation
             FROM workspace_pairing_invites
             WHERE user_id = ? AND invite_id = ?$lockClause
             """.trimIndent(),
@@ -766,6 +894,7 @@ class AuthRepository(
                     expiresAt = result.requiredInstant("expires_at"),
                     claimId = result.getString("claim_id"),
                     claimDeviceId = result.getObject("claim_device_id", UUID::class.java),
+                    incarnation = result.getObject("data_incarnation", UUID::class.java),
                 )
             }
         }
@@ -785,27 +914,30 @@ class AuthRepository(
         }
     }
 
-    private fun purgeExpiredWorkspacePairingInvites(connection: Connection, userId: UUID) {
+    private fun purgeExpiredWorkspacePairingInvites(connection: Connection, userId: UUID, incarnation: UUID) {
         connection.prepareStatement(
-            "DELETE FROM workspace_pairing_invites WHERE user_id = ? AND expires_at <= NOW()",
+            "DELETE FROM workspace_pairing_invites WHERE user_id = ? AND data_incarnation = ? AND expires_at <= NOW()",
         ).use { statement ->
             statement.setObject(1, userId)
+            statement.setObject(2, incarnation)
             statement.executeUpdate()
         }
     }
 
-    private fun <T> transaction(block: (Connection) -> T): T =
-        connection().use { connection ->
-            connection.autoCommit = false
-            try {
-                val result = block(connection)
-                connection.commit()
-                result
-            } catch (error: Throwable) {
-                connection.rollback()
-                throw error
-            }
+    private fun PairingInviteRecord.requireIncarnation(incarnation: UUID) {
+        if (this.incarnation != incarnation) {
+            throw AccountProtocolFailure(AccountError.ACCOUNT_INCARNATION_MISMATCH)
         }
+    }
+
+    private fun lockPairingInvitationCount(connection: Connection, userId: UUID) {
+        // Only creation needs this narrower count-and-insert serialization;
+        // other account requests retain their shared admission concurrently.
+        connection.prepareStatement("SELECT pg_advisory_xact_lock(hashtext(?))").use { statement ->
+            statement.setString(1, "workspace-pairing-account\u001f$userId")
+            statement.executeQuery().close()
+        }
+    }
 
     private fun connection(): Connection =
         connections.connection()
@@ -826,6 +958,7 @@ class AuthRepository(
             name = getString("name"),
             platform = getString("platform"),
             revokedAt = optionalInstant("revoked_at"),
+            incarnation = getObject("data_incarnation", UUID::class.java),
         )
 
     private fun ResultSet.requiredInstant(column: String): Instant =

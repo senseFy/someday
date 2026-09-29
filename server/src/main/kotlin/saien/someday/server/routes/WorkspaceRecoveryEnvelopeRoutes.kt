@@ -31,7 +31,7 @@ fun Route.workspaceRecoveryEnvelopeRoutes(context: ServerContext) {
             if (!call.requireRateLimit(context, "recovery-envelope-read:${auth.userId}:$deviceId")) return@get
 
             call.response.header(HttpHeaders.CacheControl, "no-store")
-            val record = context.workspaceRecoveryEnvelopeRepository.load(auth.userId)
+            val record = context.workspaceRecoveryEnvelopeRepository.load(auth.requestContext)
                 ?: return@get call.respondError(HttpStatusCode.NotFound, "not_found")
             call.respond(record.toResponse())
         }
@@ -54,8 +54,7 @@ fun Route.workspaceRecoveryEnvelopeRoutes(context: ServerContext) {
             }
             when (
                 val result = context.workspaceRecoveryEnvelopeRepository.put(
-                    userId = auth.userId,
-                    deviceId = deviceId,
+                    request = auth.requestContext,
                     input = WorkspaceRecoveryEnvelopeInput(
                         workspaceId = request.workspaceId,
                         keyFingerprint = request.keyFingerprint,

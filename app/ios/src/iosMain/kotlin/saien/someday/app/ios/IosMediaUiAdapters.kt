@@ -6,6 +6,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import okio.FileSystem
 import okio.Path.Companion.toPath
 import platform.Foundation.NSURL
@@ -21,6 +22,7 @@ import platform.darwin.NSObject
 import saien.someday.data.media.SelectedImageImportException
 import saien.someday.data.media.SelectedImageImportFailureReason
 import saien.someday.data.media.SelectedImageImportRequest
+import saien.someday.domain.workspace.WorkspaceProductSnapshot
 import saien.someday.domain.media.MediaAssetId
 import saien.someday.domain.media.isSafeOriginalFileName
 import saien.someday.sync.AuthorityCoordinatedMediaAssetStore
@@ -36,6 +38,7 @@ internal class IosMediaImportRunner(
     private val store: AuthorityCoordinatedMediaAssetStore,
 ) : MediaImportRunner {
     private var activeDelegate: IosMediaPickerDelegate? = null
+    private var starting = false
 
     @Suppress("UNUSED_PARAMETER")
     override fun start(
@@ -43,29 +46,39 @@ internal class IosMediaImportRunner(
         onResult: (MediaImportUiResult) -> Unit,
     ) {
         val rootController = rootControllerProvider()
-        if (rootController == null || activeDelegate != null) {
+        if (rootController == null || activeDelegate != null || starting) {
             onResult(MediaImportUiResult.Failed(MediaUiFailureReason.Unavailable))
             return
         }
-        val delegate = IosMediaPickerDelegate(store) { result ->
-            activeDelegate = null
-            onResult(result)
+        starting = true
+        CoroutineScope(Dispatchers.Main).launch {
+            val captured = withContext(Dispatchers.Default) { runCatching { store.captureWorkspace() } }
+            starting = false
+            val snapshot = captured.getOrElse {
+                onResult(MediaImportUiResult.Failed(MediaUiFailureReason.ImportFailed))
+                return@launch
+            }
+            val delegate = IosMediaPickerDelegate(store, snapshot) { result ->
+                activeDelegate = null
+                onResult(result)
+            }
+            activeDelegate = delegate
+            val configuration = PHPickerConfiguration().apply {
+                selectionLimit = 1
+                filter = PHPickerFilter.imagesFilter
+                preferredAssetRepresentationMode = PHPickerConfigurationAssetRepresentationModeCompatible
+            }
+            val picker = PHPickerViewController(configuration)
+            picker.delegate = delegate
+            rootController.presentViewController(picker, animated = true, completion = null)
         }
-        activeDelegate = delegate
-        val configuration = PHPickerConfiguration().apply {
-            selectionLimit = 1
-            filter = PHPickerFilter.imagesFilter
-            preferredAssetRepresentationMode = PHPickerConfigurationAssetRepresentationModeCompatible
-        }
-        val picker = PHPickerViewController(configuration)
-        picker.delegate = delegate
-        rootController.presentViewController(picker, animated = true, completion = null)
     }
 }
 
 @OptIn(ExperimentalForeignApi::class)
 private class IosMediaPickerDelegate(
     private val store: AuthorityCoordinatedMediaAssetStore,
+    private val expectedWorkspace: WorkspaceProductSnapshot,
     private val onComplete: (MediaImportUiResult) -> Unit,
 ) : NSObject(), PHPickerViewControllerDelegateProtocol {
     private var completed = false
@@ -89,7 +102,7 @@ private class IosMediaPickerDelegate(
                 } else {
                     // The provider URL is temporary, so the callback waits until
                     // the background import has copied it into app-owned storage.
-                    url.importSelectedImage(store, suggestedName)
+                    url.importSelectedImage(store, suggestedName, expectedWorkspace)
                 }
             }
             completeOnMain(importResult)
@@ -107,6 +120,7 @@ private class IosMediaPickerDelegate(
 private fun NSURL.importSelectedImage(
     store: AuthorityCoordinatedMediaAssetStore,
     suggestedName: String?,
+    expectedWorkspace: WorkspaceProductSnapshot,
 ): MediaImportUiResult {
     val localPath = path ?: return MediaImportUiResult.Failed(MediaUiFailureReason.ImportFailed)
     val originalName = suggestedName ?: lastPathComponent?.takeIf(::isSafeOriginalFileName)
@@ -117,6 +131,7 @@ private fun NSURL.importSelectedImage(
                 source = source,
                 request = SelectedImageImportRequest(originalFileName = originalName),
                 normalizer = IosMediaImageNormalizer,
+                expectedWorkspace = expectedWorkspace,
             )
         } finally {
             source.close()

@@ -46,6 +46,21 @@ class S3MediaBlobStoreIntegrationTest {
     }
 
     @Test
+    fun realServiceSeparatesIncarnationObjectsWithinTheExistingMediaPrefix() {
+        val legacy = uniqueKey("33")
+        val current = legacy.copy(incarnation = UUID.randomUUID())
+        val oldBytes = ByteArray(128) { 4 }
+        val newBytes = ByteArray(128) { 5 }
+        createStore().use { store ->
+            assertEquals(MediaBlobPutResult.Stored(false), store.putImmutable(legacy, oldBytes, sha256(oldBytes)))
+            assertEquals(MediaBlobPutResult.Stored(false), store.putImmutable(current, newBytes, sha256(newBytes)))
+            assertEquals(MediaBlobPutResult.Stored(true), store.putImmutable(current, newBytes, sha256(newBytes)))
+            assertContentEquals(oldBytes, checkNotNull(store.read(legacy, oldBytes.size)).bytes)
+            assertContentEquals(newBytes, checkNotNull(store.read(current, newBytes.size)).bytes)
+        }
+    }
+
+    @Test
     fun existingMetadataCannotHideDivergentPayloadBytes() {
         val key = uniqueKey("22")
         val expected = ByteArray(193) { 23 }

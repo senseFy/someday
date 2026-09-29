@@ -3,6 +3,9 @@ package saien.someday.server.routes
 import saien.someday.server.ServerContext
 import saien.someday.server.api.StatusResponse
 import saien.someday.server.auth.CredentialWorkUnavailableException
+import saien.someday.server.auth.AccountError
+import saien.someday.server.auth.AccountProtocolFailure
+import saien.someday.server.auth.IssuedTokens
 import saien.someday.server.auth.isValidAccountEmail
 import saien.someday.server.auth.isValidAccountPassword
 import saien.someday.server.auth.normalizeAccountEmail
@@ -16,6 +19,7 @@ import saien.someday.server.persistence.AdminSyncActivitySummary
 import saien.someday.server.persistence.AdminUserDetail
 import saien.someday.server.persistence.AdminUserSummary
 import saien.someday.server.persistence.UserRecord
+import saien.someday.server.persistence.VerifiedPasswordAccount
 import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
@@ -83,15 +87,16 @@ fun Route.adminRoutes(context: ServerContext) {
                 return@post
             }
 
-            val tokens = context.issueAdminBrowserSession(user)
-            call.setAdminAccessCookie(context, tokens.accessToken, tokens.expiresInSeconds)
+            val issued = context.issueAdminBrowserSession(user)
+            call.respondAccountIncarnation(issued.incarnation)
+            call.setAdminAccessCookie(context, issued.tokens.accessToken, issued.tokens.expiresInSeconds)
             call.respondRedirect("/admin")
         }
 
         post("/logout") {
             if (!call.requireAdminPostOrigin(context)) return@post
             val admin = call.requireAdmin(context) ?: return@post
-            context.repository.revokeSession(admin.sessionId)
+            context.repository.logout(admin.requestContext)
             call.clearAdminAccessCookie(context)
             if (call.wantsJson()) {
                 call.respond(StatusResponse(status = "ok"))
@@ -101,28 +106,28 @@ fun Route.adminRoutes(context: ServerContext) {
         }
 
         get {
-            call.requireAdmin(context) ?: return@get
-            call.respondHtml(dashboardPage(context.adminRepository.dashboard()))
+            val admin = call.requireAdmin(context) ?: return@get
+            call.respondHtml(dashboardPage(context.adminRepository.dashboard(admin.requestContext)))
         }
 
         get("/users") {
-            call.requireAdmin(context) ?: return@get
-            call.respondHtml(usersPage(context.adminRepository.listUsers()))
+            val admin = call.requireAdmin(context) ?: return@get
+            call.respondHtml(usersPage(context.adminRepository.listUsers(admin.requestContext)))
         }
 
         get("/users/{id}") {
-            call.requireAdmin(context) ?: return@get
+            val admin = call.requireAdmin(context) ?: return@get
             val userId = call.uuidParameter("id") ?: return@get call.respondError(HttpStatusCode.NotFound, "not_found")
-            val detail = context.adminRepository.userDetail(userId)
+            val detail = context.adminRepository.userDetail(admin.requestContext, userId)
                 ?: return@get call.respondError(HttpStatusCode.NotFound, "not_found")
             call.respondHtml(userDetailPage(detail))
         }
 
         post("/users/{id}/disable") {
             if (!call.requireAdminPostOrigin(context)) return@post
-            call.requireAdmin(context) ?: return@post
+            val admin = call.requireAdmin(context) ?: return@post
             val userId = call.uuidParameter("id") ?: return@post call.respondError(HttpStatusCode.NotFound, "not_found")
-            if (!context.adminRepository.disableUser(userId)) {
+            if (!context.adminRepository.disableUser(admin.requestContext, userId)) {
                 call.respondError(HttpStatusCode.NotFound, "not_found")
                 return@post
             }
@@ -131,9 +136,9 @@ fun Route.adminRoutes(context: ServerContext) {
 
         post("/sessions/{id}/revoke") {
             if (!call.requireAdminPostOrigin(context)) return@post
-            call.requireAdmin(context) ?: return@post
+            val admin = call.requireAdmin(context) ?: return@post
             val sessionId = call.uuidParameter("id") ?: return@post call.respondError(HttpStatusCode.NotFound, "not_found")
-            if (!context.adminRepository.revokeSession(sessionId)) {
+            if (!context.adminRepository.revokeSession(admin.requestContext, sessionId)) {
                 call.respondError(HttpStatusCode.NotFound, "not_found")
                 return@post
             }
@@ -141,15 +146,15 @@ fun Route.adminRoutes(context: ServerContext) {
         }
 
         get("/devices") {
-            call.requireAdmin(context) ?: return@get
-            call.respondHtml(devicesPage(context.adminRepository.listDevices()))
+            val admin = call.requireAdmin(context) ?: return@get
+            call.respondHtml(devicesPage(context.adminRepository.listDevices(admin.requestContext)))
         }
 
         post("/devices/{id}/revoke") {
             if (!call.requireAdminPostOrigin(context)) return@post
-            call.requireAdmin(context) ?: return@post
+            val admin = call.requireAdmin(context) ?: return@post
             val deviceId = call.uuidParameter("id") ?: return@post call.respondError(HttpStatusCode.NotFound, "not_found")
-            if (!context.adminRepository.revokeDevice(deviceId)) {
+            if (!context.adminRepository.revokeDevice(admin.requestContext, deviceId)) {
                 call.respondError(HttpStatusCode.NotFound, "not_found")
                 return@post
             }
@@ -157,18 +162,18 @@ fun Route.adminRoutes(context: ServerContext) {
         }
 
         get("/storage") {
-            call.requireAdmin(context) ?: return@get
-            call.respondHtml(storagePage(context.adminRepository.storage()))
+            val admin = call.requireAdmin(context) ?: return@get
+            call.respondHtml(storagePage(context.adminRepository.storage(admin.requestContext)))
         }
 
         get("/activity") {
-            call.requireAdmin(context) ?: return@get
-            call.respondHtml(syncActivityPage(context.adminRepository.syncActivity()))
+            val admin = call.requireAdmin(context) ?: return@get
+            call.respondHtml(syncActivityPage(context.adminRepository.syncActivity(admin.requestContext)))
         }
 
         get("/health") {
-            call.requireAdmin(context) ?: return@get
-            call.respondHtml(healthPage(context.adminRepository.health()))
+            val admin = call.requireAdmin(context) ?: return@get
+            call.respondHtml(healthPage(context.adminRepository.health(admin.requestContext)))
         }
     }
 }
@@ -183,24 +188,25 @@ private val AdminSecurityHeaders = createRouteScopedPlugin("AdminSecurityHeaders
     }
 }
 
-private fun ServerContext.issueAdminBrowserSession(user: UserRecord): saien.someday.server.auth.IssuedTokens {
-    val sessionId = UUID.randomUUID()
-    val tokens = tokenService.issueTokens(
-        userId = user.id,
-        sessionId = sessionId,
-        deviceId = null,
-        isAdmin = true,
-        scopes = scopesForDevice(null),
-    )
-    repository.createSessionWithRefreshToken(
-        sessionId = sessionId,
-        userId = user.id,
-        deviceId = null,
-        refreshTokenHash = tokens.refreshTokenHash,
+private data class AdminBrowserSession(val tokens: IssuedTokens, val incarnation: UUID)
+
+private fun ServerContext.issueAdminBrowserSession(user: UserRecord): AdminBrowserSession {
+    val refresh = tokenService.issueRefreshToken()
+    val issued = repository.issuePasswordSession(
+        verified = VerifiedPasswordAccount(user.id, user.passwordHash),
+        refreshTokenHash = refresh.refreshTokenHash,
         sessionExpiresAt = Instant.now().plus(config.refreshTokenTtl),
         refreshExpiresAt = Instant.now().plus(config.refreshTokenTtl),
     )
-    return tokens
+    if (!issued.isAdmin) throw AccountProtocolFailure(AccountError.FORBIDDEN)
+    val tokens = tokenService.issueTokens(
+        userId = issued.userId,
+        sessionId = issued.sessionId,
+        deviceId = issued.deviceId,
+        isAdmin = issued.isAdmin,
+        scopes = scopesForDevice(issued.deviceId),
+    ).copy(refreshToken = refresh.refreshToken, refreshTokenHash = refresh.refreshTokenHash)
+    return AdminBrowserSession(tokens, issued.incarnation)
 }
 
 private suspend fun ApplicationCall.requireAdmin(context: ServerContext): AuthenticatedCall? {
@@ -332,8 +338,8 @@ private fun dashboardPage(snapshot: AdminDashboardSnapshot): String =
         metric("Disabled users", snapshot.disabledUsers)
         metric("Devices", snapshot.totalDevices)
         metric("Revoked devices", snapshot.revokedDevices)
-        metric("Encrypted objects", snapshot.encryptedObjects)
-        metric("Accepted changes", snapshot.acceptedChanges)
+        metric("Active encrypted objects", snapshot.encryptedObjects)
+        metric("Active accepted changes", snapshot.acceptedChanges)
         appendLine("</div>")
         appendLine("</section>")
     }
@@ -385,7 +391,7 @@ private fun userDetailPage(detail: AdminUserDetail): String =
             appendLine("<tr>")
             appendLine("<td><code>${session.id}</code></td>")
             appendLine("<td>${session.deviceName?.escapeHtml() ?: "account session"}</td>")
-            appendLine("<td>${if (session.revokedAt == null) "active" else "revoked"}</td>")
+            appendLine("<td>${if (session.revokedAt != null) "revoked" else if (!session.isCurrentIncarnation) "retired" else "active"}</td>")
             appendLine("<td>${formatInstant(session.expiresAt)}</td>")
             appendLine("<td>${session.activeRefreshTokens}</td>")
             appendLine("<td>${revokeSessionForm(session)}</td>")
@@ -411,7 +417,7 @@ private fun devicesTable(devices: List<AdminDeviceSummary>): String =
             appendLine("<td>${device.ownerEmail.escapeHtml()}</td>")
             appendLine("<td>${device.name.escapeHtml()}</td>")
             appendLine("<td>${device.platform.escapeHtml()}</td>")
-            appendLine("<td>${if (device.revokedAt == null) "active" else "revoked"}</td>")
+            appendLine("<td>${if (device.revokedAt != null) "revoked" else if (!device.isCurrentIncarnation) "retired" else "active"}</td>")
             appendLine("<td>${device.lastSyncCursor?.let { "cursor $it" } ?: formatInstant(device.lastSeenAt)}</td>")
             appendLine("<td>${device.objectCount}</td>")
             appendLine("<td>${revokeDeviceForm(device)}</td>")
@@ -425,9 +431,9 @@ private fun storagePage(storage: AdminStorageSummary): String =
         appendLine("<section class=\"card\">")
         appendLine("<h2>Storage</h2>")
         appendLine("<div class=\"metrics\">")
-        metric("Encrypted objects", storage.encryptedObjects)
-        metric("Encrypted bytes", storage.encryptedBytes)
-        metric("Changes", storage.changes)
+        metric("Active encrypted objects", storage.encryptedObjects)
+        metric("Active encrypted bytes", storage.encryptedBytes)
+        metric("Active changes", storage.changes)
         appendLine("</div>")
         appendLine("</section>")
 
@@ -455,7 +461,7 @@ private fun syncActivityPage(activity: AdminSyncActivitySummary): String =
         appendLine("<section class=\"card\">")
         appendLine("<h2>Sync activity</h2>")
         appendLine("<div class=\"metrics\">")
-        metric("Accepted changes", activity.acceptedChanges)
+        metric("Active accepted changes", activity.acceptedChanges)
         appendLine("</div>")
         appendLine("<table><thead><tr><th>Time</th><th>User</th><th>Device</th><th>Object</th><th>Mutation</th><th>Cursor</th></tr></thead><tbody>")
         activity.entries.forEach { entry ->

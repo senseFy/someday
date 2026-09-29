@@ -38,96 +38,142 @@ import kotlinx.coroutines.sync.withLock
 class RefreshingSelfHostedSessionExecutor(
     private val authenticationTransport: SelfHostedSyncTransport,
     private val sessionStore: SelfHostedSessionCredentialStore,
+    private val protocol1Known: (String, String) -> Boolean = { _, _ -> false },
+    private val verifyLegacy: (saien.someday.domain.settings.SelfHostedSessionCredentials) -> Boolean = { false },
+    private val onIssuance: (saien.someday.domain.settings.SelfHostedSessionCredentials) -> Unit = {},
+    private val onAccountFailure: (String, String, SelfHostedAccountRequestContext, SelfHostedSyncHttpException) -> Unit = { _, _, _, _ -> },
 ) {
     private val refreshMutex = Mutex()
+
+    fun isVerifiedLegacy(credentials: saien.someday.domain.settings.SelfHostedSessionCredentials): Boolean =
+        credentials.accountProtocolVersion == null && !protocol1Known(credentials.endpoint, credentials.userId) && verifyLegacy(credentials)
 
     fun <T> authorized(
         endpoint: String,
         authenticatedUserId: String,
         suppliedToken: String,
-        request: (String) -> T,
+        accountContext: SelfHostedAccountRequestContext = SelfHostedAccountRequestContext(),
+        request: (String, SelfHostedAccountRequestContext) -> T,
     ): T {
         val expectedBinding = selfHostedAuthorityBindingId(endpoint, authenticatedUserId)
-        val firstToken = sessionStore.load()
-            ?.takeIf { it.authorityBindingId == expectedBinding }
-            ?.accessToken
-            ?: suppliedToken
-        return try {
-            request(firstToken)
+        var effectiveContext = accountContext.copy(protocol1Known = accountContext.protocol1Known || protocol1Known(endpoint, authenticatedUserId))
+        fun reject(code: SelfHostedErrorCode): Nothing = throw SelfHostedSyncHttpException(
+            code.statuses.first(), "Self-hosted session authority changed; credentials redacted.", code, protocol1 = true,
+        )
+        fun currentCredentials() = sessionStore.load()?.takeIf { it.authorityBindingId == expectedBinding }
+            ?: sessionStore.loadForAuthority(expectedBinding)
+        fun requireIncarnation(credentials: saien.someday.domain.settings.SelfHostedSessionCredentials) {
+            if (credentials.accountIncarnation != accountContext.accountIncarnation) reject(SelfHostedErrorCode.ACCOUNT_INCARNATION_MISMATCH)
+        }
+        fun <R> observed(action: () -> R): R = try {
+            action()
         } catch (failure: SelfHostedSyncHttpException) {
-            if (failure.status != 401) throw failure
-            val retryToken = runBlocking {
-                refreshMutex.withLock {
-                    val current = sessionStore.load()
-                        ?.takeIf { it.authorityBindingId == expectedBinding }
-                        ?: throw SelfHostedSyncHttpException(
-                            401,
-                            "Self-hosted account session is missing; credentials redacted.",
+            if (failure.protocol1) effectiveContext = effectiveContext.copy(protocol1Known = true)
+            onAccountFailure(endpoint, authenticatedUserId, effectiveContext, failure)
+            throw failure
+        }
+        val initial = observed { currentCredentials()?.also(::requireIncarnation) }
+        if (initial?.accountProtocolVersion == 1) effectiveContext = effectiveContext.copy(protocol1Known = true)
+        // Verification is tied to the same credential, before an ordinary legacy
+        // 401 can permit a refresh. Unknown authority is never legacy evidence.
+        val verifiedLegacy = observed { initial?.let { !effectiveContext.protocol1Known && isVerifiedLegacy(it) } == true }
+        effectiveContext = effectiveContext.copy(protocol1Known = effectiveContext.protocol1Known || protocol1Known(endpoint, authenticatedUserId))
+        val firstToken = initial?.accessToken ?: suppliedToken
+        return try {
+            observed { request(firstToken, effectiveContext) }
+        } catch (failure: SelfHostedSyncHttpException) {
+            val refreshable = failure.status == 401 && (
+                failure.errorCode == SelfHostedErrorCode.UNAUTHORIZED ||
+                    (failure.errorCode == null && !effectiveContext.protocol1Known && verifiedLegacy)
+                )
+            if (!refreshable) throw failure
+            val retryToken = observed {
+                runBlocking {
+                    refreshMutex.withLock {
+                        val current = currentCredentials() ?: reject(SelfHostedErrorCode.UNAUTHORIZED)
+                        requireIncarnation(current)
+                        if (current.accessToken != firstToken) return@withLock current.accessToken
+                        val refreshed = authenticationTransport.refresh(
+                            current.endpoint, SelfHostedRefreshRequest(current.refreshToken), effectiveContext,
                         )
-                    if (current.accessToken != firstToken) {
-                        return@withLock current.accessToken
-                    }
-                    val refreshed = authenticationTransport.refresh(
-                        current.endpoint,
-                        SelfHostedRefreshRequest(current.refreshToken),
-                    )
-                    if (refreshed.user.id != current.userId) {
-                        throw SelfHostedSyncHttpException(
-                            401,
-                            "Self-hosted refresh changed the authenticated account; credentials redacted.",
+                        if (refreshed.user.id != current.userId) reject(SelfHostedErrorCode.UNAUTHORIZED)
+                        val issuedIncarnation = refreshed.accountIncarnation
+                        if (issuedIncarnation == null && (effectiveContext.protocol1Known || !verifiedLegacy)) {
+                            throw SelfHostedProtocolException(SelfHostedProtocolFailureReason.MISSING_ISSUANCE_HEADER)
+                        }
+                        if (issuedIncarnation != null && issuedIncarnation != current.accountIncarnation) {
+                            reject(SelfHostedErrorCode.ACCOUNT_INCARNATION_MISMATCH)
+                        }
+                        // Login, replacement or logout may have finished while
+                        // refresh was in flight. Never overwrite their credentials.
+                        val latest = currentCredentials() ?: reject(SelfHostedErrorCode.UNAUTHORIZED)
+                        if (latest != current) {
+                            requireIncarnation(latest)
+                            effectiveContext = effectiveContext.copy(protocol1Known = effectiveContext.protocol1Known || latest.accountProtocolVersion == 1)
+                            return@withLock latest.accessToken
+                        }
+                        val updated = current.copy(
+                            userEmail = refreshed.user.email,
+                            accessToken = refreshed.accessToken,
+                            refreshToken = refreshed.refreshToken,
+                            accountIncarnation = issuedIncarnation ?: current.accountIncarnation,
+                            accountProtocolVersion = refreshed.accountProtocolVersion ?: current.accountProtocolVersion,
                         )
+                        onIssuance(updated)
+                        sessionStore.saveForAuthority(expectedBinding, updated)
+                        if (sessionStore.load()?.authorityBindingId == expectedBinding) sessionStore.save(updated)
+                        if (updated.accountProtocolVersion == 1) effectiveContext = effectiveContext.copy(protocol1Known = true)
+                        updated.accessToken
                     }
-                    val updated = current.copy(
-                        userEmail = refreshed.user.email,
-                        accessToken = refreshed.accessToken,
-                        refreshToken = refreshed.refreshToken,
-                    )
-                    sessionStore.saveForAuthority(expectedBinding, updated)
-                    sessionStore.save(updated)
-                    updated.accessToken
                 }
             }
-            request(retryToken)
+            // Exactly one replay, retaining the attempt's captured incarnation.
+            observed { request(retryToken, effectiveContext) }
         }
     }
 }
 
 interface SelfHostedSyncTransportV2 {
-    fun v2Capabilities(endpoint: String, accessToken: String): SelfHostedV2CapabilitiesResponse
-    fun v2Epoch(endpoint: String, accessToken: String, workspaceId: String): SelfHostedV2EpochResponse
+    fun v2Capabilities(endpoint: String, accessToken: String, accountContext: SelfHostedAccountRequestContext = SelfHostedAccountRequestContext()): SelfHostedV2CapabilitiesResponse
+    fun v2Epoch(endpoint: String, accessToken: String, workspaceId: String, accountContext: SelfHostedAccountRequestContext = SelfHostedAccountRequestContext()): SelfHostedV2EpochResponse
     fun v2PutCheckpointChunk(
         endpoint: String,
         accessToken: String,
         request: SelfHostedV2CheckpointChunkRequest,
+        accountContext: SelfHostedAccountRequestContext = SelfHostedAccountRequestContext(),
     ): SelfHostedV2ImmutablePutResponse
 
     fun v2PutCheckpointManifest(
         endpoint: String,
         accessToken: String,
         request: SelfHostedV2CheckpointManifestRequest,
+        accountContext: SelfHostedAccountRequestContext = SelfHostedAccountRequestContext(),
     ): SelfHostedV2ImmutablePutResponse
 
     fun v2FetchCheckpoint(
         endpoint: String,
         accessToken: String,
         request: SelfHostedV2CheckpointFetchRequest,
+        accountContext: SelfHostedAccountRequestContext = SelfHostedAccountRequestContext(),
     ): SelfHostedV2CheckpointFetchResponse
 
     fun v2CompareAndSetEpoch(
         endpoint: String,
         accessToken: String,
         request: SelfHostedV2EpochCompareAndSetRequest,
+        accountContext: SelfHostedAccountRequestContext = SelfHostedAccountRequestContext(),
     ): SelfHostedV2EpochCompareAndSetResponse
 
     fun v2CleanupCheckpointDraft(
         endpoint: String,
         accessToken: String,
         request: SelfHostedV2CheckpointCleanupRequest,
+        accountContext: SelfHostedAccountRequestContext = SelfHostedAccountRequestContext(),
     ): SelfHostedV2CheckpointCleanupResponse
 
-    fun v2Push(endpoint: String, accessToken: String, request: SelfHostedV2PushRequest): SelfHostedV2PushResponse
-    fun v2Pull(endpoint: String, accessToken: String, request: SelfHostedV2PullRequest): SelfHostedV2PullResponse
-    fun v2Frontiers(endpoint: String, accessToken: String, request: SelfHostedV2FrontierRequest): SelfHostedV2FrontierResponse
+    fun v2Push(endpoint: String, accessToken: String, request: SelfHostedV2PushRequest, accountContext: SelfHostedAccountRequestContext = SelfHostedAccountRequestContext()): SelfHostedV2PushResponse
+    fun v2Pull(endpoint: String, accessToken: String, request: SelfHostedV2PullRequest, accountContext: SelfHostedAccountRequestContext = SelfHostedAccountRequestContext()): SelfHostedV2PullResponse
+    fun v2Frontiers(endpoint: String, accessToken: String, request: SelfHostedV2FrontierRequest, accountContext: SelfHostedAccountRequestContext = SelfHostedAccountRequestContext()): SelfHostedV2FrontierResponse
 }
 
 class RefreshingSelfHostedSyncTransportV2(
@@ -135,33 +181,46 @@ class RefreshingSelfHostedSyncTransportV2(
     private val sessionExecutor: RefreshingSelfHostedSessionExecutor,
     private val authenticatedUserId: String,
 ) : SelfHostedSyncTransportV2 {
-    override fun v2Capabilities(endpoint: String, accessToken: String) =
-        authorized(endpoint, accessToken) { delegate.v2Capabilities(endpoint, it) }
-    override fun v2Epoch(endpoint: String, accessToken: String, workspaceId: String) =
-        authorized(endpoint, accessToken) { delegate.v2Epoch(endpoint, it, workspaceId) }
-    override fun v2PutCheckpointChunk(endpoint: String, accessToken: String, request: SelfHostedV2CheckpointChunkRequest) =
-        authorized(endpoint, accessToken) { delegate.v2PutCheckpointChunk(endpoint, it, request) }
-    override fun v2PutCheckpointManifest(endpoint: String, accessToken: String, request: SelfHostedV2CheckpointManifestRequest) =
-        authorized(endpoint, accessToken) { delegate.v2PutCheckpointManifest(endpoint, it, request) }
-    override fun v2FetchCheckpoint(endpoint: String, accessToken: String, request: SelfHostedV2CheckpointFetchRequest) =
-        authorized(endpoint, accessToken) { delegate.v2FetchCheckpoint(endpoint, it, request) }
-    override fun v2CompareAndSetEpoch(endpoint: String, accessToken: String, request: SelfHostedV2EpochCompareAndSetRequest) =
-        authorized(endpoint, accessToken) { delegate.v2CompareAndSetEpoch(endpoint, it, request) }
-    override fun v2CleanupCheckpointDraft(
-        endpoint: String,
-        accessToken: String,
-        request: SelfHostedV2CheckpointCleanupRequest,
-    ) = authorized(endpoint, accessToken) { delegate.v2CleanupCheckpointDraft(endpoint, it, request) }
-    override fun v2Push(endpoint: String, accessToken: String, request: SelfHostedV2PushRequest) =
-        authorized(endpoint, accessToken) { delegate.v2Push(endpoint, it, request) }
-    override fun v2Pull(endpoint: String, accessToken: String, request: SelfHostedV2PullRequest) =
-        authorized(endpoint, accessToken) { delegate.v2Pull(endpoint, it, request) }
-    override fun v2Frontiers(endpoint: String, accessToken: String, request: SelfHostedV2FrontierRequest) =
-        authorized(endpoint, accessToken) { delegate.v2Frontiers(endpoint, it, request) }
-
-    private fun <T> authorized(endpoint: String, suppliedToken: String, request: (String) -> T): T {
-        return sessionExecutor.authorized(endpoint, authenticatedUserId, suppliedToken, request)
-    }
+    override fun v2Capabilities(endpoint: String, accessToken: String, accountContext: SelfHostedAccountRequestContext) =
+        sessionExecutor.authorized(endpoint, authenticatedUserId, accessToken, accountContext) { token, context ->
+            delegate.v2Capabilities(endpoint, token, context)
+        }
+    override fun v2Epoch(endpoint: String, accessToken: String, workspaceId: String, accountContext: SelfHostedAccountRequestContext) =
+        sessionExecutor.authorized(endpoint, authenticatedUserId, accessToken, accountContext) { token, context ->
+            delegate.v2Epoch(endpoint, token, workspaceId, context)
+        }
+    override fun v2PutCheckpointChunk(endpoint: String, accessToken: String, request: SelfHostedV2CheckpointChunkRequest, accountContext: SelfHostedAccountRequestContext) =
+        sessionExecutor.authorized(endpoint, authenticatedUserId, accessToken, accountContext) { token, context ->
+            delegate.v2PutCheckpointChunk(endpoint, token, request, context)
+        }
+    override fun v2PutCheckpointManifest(endpoint: String, accessToken: String, request: SelfHostedV2CheckpointManifestRequest, accountContext: SelfHostedAccountRequestContext) =
+        sessionExecutor.authorized(endpoint, authenticatedUserId, accessToken, accountContext) { token, context ->
+            delegate.v2PutCheckpointManifest(endpoint, token, request, context)
+        }
+    override fun v2FetchCheckpoint(endpoint: String, accessToken: String, request: SelfHostedV2CheckpointFetchRequest, accountContext: SelfHostedAccountRequestContext) =
+        sessionExecutor.authorized(endpoint, authenticatedUserId, accessToken, accountContext) { token, context ->
+            delegate.v2FetchCheckpoint(endpoint, token, request, context)
+        }
+    override fun v2CompareAndSetEpoch(endpoint: String, accessToken: String, request: SelfHostedV2EpochCompareAndSetRequest, accountContext: SelfHostedAccountRequestContext) =
+        sessionExecutor.authorized(endpoint, authenticatedUserId, accessToken, accountContext) { token, context ->
+            delegate.v2CompareAndSetEpoch(endpoint, token, request, context)
+        }
+    override fun v2CleanupCheckpointDraft(endpoint: String, accessToken: String, request: SelfHostedV2CheckpointCleanupRequest, accountContext: SelfHostedAccountRequestContext) =
+        sessionExecutor.authorized(endpoint, authenticatedUserId, accessToken, accountContext) { token, context ->
+            delegate.v2CleanupCheckpointDraft(endpoint, token, request, context)
+        }
+    override fun v2Push(endpoint: String, accessToken: String, request: SelfHostedV2PushRequest, accountContext: SelfHostedAccountRequestContext) =
+        sessionExecutor.authorized(endpoint, authenticatedUserId, accessToken, accountContext) { token, context ->
+            delegate.v2Push(endpoint, token, request, context)
+        }
+    override fun v2Pull(endpoint: String, accessToken: String, request: SelfHostedV2PullRequest, accountContext: SelfHostedAccountRequestContext) =
+        sessionExecutor.authorized(endpoint, authenticatedUserId, accessToken, accountContext) { token, context ->
+            delegate.v2Pull(endpoint, token, request, context)
+        }
+    override fun v2Frontiers(endpoint: String, accessToken: String, request: SelfHostedV2FrontierRequest, accountContext: SelfHostedAccountRequestContext) =
+        sessionExecutor.authorized(endpoint, authenticatedUserId, accessToken, accountContext) { token, context ->
+            delegate.v2Frontiers(endpoint, token, request, context)
+        }
 }
 
 @Serializable
@@ -338,16 +397,18 @@ class SelfHostedSyncRemoteV2(
     private val workspaceKey: WorkspaceMasterKey,
     private val accessTokenProvider: () -> String,
     private val transport: SelfHostedSyncTransportV2,
+    private val accountContext: SelfHostedAccountRequestContext = SelfHostedAccountRequestContext(),
 ) : WorkspaceSyncRemoteV2 {
     private val endpoint = normalizeSelfHostedEndpoint(endpoint)
     init {
         require(SELF_HOSTED_WORKSPACE_ID.matches(workspaceId)) { "Invalid workspace scope." }
     }
+    override val accountIncarnation: String get() = accountContext.accountIncarnation
     override val remoteProfile: String = SyncRemoteProfileV2.SELF_HOSTED.wireValue
     override val authorityBindingId: String = selfHostedAuthorityBindingId(this.endpoint, authenticatedUserId)
 
     override fun capabilities(): WorkspaceSyncCapabilitiesV2 {
-        val value = transport.v2Capabilities(endpoint, token())
+        val value = transport.v2Capabilities(endpoint, token(), accountContext)
         if (value.parentIndexedMetadata) error("Initial V2 profile must keep parent metadata opaque.")
         return WorkspaceSyncCapabilitiesV2(
             value.profile, value.contractId, value.semanticProtocolVersion, value.schemaSetVersion,
@@ -356,7 +417,7 @@ class SelfHostedSyncRemoteV2(
         )
     }
 
-    override fun loadEpochPointer(): EncryptedWorkspaceObjectV2? = transport.v2Epoch(endpoint, token(), workspaceId).pointer
+    override fun loadEpochPointer(): EncryptedWorkspaceObjectV2? = transport.v2Epoch(endpoint, token(), workspaceId, accountContext).pointer
 
     override fun fetchCheckpoint(
         pointer: EncryptedWorkspaceObjectV2,
@@ -365,8 +426,7 @@ class SelfHostedSyncRemoteV2(
         val manifestValue = transport.v2FetchCheckpoint(
             endpoint, token(), SelfHostedV2CheckpointFetchRequest(
                 descriptor.syncEpochId, descriptor.checkpointId, workspaceId = workspaceId,
-            ),
-        )
+            ), accountContext = accountContext)
         val manifestOuter = requireNotNull(manifestValue.manifest) {
             "Self-hosted V2 checkpoint manifest response is incomplete."
         }
@@ -389,8 +449,7 @@ class SelfHostedSyncRemoteV2(
                     descriptor.checkpointId,
                     chunkIndex = ref.chunkIndex,
                     workspaceId = workspaceId,
-                ),
-            )
+                ), accountContext = accountContext)
             require(value.manifest == null) { "Chunk fetch returned an unexpected checkpoint manifest." }
             requireNotNull(value.chunk) { "Self-hosted V2 checkpoint chunk ${ref.chunkIndex} is missing." }
         }
@@ -404,8 +463,7 @@ class SelfHostedSyncRemoteV2(
     ): WorkspaceImmutablePutResultV2 = transport.v2PutCheckpointChunk(
         endpoint, token(), SelfHostedV2CheckpointChunkRequest(
             descriptor.syncEpochId, descriptor.checkpointId, ref, chunk, workspaceId,
-        ),
-    ).toDomain()
+        ), accountContext = accountContext).toDomain()
 
     override fun putCheckpointManifest(
         descriptor: SyncEpochDescriptorV2,
@@ -431,8 +489,7 @@ class SelfHostedSyncRemoteV2(
                 decoded.totalObjectCount,
                 manifest,
                 workspaceId,
-            ),
-        )
+            ), accountContext = accountContext)
         return bundle.toDomain()
     }
 
@@ -446,8 +503,7 @@ class SelfHostedSyncRemoteV2(
         endpoint, token(), SelfHostedV2CheckpointManifestRequest(
             descriptor.syncEpochId, descriptor.checkpointId, descriptor.checkpointDigest,
             chunks, totalObjectCount, manifest, workspaceId,
-        ),
-    ).toDomain()
+        ), accountContext = accountContext).toDomain()
 
     override fun compareAndSetEpochPointer(
         descriptor: SyncEpochDescriptorV2,
@@ -457,8 +513,7 @@ class SelfHostedSyncRemoteV2(
         val response = transport.v2CompareAndSetEpoch(
             endpoint, token(), SelfHostedV2EpochCompareAndSetRequest(
                 expectedCurrentDigest, descriptor.toWire(pointer.objectDigest), pointer, workspaceId,
-            ),
-        )
+            ), accountContext = accountContext)
         return when {
             response.published -> WorkspacePointerPublishResultV2.Published(response.idempotentReplay)
             response.error == "epoch_pointer_compare_and_set_failed" ->
@@ -488,8 +543,7 @@ class SelfHostedSyncRemoteV2(
                 previousPointerDigest = draft.pointer.previousPointerDigest,
                 chunks = draft.chunks.map { it.ref },
                 workspaceId = workspaceId,
-            ),
-        )
+            ), accountContext = accountContext)
         return if (response.deleted) {
             WorkspaceCheckpointDraftCleanupResultV2.Deleted(response.alreadyAbsent)
         } else {
@@ -504,8 +558,7 @@ class SelfHostedSyncRemoteV2(
         val value = transport.v2Pull(
             endpoint, token(), SelfHostedV2PullRequest(
                 syncEpochId, cursors["global"]?.toLongOrNull(), limit, workspaceId,
-            ),
-        )
+            ), accountContext = accountContext)
         return WorkspaceSyncPullResultV2(
             value.units.map { unit ->
                 WorkspaceEncryptedCursorUnitV2(
@@ -520,8 +573,7 @@ class SelfHostedSyncRemoteV2(
 
     override fun push(syncEpochId: String, objects: List<EncryptedWorkspaceObjectV2>): WorkspaceSyncPushResultV2 {
         val value = transport.v2Push(
-            endpoint, token(), SelfHostedV2PushRequest(syncEpochId, MINIMUM_WRITER_VERSION_V2, objects, workspaceId),
-        )
+            endpoint, token(), SelfHostedV2PushRequest(syncEpochId, MINIMUM_WRITER_VERSION_V2, objects, workspaceId), accountContext = accountContext)
         return if (value.accepted) WorkspaceSyncPushResultV2.Accepted(value.acknowledgements.map {
             WorkspaceMutationAckV2(it.mutationId, it.objectId, it.objectDigest, it.idempotentReplay)
         }) else WorkspaceSyncPushResultV2.Rejected(
@@ -530,8 +582,7 @@ class SelfHostedSyncRemoteV2(
     }
 
     override fun epochFrontiers(syncEpochId: String): List<SyncStreamFrontierV2> = transport.v2Frontiers(
-        endpoint, token(), SelfHostedV2FrontierRequest(syncEpochId, workspaceId),
-    ).frontiers.map { SyncStreamFrontierV2(it.streamId, it.cursorValue, it.streamDigest) }.sortedBy { it.streamId }
+        endpoint, token(), SelfHostedV2FrontierRequest(syncEpochId, workspaceId), accountContext = accountContext).frontiers.map { SyncStreamFrontierV2(it.streamId, it.cursorValue, it.streamDigest) }.sortedBy { it.streamId }
 
 
     private fun token(): String = accessTokenProvider().takeIf(String::isNotBlank)

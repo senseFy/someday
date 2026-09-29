@@ -42,7 +42,7 @@ fun Route.deviceRoutes(context: ServerContext) {
             val refreshToken = context.tokenService.issueRefreshToken()
             val deviceSession = try {
                 context.repository.registerDevice(
-                    userId = auth.userId,
+                    request = auth.requestContext,
                     deviceId = requestedDeviceId,
                     name = deviceName,
                     platform = platform,
@@ -58,12 +58,13 @@ fun Route.deviceRoutes(context: ServerContext) {
                 return@post
             }
             val tokens = context.tokenService.issueTokens(
-                userId = auth.userId,
-                sessionId = deviceSession.sessionId,
+                userId = deviceSession.issuance.userId,
+                sessionId = deviceSession.issuance.sessionId,
                 deviceId = deviceSession.device.id,
-                isAdmin = auth.isAdmin,
+                isAdmin = deviceSession.issuance.isAdmin,
                 scopes = scopesForDevice(deviceSession.device.id),
             )
+            call.respondAccountIncarnation(deviceSession.issuance.incarnation)
             call.respond(
                 DeviceRegistrationResponse(
                     device = deviceSession.device.toResponse(),
@@ -78,7 +79,7 @@ fun Route.deviceRoutes(context: ServerContext) {
             val auth = call.requireAuthenticated(context, requiredScope = "devices") ?: return@get
             call.respond(
                 DevicesResponse(
-                    devices = context.repository.listDevices(auth.userId).map { it.toResponse() },
+                    devices = context.repository.listDevices(auth.requestContext).map { it.toResponse() },
                 ),
             )
         }
@@ -90,7 +91,7 @@ fun Route.deviceRoutes(context: ServerContext) {
                 call.respondError(HttpStatusCode.NotFound, "not_found")
                 return@delete
             }
-            val revoked = context.repository.revokeDevice(auth.userId, deviceId)
+            val revoked = context.repository.revokeDevice(auth.requestContext, deviceId)
             if (!revoked) {
                 call.respondError(HttpStatusCode.NotFound, "not_found")
                 return@delete

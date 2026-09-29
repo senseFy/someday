@@ -26,6 +26,13 @@ recovery without exposing a real user's code.
 From the second server release onward, release acceptance includes an actual
 upgrade of non-empty data from the immediately preceding version.
 
+V10 introduces account incarnation admission. Logical reset remains off unless
+explicitly enabled; V11 adds operator reclamation verification context.
+It preserves existing data as G0. Upgrade validation includes a nonempty V9→V10
+fixture and unchanged legacy clients. After a future reset release, drain every
+pre-incarnation server process before enabling reset; startup version refusal
+cannot stop an older process already running.
+
 ## Failed upgrade
 
 Stop the new server before deciding how to recover. If its migration did not

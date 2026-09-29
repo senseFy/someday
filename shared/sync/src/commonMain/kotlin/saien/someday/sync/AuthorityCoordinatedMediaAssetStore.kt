@@ -15,6 +15,9 @@ import saien.someday.data.media.SelectedImageImportRequest
 import saien.someday.domain.media.MAX_MEDIA_ASSET_ENCODED_BYTE_COUNT
 import saien.someday.domain.media.MAX_MEDIA_ASSET_PIXEL_COUNT
 import saien.someday.domain.media.MediaAssetId
+import saien.someday.domain.workspace.UnrestrictedWorkspaceProductAccess
+import saien.someday.domain.workspace.WorkspaceProductAccess
+import saien.someday.domain.workspace.WorkspaceProductSnapshot
 
 sealed interface CoordinatedMediaPreviewReadResult {
     class Loaded(bytes: ByteArray) : CoordinatedMediaPreviewReadResult {
@@ -40,24 +43,31 @@ sealed interface CoordinatedMediaPreviewReadResult {
 class AuthorityCoordinatedMediaAssetStore internal constructor(
     private val delegate: LocalMediaAssetStore,
     private val workspaceLifecycleCoordinator: WorkspaceLifecycleCoordinator,
+    private val workspaceProductAccess: WorkspaceProductAccess = UnrestrictedWorkspaceProductAccess,
 ) {
+    /** Capture on an IO dispatcher before opening a picker, then pass it to the eventual import. */
+    fun captureWorkspace(): WorkspaceProductSnapshot = workspaceProductAccess.capture()
+
     fun getAsset(assetId: MediaAssetId): LocalMediaAsset? = delegate.getAsset(assetId)
 
     fun importAsset(
         source: Source,
         request: MediaAssetImportRequest,
-    ): MediaAssetImportResult = localMutation { importAsset(source, request) }
+        expectedWorkspace: WorkspaceProductSnapshot? = null,
+    ): MediaAssetImportResult = productMutation(expectedWorkspace) { importAsset(source, request) }
 
     fun importAsset(
         request: MediaAssetImportRequest,
+        expectedWorkspace: WorkspaceProductSnapshot? = null,
         write: (BufferedSink) -> Unit,
-    ): MediaAssetImportResult = localMutation { importAsset(request, write) }
+    ): MediaAssetImportResult = productMutation(expectedWorkspace) { importAsset(request, write) }
 
     fun importSelectedImage(
         source: Source,
         request: SelectedImageImportRequest,
         normalizer: MediaImageNormalizer,
-    ): MediaAssetImportResult = localMutation { importSelectedImage(source, request, normalizer) }
+        expectedWorkspace: WorkspaceProductSnapshot? = null,
+    ): MediaAssetImportResult = productMutation(expectedWorkspace) { importSelectedImage(source, request, normalizer) }
 
     fun verifyAsset(assetId: MediaAssetId): MediaAssetVerificationResult =
         localMutation { verifyAsset(assetId) }
@@ -103,10 +113,20 @@ class AuthorityCoordinatedMediaAssetStore internal constructor(
         }
     }
 
-    fun cleanupOrphans(orphanedBefore: Instant): MediaAssetCleanupResult =
-        localMutation { cleanupOrphans(orphanedBefore) }
+    fun cleanupOrphans(
+        orphanedBefore: Instant,
+        expectedWorkspace: WorkspaceProductSnapshot? = null,
+    ): MediaAssetCleanupResult = productMutation(expectedWorkspace) { cleanupOrphans(orphanedBefore) }
 
-    fun cleanupOrphans(): MediaAssetCleanupResult = localMutation { cleanupOrphans() }
+    fun cleanupOrphans(expectedWorkspace: WorkspaceProductSnapshot? = null): MediaAssetCleanupResult =
+        productMutation(expectedWorkspace) { cleanupOrphans() }
+
+    private fun <T> productMutation(
+        expectedWorkspace: WorkspaceProductSnapshot?,
+        block: LocalMediaAssetStore.() -> T,
+    ): T = workspaceLifecycleCoordinator.productAccess {
+        workspaceProductAccess.mutate(expectedWorkspace) { delegate.block() }
+    }
 
     internal fun listAssetsPendingPublication(
         authorityBindingId: String,

@@ -37,17 +37,35 @@ class SelfHostedSetupService(
                             SelfHostedSetupReason.EndpointMismatch,
                         )
                     }
-                    val credentials = SelfHostedSyncClient(
-                        endpoint = binding.endpoint,
-                        transport = transport,
-                    ).loginAndReconnectBound(
-                        email = sanitized.email,
-                        password = sanitized.password,
-                        deviceName = sanitized.deviceName,
-                        platform = sanitized.platform,
-                        expectedUserId = binding.authenticatedUserId,
-                        stableDeviceId = requirement.localWriterDeviceId,
-                    ).toCredentials()
+                    val credentials = try {
+                        SelfHostedSyncClient(
+                            endpoint = binding.endpoint,
+                            transport = transport,
+                            accountContext = SelfHostedAccountRequestContext(
+                                requirement.accountIncarnation,
+                                requirement.accountIncarnation != saien.someday.domain.settings.INITIAL_ACCOUNT_INCARNATION ||
+                                    sessionStore.loadForAuthority(requirement.authorityBindingId)?.accountProtocolVersion == 1 ||
+                                    activeWorkspaceSessionGuard.protocol1Known(binding.endpoint, binding.authenticatedUserId),
+                            ),
+                            protocol1Known = activeWorkspaceSessionGuard.protocol1Known,
+                            onProtocol1 = activeWorkspaceSessionGuard.onProtocol1,
+                        ).loginAndReconnectBound(
+                            email = sanitized.email,
+                            password = sanitized.password,
+                            deviceName = sanitized.deviceName,
+                            platform = sanitized.platform,
+                            expectedUserId = binding.authenticatedUserId,
+                            stableDeviceId = requirement.localWriterDeviceId,
+                            expectedAccountIncarnation = requirement.accountIncarnation,
+                        ).toCredentials()
+                    } catch (failure: SelfHostedSyncHttpException) {
+                        if (failure.indicatesRetiredAccountIncarnation()) {
+                            // Freeze the original bound copy before a waiting replacement
+                            // can acquire the shared lifecycle boundary.
+                            activeWorkspaceSessionGuard.markCurrentIncarnationMismatch()
+                        }
+                        throw failure
+                    }
                     activeWorkspaceSessionGuard.requireCompatible(credentials)
                     sessionStore.saveForAuthority(requirement.authorityBindingId, credentials)
                     sessionStore.save(credentials)
@@ -63,6 +81,8 @@ class SelfHostedSetupService(
                 val client = SelfHostedSyncClient(
                     endpoint = sanitized.endpoint,
                     transport = transport,
+                    protocol1Known = activeWorkspaceSessionGuard.protocol1Known,
+                    onProtocol1 = activeWorkspaceSessionGuard.onProtocol1,
                 )
                 val session = if (sanitized.createAccount) {
                     client.registerAndConnect(
@@ -94,11 +114,22 @@ class SelfHostedSetupService(
                 )
             }
         }.getOrElse { failure ->
+            if (failure.indicatesRetiredAccountIncarnation()) {
+                return@getOrElse SelfHostedSetupResult.failure(SelfHostedSetupReason.AccountIncarnationMismatch)
+            }
             SelfHostedSetupResult.failure(
                 reason = SelfHostedSetupReason.Failed,
                 diagnosticMessage =
                     "Self-hosted setup failed: ${failure.message ?: "unknown error"}; password/token values redacted.",
             )
+        }
+
+    private fun Throwable.indicatesRetiredAccountIncarnation(): Boolean =
+        this is SelfHostedSyncHttpException && when (errorCode) {
+            SelfHostedErrorCode.ACCOUNT_SESSION_STALE,
+            SelfHostedErrorCode.ACCOUNT_INCARNATION_MISMATCH,
+            -> true
+            else -> false
         }
 
     private fun readyResult(

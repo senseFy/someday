@@ -43,6 +43,7 @@ The repository root retains project entry points and policies such as
 | [Entity DAG V2 subsystem](specs/sync-system-v2-spec.md) | Active internal DAG protocol; not an obsolete product mode. |
 | [Self-hosted media V3](specs/self-hosted-media-v3.md) | Encrypted media objects, publication and bounds. |
 | [Workspace pairing](specs/workspace-pairing-protocol.md) | Device-to-device workspace joining and replacement. |
+| [Account incarnation admission](specs/account-data-reset-protocol.md) | Account admission, logical reset, protocol metadata and reclamation contract. |
 | [Workspace recovery](specs/workspace-recovery-protocol.md) | Recovery codes, envelopes and workspace replacement. |
 | [Day One import](specs/day-one-import.md) | Supported export/import compatibility profile. |
 | [Server storage architecture](specs/server-storage-architecture.md) | Persistence topology and storage/security boundaries. |
@@ -58,6 +59,7 @@ The repository root retains project entry points and policies such as
 | [Self-hosting](guides/self-hosting.md) | Deployment overview and production configuration. |
 | [Standalone deployment](guides/self-hosting-standalone.md) | Single-host Docker setup. |
 | [External storage deployment](guides/self-hosting-external.md) | External PostgreSQL and S3-compatible media. |
+| [Account reset maintenance](guides/account-data-reset-maintenance.md) | Reset opt-in, retired-data cleanup, certification and restore invalidation. |
 | [Server backup and recovery](guides/server-backup-and-recovery.md) | Coordinated database/media recovery. |
 | [Server upgrades](guides/server-upgrades.md) | Upgrade and rollback procedure. |
 | [Server release](guides/server-release.md) | Maintainer image and deployment-bundle publication. |
@@ -68,3 +70,5 @@ The repository root retains project entry points and policies such as
 | Document | Remaining work |
 | --- | --- |
 | [Client image support](plans/client-image-support-plan.md) | **Draft:** legacy acceptance status needs confirmation; implementation and automated gates are recorded complete, while real-client UI acceptance remains before release. |
+| [Account data reset design](plans/account-data-reset/design.md) | **Accepted:** prerequisite and Stages A/B1/B2/C/D verified; Stage E local verification recorded, release acceptance pending. |
+| [Account data reset implementation and review](plans/account-data-reset/implementation.md) | **Accepted:** local Stage E evidence recorded; provider certification, released-client evidence and coordinated rollout remain; reset defaults off. |

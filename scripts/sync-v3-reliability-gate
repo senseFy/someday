@@ -39,6 +39,8 @@ MINIO_ROOT_USER="someday_minio_admin"
 MINIO_ROOT_PASSWORD="gate-minio-admin-only-password"
 MINIO_APP_USER="someday_s3_app"
 MINIO_APP_PASSWORD="gate-s3-app-only-password"
+MINIO_MAINTENANCE_USER="someday_s3_maintenance"
+MINIO_MAINTENANCE_PASSWORD="gate-s3-maintenance-only-password"
 MINIO_BUCKET="someday-media"
 SERVER_PID=""
 SERVER_JWT_SECRET=""
@@ -373,6 +375,7 @@ docker run --rm \
     --network "$NETWORK_NAME" \
     --entrypoint /bin/sh \
     --volume "$ROOT_DIR/scripts/fixtures/minio-media-policy.json:/policy.json:ro" \
+    --volume "$ROOT_DIR/scripts/fixtures/minio-media-maintenance-policy.json:/maintenance-policy.json:ro" \
     --volume "$MINIO_CERT_DIR/public.crt:/root/.mc/certs/CAs/someday-gate.crt:ro" \
     "$MINIO_MC_IMAGE" \
     -c "mc alias set gate https://$MINIO_NAME:9000 '$MINIO_ROOT_USER' '$MINIO_ROOT_PASSWORD' >/dev/null && \
@@ -380,7 +383,10 @@ docker run --rm \
         mc version enable gate/$MINIO_BUCKET >/dev/null && \
         mc admin user add gate '$MINIO_APP_USER' '$MINIO_APP_PASSWORD' >/dev/null && \
         mc admin policy create gate someday-media-app /policy.json >/dev/null && \
-        mc admin policy attach gate someday-media-app --user '$MINIO_APP_USER' >/dev/null"
+        mc admin policy attach gate someday-media-app --user '$MINIO_APP_USER' >/dev/null && \
+        mc admin user add gate '$MINIO_MAINTENANCE_USER' '$MINIO_MAINTENANCE_PASSWORD' >/dev/null && \
+        mc admin policy create gate someday-media-maintenance /maintenance-policy.json >/dev/null && \
+        mc admin policy attach gate someday-media-maintenance --user '$MINIO_MAINTENANCE_USER' >/dev/null"
 
 docker exec "$POSTGRES_NAME" psql \
     --username "$POSTGRES_ADMIN_USER" \
@@ -446,6 +452,8 @@ phase "self-hosted-postgresql-integration" env \
 phase "self-hosted-s3-integration" env \
     SOMEDAY_S3_TEST_ENDPOINT="$MINIO_ENDPOINT" \
     SOMEDAY_S3_TEST_BUCKET="$MINIO_BUCKET" \
+    SOMEDAY_S3_MAINTENANCE_TEST_ACCESS_KEY_ID="$MINIO_MAINTENANCE_USER" \
+    SOMEDAY_S3_MAINTENANCE_TEST_SECRET_ACCESS_KEY="$MINIO_MAINTENANCE_PASSWORD" \
     SOMEDAY_S3_TEST_REGION=us-east-1 \
     AWS_ACCESS_KEY_ID="$MINIO_APP_USER" \
     AWS_SECRET_ACCESS_KEY="$MINIO_APP_PASSWORD" \

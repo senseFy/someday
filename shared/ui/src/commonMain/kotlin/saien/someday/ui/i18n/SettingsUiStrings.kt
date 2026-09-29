@@ -5,6 +5,7 @@ package saien.someday.ui.i18n
  * Defaults are English for unit tests; production injects composeResources values.
  */
 data class SettingsUiStrings(
+    val accountReset: AccountResetUiStrings = AccountResetUiStrings(),
     val themeUpdated: String = "Theme updated.",
     val languageUpdated: String = "Language updated.",
     val previewUpdated: String = "Preview preference updated.",

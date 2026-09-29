@@ -40,7 +40,9 @@ a server storage and authorization scope.
 
 The current clients expose one active local workspace. The protocol and server
 schema scope records by `(account, workspaceId)`, and account quotas apply
-across all workspaces owned by that account. Separately, an account may have one
+across all workspaces in that account’s active incarnation.
+Server admission is defined by the [account incarnation contract](account-data-reset-protocol.md);
+server reset defaults off until compatible client rollout and operator opt-in. Separately, an account may have one
 current recovery envelope selecting one already initialized workspace. Older
 workspace data may remain stored, but it is not another discoverable recovery
 candidate.
@@ -67,10 +69,14 @@ revoked device is never resurrected. Registration never allocates a replacement
 writer behind the client's back; the client rejects a response containing
 another UUID.
 
-After first publication, the client persists the exact account, workspace, and
-writer binding. Entity publication, media access, setup reuse, pairing, and
-recovery-envelope replacement all fail before network mutation if the current
-session does not match it. Server session and device-token revocation are
+After first publication, the client persists the exact account, account
+incarnation, workspace, and writer binding. The incarnation is independent of
+the DAG's local generation. Ordinary entity publication, media access, setup
+reuse, pairing, and recovery-envelope replacement fail before network mutation
+if the current session does not match it. Explicit account-reset rejoin is a
+separate path: a durable gate, fresh consent for the exact old copy and verified
+current incarnation permit enrollment and replacement without publishing old
+content through the new session. Server session and device-token revocation are
 supported. Master-key rotation and cryptographic device revocation are not
 currently supported.
 
@@ -78,6 +84,16 @@ An expired or missing refresh session does not strand the workspace. Explicit
 setup may authenticate again only at the bound endpoint, must recover the same
 server `userId` before any device mutation, and then re-registers the exact
 stable non-revoked writer UUID. A revoked device remains revoked.
+
+Issuing credentials must also match the persisted account incarnation before
+ordinary renewal registers that writer. A mismatch durably gates old content
+and preserves the local copy. Shared reset intent/reconciliation and strict
+protocol fallback are defined by the [account incarnation contract](account-data-reset-protocol.md#shared-client-authority-and-failure-handling).
+The shared account-reset UI keeps remote completion separate from explicit local
+discard/rejoin. Product mutations honor the durable read-only/offline gate;
+queued UI/import results are scoped to the captured workspace and incarnation.
+The [product workflow](account-data-reset-protocol.md#product-workflow-and-workspace-replacement)
+owns these rules. Rollout remains pending; reset is disabled by default.
 
 Switching to another endpoint or account is a separate, explicitly confirmed
 operation. An unbound local draft retains its contents and only forgets the
@@ -98,6 +114,15 @@ Product code reads and writes notes, notebooks, deletions, and synchronized
 preferences through typed DAG repositories. A durable outbox records remote
 work in the same local transaction as each mutation. UI and platform workers
 do not write protocol or projection tables directly.
+
+Product operations, synchronization's local commits, and durable account-state
+writes share the product-access boundary. Its synchronous lock permits
+same-thread reentry for account callbacks during pointer commit. Lock order is
+workspace lifecycle, product access, then SQLite transaction; product access
+must not acquire the outer lifecycle lock. Local bookkeeping waits for a product
+transaction to finish rather than competing with its read-to-write transition.
+Upload, pull and push remain outside these local-write sections; the existing
+final snapshot/pointer-CAS/activation barrier is retained.
 
 Android foreground startup and background reminders share one application-owned
 client service graph. Its synchronized, off-main-thread initialization covers

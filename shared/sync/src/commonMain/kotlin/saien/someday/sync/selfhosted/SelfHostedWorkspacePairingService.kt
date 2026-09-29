@@ -12,6 +12,9 @@ import saien.someday.domain.settings.normalizeSelfHostedEndpoint
 import saien.someday.domain.settings.WorkspaceJoinPackageProvider
 import saien.someday.domain.settings.WorkspaceJoinResult
 import saien.someday.domain.settings.WorkspaceJoiner
+import saien.someday.domain.settings.WorkspaceJoinPackage
+import saien.someday.domain.settings.WorkspaceJoinAuthorityCapture
+import saien.someday.domain.settings.authorityBindingId
 import saien.someday.domain.settings.WorkspacePairingInvitation
 import saien.someday.domain.settings.WorkspacePairingInvitationCanceller
 import saien.someday.domain.settings.WorkspacePairingInvitationCreator
@@ -83,7 +86,7 @@ class SelfHostedWorkspacePairingService(
                 packageData = packageData,
             )
             val response = try {
-                sessionExecutor.authorized(session.endpoint, session.userId, session.accessToken) { accessToken ->
+                sessionExecutor.authorized(session.endpoint, session.userId, session.accessToken, session.accountRequestContext()) { accessToken, accountContext ->
                     transport.createPairingInvite(
                         endpoint = session.endpoint,
                         accessToken = accessToken,
@@ -93,10 +96,14 @@ class SelfHostedWorkspacePairingService(
                             envelopeDigest = encoded.digest,
                             expiresAtEpochMillis = requestedExpiry,
                         ),
+                        accountContext = accountContext,
                     )
                 }
             } catch (error: SelfHostedSyncHttpException) {
-                if (error.status == 409) return@repeat
+                if (activeWorkspaceSessionGuard.recordAccountFailure(session.toCredentials(), error)) {
+                    return WorkspacePairingInvitationResult.failure(WorkspacePairingReason.AuthorityMismatch)
+                }
+                if (error.isPairingBusiness(SelfHostedErrorCode.PAIRING_CONFLICT, 409, session)) return@repeat
                 return WorkspacePairingInvitationResult.failure(
                     reason = WorkspacePairingReason.ServerRequestFailed,
                     diagnosticMessage = error.safePairingFailureDetail(),
@@ -142,26 +149,32 @@ class SelfHostedWorkspacePairingService(
         }
 
     private fun joinWithTokenLocked(token: WorkspacePairingToken): WorkspaceJoinResult {
-        val session = when (val sessionResult = requireSession()) {
+        val session = when (val sessionResult = requireSession(replacement = true)) {
             is PairingSessionResult.Ready -> sessionResult.session
             is PairingSessionResult.Failed -> return WorkspaceJoinResult.failure(sessionResult.reason)
         }
+        val capturedRequirement = activeWorkspaceSessionGuard.currentRequirement()
+        val previousWorkspace = activeWorkspaceSessionGuard.capturePreviousWorkspace()
         val material = token.deriveMaterial()
         val claimId = base64UrlNoPadding(crypto.randomBytes(CLAIM_ID_BYTES))
         val claimed = try {
-            sessionExecutor.authorized(session.endpoint, session.userId, session.accessToken) { accessToken ->
+            sessionExecutor.authorized(session.endpoint, session.userId, session.accessToken, session.accountRequestContext()) { accessToken, accountContext ->
                 transport.claimPairingInvite(
                     endpoint = session.endpoint,
                     accessToken = accessToken,
                     inviteId = material.inviteId,
                     request = SelfHostedPairingInviteClaimRequest(claimId),
+                    accountContext = accountContext,
                 )
             }
         } catch (error: SelfHostedSyncHttpException) {
-            return when (error.status) {
-                404 -> WorkspaceJoinResult.failure(WorkspacePairingReason.InvitationNotFound)
-                409 -> WorkspaceJoinResult.failure(WorkspacePairingReason.InvitationAlreadyUsed)
-                410 -> WorkspaceJoinResult.failure(WorkspacePairingReason.InvitationExpired)
+            if (activeWorkspaceSessionGuard.recordAccountFailure(session.toCredentials(), error)) {
+                return WorkspaceJoinResult.failure(WorkspacePairingReason.AuthorityMismatch)
+            }
+            return when {
+                error.isPairingBusiness(SelfHostedErrorCode.NOT_FOUND, 404, session) -> WorkspaceJoinResult.failure(WorkspacePairingReason.InvitationNotFound)
+                error.isPairingBusiness(SelfHostedErrorCode.PAIRING_CONFLICT, 409, session) -> WorkspaceJoinResult.failure(WorkspacePairingReason.InvitationAlreadyUsed)
+                error.isPairingBusiness(SelfHostedErrorCode.EXPIRED, 410, session) -> WorkspaceJoinResult.failure(WorkspacePairingReason.InvitationExpired)
                 else -> WorkspaceJoinResult.failure(
                     WorkspacePairingReason.ServerRequestFailed,
                     error.safeMessage,
@@ -195,66 +208,76 @@ class SelfHostedWorkspacePairingService(
                 WorkspacePairingEnvelopeDecodeResult.Invalid ->
                     return WorkspaceJoinResult.failure(WorkspacePairingReason.VerificationFailed)
             }
+            val current = checkNotNull(sessionStore.load())
+            require(current.authorityBindingId == session.toCredentials().authorityBindingId &&
+                current.deviceId == session.deviceId && current.accountIncarnation == session.accountIncarnation)
+            activeWorkspaceSessionGuard.requireCapturedReplacement(current, capturedRequirement, previousWorkspace)
             return workspaceLifecycleCoordinator.productAccess {
                 workspaceJoiner.join(
-                    packageData = decoded.packageData,
+                    packageData = decoded.packageData.captureAuthority(session, previousWorkspace),
                     replaceExistingWorkspace = true,
                 )
             }
         } finally {
             runCatching {
-                sessionExecutor.authorized(session.endpoint, session.userId, session.accessToken) { accessToken ->
+                sessionExecutor.authorized(session.endpoint, session.userId, session.accessToken, session.accountRequestContext()) { accessToken, accountContext ->
                     transport.completePairingInvite(
                         endpoint = session.endpoint,
                         accessToken = accessToken,
                         inviteId = material.inviteId,
                         request = SelfHostedPairingInviteCompleteRequest(claimId),
+                        accountContext = accountContext,
                     )
                 }
-            }
+            }.onFailure { activeWorkspaceSessionGuard.recordAccountFailure(session.toCredentials(), it) }
         }
     }
 
     override fun cancelInvitation(invitation: WorkspacePairingInvitation): WorkspaceJoinResult =
         runCatching {
-            val token = WorkspacePairingToken.parse(invitation.revealManualToken())
-                ?: return WorkspaceJoinResult.failure(WorkspacePairingReason.InvalidToken)
-            val session = when (val sessionResult = requireSession()) {
-                is PairingSessionResult.Ready -> sessionResult.session
-                is PairingSessionResult.Failed -> return WorkspaceJoinResult.failure(sessionResult.reason)
-            }
-            try {
-                sessionExecutor.authorized(session.endpoint, session.userId, session.accessToken) { accessToken ->
-                    transport.cancelPairingInvite(
-                        endpoint = session.endpoint,
-                        accessToken = accessToken,
-                        inviteId = token.deriveMaterial().inviteId,
-                    )
-                }
-                WorkspaceJoinResult.success(WorkspacePairingReason.InvitationCancelled)
-            } catch (error: SelfHostedSyncHttpException) {
-                when (error.status) {
-                    404, 410 -> WorkspaceJoinResult.success(WorkspacePairingReason.InvitationUnavailable)
-                    409 -> WorkspaceJoinResult.failure(WorkspacePairingReason.InvitationAlreadyUsed)
-                    else -> WorkspaceJoinResult.failure(
-                        WorkspacePairingReason.ServerRequestFailed,
-                        error.safeMessage,
-                    )
-                }
-            } catch (error: Throwable) {
-                WorkspaceJoinResult.failure(
-                    WorkspacePairingReason.ServerRequestFailed,
-                    error.safePairingFailureDetail(),
+            workspaceLifecycleCoordinator.exclusive { cancelInvitationLocked(invitation) }
+        }.getOrElse { error ->
+            WorkspaceJoinResult.failure(WorkspacePairingReason.Failed, error.safePairingFailureDetail())
+        }
+
+    private fun cancelInvitationLocked(invitation: WorkspacePairingInvitation): WorkspaceJoinResult {
+        val token = WorkspacePairingToken.parse(invitation.revealManualToken())
+            ?: return WorkspaceJoinResult.failure(WorkspacePairingReason.InvalidToken)
+        val session = when (val sessionResult = requireSession()) {
+            is PairingSessionResult.Ready -> sessionResult.session
+            is PairingSessionResult.Failed -> return WorkspaceJoinResult.failure(sessionResult.reason)
+        }
+        return try {
+            sessionExecutor.authorized(session.endpoint, session.userId, session.accessToken, session.accountRequestContext()) { accessToken, accountContext ->
+                transport.cancelPairingInvite(
+                    endpoint = session.endpoint,
+                    accessToken = accessToken,
+                    inviteId = token.deriveMaterial().inviteId,
+                    accountContext = accountContext,
                 )
             }
-        }.getOrElse { error ->
+            WorkspaceJoinResult.success(WorkspacePairingReason.InvitationCancelled)
+        } catch (error: SelfHostedSyncHttpException) {
+            if (activeWorkspaceSessionGuard.recordAccountFailure(session.toCredentials(), error)) {
+                return WorkspaceJoinResult.failure(WorkspacePairingReason.AuthorityMismatch)
+            }
+            when {
+                error.isPairingBusiness(SelfHostedErrorCode.NOT_FOUND, 404, session) || error.isPairingBusiness(SelfHostedErrorCode.EXPIRED, 410, session) -> WorkspaceJoinResult.success(WorkspacePairingReason.InvitationUnavailable)
+                error.isPairingBusiness(SelfHostedErrorCode.PAIRING_CONFLICT, 409, session) -> WorkspaceJoinResult.failure(WorkspacePairingReason.InvitationAlreadyUsed)
+                else -> WorkspaceJoinResult.failure(
+                    WorkspacePairingReason.ServerRequestFailed,
+                    error.safeMessage,
+                )
+            }
+        } catch (error: Throwable) {
             WorkspaceJoinResult.failure(
-                WorkspacePairingReason.Failed,
+                WorkspacePairingReason.ServerRequestFailed,
                 error.safePairingFailureDetail(),
             )
         }
+    }
 
-    private fun requireSession(): PairingSessionResult {
+    private fun requireSession(replacement: Boolean = false): PairingSessionResult {
         val sync = settingsProvider().syncConfiguration
         if (sync.mode != SyncMode.SelfHosted) {
             return PairingSessionResult.Failed(WorkspacePairingReason.SessionRequired)
@@ -264,11 +287,17 @@ class SelfHostedWorkspacePairingService(
         }
         val credentials = sessionStore.load()
             ?: return PairingSessionResult.Failed(WorkspacePairingReason.SessionRequired)
-        if (!activeWorkspaceSessionGuard.isCompatible(credentials)) {
+        if (runCatching {
+            if (replacement) activeWorkspaceSessionGuard.requireReplacementCompatible(credentials)
+            else activeWorkspaceSessionGuard.requireCompatible(credentials)
+        }.isFailure) {
             return PairingSessionResult.Failed(WorkspacePairingReason.AuthorityMismatch)
         }
         return PairingSessionResult.Ready(SelfHostedSyncSession.fromCredentials(credentials))
     }
+
+    private fun SelfHostedSyncHttpException.isPairingBusiness(code: SelfHostedErrorCode, legacyStatus: Int, session: SelfHostedSyncSession): Boolean =
+        errorCode == code || (errorCode == null && !protocol1 && status == legacyStatus && sessionExecutor.isVerifiedLegacy(session.toCredentials()))
 
     private fun authority(session: SelfHostedSyncSession): WorkspacePairingAuthority =
         WorkspacePairingAuthority(
@@ -280,6 +309,17 @@ class SelfHostedWorkspacePairingService(
         const val CLAIM_ID_BYTES: Int = 16
     }
 }
+
+internal fun WorkspaceJoinPackage.captureAuthority(
+    session: SelfHostedSyncSession,
+    previous: Pair<String, String>?,
+): WorkspaceJoinPackage = WorkspaceJoinPackage(
+    metadataJson, recoveryCode, workspaceId, keyFingerprint,
+    WorkspaceJoinAuthorityCapture(
+        session.toCredentials().authorityBindingId, session.deviceId, session.accountIncarnation,
+        previous?.first, previous?.second,
+    ),
+)
 
 private sealed interface PairingSessionResult {
     data class Ready(val session: SelfHostedSyncSession) : PairingSessionResult

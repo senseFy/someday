@@ -2,6 +2,8 @@ package saien.someday.server.media
 
 import java.security.MessageDigest
 import java.time.Duration
+import java.util.UUID
+import saien.someday.server.auth.ACCOUNT_INITIAL_INCARNATION
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -15,12 +17,13 @@ import java.util.concurrent.TimeoutException
 internal fun verifyMediaBlobStoreStartup(
     store: MediaBlobStore,
     timeout: Duration = STARTUP_PROBE_TIMEOUT,
+    incarnation: UUID = ACCOUNT_INITIAL_INCARNATION,
 ) {
     require(timeout.isPositive()) { "Media startup probe timeout must be positive." }
     val executor = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "someday-media-startup-probe").apply { isDaemon = true }
     }
-    val future = executor.submit { verifyMediaBlobStoreContract(store) }
+    val future = executor.submit { verifyMediaBlobStoreContract(store, incarnation) }
     try {
         future.get(timeout.toMillis(), TimeUnit.MILLISECONDS)
     } catch (failure: TimeoutException) {
@@ -33,21 +36,21 @@ internal fun verifyMediaBlobStoreStartup(
     }
 }
 
-private fun verifyMediaBlobStoreContract(store: MediaBlobStore) {
+private fun verifyMediaBlobStoreContract(store: MediaBlobStore, incarnation: UUID) {
     val access = when (store) {
         is FileSystemMediaBlobStore -> StartupProbeAccess(
-            put = store::putStartupProbe,
-            head = store::headStartupProbe,
-            read = store::readStartupProbe,
-            missingByMetadata = store::isStartupProbeMissingByMetadata,
-            missingByRead = store::isStartupProbeMissingByRead,
+            put = { bytes, digest -> store.putStartupProbe(bytes, digest, incarnation) },
+            head = { store.headStartupProbe(incarnation) },
+            read = { maxBytes -> store.readStartupProbe(maxBytes, incarnation) },
+            missingByMetadata = { store.isStartupProbeMissingByMetadata(incarnation) },
+            missingByRead = { store.isStartupProbeMissingByRead(incarnation) },
         )
         is S3MediaBlobStore -> StartupProbeAccess(
-            put = store::putStartupProbe,
-            head = store::headStartupProbe,
-            read = store::readStartupProbe,
-            missingByMetadata = store::isStartupProbeMissingByMetadata,
-            missingByRead = store::isStartupProbeMissingByRead,
+            put = { bytes, digest -> store.putStartupProbe(bytes, digest, incarnation) },
+            head = { store.headStartupProbe(incarnation) },
+            read = { maxBytes -> store.readStartupProbe(maxBytes, incarnation) },
+            missingByMetadata = { store.isStartupProbeMissingByMetadata(incarnation) },
+            missingByRead = { store.isStartupProbeMissingByRead(incarnation) },
         )
         else -> error("Configured media store does not support the startup probe: ${store::class.qualifiedName}")
     }

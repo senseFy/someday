@@ -60,6 +60,9 @@ kotlin {
         }
         iosMain {
             kotlin.srcDir(generatedIosBuildConfigDir)
+            if (providers.gradleProperty("someday.resetRenderFixtures").orNull == "true") {
+                kotlin.srcDir("src/resetRenderFixture/kotlin")
+            }
         }
         commonTest.dependencies {
             implementation(kotlin("test"))

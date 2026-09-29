@@ -46,6 +46,25 @@ class FileSystemMediaBlobStoreTest {
     }
 
     @Test
+    fun nonzeroIncarnationUsesAnIsolatedNestedRootWithoutChangingLegacyPaths() {
+        val root = temporaryFolder.newFolder("incarnation-media").toPath()
+        val store = FileSystemMediaBlobStore(root)
+        val legacyKey = MediaBlobKey(UUID.randomUUID(), WORKSPACE, "01".repeat(32))
+        val currentKey = legacyKey.copy(incarnation = UUID.randomUUID())
+        val legacyBytes = ByteArray(64) { 1 }
+        val currentBytes = ByteArray(64) { 2 }
+
+        store.putImmutable(legacyKey, legacyBytes, sha256(legacyBytes))
+        store.putImmutable(currentKey, currentBytes, sha256(currentBytes))
+
+        assertContentEquals(legacyBytes, store.read(legacyKey, legacyBytes.size)?.bytes)
+        assertContentEquals(currentBytes, store.read(currentKey, currentBytes.size)?.bytes)
+        val suffix = "$WORKSPACE/01/01/${legacyKey.mediaId}/object.bin"
+        assertTrue(Files.isRegularFile(root.resolve("${legacyKey.userId}/$suffix")))
+        assertTrue(Files.isRegularFile(root.resolve(".incarnations/v1/${currentKey.userId}/${currentKey.incarnation}/$suffix")))
+    }
+
+    @Test
     fun rejectsASecondValueAndNeverCrossesAccountOrObjectBoundaries() {
         val store = FileSystemMediaBlobStore(temporaryFolder.newFolder("media").toPath())
         val firstUser = UUID.fromString("123e4567-e89b-42d3-a456-426614174000")

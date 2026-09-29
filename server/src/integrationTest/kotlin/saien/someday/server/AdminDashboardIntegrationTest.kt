@@ -18,6 +18,10 @@ import saien.someday.server.api.SyncV2ImmutablePutResponse
 import saien.someday.server.api.SyncV2ObjectPayload
 import saien.someday.server.api.SyncV2PushRequest
 import saien.someday.server.api.SyncV2PushResponse
+import saien.someday.server.auth.ACCOUNT_INITIAL_INCARNATION
+import saien.someday.server.persistence.AccountAdmission
+import saien.someday.server.persistence.AccountLockMode
+import saien.someday.server.persistence.DatabaseConnectionProvider
 import saien.someday.sync.causality.v2.CanonicalWorkspaceCausalityMaterializerV2
 import saien.someday.sync.causality.v2.NotebookContentV2
 import saien.someday.sync.causality.v2.PreparedWorkspaceEpochCheckpointV2
@@ -148,11 +152,65 @@ class AdminDashboardIntegrationTest {
             setBody(adminLoginForm(email, password))
         }
         assertEquals(HttpStatusCode.Found, success.status, success.bodyAsText())
+        assertEquals(ACCOUNT_INITIAL_INCARNATION.toString(), success.headers["X-Someday-Account-Incarnation"])
         val cookie = success.headers.getAll(HttpHeaders.SetCookie).orEmpty().joinToString(";")
         assertTrue(cookie.contains("someday_admin_access="), cookie)
         assertTrue(cookie.contains("HttpOnly"), cookie)
         assertTrue(cookie.contains("SameSite=Strict"), cookie)
         assertTrue(cookie.contains("Secure"), cookie)
+    }
+
+    @Test
+    fun adminResetRejectsOldCookieAndFreshBrowserLoginCapturesTheNewIncarnation() = testApplication {
+        val config = productionTestServerConfig(dbUrl, dbUser, dbPassword)
+        val context = ServerContext.create(config)
+        val email = "admin-incarnation-${System.nanoTime()}@example.com"
+        val password = "valid-admin-password"
+        val user = assertNotNull(context.repository.createAdminUser(email, context.credentialHasher.hash(password)))
+        application { somedayServerModule(context) }
+        val browser = createClient { followRedirects = false }
+        val original = browser.post("/admin/login") {
+            headers.append(HttpHeaders.Origin, config.publicOrigin)
+            setBody(adminLoginForm(email, password))
+        }
+        assertEquals(HttpStatusCode.Found, original.status, original.bodyAsText())
+        val oldCookie = assertNotNull(original.headers[HttpHeaders.SetCookie]).substringBefore(';')
+        val next = UUID.randomUUID()
+        AccountAdmission.transaction(
+            DatabaseConnectionProvider { DriverManager.getConnection(dbConnectionUrl, dbUser, dbPassword) },
+            listOf(user.id),
+            AccountLockMode.EXCLUSIVE,
+        ) { connection ->
+            connection.prepareStatement("UPDATE someday_account_data_incarnations SET state = 'retired', retired_at = clock_timestamp() WHERE user_id = ? AND state = 'active'").use { statement ->
+                statement.setObject(1, user.id)
+                assertEquals(1, statement.executeUpdate())
+            }
+            connection.prepareStatement("INSERT INTO someday_account_data_incarnations(user_id, incarnation, state, storage_layout, created_at) VALUES (?, ?, 'active', 'incarnation-v1', clock_timestamp())").use { statement ->
+                statement.setObject(1, user.id)
+                statement.setObject(2, next)
+                statement.executeUpdate()
+            }
+        }
+        val stale = browser.get("/admin") { headers.append(HttpHeaders.Cookie, oldCookie) }
+        assertEquals(HttpStatusCode.Unauthorized, stale.status, stale.bodyAsText())
+        assertEquals("account_session_stale", stale.headers["X-Someday-Error-Code"])
+
+        val renewed = browser.post("/admin/login") {
+            headers.append(HttpHeaders.Origin, config.publicOrigin)
+            setBody(adminLoginForm(email, password))
+        }
+        assertEquals(HttpStatusCode.Found, renewed.status, renewed.bodyAsText())
+        assertEquals(next.toString(), renewed.headers["X-Someday-Account-Incarnation"])
+        val newCookie = assertNotNull(renewed.headers[HttpHeaders.SetCookie]).substringBefore(';')
+        val dashboard = browser.get("/admin") { headers.append(HttpHeaders.Cookie, newCookie) }
+        assertEquals(HttpStatusCode.OK, dashboard.status, dashboard.bodyAsText())
+        val logout = browser.post("/admin/logout") {
+            headers.append(HttpHeaders.Origin, config.publicOrigin)
+            headers.append(HttpHeaders.Cookie, newCookie)
+        }
+        assertEquals(HttpStatusCode.Found, logout.status, logout.bodyAsText())
+        val revoked = browser.get("/admin") { headers.append(HttpHeaders.Cookie, newCookie) }
+        assertEquals(HttpStatusCode.Unauthorized, revoked.status, revoked.bodyAsText())
     }
 
     @Test
@@ -322,14 +380,14 @@ class AdminDashboardIntegrationTest {
             bearerAuth(admin.accessToken)
         }
         assertEquals(HttpStatusCode.OK, storage.status, storage.bodyAsText())
-        assertTrue(storage.bodyAsText().contains("Encrypted objects"))
+        assertTrue(storage.bodyAsText().contains("Active encrypted objects"))
         assertTrue(storage.bodyAsText().contains("workspace_entity_version_v2"))
 
         val activity = client.get("/admin/activity") {
             bearerAuth(admin.accessToken)
         }
         assertEquals(HttpStatusCode.OK, activity.status, activity.bodyAsText())
-        assertTrue(activity.bodyAsText().contains("Accepted changes"), activity.bodyAsText())
+        assertTrue(activity.bodyAsText().contains("Active accepted changes"), activity.bodyAsText())
         assertTrue(activity.bodyAsText().contains("Sync activity"), activity.bodyAsText())
 
         val health = client.get("/admin/health") {

@@ -82,6 +82,8 @@ CREATE TABLE sync_local_authority_system_v2 (
   authority_binding_id TEXT NOT NULL,
   pointer_digest TEXT NOT NULL,
   updated_at INTEGER NOT NULL,
+  account_incarnation TEXT NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000'
+    CHECK (length(account_incarnation) = 36),
   FOREIGN KEY(remote_profile, epoch_id)
     REFERENCES sync_epochs_v2(remote_profile, epoch_id) ON DELETE RESTRICT
 );
@@ -454,6 +456,83 @@ CREATE TABLE sync_source_imports_system_v2 (
     REFERENCES workspace_entity_versions_v2(epoch_id, version_id) ON DELETE RESTRICT
 );
 
+CREATE TABLE account_reset_intents (
+  singleton_id INTEGER NOT NULL PRIMARY KEY CHECK (singleton_id = 1),
+  operation_id TEXT NOT NULL UNIQUE CHECK (length(operation_id) = 36),
+  endpoint TEXT NOT NULL CHECK (length(endpoint) BETWEEN 1 AND 2048),
+  user_id TEXT NOT NULL CHECK (length(user_id) BETWEEN 1 AND 255),
+  expected_incarnation TEXT NOT NULL CHECK (length(expected_incarnation) = 36),
+  original_incarnation TEXT NOT NULL CHECK (length(original_incarnation) = 36),
+  original_workspace_id TEXT NOT NULL,
+  original_writer_id TEXT NOT NULL,
+  consent_target_incarnation TEXT CHECK (consent_target_incarnation IS NULL OR length(consent_target_incarnation) = 36),
+  state TEXT NOT NULL CHECK (state IN ('intent_persisted', 'outcome_unknown', 'remote_committed_local_pending')),
+  earlier_outcome_unknown INTEGER NOT NULL CHECK (earlier_outcome_unknown IN (0, 1)),
+  submission_number INTEGER NOT NULL CHECK (submission_number >= 0),
+  receipt_incarnation TEXT CHECK (receipt_incarnation IS NULL OR length(receipt_incarnation) = 36),
+  receipt_committed_at INTEGER,
+  updated_at INTEGER NOT NULL,
+  CHECK ((receipt_incarnation IS NULL) = (receipt_committed_at IS NULL)),
+  CHECK (state <> 'remote_committed_local_pending' OR receipt_incarnation IS NOT NULL)
+);
+
+CREATE TABLE account_workspace_gates (
+  endpoint TEXT NOT NULL CHECK (length(endpoint) BETWEEN 1 AND 2048),
+  user_id TEXT NOT NULL CHECK (length(user_id) BETWEEN 1 AND 255),
+  workspace_id TEXT NOT NULL,
+  expected_incarnation TEXT NOT NULL CHECK (length(expected_incarnation) = 36),
+  reason TEXT NOT NULL CHECK (reason IN ('reset_required', 'reset_pending', 'outcome_unknown', 'remote_committed')),
+  offline_editing INTEGER NOT NULL CHECK (offline_editing IN (0, 1)),
+  updated_at INTEGER NOT NULL,
+  discard_target_incarnation TEXT CHECK (discard_target_incarnation IS NULL OR length(discard_target_incarnation) = 36),
+  PRIMARY KEY(endpoint, user_id, workspace_id)
+);
+
+CREATE TABLE account_protocol_capabilities (
+  endpoint TEXT NOT NULL CHECK (length(endpoint) BETWEEN 1 AND 2048),
+  user_id TEXT NOT NULL CHECK (length(user_id) BETWEEN 1 AND 255),
+  protocol_version INTEGER NOT NULL CHECK (protocol_version = 1),
+  observed_at INTEGER NOT NULL,
+  PRIMARY KEY(endpoint, user_id)
+);
+
+selectAccountResetIntent:
+SELECT * FROM account_reset_intents WHERE singleton_id = 1;
+
+upsertAccountResetIntent:
+INSERT OR REPLACE INTO account_reset_intents(
+  singleton_id, operation_id, endpoint, user_id, expected_incarnation, original_incarnation,
+  original_workspace_id, original_writer_id, consent_target_incarnation, state,
+  earlier_outcome_unknown, submission_number, receipt_incarnation, receipt_committed_at, updated_at
+)
+VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+deleteAccountResetIntent:
+DELETE FROM account_reset_intents WHERE operation_id = ?;
+
+selectAccountWorkspaceGate:
+SELECT * FROM account_workspace_gates WHERE endpoint = ? AND user_id = ? AND workspace_id = ?;
+
+selectAllAccountWorkspaceGates:
+SELECT * FROM account_workspace_gates ORDER BY endpoint, user_id, workspace_id;
+
+upsertAccountWorkspaceGate:
+INSERT OR REPLACE INTO account_workspace_gates(
+  endpoint, user_id, workspace_id, expected_incarnation, reason, offline_editing, updated_at, discard_target_incarnation
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+
+deleteMatchingAccountWorkspaceGate:
+DELETE FROM account_workspace_gates
+WHERE endpoint = ? AND user_id = ? AND workspace_id = ? AND expected_incarnation = ?;
+
+selectAccountProtocolCapability:
+SELECT * FROM account_protocol_capabilities WHERE endpoint = ? AND user_id = ?;
+
+rememberAccountProtocolOne:
+INSERT OR IGNORE INTO account_protocol_capabilities(endpoint, user_id, protocol_version, observed_at)
+VALUES (?, ?, 1, ?);
+
 insertOrReplaceSetting:
 INSERT OR REPLACE INTO settings(id, value, updated_at)
 VALUES (?, ?, ?);
@@ -580,9 +659,9 @@ ORDER BY created_at DESC, remote_profile ASC, epoch_id DESC;
 upsertLocalAuthoritySystemV2:
 INSERT OR REPLACE INTO sync_local_authority_system_v2(
   singleton_id, remote_profile, epoch_id, local_writer_device_id,
-  authority_binding_id, pointer_digest, updated_at
+  authority_binding_id, pointer_digest, updated_at, account_incarnation
 )
-VALUES (1, ?, ?, ?, ?, ?, ?);
+VALUES (1, ?, ?, ?, ?, ?, ?, ?);
 
 selectLocalAuthoritySystemV2:
 SELECT *

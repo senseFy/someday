@@ -16,6 +16,7 @@ import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials
@@ -43,6 +44,27 @@ class S3MediaBlobStoreTest {
             assertEquals("application/octet-stream", put.headers["content-type"])
             assertContentEquals(bytes, put.body)
             assertEquals(listOf("PUT", "HEAD", "GET"), server.calls.map(CapturedCall::method))
+        }
+    }
+
+    @Test
+    fun nonzeroIncarnationAndProbeStayInsideTheProtectedMediaPrefix() = withServer { server ->
+        createStore(server).use { store ->
+            val key = KEY.copy(incarnation = UUID.randomUUID())
+            val bytes = ByteArray(64) { 3 }
+            val nestedPath = "/$BUCKET/media/v1/.incarnations/v1/${key.userId}/${key.incarnation}/$WORKSPACE/${key.mediaId}.bin"
+            assertEquals(MediaBlobPutResult.Stored(false), store.putImmutable(key, bytes, sha256(bytes)))
+            assertContentEquals(bytes, store.read(key, bytes.size)?.bytes)
+            assertNull(store.head(KEY))
+            assertContentEquals(bytes, server.objectAt(nestedPath)?.bytes)
+
+            verifyMediaBlobStoreStartup(store, incarnation = key.incarnation)
+            verifyMediaBlobStoreStartup(store, incarnation = UUID.randomUUID())
+            val probePath = "/$BUCKET/media/v1/.incarnations/v1/.someday-system/startup-probe-v1.bin"
+            assertNotNull(server.objectAt(probePath))
+            assertTrue(server.calls.filter { it.method == "PUT" }.all {
+                it.path == nestedPath || it.path == probePath
+            })
         }
     }
 

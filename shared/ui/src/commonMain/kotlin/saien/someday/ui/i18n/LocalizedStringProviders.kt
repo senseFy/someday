@@ -254,6 +254,7 @@ fun rememberSettingsUiStrings(): SettingsUiStrings {
     val dayOneImportUnavailable = stringResource(Res.string.import_day_one_unavailable)
     val unknownError = stringResource(Res.string.common_unknown_error)
     val strings = SettingsUiStrings(
+        accountReset = rememberAccountResetUiStrings(),
         themeUpdated = themeUpdated,
         languageUpdated = languageUpdated,
         previewUpdated = previewUpdated,

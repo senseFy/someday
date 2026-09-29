@@ -13,6 +13,7 @@ import okio.source
 import saien.someday.data.media.SelectedImageImportException
 import saien.someday.data.media.SelectedImageImportFailureReason
 import saien.someday.data.media.SelectedImageImportRequest
+import saien.someday.domain.workspace.WorkspaceProductSnapshot
 import saien.someday.domain.media.MediaAssetId
 import saien.someday.domain.media.isSafeOriginalFileName
 import saien.someday.sync.AuthorityCoordinatedMediaAssetStore
@@ -24,6 +25,7 @@ import saien.someday.ui.media.MediaUiFailureReason
 internal fun ContentResolver.importSelectedImage(
     uri: Uri,
     store: AuthorityCoordinatedMediaAssetStore,
+    expectedWorkspace: WorkspaceProductSnapshot,
 ): MediaImportUiResult {
     val fileName = runCatching {
         query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
@@ -39,6 +41,7 @@ internal fun ContentResolver.importSelectedImage(
                     source = source,
                     request = SelectedImageImportRequest(originalFileName = fileName),
                     normalizer = AndroidMediaImageNormalizer,
+                    expectedWorkspace = expectedWorkspace,
                 )
             }
         } ?: return MediaImportUiResult.Failed(MediaUiFailureReason.ImportFailed)

@@ -201,6 +201,7 @@ class SelfHostedWorkspaceRecoveryService(
         )
         pendingSetup = PendingRecoverySetup(
             authorityBindingId = session.toCredentials().authorityBindingId,
+            accountIncarnation = session.accountIncarnation,
             packageData = packageData,
             request = request,
         )
@@ -227,6 +228,9 @@ class SelfHostedWorkspaceRecoveryService(
         if (!workspaceRecoveryPublisherReady()) {
             return WorkspaceRecoveryCodeResult.failure(WorkspaceRecoveryReason.PublishRequired)
         }
+        if (session.accountIncarnation != pending.accountIncarnation) {
+            return WorkspaceRecoveryCodeResult.failure(WorkspaceRecoveryReason.AuthorityMismatch)
+        }
         if (session.toCredentials().authorityBindingId != pending.authorityBindingId ||
             requirement.workspaceId != pending.request.workspaceId ||
             localWorkspaceKeyFingerprint() != pending.request.keyFingerprint ||
@@ -236,13 +240,18 @@ class SelfHostedWorkspaceRecoveryService(
             return WorkspaceRecoveryCodeResult.failure(WorkspaceRecoveryReason.AuthorityMismatch)
         }
         val stored = try {
-            sessionExecutor.authorized(session.endpoint, session.userId, session.accessToken) { accessToken ->
-                transport.putWorkspaceRecoveryEnvelope(session.endpoint, accessToken, pending.request)
+            sessionExecutor.authorized(session.endpoint, session.userId, session.accessToken, session.accountRequestContext()) { accessToken, accountContext ->
+                transport.putWorkspaceRecoveryEnvelope(session.endpoint, accessToken, pending.request, accountContext)
             }
         } catch (failure: SelfHostedSyncHttpException) {
-            if (failure.status == 409) pendingSetup = null
+            if (activeWorkspaceSessionGuard.recordAccountFailure(session.toCredentials(), failure)) {
+                return WorkspaceRecoveryCodeResult.failure(WorkspaceRecoveryReason.AuthorityMismatch)
+            }
+            val conflict = failure.errorCode == SelfHostedErrorCode.RECOVERY_ENVELOPE_CONFLICT ||
+                (failure.errorCode == null && !failure.protocol1 && failure.status == 409 && sessionExecutor.isVerifiedLegacy(session.toCredentials()))
+            if (conflict) pendingSetup = null
             return WorkspaceRecoveryCodeResult.failure(
-                reason = if (failure.status == 409) {
+                reason = if (conflict) {
                     WorkspaceRecoveryReason.ServerConflict
                 } else {
                     WorkspaceRecoveryReason.ServerRequestFailed
@@ -263,7 +272,9 @@ class SelfHostedWorkspaceRecoveryService(
     }
 
     private fun recoverLocked(recoveryCode: String): WorkspaceRecoveryRestoreResult {
-        val session = when (val result = requireSession()) {
+        val capturedRequirement = activeWorkspaceSessionGuard.currentRequirement()
+        val previousWorkspace = activeWorkspaceSessionGuard.capturePreviousWorkspace()
+        val session = when (val result = requireSession(replacement = true)) {
             is RecoverySessionResult.Ready -> result.session
             is RecoverySessionResult.Failed -> return WorkspaceRecoveryRestoreResult.failure(result.reason)
         }
@@ -279,10 +290,11 @@ class SelfHostedWorkspaceRecoveryService(
         }
         val requirement = activeWorkspaceSessionGuard.currentRequirement()
         val localKeyFingerprint = localWorkspaceKeyFingerprint()
-        if (requirement != null && requirement.workspaceId != remote.packageData.workspaceId) {
+        val sameIncarnation = requirement?.accountIncarnation == session.accountIncarnation
+        if (requirement != null && sameIncarnation && requirement.workspaceId != remote.packageData.workspaceId) {
             return WorkspaceRecoveryRestoreResult.failure(WorkspaceRecoveryReason.AuthorityMismatch)
         }
-        if (requirement != null && localKeyFingerprint != null) {
+        if (requirement != null && sameIncarnation && localKeyFingerprint != null) {
             return WorkspaceRecoveryRestoreResult.failure(
                 if (localKeyFingerprint == remote.packageData.keyFingerprint) {
                     WorkspaceRecoveryReason.RecoveryNotRequired
@@ -297,8 +309,12 @@ class SelfHostedWorkspaceRecoveryService(
             workspaceId = remote.packageData.workspaceId,
             keyFingerprint = remote.packageData.keyFingerprint,
         )
+        val current = checkNotNull(sessionStore.load())
+        require(current.authorityBindingId == session.toCredentials().authorityBindingId &&
+            current.deviceId == session.deviceId && current.accountIncarnation == session.accountIncarnation)
+        activeWorkspaceSessionGuard.requireCapturedReplacement(current, capturedRequirement, previousWorkspace)
         val joined = workspaceLifecycleCoordinator.productAccess {
-            workspaceJoiner.join(packageData, replaceExistingWorkspace = true)
+            workspaceJoiner.join(packageData.captureAuthority(session, previousWorkspace), replaceExistingWorkspace = true)
         }
         return if (joined.success) {
             WorkspaceRecoveryRestoreResult.recovered()
@@ -312,12 +328,13 @@ class SelfHostedWorkspaceRecoveryService(
 
     private fun loadRemoteEnvelope(session: SelfHostedSyncSession): RecoveryEnvelopeLoadResult {
         val response = try {
-            sessionExecutor.authorized(session.endpoint, session.userId, session.accessToken) { accessToken ->
-                transport.getWorkspaceRecoveryEnvelope(session.endpoint, accessToken)
+            sessionExecutor.authorized(session.endpoint, session.userId, session.accessToken, session.accountRequestContext()) { accessToken, accountContext ->
+                transport.getWorkspaceRecoveryEnvelope(session.endpoint, accessToken, accountContext)
             }
         } catch (failure: Throwable) {
+            val accountFailure = activeWorkspaceSessionGuard.recordAccountFailure(session.toCredentials(), failure)
             return RecoveryEnvelopeLoadResult.Failed(
-                reason = WorkspaceRecoveryReason.ServerRequestFailed,
+                reason = if (accountFailure) WorkspaceRecoveryReason.AuthorityMismatch else WorkspaceRecoveryReason.ServerRequestFailed,
                 diagnosticMessage = failure.safeRecoveryFailureDetail(),
             )
         } ?: return RecoveryEnvelopeLoadResult.Missing
@@ -331,16 +348,17 @@ class SelfHostedWorkspaceRecoveryService(
         )
     }
 
-    private fun requireSession(): RecoverySessionResult {
+    private fun requireSession(replacement: Boolean = false): RecoverySessionResult {
         val sync = settingsProvider().syncConfiguration
         if (sync.mode != SyncMode.SelfHosted || !sync.selfHostedSession.loggedIn) {
             return RecoverySessionResult.Failed(WorkspaceRecoveryReason.SessionRequired)
         }
         val credentials = sessionStore.load()
             ?: return RecoverySessionResult.Failed(WorkspaceRecoveryReason.SessionRequired)
-        if (!activeWorkspaceSessionGuard.isCompatible(credentials)) {
-            return RecoverySessionResult.Failed(WorkspaceRecoveryReason.AuthorityMismatch)
-        }
+        if (runCatching {
+            if (replacement) activeWorkspaceSessionGuard.requireReplacementCompatible(credentials)
+            else activeWorkspaceSessionGuard.requireCompatible(credentials)
+        }.isFailure) return RecoverySessionResult.Failed(WorkspaceRecoveryReason.AuthorityMismatch)
         return RecoverySessionResult.Ready(SelfHostedSyncSession.fromCredentials(credentials))
     }
 }
@@ -502,6 +520,7 @@ private data class StoredRecoveryEnvelope(
 
 private data class PendingRecoverySetup(
     val authorityBindingId: String,
+    val accountIncarnation: String,
     val packageData: WorkspaceJoinPackage,
     val request: SelfHostedWorkspaceRecoveryEnvelopePutRequest,
 ) {

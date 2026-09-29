@@ -27,6 +27,8 @@ POSTGRES_ADMIN_USER="someday_admin"
 POSTGRES_ADMIN_PASSWORD="recovery-admin-only-password"
 POSTGRES_APP_USER="someday_app"
 POSTGRES_APP_PASSWORD="recovery-app-only-password"
+POSTGRES_MAINTENANCE_USER="someday_recovery_maintenance"
+POSTGRES_MAINTENANCE_PASSWORD="recovery-maintenance-only-password"
 SOURCE_DATABASE="someday_recovery_source"
 RESTORED_DATABASE="someday_recovery_restored"
 SERVER_PID=""
@@ -290,6 +292,36 @@ run_media_integrity() {
         "$ROOT_DIR/server/build/install/server/bin/verify-media-integrity"
 }
 
+run_reclamation_invalidation() {
+    SOMEDAY_DEPLOYMENT_MODE=production \
+    SOMEDAY_HOST=127.0.0.1 \
+    SOMEDAY_PUBLIC_BASE_URL=https://someday-recovery.invalid \
+    SOMEDAY_DB_URL="$RESTORED_DB_URL" \
+    SOMEDAY_DB_USER="$POSTGRES_APP_USER" \
+    SOMEDAY_DB_PASSWORD="$POSTGRES_APP_PASSWORD" \
+    SOMEDAY_MAINTENANCE_DB_USER="$POSTGRES_MAINTENANCE_USER" \
+    SOMEDAY_MAINTENANCE_DB_PASSWORD="$POSTGRES_MAINTENANCE_PASSWORD" \
+    SOMEDAY_DB_TLS_MODE=private \
+    SOMEDAY_MEDIA_BACKEND=filesystem \
+    SOMEDAY_MEDIA_BLOB_DIR="$RESTORED_MEDIA_DIR" \
+    SOMEDAY_JWT_SECRET="$JWT_SECRET" \
+        "$ROOT_DIR/server/build/install/server/bin/invalidate-reclamation-attestations" "$@"
+}
+
+invalidate_restored_reclamation() {
+    local identity before after
+    docker exec "$POSTGRES_NAME" psql \
+        --username "$POSTGRES_ADMIN_USER" --dbname "$RESTORED_DATABASE" --set ON_ERROR_STOP=1 \
+        --command "GRANT USAGE ON SCHEMA public TO $POSTGRES_MAINTENANCE_USER; GRANT SELECT, UPDATE ON someday_account_data_incarnations, someday_maintenance_context TO $POSTGRES_MAINTENANCE_USER" \
+        >/dev/null
+    before="$(docker exec "$POSTGRES_NAME" psql --username "$POSTGRES_ADMIN_USER" --dbname "$RESTORED_DATABASE" --tuples-only --no-align --set ON_ERROR_STOP=1 --command 'SELECT verification_context FROM someday_maintenance_context WHERE singleton')"
+    identity="$(run_reclamation_invalidation | sed -n 's/^databaseIdentity=//p')"
+    [[ -n "$identity" && "$identity" != *$'\n'* ]] || die "invalidation dry-run did not return exactly one database identity"
+    run_reclamation_invalidation --execute --ingress-stopped --maintenance-stopped --database-identity "$identity"
+    after="$(docker exec "$POSTGRES_NAME" psql --username "$POSTGRES_ADMIN_USER" --dbname "$RESTORED_DATABASE" --tuples-only --no-align --set ON_ERROR_STOP=1 --command 'SELECT verification_context FROM someday_maintenance_context WHERE singleton')"
+    [[ -n "$before" && -n "$after" && "$before" != "$after" ]] || die "restore did not invalidate the maintenance context"
+}
+
 restore_recovery_unit() {
     local source_rows="$RECOVERY_SET_DIR/source-rows.tsv"
     local restored_rows="$RECOVERY_SET_DIR/restored-rows.tsv"
@@ -353,6 +385,9 @@ restore_recovery_unit() {
     [[ "$(wc -l <"$restored_flyway" | tr -d '[:space:]')" -gt 1 ]] || die "restored Flyway history is empty"
 
     RESTORED_DB_URL="jdbc:postgresql://127.0.0.1:$POSTGRES_PORT/$RESTORED_DATABASE"
+    # Ingress and maintenance remain stopped until restored attestations and
+    # process-local deletion plans have been invalidated with a distinct role.
+    invalidate_restored_reclamation
     run_media_integrity "$RESTORED_DB_URL" "$RESTORED_MEDIA_DIR"
     missing_file="$(
         docker exec "$POSTGRES_NAME" psql \
@@ -412,6 +447,7 @@ docker exec "$POSTGRES_NAME" psql \
     --dbname postgres \
     --set ON_ERROR_STOP=1 \
     --command "CREATE ROLE $POSTGRES_APP_USER LOGIN PASSWORD '$POSTGRES_APP_PASSWORD' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS" \
+    --command "CREATE ROLE $POSTGRES_MAINTENANCE_USER LOGIN PASSWORD '$POSTGRES_MAINTENANCE_PASSWORD' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS" \
     >/dev/null
 docker exec "$POSTGRES_NAME" createdb \
     --username "$POSTGRES_ADMIN_USER" \

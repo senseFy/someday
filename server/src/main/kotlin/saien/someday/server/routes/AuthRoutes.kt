@@ -14,7 +14,9 @@ import saien.someday.server.auth.isValidAccountPassword
 import saien.someday.server.auth.normalizeAccountEmail
 import saien.someday.server.auth.scopesForDevice
 import saien.someday.server.persistence.UserRecord
+import saien.someday.server.persistence.VerifiedPasswordAccount
 import io.ktor.http.HttpStatusCode
+import io.ktor.server.application.ApplicationCall
 import io.ktor.server.application.call
 import io.ktor.server.response.respond
 import io.ktor.server.routing.Route
@@ -52,7 +54,7 @@ fun Route.authRoutes(context: ServerContext) {
                 call.respondError(HttpStatusCode.Conflict, "account_exists")
                 return@post
             }
-            val response = issueSessionResponse(context, user, deviceId = null)
+            val response = call.issueSessionResponse(context, user)
             call.respond(response)
         }
 
@@ -77,7 +79,7 @@ fun Route.authRoutes(context: ServerContext) {
                 call.respondError(HttpStatusCode.Unauthorized, "invalid_credentials")
                 return@post
             }
-            val response = issueSessionResponse(context, user, deviceId = null)
+            val response = call.issueSessionResponse(context, user)
             call.respond(response)
         }
 
@@ -101,6 +103,7 @@ fun Route.authRoutes(context: ServerContext) {
                 isAdmin = refreshSnapshot.isAdmin,
                 scopes = scopesForDevice(refreshSnapshot.deviceId),
             )
+            call.respondAccountIncarnation(refreshSnapshot.incarnation)
             call.respond(
                 AuthTokensResponse(
                     accessToken = accessTokens.accessToken,
@@ -117,52 +120,53 @@ fun Route.authRoutes(context: ServerContext) {
         post("/logout") {
             call.receiveJsonOrNull<LogoutRequest>() ?: return@post
             val auth = call.requireAuthenticated(context, requiredScope = "auth") ?: return@post
-            context.repository.revokeSession(auth.sessionId)
+            context.repository.logout(auth.requestContext)
             call.respond(StatusResponse(status = "ok"))
         }
     }
 
     get("/me") {
         val auth = call.requireAuthenticated(context, requiredScope = "auth") ?: return@get
+        val admitted = context.repository.admitRequest(auth.requestContext)
         call.respond(
             MeResponse(
-                id = auth.userId.toString(),
-                email = auth.email,
-                deviceId = auth.deviceId?.toString(),
+                id = admitted.userId.toString(),
+                email = admitted.email,
+                deviceId = admitted.deviceId?.toString(),
                 scopes = auth.scopes.sorted(),
             ),
         )
     }
 }
 
-private fun issueSessionResponse(
+private fun ApplicationCall.issueSessionResponse(
     context: ServerContext,
     user: UserRecord,
-    deviceId: UUID?,
 ): AuthTokensResponse {
     val sessionId = UUID.randomUUID()
-    val tokens = context.tokenService.issueTokens(
-        userId = user.id,
+    val refresh = context.tokenService.issueRefreshToken()
+    val issued = context.repository.issuePasswordSession(
+        verified = VerifiedPasswordAccount(user.id, user.passwordHash),
         sessionId = sessionId,
-        deviceId = deviceId,
-        isAdmin = user.isAdmin,
-        scopes = scopesForDevice(deviceId),
-    )
-    context.repository.createSessionWithRefreshToken(
-        sessionId = sessionId,
-        userId = user.id,
-        deviceId = deviceId,
-        refreshTokenHash = tokens.refreshTokenHash,
+        refreshTokenHash = refresh.refreshTokenHash,
         sessionExpiresAt = Instant.now().plus(context.config.refreshTokenTtl),
         refreshExpiresAt = Instant.now().plus(context.config.refreshTokenTtl),
     )
+    val tokens = context.tokenService.issueTokens(
+        userId = issued.userId,
+        sessionId = issued.sessionId,
+        deviceId = issued.deviceId,
+        isAdmin = issued.isAdmin,
+        scopes = scopesForDevice(issued.deviceId),
+    )
+    respondAccountIncarnation(issued.incarnation)
     return AuthTokensResponse(
         accessToken = tokens.accessToken,
-        refreshToken = tokens.refreshToken,
+        refreshToken = refresh.refreshToken,
         expiresInSeconds = tokens.expiresInSeconds,
         user = UserResponse(
-            id = user.id.toString(),
-            email = user.email,
+            id = issued.userId.toString(),
+            email = issued.email,
         ),
     )
 }

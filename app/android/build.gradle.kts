@@ -55,6 +55,11 @@ if (releaseSigningRequested || releaseSigningValues.values.any { it != null }) {
 
 android {
     namespace = "saien.someday.app.android"
+    if (providers.gradleProperty("someday.resetRenderFixtures").orNull == "true") {
+        // Explicit render-only source set; never packaged by a normal debug or release build.
+        sourceSets.getByName("debug").java.srcDir("src/resetRenderFixture/kotlin")
+        sourceSets.getByName("debug").manifest.srcFile("src/resetRenderFixture/AndroidManifest.xml")
+    }
     compileSdk = libs.versions.android.compileSdk.get().toInt()
 
     defaultConfig {

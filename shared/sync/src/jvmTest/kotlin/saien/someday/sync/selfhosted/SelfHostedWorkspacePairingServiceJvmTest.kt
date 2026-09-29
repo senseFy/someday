@@ -28,6 +28,63 @@ import saien.someday.sync.WorkspaceLifecycleCoordinator
 
 class SelfHostedWorkspacePairingServiceJvmTest {
     @Test
+    fun cancellationCannotSendUntilTheActiveWorkspaceLifecycleCompletes() {
+        val transport = MemorySelfHostedPairingTransport()
+        val lifecycle = WorkspaceLifecycleCoordinator()
+        val service = pairingService(transport, MemorySessionStore(testCredentials()), workspaceLifecycleCoordinator = lifecycle)
+        val invitation = assertNotNull(service.createInvitation().invitation)
+        val attempting = CountDownLatch(1)
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            val cancellation = lifecycle.exclusive {
+                val future = executor.submit(java.util.concurrent.Callable {
+                    attempting.countDown()
+                    service.cancelInvitation(invitation)
+                })
+                assertTrue(attempting.await(5, TimeUnit.SECONDS))
+                assertEquals(0, transport.cancelCount)
+                future
+            }
+            assertTrue(cancellation.get(5, TimeUnit.SECONDS).success)
+            assertEquals(1, transport.cancelCount)
+        } finally { executor.shutdownNow() }
+    }
+
+    @Test
+    fun typedIncarnationCreateConflictDoesNotRetryInviteIdAndPersistsGate() {
+        val credentials = testCredentials()
+        val transport = MemorySelfHostedPairingTransport().apply {
+            failNextCreate = SelfHostedSyncHttpException(409, "changed", SelfHostedErrorCode.ACCOUNT_INCARNATION_MISMATCH, true)
+        }
+        val requirement = ActiveWorkspaceSessionRequirement(credentials.authorityBindingId, credentials.deviceId,
+            "workspace-00000000000000000000000000000000")
+        var persisted = 0
+        val service = pairingService(transport, MemorySessionStore(credentials),
+            activeWorkspaceSessionGuard = ActiveWorkspaceSessionGuard(persistIncarnationGate = { persisted++ }) { requirement })
+        val result = service.createInvitation()
+        assertFalse(result.success)
+        assertEquals(WorkspacePairingReason.AuthorityMismatch, result.reason)
+        assertEquals(1, transport.createTokens.size)
+        assertEquals(1, persisted)
+    }
+
+    @Test
+    fun bestEffortCompleteStillPersistsIncarnationFailureAfterLocalJoin() {
+        val credentials = testCredentials()
+        val transport = MemorySelfHostedPairingTransport()
+        val requirement = ActiveWorkspaceSessionRequirement(credentials.authorityBindingId, credentials.deviceId,
+            "workspace-00000000000000000000000000000000")
+        var persisted = 0
+        val service = pairingService(transport, MemorySessionStore(credentials),
+            activeWorkspaceSessionGuard = ActiveWorkspaceSessionGuard(persistIncarnationGate = { persisted++ }) { requirement })
+        val invitation = assertNotNull(service.createInvitation().invitation)
+        transport.failNextComplete = SelfHostedSyncHttpException(401, "stale", SelfHostedErrorCode.ACCOUNT_SESSION_STALE, true)
+        assertTrue(service.joinWithToken(invitation.revealManualToken(), true).success)
+        assertEquals(1, persisted)
+        assertEquals(0, transport.refreshCount)
+    }
+
+    @Test
     fun invitationIsEncryptedClaimedCompletedAndOneUse() {
         val transport = MemorySelfHostedPairingTransport()
         val store = MemorySessionStore(testCredentials())
@@ -58,7 +115,7 @@ class SelfHostedWorkspacePairingServiceJvmTest {
 
         assertTrue(joined.success, joined.diagnosticMessage)
         assertEquals(WorkspacePairingReason.Joined, joined.reason)
-        assertEquals(packageData, joinedPackage)
+        assertEquals(packageData.captureAuthority(SelfHostedSyncSession.fromCredentials(testCredentials()), null), joinedPackage)
         assertEquals(true, replacementAuthorized)
         assertEquals(1, joinCount)
         assertEquals(1, transport.claimCount)
@@ -276,8 +333,8 @@ class SelfHostedWorkspacePairingServiceJvmTest {
         val executor = RefreshingSelfHostedSessionExecutor(transport, store)
 
         assertFailsWith<SelfHostedSyncHttpException> {
-            executor.authorized(original.endpoint, original.userId, original.accessToken) {
-                throw SelfHostedSyncHttpException(401, "unauthorized")
+            executor.authorized(original.endpoint, original.userId, original.accessToken) { _, _ ->
+                throw SelfHostedSyncHttpException(401, "unauthorized", SelfHostedErrorCode.UNAUTHORIZED, true)
             }
         }
 
@@ -419,6 +476,8 @@ internal class MemorySelfHostedPairingTransport : SelfHostedSyncTransport {
     var rejectFirstCreateToken: String? = null
     var tamperNextClaimDigest: Boolean = false
     var failNextClaim: Throwable? = null
+    var failNextCreate: Throwable? = null
+    var failNextComplete: Throwable? = null
     var refreshCount: Int = 0
         private set
     var refreshUserId: String = "user-a"
@@ -430,19 +489,27 @@ internal class MemorySelfHostedPairingTransport : SelfHostedSyncTransport {
         private set
     val createTokens = mutableListOf<String>()
 
-    override fun register(endpoint: String, request: SelfHostedAuthRequest): SelfHostedAuthTokensResponse =
+    override fun register(endpoint: String, request: SelfHostedAuthRequest,
+            accountContext: saien.someday.sync.selfhosted.SelfHostedAccountRequestContext,
+        ): SelfHostedAuthTokensResponse =
         error("unused")
 
-    override fun login(endpoint: String, request: SelfHostedAuthRequest): SelfHostedAuthTokensResponse =
+    override fun login(endpoint: String, request: SelfHostedAuthRequest,
+            accountContext: saien.someday.sync.selfhosted.SelfHostedAccountRequestContext,
+        ): SelfHostedAuthTokensResponse =
         error("unused")
 
-    override fun refresh(endpoint: String, request: SelfHostedRefreshRequest): SelfHostedAuthTokensResponse {
+    override fun refresh(endpoint: String, request: SelfHostedRefreshRequest,
+            accountContext: saien.someday.sync.selfhosted.SelfHostedAccountRequestContext,
+        ): SelfHostedAuthTokensResponse {
         refreshCount += 1
         return SelfHostedAuthTokensResponse(
             accessToken = "fresh-access",
             refreshToken = "fresh-refresh",
             expiresInSeconds = 900,
             user = SelfHostedUserResponse(refreshUserId, "alice@example.com"),
+            accountIncarnation = saien.someday.domain.settings.INITIAL_ACCOUNT_INCARNATION,
+            accountProtocolVersion = 1,
         )
     }
 
@@ -450,21 +517,24 @@ internal class MemorySelfHostedPairingTransport : SelfHostedSyncTransport {
         endpoint: String,
         accessToken: String,
         request: SelfHostedDeviceRegistrationRequest,
-    ): SelfHostedDeviceRegistrationResponse = error("unused")
+            accountContext: saien.someday.sync.selfhosted.SelfHostedAccountRequestContext,
+        ): SelfHostedDeviceRegistrationResponse = error("unused")
 
     override fun createPairingInvite(
         endpoint: String,
         accessToken: String,
         inviteId: String,
         request: SelfHostedPairingInviteCreateRequest,
-    ): SelfHostedPairingInviteCreateResponse {
+            accountContext: saien.someday.sync.selfhosted.SelfHostedAccountRequestContext,
+        ): SelfHostedPairingInviteCreateResponse {
         createTokens += accessToken
+        failNextCreate?.let { failure -> failNextCreate = null; throw failure }
         if (rejectFirstCreateToken == accessToken) {
             rejectFirstCreateToken = null
-            throw SelfHostedSyncHttpException(401, "unauthorized")
+            throw SelfHostedSyncHttpException(401, "unauthorized", SelfHostedErrorCode.UNAUTHORIZED, true)
         }
         if (invitations.putIfAbsent(inviteId, Invite(request)) != null) {
-            throw SelfHostedSyncHttpException(409, "conflict")
+            throw SelfHostedSyncHttpException(409, "conflict", SelfHostedErrorCode.PAIRING_CONFLICT, true)
         }
         return SelfHostedPairingInviteCreateResponse("created", request.expiresAtEpochMillis)
     }
@@ -474,14 +544,15 @@ internal class MemorySelfHostedPairingTransport : SelfHostedSyncTransport {
         accessToken: String,
         inviteId: String,
         request: SelfHostedPairingInviteClaimRequest,
-    ): SelfHostedPairingInviteClaimResponse {
+            accountContext: saien.someday.sync.selfhosted.SelfHostedAccountRequestContext,
+        ): SelfHostedPairingInviteClaimResponse {
         failNextClaim?.let { failure ->
             failNextClaim = null
             throw failure
         }
         claimCount += 1
-        val invite = invitations[inviteId] ?: throw SelfHostedSyncHttpException(404, "missing")
-        if (invite.state != "available") throw SelfHostedSyncHttpException(409, "claimed")
+        val invite = invitations[inviteId] ?: throw SelfHostedSyncHttpException(404, "missing", SelfHostedErrorCode.NOT_FOUND, true)
+        if (invite.state != "available") throw SelfHostedSyncHttpException(409, "claimed", SelfHostedErrorCode.PAIRING_CONFLICT, true)
         invite.state = "claimed"
         invite.claimId = request.claimId
         val digest = if (tamperNextClaimDigest) {
@@ -502,18 +573,22 @@ internal class MemorySelfHostedPairingTransport : SelfHostedSyncTransport {
         accessToken: String,
         inviteId: String,
         request: SelfHostedPairingInviteCompleteRequest,
-    ) {
-        val invite = invitations[inviteId] ?: throw SelfHostedSyncHttpException(404, "missing")
+            accountContext: saien.someday.sync.selfhosted.SelfHostedAccountRequestContext,
+        ) {
+        failNextComplete?.let { failure -> failNextComplete = null; throw failure }
+        val invite = invitations[inviteId] ?: throw SelfHostedSyncHttpException(404, "missing", SelfHostedErrorCode.NOT_FOUND, true)
         if (invite.state != "claimed" || invite.claimId != request.claimId) {
-            throw SelfHostedSyncHttpException(409, "conflict")
+            throw SelfHostedSyncHttpException(409, "conflict", SelfHostedErrorCode.PAIRING_CONFLICT, true)
         }
         completeCount += 1
         invite.state = "completed"
     }
 
-    override fun cancelPairingInvite(endpoint: String, accessToken: String, inviteId: String) {
-        val invite = invitations[inviteId] ?: throw SelfHostedSyncHttpException(404, "missing")
-        if (invite.state != "available") throw SelfHostedSyncHttpException(409, "conflict")
+    override fun cancelPairingInvite(endpoint: String, accessToken: String, inviteId: String,
+            accountContext: saien.someday.sync.selfhosted.SelfHostedAccountRequestContext,
+        ) {
+        val invite = invitations[inviteId] ?: throw SelfHostedSyncHttpException(404, "missing", SelfHostedErrorCode.NOT_FOUND, true)
+        if (invite.state != "available") throw SelfHostedSyncHttpException(409, "conflict", SelfHostedErrorCode.PAIRING_CONFLICT, true)
         cancelCount += 1
         invite.state = "cancelled"
     }

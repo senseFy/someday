@@ -1,3 +1,4 @@
+import java.nio.file.Files
 import org.gradle.api.tasks.testing.logging.TestLogEvent
 import org.gradle.jvm.toolchain.JavaLanguageVersion
 import org.gradle.jvm.toolchain.JavaLauncher
@@ -128,6 +129,27 @@ tasks.register<JavaExec>("runUiSmoke") {
         configurations.named("jvmRuntimeClasspath"),
     )
     mainClass.set("saien.someday.app.desktop.DesktopSmokeKt")
+}
+
+tasks.register<JavaExec>("runIsolatedUiShell") {
+    group = "verification"
+    description = "Opens the real Desktop shell in a disposable profile without the owner Keychain."
+    dependsOn("jvmTestClasses")
+    classpath = files(
+        kotlin.targets.getByName("jvm").compilations.getByName("test").output.allOutputs,
+        configurations.named("jvmTestRuntimeClasspath"),
+    )
+    mainClass.set("saien.someday.app.desktop.DesktopIsolatedShellHarness")
+    doFirst {
+        val profile = Files.createTempDirectory("someday-isolated-shell-")
+        Files.createFile(profile.resolve(".test-owned-profile"))
+        systemProperty("user.home", profile.toString())
+        systemProperty("someday.isolatedShell", "true")
+        providers.gradleProperty("someday.isolatedResetScenario").orNull?.let {
+            systemProperty("someday.isolatedResetScenario", it)
+        }
+        logger.lifecycle("Disposable Desktop shell profile: $profile")
+    }
 }
 
 tasks.register("desktopWindowsLinuxPackageSmoke") {

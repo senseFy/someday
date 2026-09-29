@@ -5,6 +5,7 @@ package saien.someday.integration
 import java.util.Base64
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNotEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
@@ -13,9 +14,11 @@ import kotlin.time.Instant
 import okio.Buffer
 import saien.someday.data.media.MediaAssetImportRequest
 import saien.someday.domain.notes.NoteInput
+import saien.someday.domain.settings.WorkspacePairingReason
 import saien.someday.domain.settings.authorityBindingId
 import saien.someday.integration.testkit.RealSelfHostedFixture
 import saien.someday.integration.testkit.assertSuccessfulSync
+import saien.someday.integration.testkit.restoreKnownWorkspacePackage
 
 class SelfHostedPairingJourneyTest {
     @Test
@@ -59,6 +62,7 @@ class SelfHostedPairingJourneyTest {
             val oldWorkspacePackage = assertNotNull(
                 joiner.workspaceJoinPackageProvider.createPackage().packageData,
             )
+            val oldWorkspaceAccount = assertNotNull(joiner.sessionStore.load())
             val discardedPendingNote = joiner.services.notesRepository.createNote(
                 NoteInput(
                     notebookId = discardedNotebook.id,
@@ -107,14 +111,29 @@ class SelfHostedPairingJourneyTest {
 
             val oldWorkspaceReader = fixture.newDevice("desktop-old-workspace", "desktop")
             oldWorkspaceReader.connect(createAccount = false)
-            val oldWorkspaceJoin = oldWorkspaceReader.workspaceJoiner.join(
+            val beforeRejectedReplacement = oldWorkspaceReader.workspaceKeys.workspaceIdOrNull()
+            val uncapturedJoin = oldWorkspaceReader.services.workspaceLifecycleCoordinator.exclusive {
+                oldWorkspaceReader.services.workspaceLifecycleCoordinator.productAccess {
+                    oldWorkspaceReader.workspaceJoiner.join(oldWorkspacePackage, replaceExistingWorkspace = true)
+                }
+            }
+            assertFalse(uncapturedJoin.success)
+            assertEquals(WorkspacePairingReason.ReplacementFailed, uncapturedJoin.reason)
+            assertEquals(beforeRejectedReplacement, oldWorkspaceReader.workspaceKeys.workspaceIdOrNull())
+            assertNull(oldWorkspaceReader.services.activeWorkspaceSessionGuard.currentRequirement())
+
+            val oldWorkspaceJoin = oldWorkspaceReader.restoreKnownWorkspacePackage(
                 packageData = oldWorkspacePackage,
-                replaceExistingWorkspace = true,
+                sourceAuthorityBindingId = oldWorkspaceAccount.authorityBindingId,
+                sourceAccountIncarnation = oldWorkspaceAccount.accountIncarnation,
             )
             assertTrue(
                 oldWorkspaceJoin.success,
                 oldWorkspaceJoin.diagnosticMessage ?: oldWorkspaceJoin.reason.name,
             )
+            val restoredBinding = assertNotNull(oldWorkspaceReader.services.activeWorkspaceSessionGuard.currentRequirement())
+            assertEquals(oldWorkspaceAccount.accountIncarnation, restoredBinding.accountIncarnation)
+            assertEquals(oldWorkspaceReader.deviceId, restoredBinding.localWriterDeviceId)
             oldWorkspaceReader.assertSuccessfulSync()
             assertNotNull(
                 oldWorkspaceReader.services.notesRepository.getNoteDetails(discardedPublishedNote.id),

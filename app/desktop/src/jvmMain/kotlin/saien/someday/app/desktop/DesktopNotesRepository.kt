@@ -20,6 +20,9 @@ import saien.someday.data.settings.ClientSettingsRepository
 import saien.someday.data.settings.SqlDelightClientSettingsRepository
 import saien.someday.domain.notes.NotesRepository
 import saien.someday.domain.settings.ClientSettings
+import saien.someday.domain.settings.AccountDataResetManager
+import saien.someday.domain.workspace.WorkspaceProductSnapshot
+import saien.someday.domain.workspace.WorkspaceProductAccess
 import saien.someday.domain.settings.ManualSyncRunner
 import saien.someday.domain.settings.SelfHostedConnectionSwitcher
 import saien.someday.domain.settings.SelfHostedSessionCredentialStore
@@ -33,6 +36,7 @@ import saien.someday.sync.createSystemV3ClientServices
 import saien.someday.sync.selfhosted.JdkSelfHostedSyncTransport
 import saien.someday.sync.selfhosted.SelfHostedConnectionSwitchService
 import saien.someday.sync.selfhosted.SelfHostedSetupService
+import saien.someday.sync.selfhosted.SelfHostedAccountResetManager
 import saien.someday.sync.selfhosted.SelfHostedWorkspacePairingService
 import saien.someday.sync.selfhosted.SelfHostedWorkspaceRecoveryService
 import saien.someday.sync.selfhosted.SystemV3MediaCoordinator
@@ -56,10 +60,12 @@ class DesktopClientRepositories(
     val workspacePairingInvitationJoiner: WorkspacePairingInvitationJoiner,
     val workspacePairingInvitationCanceller: WorkspacePairingInvitationCanceller,
     val workspaceRecoveryManager: WorkspaceRecoveryManager,
+    val accountDataResetManager: AccountDataResetManager,
+    val workspaceProductAccess: WorkspaceProductAccess,
     val localMediaAssetStore: AuthorityCoordinatedMediaAssetStore,
     val mediaCoordinator: SystemV3MediaCoordinator,
     private val localDataExporter: LocalDataExporter,
-    private val dayOneArchiveImporter: (ByteArray, String, saien.someday.data.media.MediaImageNormalizer) -> DayOneImportSummary,
+    private val dayOneArchiveImporter: (ByteArray, String, saien.someday.data.media.MediaImageNormalizer, WorkspaceProductSnapshot?) -> DayOneImportSummary,
     private val exportDirectory: File,
     private val driver: JdbcSqliteDriver,
     private val selfHostedTransport: JdkSelfHostedSyncTransport,
@@ -92,15 +98,19 @@ class DesktopClientRepositories(
         )
     }
 
-    fun importDayOneArchive(file: File): SettingsImportSummary =
-        dayOneArchiveImporter(file.readBytes(), file.nameWithoutExtension, DesktopMediaImageNormalizer)
+    fun importDayOneArchive(file: File, expectedWorkspace: WorkspaceProductSnapshot): SettingsImportSummary =
+        dayOneArchiveImporter(file.readBytes(), file.nameWithoutExtension, DesktopMediaImageNormalizer, expectedWorkspace)
             .toSettingsImportSummary()
 }
 
-fun createDesktopClientRepositories(): DesktopClientRepositories {
+fun createDesktopClientRepositories(): DesktopClientRepositories =
+    createDesktopClientRepositories(DesktopSelfHostedSessionCredentialStore())
+
+/** Internal injection keeps isolated shell tests away from the owner macOS Keychain. */
+internal fun createDesktopClientRepositories(sessionStore: SelfHostedSessionCredentialStore): DesktopClientRepositories {
     val localData = createDesktopLocalDataRepository(resolveDesktopLocalDeviceId())
     return runCatching {
-        assembleDesktopClientRepositoriesWithOwnedTransport(localData)
+        assembleDesktopClientRepositoriesWithOwnedTransport(localData, sessionStore)
     }.getOrElse { failure ->
         runCatching { localData.driver.close() }
         throw failure
@@ -109,10 +119,11 @@ fun createDesktopClientRepositories(): DesktopClientRepositories {
 
 private fun assembleDesktopClientRepositoriesWithOwnedTransport(
     localData: DesktopLocalData,
+    sessionStore: SelfHostedSessionCredentialStore,
 ): DesktopClientRepositories {
     val selfHostedTransport = JdkSelfHostedSyncTransport()
     return runCatching {
-        assembleDesktopClientRepositories(localData, selfHostedTransport)
+        assembleDesktopClientRepositories(localData, selfHostedTransport, sessionStore)
     }.getOrElse { failure ->
         runCatching { selfHostedTransport.close() }
         throw failure
@@ -122,6 +133,7 @@ private fun assembleDesktopClientRepositoriesWithOwnedTransport(
 private fun assembleDesktopClientRepositories(
     localData: DesktopLocalData,
     selfHostedTransport: JdkSelfHostedSyncTransport,
+    sessionStore: SelfHostedSessionCredentialStore,
 ): DesktopClientRepositories {
     val localRepository = localData.repository
     val settingsRepository = SqlDelightClientSettingsRepository(localRepository)
@@ -130,7 +142,7 @@ private fun assembleDesktopClientRepositories(
         deviceId = localRepository.localDeviceId,
     )
     val workspaceKeys = bootstrapDesktopWorkspaceKeys(localRepository)
-    val selfHostedSessionCredentialStore = DesktopSelfHostedSessionCredentialStore()
+    val selfHostedSessionCredentialStore = sessionStore
     val localMediaAssetStore = LocalMediaAssetStore(
         database = localRepository.database,
         appPrivateRoot = File(System.getProperty("user.home"), ".someday").absolutePath.toPath(),
@@ -212,6 +224,29 @@ private fun assembleDesktopClientRepositories(
         workspacePairingInvitationJoiner = selfHostedPairingService,
         workspacePairingInvitationCanceller = selfHostedPairingService,
         workspaceRecoveryManager = selfHostedRecoveryService,
+        accountDataResetManager = SelfHostedAccountResetManager(
+            services = systemV3Services,
+            sessionStore = selfHostedSessionCredentialStore,
+            transport = selfHostedTransport,
+            settingsRepository = settingsRepository,
+            workspaceIdProvider = workspaceKeys::workspaceIdOrNull,
+            localDeviceIdProvider = { localRepository.localDeviceId },
+            deviceName = "Desktop",
+            platform = "desktop",
+            freshWorkspaceReplacement = { before, after ->
+                workspaceKeys.replaceWithFreshWorkspace(
+                    deviceName = "Desktop",
+                    platform = "desktop",
+                    beforeMetadataReplacement = before,
+                    afterMetadataReplacement = after,
+                )
+                Unit
+            },
+            pairing = selfHostedPairingService,
+            recovery = selfHostedRecoveryService,
+            canExportProvider = { workspaceKeys.unlockedOrUnlock() != null },
+        ),
+        workspaceProductAccess = systemV3Services.workspaceProductAccess,
         localMediaAssetStore = systemV3Services.localMediaAssetStore,
         mediaCoordinator = systemV3Services.mediaCoordinator,
         localDataExporter = LocalDataExporter(

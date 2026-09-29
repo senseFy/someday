@@ -1,12 +1,18 @@
+@file:OptIn(kotlin.time.ExperimentalTime::class)
+
 package saien.someday.app.android
 
+import android.Manifest
 import android.app.Instrumentation
+import android.app.NotificationManager
 import android.content.Context
 import android.content.ContextWrapper
 import android.content.SharedPreferences
 import android.database.DatabaseErrorHandler
 import android.database.sqlite.SQLiteDatabase
 import android.os.Looper
+import android.os.Build
+import android.content.pm.PackageManager
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import java.io.File
@@ -24,6 +30,13 @@ import kotlin.test.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import saien.someday.domain.notes.NoteInput
+import saien.someday.domain.settings.OnThisDayNotificationPreferences
+import kotlinx.datetime.LocalDate
+import kotlinx.datetime.TimeZone
+import kotlinx.datetime.atTime
+import kotlinx.datetime.toInstant
+import kotlinx.datetime.toLocalDateTime
+import kotlin.time.Clock
 
 @RunWith(AndroidJUnit4::class)
 class AndroidWorkspaceInitializationTest {
@@ -34,6 +47,48 @@ class AndroidWorkspaceInitializationTest {
     @Test
     fun reminderFirstAndOverlappingForegroundShareWorkspaceAndSurviveRestart() =
         assertSharedInitialization(reminderFirst = true)
+
+    @Test
+    fun enabledFireReadsPriorYearNotesThroughTheSharedGraphAndLeavesItUsable() {
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val context = IsolatedWorkspaceContext(instrumentation.targetContext)
+        val application = context.newApplication()
+        context.continueInitialization.countDown()
+        val repositories = application.clientRepositories
+        val grantNotification = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        try {
+            if (grantNotification) instrumentation.uiAutomation.grantRuntimePermission(context.packageName, Manifest.permission.POST_NOTIFICATIONS)
+            val zone = TimeZone.currentSystemDefault()
+            val today = Clock.System.now().toLocalDateTime(zone).date
+            // Four years also keeps February 29 valid; the app query is month/day based.
+            val priorYear = LocalDate(today.year - 4, today.month, today.day).atTime(12, 0).toInstant(zone)
+            val notebook = repositories.notesRepository.createNotebook("Reminder regression")
+            val note = repositories.notesRepository.createNote(NoteInput(
+                notebook.id, "Prior-year memory", "Reminder shares the active workspace", priorYear, timeZoneId = zone.id,
+            ))
+            repositories.settingsRepository.save(repositories.settingsRepository.load().copy(
+                onThisDayNotifications = OnThisDayNotificationPreferences(enabled = true, hour = 9, minute = 0),
+            ))
+            assertEquals(listOf(note.id), repositories.notesRepository.listPriorYearNotesForDate(today).map { it.id })
+
+            // Enabled + a matching note reaches both the production notes query and notification path.
+            handleOnThisDayBroadcast(context, OnThisDayBroadcastKind.Fire)
+
+            assertSame(repositories, application.clientRepositories)
+            assertEquals(1, context.keyStoreOpenCount.get())
+            assertEquals("Reminder shares the active workspace", assertNotNull(repositories.notesRepository.getNoteDetails(note.id)).markdownBody)
+            val current = repositories.notesRepository.createNote(NoteInput(notebook.id, "After Fire", "Still writable"))
+            assertNotNull(repositories.notesRepository.getNoteDetails(current.id))
+        } finally {
+            AndroidOnThisDayNotificationScheduler(context).cancel()
+            context.getSystemService(NotificationManager::class.java)?.cancel(OnThisDayNotificationContract.NotificationId)
+            // Runtime revocation kills the target process, including this instrumentation.
+            // This suite runs only in its disposable emulator installation.
+            repositories.close()
+            context.cleanUp()
+        }
+    }
 
     private fun assertSharedInitialization(reminderFirst: Boolean) {
         val context = IsolatedWorkspaceContext(InstrumentationRegistry.getInstrumentation().targetContext)

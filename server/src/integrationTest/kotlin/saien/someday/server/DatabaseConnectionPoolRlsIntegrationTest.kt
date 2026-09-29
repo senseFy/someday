@@ -129,7 +129,7 @@ class DatabaseConnectionPoolRlsIntegrationTest {
         workspaceId: String,
     ) {
         connection.prepareStatement(
-            "INSERT INTO someday_entity_workspaces(user_id, workspace_id) VALUES (?, ?)",
+            "INSERT INTO someday_entity_workspaces(user_id, workspace_id, data_incarnation) VALUES (?, ?, '00000000-0000-0000-0000-000000000000')",
         ).use { statement ->
             statement.setObject(1, identity.userId)
             statement.setString(2, workspaceId)

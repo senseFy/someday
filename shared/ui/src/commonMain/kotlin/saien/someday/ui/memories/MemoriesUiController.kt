@@ -9,6 +9,9 @@ import saien.someday.domain.notes.MemoryDayCount
 import saien.someday.domain.notes.MemoryMonth
 import saien.someday.domain.notes.NoteSummary
 import saien.someday.domain.notes.NotesRepository
+import saien.someday.domain.workspace.UnrestrictedWorkspaceProductAccess
+import saien.someday.domain.workspace.WorkspaceProductAccess
+import saien.someday.domain.workspace.WorkspaceProductSnapshot
 import saien.someday.ui.i18n.MemoriesUiStrings
 import saien.someday.ui.i18n.formatUiString
 import kotlinx.coroutines.CoroutineDispatcher
@@ -24,6 +27,7 @@ class MemoriesUiController(
     strings: MemoriesUiStrings = MemoriesUiStrings(),
     initialSelectedDate: LocalDate = currentLocalDate(),
     private val backgroundDispatcher: CoroutineDispatcher = Dispatchers.Default,
+    private val workspaceProductAccess: WorkspaceProductAccess = UnrestrictedWorkspaceProductAccess,
 ) {
     private var strings = strings
     var state: MemoriesUiState by mutableStateOf(
@@ -52,16 +56,21 @@ class MemoriesUiController(
         selectedDate: LocalDate = state.selectedDate,
     ): MemoriesRepositoryData =
         withContext(backgroundDispatcher) {
-            MemoriesRepositoryData(
-                month = month,
-                selectedDate = selectedDate,
-                dayCounts = repository.listMemoryDayCounts(month),
-                selectedDayNotes = repository.listNotesForDate(selectedDate),
-                priorYearNotes = repository.listPriorYearNotesForDate(selectedDate),
-            )
+            val captured = workspaceProductAccess.capture()
+            workspaceProductAccess.read(captured) {
+                MemoriesRepositoryData(
+                    month = month,
+                    selectedDate = selectedDate,
+                    dayCounts = repository.listMemoryDayCounts(month),
+                    selectedDayNotes = repository.listNotesForDate(selectedDate),
+                    priorYearNotes = repository.listPriorYearNotesForDate(selectedDate),
+                    workspaceSnapshot = captured,
+                )
+            }
         }
 
     fun applyRepositoryData(data: MemoriesRepositoryData) {
+        if (data.workspaceSnapshot?.let(workspaceProductAccess::isCurrent) == false) return
         if (state.month == data.month && state.selectedDate == data.selectedDate) {
             state = state.withRepositoryData(data)
         }
@@ -153,6 +162,7 @@ data class MemoriesRepositoryData(
     val dayCounts: List<MemoryDayCount>,
     val selectedDayNotes: List<NoteSummary>,
     val priorYearNotes: List<NoteSummary>,
+    val workspaceSnapshot: WorkspaceProductSnapshot? = null,
 )
 
 data class MemoryCalendarDay(

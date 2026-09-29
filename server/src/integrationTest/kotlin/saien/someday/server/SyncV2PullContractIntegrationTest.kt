@@ -50,9 +50,8 @@ class SyncV2PullContractIntegrationTest {
         }
         assertIs<SyncV2PushRepositoryResult.Accepted>(
             repository.push(
-                identity.userId,
+                identity.request,
                 WORKSPACE_ID,
-                identity.deviceId,
                 genesis.metadata.epochId,
                 writerProtocolVersion = 2,
                 objects = objects,
@@ -90,7 +89,7 @@ class SyncV2PullContractIntegrationTest {
     }
 
     private fun pull(after: Long, limit: Int) = repository.pull(
-        identity.userId,
+        identity.request,
         WORKSPACE_ID,
         genesis.metadata.epochId,
         afterCursor = after,

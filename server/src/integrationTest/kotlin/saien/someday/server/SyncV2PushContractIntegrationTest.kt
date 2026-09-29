@@ -72,7 +72,7 @@ class SyncV2PushContractIntegrationTest {
         assertEquals("mutation_reuse_mismatch", rejected.error)
 
         val pulled = repository.pull(
-            identity.userId,
+            identity.request,
             WORKSPACE_ID,
             genesis.metadata.epochId,
             afterCursor = 0,
@@ -105,7 +105,7 @@ class SyncV2PushContractIntegrationTest {
         )
 
         val pulled = repository.pull(
-            identity.userId,
+            identity.request,
             WORKSPACE_ID,
             genesis.metadata.epochId,
             afterCursor = 0,
@@ -134,7 +134,7 @@ class SyncV2PushContractIntegrationTest {
         assertEquals("mutation_reuse_mismatch", collision.error)
 
         val afterReplay = repository.pull(
-            identity.userId,
+            identity.request,
             WORKSPACE_ID,
             genesis.metadata.epochId,
             afterCursor = 0,
@@ -155,12 +155,13 @@ class SyncV2PushContractIntegrationTest {
         }
 
         countingConnections.reset()
+        val batchExecutions = mutableListOf<Int>()
         objects.chunked(MAX_PUSH_OBJECTS).forEach { batch ->
+            val beforeBatch = countingConnections.statementExecutions
             val result = assertIs<SyncV2PushRepositoryResult.Accepted>(
                 bulkRepository.push(
-                    identity.userId,
+                    identity.request,
                     WORKSPACE_ID,
-                    identity.deviceId,
                     genesis.metadata.epochId,
                     writerProtocolVersion = 2,
                     objects = batch,
@@ -168,12 +169,13 @@ class SyncV2PushContractIntegrationTest {
             )
             assertEquals(batch.size, result.acknowledgements.size)
             assertTrue(result.acknowledgements.none { it.idempotentReplay })
+            batchExecutions += countingConnections.statementExecutions - beforeBatch
         }
 
-        assertEquals(
-            IMPORT_BATCH_COUNT * FRESH_BATCH_DATABASE_EXECUTIONS,
-            countingConnections.statementExecutions,
-            "A push batch must use a fixed number of database round trips instead of one set per object.",
+        assertEquals(1, batchExecutions.distinct().size, "Admission must add only fixed per-batch overhead.")
+        assertTrue(
+            batchExecutions.first() <= MAX_BATCH_DATABASE_EXECUTIONS,
+            "A push batch must remain bounded independently of its object count.",
         )
         assertEquals(
             IMPORT_OBJECT_COUNT.toLong(),
@@ -189,7 +191,7 @@ class SyncV2PushContractIntegrationTest {
         )
 
         val pulled = bulkRepository.pull(
-            identity.userId,
+            identity.request,
             WORKSPACE_ID,
             genesis.metadata.epochId,
             afterCursor = 0,
@@ -201,23 +203,21 @@ class SyncV2PushContractIntegrationTest {
         countingConnections.reset()
         val replay = assertIs<SyncV2PushRepositoryResult.Accepted>(
             bulkRepository.push(
-                identity.userId,
+                identity.request,
                 WORKSPACE_ID,
-                identity.deviceId,
                 genesis.metadata.epochId,
                 writerProtocolVersion = 2,
                 objects = objects.take(MAX_PUSH_OBJECTS),
             ),
         )
         assertTrue(replay.acknowledgements.all { it.idempotentReplay })
-        assertEquals(REPLAY_BATCH_DATABASE_EXECUTIONS, countingConnections.statementExecutions)
+        assertTrue(countingConnections.statementExecutions <= batchExecutions.first())
     }
 
     private fun push(objects: List<saien.someday.server.persistence.SyncV2ObjectInput>) =
         repository.push(
-            identity.userId,
+            identity.request,
             WORKSPACE_ID,
-            identity.deviceId,
             genesis.metadata.epochId,
             writerProtocolVersion = 2,
             objects = objects,
@@ -229,8 +229,7 @@ class SyncV2PushContractIntegrationTest {
         const val MAX_PUSH_OBJECTS = 100
         const val IMPORT_BATCH_COUNT = 100
         const val IMPORT_OBJECT_COUNT = MAX_PUSH_OBJECTS * IMPORT_BATCH_COUNT
-        const val FRESH_BATCH_DATABASE_EXECUTIONS = 9
-        const val REPLAY_BATCH_DATABASE_EXECUTIONS = 7
+        const val MAX_BATCH_DATABASE_EXECUTIONS = 24
     }
 }
 

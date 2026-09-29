@@ -166,3 +166,13 @@ must not collect users' codes. The persistence and object-storage invariants are
 documented in [Server Storage Architecture](../specs/server-storage-architecture.md),
 and the user-key flow in
 [Workspace Recovery Protocol](../specs/workspace-recovery-protocol.md).
+
+
+## Account data reset
+
+`SOMEDAY_ACCOUNT_RESET_ENABLED` defaults to `false`. The server reset and
+operator reclamation tools are implemented; client reset/rejoin integration and
+coordinated rollout remain pending. Keep reset off until compatible clients and
+the [operator checklist](account-data-reset-maintenance.md) are ready. Operator
+opt-in is separate from a successful storage read/write probe. Disabling new
+resets preserves receipts, incarnation fencing and current data access.

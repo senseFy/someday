@@ -1,4 +1,5 @@
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import org.gradle.api.tasks.testing.Test
 
 plugins {
     alias(libs.plugins.kotlin.multiplatform)
@@ -48,6 +49,7 @@ kotlin {
         jvmTest.dependencies {
             implementation(libs.sqldelight.sqlite.driver)
         }
+        named("jvmTest") { resources.srcDir("src/commonMain/sqldelight/databases") }
         iosMain.dependencies {
             implementation(libs.sqldelight.native.driver)
         }
@@ -60,22 +62,37 @@ sqldelight {
             packageName.set("saien.someday.data.local.db")
             schemaOutputDirectory.set(file("src/commonMain/sqldelight/databases"))
             // SQLDelight 2.1.0's ObjectDiffer does not terminate on this
-            // schema's foreign-key graph. The baseline verifier below checks
-            // the generated SQLite schema without retaining old migrations.
+            // schema's foreign-key graph. The replacement verifier below runs
+            // a seeded snapshot through the real JVM driver migration and
+            // compares its full catalog and preserved data with a fresh DB.
             verifyMigrations.set(false)
         }
     }
 }
 
-val verifySomedayDatabaseV2Baseline by tasks.registering(Exec::class) {
+val verifySomedayDatabaseMigrationSnapshots by tasks.registering(Exec::class) {
     group = "verification"
-    description = "Verifies the squashed System V3 SQLDelight baseline."
+    description = "Verifies frozen SQLDelight history and migrated/fresh SQLite catalogs."
     commandLine(rootProject.file("scripts/verify-sqldelight-v2-baseline"))
     inputs.files(
         file("src/commonMain/sqldelight/databases/1.db"),
+        file("src/commonMain/sqldelight/databases/2.db"),
+        file("src/commonMain/sqldelight/databases/3.db"),
+        file("src/commonMain/sqldelight/saien/someday/data/local/db/1.sqm"),
+        file("src/commonMain/sqldelight/saien/someday/data/local/db/2.sqm"),
         file("src/commonMain/sqldelight/saien/someday/data/local/db/Someday.sq"),
         rootProject.file("scripts/verify-sqldelight-v2-baseline"),
     )
+}
+
+val verifySomedayDatabaseMigration by tasks.registering(Test::class) {
+    group = "verification"
+    description = "Upgrades nonempty v1/v2 databases through the shared driver and verifies v3 data/catalogs."
+    val jvmTests = tasks.named<Test>("jvmTest")
+    dependsOn("jvmTestClasses", verifySomedayDatabaseMigrationSnapshots)
+    testClassesDirs = jvmTests.get().testClassesDirs
+    classpath = jvmTests.get().classpath
+    filter { includeTestsMatching("saien.someday.data.local.SomedayDatabaseMigrationTest") }
 }
 
 tasks.matching { it.name == "verifyCommonMainSomedayDatabaseMigration" }.configureEach {
@@ -83,11 +100,11 @@ tasks.matching { it.name == "verifyCommonMainSomedayDatabaseMigration" }.configu
 }
 
 tasks.named("verifySqlDelightMigration") {
-    dependsOn(verifySomedayDatabaseV2Baseline)
+    dependsOn(verifySomedayDatabaseMigration)
 }
 
 tasks.named("check") {
-    dependsOn(verifySomedayDatabaseV2Baseline)
+    dependsOn(verifySomedayDatabaseMigration)
 }
 
 android {

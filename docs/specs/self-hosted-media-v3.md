@@ -69,6 +69,13 @@ it requires operator recovery from a valid media-store copy.
 
 There is no list, patch, chunk, manifest, draft, finalize, or delete endpoint.
 
+Clients carry the captured issuing/workspace incarnation through HEAD, GET and
+PUT and enforce [account error handling](account-data-reset-protocol.md#shared-client-authority-and-failure-handling)
+before media-specific status decoding. A stale or retired GET cannot be treated
+as a missing blob and trigger a repair PUT. The captured authority is rechecked
+before committing local publication evidence. Workspace IDs cannot be reused
+across incarnations, so the existing proof tuple needs no incarnation column.
+
 ## Storage and quota
 
 PostgreSQL stores bounded metadata and the configured blob store holds the
@@ -76,16 +83,22 @@ ciphertext. The server supports two blob backends: filesystem for standalone
 deployments and S3-compatible object storage for external deployments.
 
 A filesystem implementation may shard that logical identity internally. The
-current layout is:
+G0 layout is:
 
 ```text
 <root>/<user-id>/<workspace-id>/<media-id[0:2]>/<media-id[2:4]>/<media-id>/object.bin
 ```
 
-This physical layout is not part of the wire contract.
+Nonzero incarnations prepend `.incarnations/v1/<user-id>/<incarnation>/`
+in place of `<user-id>/`. These physical layouts are not part of the wire
+contract. The workspace registry supplies the incarnation after
+[account admission](account-data-reset-protocol.md).
 
 The S3 adapter uses the same identity beneath a fixed `media/v1/`
-prefix. It requires private PUT/HEAD/GET, strong read-after-write behavior, and
+prefix. G0 keys remain `media/v1/<user-id>/<workspace-id>/<media-id>.bin`;
+nonzero keys use
+`media/v1/.incarnations/v1/<user-id>/<incarnation>/<workspace-id>/<media-id>.bin`.
+It requires private PUT/HEAD/GET, strong read-after-write behavior, and
 conditional create equivalent to `If-None-Match: *`. The server does not use
 public object URLs, expose storage credentials, rely on ETag as SHA-256, invoke
 bucket listing, or require multipart upload. The provider must keep missing
@@ -100,10 +113,15 @@ object, while different bytes at the same identity are always rejected. The
 current server leaves these orphans in place and does not delete objects at
 runtime.
 
-Quota is checked atomically per account across all workspaces and counts
-PostgreSQL-indexed published ciphertext bytes. A safe orphan consumes backend
-capacity without counting against published account quota. Published objects
-are not currently garbage-collected.
+Quota is checked atomically per account across all workspaces of its active
+incarnation and counts PostgreSQL-indexed published ciphertext bytes. Retired
+incarnation bytes do not consume active quota. The media transaction pins
+`READ COMMITTED` before scope SQL, so a quota-lock waiter sees the preceding
+upload's committed metadata even if its connection defaults to `REPEATABLE READ`.
+A safe orphan consumes backend
+capacity without counting against published account quota. Current-incarnation objects are not garbage-collected. Retired namespaces can
+be reclaimed only through the separate [operator maintenance boundary](../guides/account-data-reset-maintenance.md);
+retention can prevent reclamation indefinitely.
 
 ## Client publication proof
 

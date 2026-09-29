@@ -1,6 +1,8 @@
 package saien.someday.server.persistence
 
 import saien.someday.server.ServerConfig
+import saien.someday.server.auth.AccountAccess
+import saien.someday.server.auth.AccountRequestContext
 import java.security.MessageDigest
 import java.sql.Connection
 import java.sql.ResultSet
@@ -135,17 +137,19 @@ class SyncV2Repository(
     config: ServerConfig,
     private val connections: DatabaseConnectionProvider = directDatabaseConnectionProvider(config),
 ) {
-    fun loadEpoch(userId: UUID, workspaceId: String): SyncV2EpochRecord? =
-        scopedConnection(userId, workspaceId).use { connection ->
-        loadActiveEpoch(connection, userId, workspaceId, false)
-    }
+    fun loadEpoch(request: AccountRequestContext, workspaceId: String): SyncV2EpochRecord? =
+        transaction(request, workspaceId) { connection, account ->
+            loadActiveEpoch(connection, account.userId, workspaceId, false)
+        }
 
     fun putCheckpointChunk(
-        userId: UUID,
+        request: AccountRequestContext,
         workspaceId: String,
         input: SyncV2CheckpointChunkInput,
-    ): SyncV2ImmutablePutRepositoryResult = transaction(userId, workspaceId) { connection ->
+    ): SyncV2ImmutablePutRepositoryResult = transaction(request, workspaceId) { connection, account ->
+        val userId = account.userId
         lockWorkspace(connection, userId, workspaceId)
+        ensureWorkspace(connection, account, workspaceId)
         val ref = input.ref
         val existing = connection.prepareStatement(
             """
@@ -210,11 +214,13 @@ class SyncV2Repository(
     }
 
     fun putCheckpointManifest(
-        userId: UUID,
+        request: AccountRequestContext,
         workspaceId: String,
         input: SyncV2CheckpointManifestInput,
-    ): SyncV2ImmutablePutRepositoryResult = transaction(userId, workspaceId) { connection ->
+    ): SyncV2ImmutablePutRepositoryResult = transaction(request, workspaceId) { connection, account ->
+        val userId = account.userId
         lockWorkspace(connection, userId, workspaceId)
+        ensureWorkspace(connection, account, workspaceId)
         val fingerprint = chunkRefsFingerprint(input.chunks)
         val existing = connection.prepareStatement(
             """
@@ -275,11 +281,13 @@ class SyncV2Repository(
     }
 
     fun cleanupCheckpointDraft(
-        userId: UUID,
+        request: AccountRequestContext,
         workspaceId: String,
         input: SyncV2CheckpointCleanupInput,
-    ): SyncV2CheckpointCleanupRepositoryResult = transaction(userId, workspaceId) { connection ->
+    ): SyncV2CheckpointCleanupRepositoryResult = transaction(request, workspaceId) { connection, account ->
+        val userId = account.userId
         lockWorkspace(connection, userId, workspaceId)
+        ensureWorkspace(connection, account, workspaceId)
         val current = loadActiveEpoch(connection, userId, workspaceId, true)
             ?: return@transaction SyncV2CheckpointCleanupRepositoryResult.Retained(
                 "checkpoint_still_publishable",
@@ -393,16 +401,16 @@ class SyncV2Repository(
     }
 
     fun compareAndSetEpoch(
-        userId: UUID,
+        request: AccountRequestContext,
         workspaceId: String,
         expectedCurrentDigest: String?,
         metadata: SyncV2EpochMetadataRecord,
         pointerObjectJson: String,
     ): SyncV2PointerPublishRepositoryResult = transaction(
-        userId,
+        request,
         workspaceId,
-        ensureWorkspace = false,
-    ) { connection ->
+    ) { connection, account ->
+        val userId = account.userId
         lockWorkspaceRecoveryAccount(connection, userId)
         lockWorkspace(connection, userId, workspaceId)
         val current = loadActiveEpoch(connection, userId, workspaceId, true)
@@ -460,11 +468,12 @@ class SyncV2Repository(
     }
 
     fun loadCheckpointManifest(
-        userId: UUID,
+        request: AccountRequestContext,
         workspaceId: String,
         epochId: String,
         checkpointId: String,
-    ): String? = scopedConnection(userId, workspaceId).use { connection ->
+    ): String? = transaction(request, workspaceId) { connection, account ->
+        val userId = account.userId
         connection.prepareStatement(
             """
             SELECT encrypted_object_json FROM someday_sync_v2_checkpoint_manifests
@@ -480,12 +489,13 @@ class SyncV2Repository(
     }
 
     fun loadCheckpointChunk(
-        userId: UUID,
+        request: AccountRequestContext,
         workspaceId: String,
         epochId: String,
         checkpointId: String,
         chunkIndex: Int,
-    ): String? = scopedConnection(userId, workspaceId).use { connection ->
+    ): String? = transaction(request, workspaceId) { connection, account ->
+        val userId = account.userId
         connection.prepareStatement(
             """
             SELECT encrypted_object_json FROM someday_sync_v2_checkpoint_chunks
@@ -502,14 +512,16 @@ class SyncV2Repository(
     }
 
     fun push(
-        userId: UUID,
+        request: AccountRequestContext,
         workspaceId: String,
-        deviceId: UUID,
         epochId: String,
         writerProtocolVersion: Int,
         objects: List<SyncV2ObjectInput>,
-    ): SyncV2PushRepositoryResult = transaction(userId, workspaceId) { connection ->
+    ): SyncV2PushRepositoryResult = transaction(request, workspaceId) { connection, account ->
+        val userId = account.userId
+        val deviceId = checkNotNull(account.deviceId)
         lockWorkspace(connection, userId, workspaceId)
+        ensureWorkspace(connection, account, workspaceId)
         val epoch = loadActiveEpoch(connection, userId, workspaceId, true)
             ?: return@transaction SyncV2PushRepositoryResult.Rejected("v2_epoch_not_initialized")
         if (epoch.metadata.epochId != epochId) {
@@ -569,21 +581,23 @@ class SyncV2Repository(
     }
 
     fun pull(
-        userId: UUID,
+        request: AccountRequestContext,
         workspaceId: String,
         epochId: String,
         afterCursor: Long,
         limit: Int,
-    ): SyncV2PullRepositoryResult = scopedConnection(userId, workspaceId).use { connection ->
+    ): SyncV2PullRepositoryResult = transaction(request, workspaceId) { connection, account ->
+        val userId = account.userId
+        touchDevice(connection, account)
         if (loadEpochById(connection, userId, workspaceId, epochId) == null) {
-            return@use SyncV2PullRepositoryResult(emptyList(), true, error = "epoch_not_found")
+            return@transaction SyncV2PullRepositoryResult(emptyList(), true, error = "epoch_not_found")
         }
         val maximum = maximumCursor(connection, userId, workspaceId, epochId)
         if (afterCursor > maximum) {
             // An authenticated client cursor ahead of the server is rollback
             // evidence. The first-release protocol never discards history and
             // therefore has no rebootstrap/horizon escape hatch.
-            return@use SyncV2PullRepositoryResult(
+            return@transaction SyncV2PullRepositoryResult(
                 emptyList(),
                 complete = true,
                 error = "remote_rollback_detected",
@@ -617,7 +631,7 @@ class SyncV2Repository(
         // the cursor and could let a client upload on top of incomplete
         // history. Preserve the gap as a blocking recovery condition.
         if (values.any { (_, encodedObject) -> encodedObject == null }) {
-            return@use SyncV2PullRepositoryResult(
+            return@transaction SyncV2PullRepositoryResult(
                 changes = emptyList(),
                 complete = false,
                 error = "missing_remote_object",
@@ -631,9 +645,10 @@ class SyncV2Repository(
         )
     }
 
-    fun frontier(userId: UUID, workspaceId: String, epochId: String): SyncV2EpochFrontierRecord? =
-        scopedConnection(userId, workspaceId).use { connection ->
-            if (loadEpochById(connection, userId, workspaceId, epochId) == null) return@use null
+    fun frontier(request: AccountRequestContext, workspaceId: String, epochId: String): SyncV2EpochFrontierRecord? =
+        transaction(request, workspaceId) { connection, account ->
+            val userId = account.userId
+            if (loadEpochById(connection, userId, workspaceId, epochId) == null) return@transaction null
             connection.prepareStatement(
                 """
                 SELECT cursor, object_digest FROM someday_sync_v2_changes
@@ -654,10 +669,11 @@ class SyncV2Repository(
             }
         }
 
-    fun status(userId: UUID, workspaceId: String): SyncV2StatusSnapshot =
-        scopedConnection(userId, workspaceId).use { connection ->
+    fun status(request: AccountRequestContext, workspaceId: String): SyncV2StatusSnapshot =
+        transaction(request, workspaceId) { connection, account ->
+            val userId = account.userId
             val epoch = loadActiveEpoch(connection, userId, workspaceId, false)
-                ?: return@use SyncV2StatusSnapshot(null, 0, 0)
+                ?: return@transaction SyncV2StatusSnapshot(null, 0, 0)
             val cursor = maximumCursor(connection, userId, workspaceId, epoch.metadata.epochId)
             val count = connection.prepareStatement(
                 "SELECT COUNT(*) FROM someday_sync_v2_objects " +
@@ -1011,67 +1027,51 @@ class SyncV2Repository(
     }
 
     private fun <T> transaction(
-        userId: UUID,
+        request: AccountRequestContext,
         workspaceId: String,
-        ensureWorkspace: Boolean = true,
-        block: (Connection) -> T,
-    ): T = connection().use { connection ->
-        // RLS scope selection executes SQL before the account advisory lock.
-        // Pin READ COMMITTED before any statement so a waiter receives a fresh
-        // snapshot after the lock holder commits, regardless of the database
-        // or role's default transaction isolation.
-        connection.transactionIsolation = Connection.TRANSACTION_READ_COMMITTED
-        connection.autoCommit = false
-        try {
-            selectWorkspaceScope(connection, userId, workspaceId, local = true, ensureWorkspace = ensureWorkspace)
-            block(connection).also { connection.commit() }
-        } catch (failure: Throwable) {
-            connection.rollback()
-            throw failure
-        }
+        block: (Connection, AdmittedAccount) -> T,
+    ): T = AccountAdmission.transaction(
+        connections,
+        listOf(request.userId),
+        scope = { connection -> selectWorkspaceScope(connection, request.userId, workspaceId) },
+    ) { connection ->
+        val account = AccountAdmission.admit(connection, request, AccountAccess.SYNC, workspaceId)
+        block(connection, account)
     }
 
-    private fun connection(): Connection =
-        connections.connection()
-
-    private fun scopedConnection(userId: UUID, workspaceId: String): Connection {
-        val connection = connection()
-        try {
-            connection.autoCommit = false
-            selectWorkspaceScope(connection, userId, workspaceId, local = false, ensureWorkspace = false)
-            connection.commit()
-            connection.autoCommit = true
-            return connection
-        } catch (failure: Throwable) {
-            runCatching { connection.rollback() }
-            runCatching { connection.close() }
-            throw failure
-        }
-    }
-
-    /** Selects one fail-closed RLS namespace; only write transactions create its registry row. */
-    private fun selectWorkspaceScope(
-        connection: Connection,
-        userId: UUID,
-        workspaceId: String,
-        local: Boolean,
-        ensureWorkspace: Boolean,
-    ) {
+    /** Scope selection is read-only; admission and narrower locks precede registry creation. */
+    private fun selectWorkspaceScope(connection: Connection, userId: UUID, workspaceId: String) {
         require(WORKSPACE_ID.matches(workspaceId)) { "Invalid workspace scope." }
-        connection.prepareStatement("SELECT set_config('someday.user_id', ?, ?)").use { statement ->
+        connection.prepareStatement("SELECT set_config('someday.user_id', ?, true)").use { statement ->
             statement.setString(1, userId.toString())
-            statement.setBoolean(2, local)
             statement.executeQuery().close()
         }
-        setWorkspaceScope(connection, workspaceId, local)
-        if (ensureWorkspace) {
-            connection.prepareStatement(
-                "INSERT INTO someday_entity_workspaces(user_id, workspace_id) VALUES (?, ?) ON CONFLICT DO NOTHING",
-            ).use { statement ->
-                statement.setObject(1, userId)
-                statement.setString(2, workspaceId)
-                statement.executeUpdate()
-            }
+        setWorkspaceScope(connection, workspaceId, local = true)
+    }
+
+    private fun ensureWorkspace(connection: Connection, account: AdmittedAccount, workspaceId: String) {
+        connection.prepareStatement(
+            "INSERT INTO someday_entity_workspaces(user_id, workspace_id, data_incarnation) " +
+                "VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
+        ).use { statement ->
+            statement.setObject(1, account.userId)
+            statement.setString(2, workspaceId)
+            statement.setObject(3, account.incarnation)
+            statement.executeUpdate()
+        }
+    }
+
+    private fun touchDevice(connection: Connection, account: AdmittedAccount) {
+        connection.prepareStatement(
+            """
+            UPDATE someday_devices SET last_seen_at = NOW()
+            WHERE id = ? AND user_id = ? AND data_incarnation = ? AND revoked_at IS NULL
+            """.trimIndent(),
+        ).use { statement ->
+            statement.setObject(1, checkNotNull(account.deviceId))
+            statement.setObject(2, account.userId)
+            statement.setObject(3, account.incarnation)
+            statement.executeUpdate()
         }
     }
 

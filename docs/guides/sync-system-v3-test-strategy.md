@@ -49,6 +49,88 @@ portable metadata without device-local aliases, KDF/AEAD authentication,
 envelope identity binding, secret redaction, setup confirmation, and atomic
 replacement behavior.
 
+Account reset client coverage uses the same local persistence and lifecycle
+boundaries. `SqlDelightAccountStateRepositoryTest` proves that intent and gates
+commit together, uncertainty survives reopen and later rejected attempts,
+workspace replacement cannot bypass an unresolved intent, and offline editing
+invalidates discard consent. Confirmation freezes the original copy before
+discovery; failed discovery or process loss cannot restore earlier consent.
+Completion shares the workspace-replacement transaction, so injected local
+failure restores both intent and gate.
+
+`SelfHostedAccountResetServiceTest` covers persistence before POST, lost responses,
+receipt-404 ambiguity, fresh consent after offline editing, and concurrent
+submission without holding the workspace lifecycle lock through HTTP. A barrier
+also proves that an offline exit while confirmation discovery is pending
+invalidates that confirmation and preserves subsequent local edits.
+`AccountDiscoveryPersistenceTest` and `AccountSessionExecutorTest` cover strict
+same-credential legacy proof, monotonic protocol capability, issuance during
+legacy verification, one ordinary unauthorized refresh, no refresh for stale
+incarnation or busy responses, and rejection of late credential updates.
+Protocol evidence can come from valid discovery, issuance, or fully validated
+typed error metadata; malformed or contradictory metadata is not evidence.
+Error-derived evidence belongs to an already known canonical endpoint/account
+ID; an initial login with only an email address must not fabricate the user ID.
+
+`SelfHostedAccountTransportTest` exercises both actual Ktor and JDK adapters
+against a local HTTP fixture. It checks typed errors before route-specific 409
+decoding, bodyless HEAD classification, bounded strict control/error bodies,
+receipt identity, issuance headers, and renewal mismatch before registration.
+The secure-credential storage tests cover old-envelope G0 migration and the new
+incarnation/protocol fields. These tests complement Pair/Recover replacement
+coverage; they do not substitute for platform UI or release acceptance.
+
+File-backed lifecycle tests serialize sync bookkeeping and account callbacks
+against a product read/write transaction. They cover same-thread product-lock
+reentry, cross-thread exclusion, and rollback of intent/gate deletion inside the
+existing replacement transaction. The original activation/replacement exclusion
+tests remain in place. Network waits are coordinated with latches rather than
+adding SQLite busy retries or increasing timeouts.
+
+`SelfHostedAccountResetManagerTest` exercises the product workflow through real
+local repositories, including secure-key replacement callbacks and replacement
+rollback. A barrier allows real pairing to replace the local copy before an
+older control request returns an incarnation error; the new copy must remain
+unfrozen. Bound setup tests also cover reset between password login and device
+registration, and require the old-copy gate to be saved before releasing the
+workspace lifecycle lock.
+
+`AccountResetUiControllerTest` covers the UI dispatcher boundary, request
+identity, cancellation, and local versus remote completion feedback. Export
+and local replacement are serialized, and a late export result cannot report
+backup success for a replaced copy. `WorkspaceProductUiGuardTest` checks that
+only the next revision of the same workspace's initial binding preserves an
+unsaved editor, cancelled batches release their own busy state, and read-only
+copies remain searchable without permitting writes.
+`SettingsFirstAuthorityBindingTest` verifies that the first successful authority
+binding preserves pulled settings and completes UI feedback, while replacement
+or concurrent identity changes still reject stale writes. It also exercises
+sync, Fresh replacement and another sync on one controller, ensuring an
+operation's captured workspace cannot leak into the next operation.
+`AccountResetDesktopRenderTest` renders the production reset content at an
+explicit 320-by-640 desktop test viewport, checks password and exact-phrase
+requirements, Tab/IME Next focus, persistent outcomes, and large Chinese text. Set
+`SOMEDAY_REVIEW_ARTIFACTS` to retain its Skia-rendered images.
+
+Platform graph checks keep the same production composition: the isolated
+Desktop graph test reopens the same workspace and stable writer, while Android
+instrumentation exercises enabled reminder `Fire` with a prior-year note and
+subsequent product writes through the shared application graph. Render-only
+mobile fixtures require the explicit `someday.resetRenderFixtures=true` build
+property and use disposable emulators/simulators. They exercise the production
+forms with synthetic account state; they do not prove live reset requests or
+released-package compatibility. Normal builds exclude these fixture sources.
+
+The public `:shared:data:verifySqlDelightMigration` gate runs real nonempty
+schema-1-to-3 and schema-2-to-3 upgrades through the shared JVM factory. All 23
+original tables and all 26 schema-2 tables contain related data; every original
+column value survives, and the upgraded catalog matches both a fresh database
+and the schema-3 snapshot. It also proves G0 authority backfill, unchanged media
+proof, preservation of pending reset intent and gates without granting discard
+consent, repeat opens, and future-schema refusal. See
+[database migrations](database-migrations.md) for the frozen snapshot and
+replacement-verifier rules.
+
 The standard shape is:
 
 ```text
@@ -72,6 +154,25 @@ the blob boundary with
 a controllable implementation to force a precise write, corruption, or orphan
 condition. Both real backends remain covered separately.
 
+Account reset tests exercise the implemented server boundary from
+[the incarnation protocol](../specs/account-data-reset-protocol.md): real
+PostgreSQL admission waits, retirement timestamps after publishers drain,
+atomic rollback, uncertain commit followed by receipt lookup, password-snapshot
+changes, current-session replay, and strict request validation. Readiness probes
+must release database connections before storage IO.
+
+Retired-data maintenance tests cover bounded SQL deletion, preserved workspace
+tombstones and device claims, complete version/delete-marker pagination, partial
+listing failures, retention denial, and persistent late-object violations. The
+container packaging gate runs the actual Linux filesystem maintenance launcher
+with a separate restricted database role, while unsupported host filesystem
+providers must prove rejection without deletion. The S3 suite uses a separate
+maintenance identity and a real multi-page versioned namespace. Restore tests
+invalidate prior certification through the packaged operator command before
+reopening ingress. These checks do not certify a production provider's retention
+or remote-write settlement assumptions. Client reset/rejoin acceptance remains
+in the [implementation plan](../plans/account-data-reset/implementation.md).
+
 ### Real self-hosted journeys
 
 Location: `integration-tests/src/test` under the `realRemoteTest` task.
@@ -88,6 +189,23 @@ contains only a small set of product journeys:
 3. image import, media-first publication, entity sync, and lazy materialization;
 4. pairing, atomic workspace replacement, bootstrap, and visible notes;
 5. recovery-code setup, fresh-client recovery, bootstrap, and visible notes.
+
+Account reset has a separate `:integration-tests:accountResetJourneyTest` task.
+Run it only against a disposable server with registration and
+`SOMEDAY_ACCOUNT_RESET_ENABLED=true`, supplying `SOMEDAY_E2E_ENDPOINT` and the
+matching `SOMEDAY_DB_URL`, `SOMEDAY_DB_USER`, and `SOMEDAY_DB_PASSWORD`. The normal
+`realRemoteTest` task excludes it so the default reset-disabled gate stays
+meaningful. The reset task always executes rather than reusing an up-to-date
+test result.
+
+Its JDK/Ktor journeys verify nonempty text and image data, an unaffected control
+account, stale-session and legacy-wire refusal, separate local-discard consent,
+fresh and paired replacement, stable writer identity, and lost-response
+reconciliation with the same operation ID. PostgreSQL assertions fingerprint
+all six entity tables, and local installations reopen file-backed SQLite.
+These tests emulate legacy wire requests; they do not replace acceptance with
+actual old binaries, OS process restarts, platform secure storage, or provider
+policy certification.
 
 An E2E journey asserts externally meaningful state. It may observe a public
 cross-plane boundary to prove that media is already durable before entity
@@ -228,6 +346,40 @@ Apple host, and compilation is reported separately from transport tests.
 
 Static architecture checks protect suite boundaries without hard-coding test
 method names or replacing behavioral evidence.
+
+The account-reset schema change also has a limited compatibility observation:
+the preserved pre-change, already-compiled schema-1 JVM factory opened a
+disposable nonempty schema-2 database without refusal and left its version at 2.
+This demonstrates the old SQLDelight 2.1.0 factory limitation; it does not prove
+that all old-client operations are safe on schema 2. The tested artifact was a
+local compiled factory, not a released Desktop package or its UI. Formal old
+released-binary and platform reset/rejoin acceptance remain in Stage E of the
+[implementation plan](../plans/account-data-reset/implementation.md); shared
+client Stage C validation is tracked there separately.
+
+Stage D workflow tests compose the real local database, keys, authority guard,
+reset manager and Pair/Recover services. Synthetic transports cover response
+loss, control-only reauthentication, an in-flight offline exit, missing-gate
+recovery, fresh discard consent, and local replacement rollback. Shared UI tests
+check background dispatch, duplicate submissions, stale completions and fixed
+error messages. The Android enabled reminder test executes `Fire` against a
+prior-year note through the platform graph, in addition to disabled coverage.
+
+For rendered checks, the explicit `-Psomeday.resetRenderFixtures=true` build
+property adds isolated Compose fixtures to shared UI and disposable mobile
+shells. It is absent from normal builds. Fixtures render the real reset
+components with synthetic state and perform no network or workspace mutations;
+they complement, rather than replace, the real workflow tests. Cover unavailable,
+confirmation, unknown/offline, committed, mismatch and local-failure states,
+four locales, narrow layouts, large text, keyboard focus and accessibility.
+Desktop also has `:app:desktop:runIsolatedUiShell` with a temporary profile and
+no owner Keychain access; `-Psomeday.isolatedResetScenario=ready` selects synthetic
+reset UI within the otherwise real shell.
+
+Use newly created Android/iOS simulators and explicit device identifiers. Never
+run installation, instrumentation, application-data clearing, or uninstall steps
+against an owner device. Render screenshots and transient test profiles are
+local build evidence, not maintained documentation or release artifacts.
 
 ## 5. Evolution rules
 

@@ -58,9 +58,8 @@ fun Route.pairingRoutes(context: ServerContext) {
             val effectiveExpiry = if (requestedExpiry.isAfter(maximumExpiry)) maximumExpiry else requestedExpiry
             when (
                 val result = context.repository.createWorkspacePairingInvite(
-                    userId = auth.userId,
+                    request = auth.requestContext,
                     inviteId = inviteId,
-                    creatorDeviceId = deviceId,
                     envelopeJson = request.envelopeJson,
                     envelopeDigest = request.envelopeDigest,
                     expiresAt = effectiveExpiry,
@@ -105,10 +104,9 @@ fun Route.pairingRoutes(context: ServerContext) {
             }
             when (
                 val result = context.repository.claimWorkspacePairingInvite(
-                    userId = auth.userId,
+                    request = auth.requestContext,
                     inviteId = inviteId,
                     claimId = request.claimId,
-                    claimDeviceId = deviceId,
                     now = Instant.now(),
                 )
             ) {
@@ -153,10 +151,9 @@ fun Route.pairingRoutes(context: ServerContext) {
             }
             when (
                 context.repository.completeWorkspacePairingInvite(
-                    userId = auth.userId,
+                    request = auth.requestContext,
                     inviteId = inviteId,
                     claimId = request.claimId,
-                    claimDeviceId = deviceId,
                     now = Instant.now(),
                 )
             ) {
@@ -188,9 +185,8 @@ fun Route.pairingRoutes(context: ServerContext) {
             }
             when (
                 context.repository.cancelWorkspacePairingInvite(
-                    userId = auth.userId,
+                    request = auth.requestContext,
                     inviteId = inviteId,
-                    creatorDeviceId = deviceId,
                     now = Instant.now(),
                 )
             ) {

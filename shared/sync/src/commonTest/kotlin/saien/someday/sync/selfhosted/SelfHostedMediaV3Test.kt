@@ -99,7 +99,9 @@ internal class InMemoryMediaTransportV3 : SelfHostedMediaTransportV3 {
     var puts = 0
     var gets = 0
 
-    override fun systemV3Capabilities(endpoint: String, accessToken: String) =
+    override fun systemV3Capabilities(endpoint: String, accessToken: String,
+            accountContext: saien.someday.sync.selfhosted.SelfHostedAccountRequestContext,
+        ) =
         SelfHostedSystemV3CapabilitiesResponse(
             SYSTEM_V3_CONTRACT_ID,
             3,
@@ -137,7 +139,8 @@ internal class InMemoryMediaTransportV3 : SelfHostedMediaTransportV3 {
         workspaceId: String,
         mediaId: String,
         prepared: SelfHostedPreparedMediaObjectV3,
-    ): SelfHostedMediaPutResponseV3 {
+            accountContext: saien.someday.sync.selfhosted.SelfHostedAccountRequestContext,
+        ): SelfHostedMediaPutResponseV3 {
         val key = workspaceId to mediaId
         val existing = objects[key]
         if (existing != null && existing.ciphertextSha256 != prepared.encryptedSha256) {
@@ -155,12 +158,16 @@ internal class InMemoryMediaTransportV3 : SelfHostedMediaTransportV3 {
         return SelfHostedMediaPutResponseV3(true, idempotentReplay = existing != null)
     }
 
-    override fun headMediaObject(endpoint: String, accessToken: String, workspaceId: String, mediaId: String) =
+    override fun headMediaObject(endpoint: String, accessToken: String, workspaceId: String, mediaId: String,
+            accountContext: saien.someday.sync.selfhosted.SelfHostedAccountRequestContext,
+        ) =
         objects[workspaceId to mediaId]?.let {
             SelfHostedMediaRemoteHeadV3(it.ciphertextBytes, it.ciphertextSha256)
         }
 
-    override fun getMediaObject(endpoint: String, accessToken: String, workspaceId: String, mediaId: String):
+    override fun getMediaObject(endpoint: String, accessToken: String, workspaceId: String, mediaId: String,
+            accountContext: saien.someday.sync.selfhosted.SelfHostedAccountRequestContext,
+        ):
         SelfHostedMediaRemoteObjectV3 {
         gets++
         return checkNotNull(objects[workspaceId to mediaId])

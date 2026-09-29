@@ -13,6 +13,29 @@ import saien.someday.data.local.db.SomedayDatabase
 
 class SqlDelightSyncProtocolStoreV2Test {
     @Test
+    fun persistedIncarnationSurvivesRestartAndRejectsRebindingWithOtherIncarnation() {
+        val driver = createSomedayJdbcDriver("jdbc:sqlite::memory:")
+        try {
+            val database = SomedayDatabase(driver)
+            val store = SqlDelightSyncProtocolStoreV2(database)
+            val epoch = descriptor("00000000-0000-4000-8000-0000000000e1", "00000000-0000-4000-8000-0000000000c1")
+            val incarnation = "00000000-0000-4000-8000-000000000001"
+            assertIs<SyncEpochPersistResultV2.Stored>(store.persistPreparingEpoch(PROFILE, epoch, "pointer", AUTHORITY, WRITER, incarnation))
+            val restarted = SqlDelightSyncProtocolStoreV2(database)
+            assertEquals(incarnation, restarted.loadLocalAuthority()?.accountIncarnation)
+            assertIs<SyncEpochPersistResultV2.ImmutableMismatch>(restarted.persistPreparingEpoch(PROFILE, epoch, "pointer", AUTHORITY, WRITER))
+            assertEquals(incarnation, restarted.loadLocalAuthority()?.accountIncarnation)
+            assertEquals(WRITER, restarted.loadLocalAuthority()?.localWriterDeviceId)
+            assertEquals(epoch, restarted.loadEpoch(PROFILE, epoch.syncEpochId)?.descriptor)
+            kotlin.test.assertFailsWith<IllegalArgumentException> {
+                restarted.activateEpoch(PROFILE, epoch.syncEpochId, Instant.fromEpochMilliseconds(2_000), WRITER, AUTHORITY,
+                    saien.someday.domain.settings.INITIAL_ACCOUNT_INCARNATION)
+            }
+            assertEquals(SyncEpochLifecycleV2.PREPARING, restarted.loadEpoch(PROFILE, epoch.syncEpochId)?.lifecycle)
+        } finally { driver.close() }
+    }
+
+    @Test
     fun resolvedDeadLetterIsDeletedInsteadOfEnteringARepairLifecycle() {
         val driver = createSomedayJdbcDriver("jdbc:sqlite::memory:")
         try {

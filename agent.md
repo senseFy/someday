@@ -105,8 +105,8 @@
   domain validation, local persistence, wire capabilities, and server routes.
 - Local media publication evidence is the atomic tuple of account authority,
   workspace id, and ciphertext digest. Server object identity and blob keys are
-  account/workspace scoped; quota remains an account-wide total across
-  workspaces.
+  account/workspace scoped; quota sums all workspaces in the active account
+  incarnation. Retired bytes do not count toward active publication quota.
 
 ## Self-hosted Server
 
@@ -126,7 +126,7 @@
   public object URLs, or S3-mounted filesystem emulation.
 - Blob publication precedes PostgreSQL metadata. Preserve immutable exact
   replay, retain safe untracked blobs after a database failure, and give the
-  first-release application runtime no list/delete operations, no effective
+  HTTP application runtime no list/delete operations, no effective
   delete path, and no compensation state machine. Provider permissions must
   make a missing HEAD/GET distinguishable from an authorization failure; grant
   only the smallest bucket-level permission needed for `media/v1/*`.

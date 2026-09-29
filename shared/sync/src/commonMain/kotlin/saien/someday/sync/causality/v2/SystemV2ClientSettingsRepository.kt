@@ -16,6 +16,8 @@ import saien.someday.domain.settings.WorkspacePreferencesSnapshot
 import saien.someday.domain.settings.WorkspacePreferencesSyncState
 import saien.someday.domain.settings.WorkspacePreferencesSyncStatus
 import saien.someday.sync.WorkspaceLifecycleCoordinator
+import saien.someday.domain.workspace.UnrestrictedWorkspaceProductAccess
+import saien.someday.domain.workspace.WorkspaceProductAccess
 import kotlin.time.Clock
 import kotlin.time.Instant
 
@@ -32,6 +34,7 @@ class SystemV2ClientSettingsRepository(
     remoteProfileProvider: () -> String,
     private val clock: () -> Instant = { Clock.System.now() },
     private val workspaceLifecycleCoordinator: WorkspaceLifecycleCoordinator? = null,
+    private val workspaceProductAccess: WorkspaceProductAccess = UnrestrictedWorkspaceProductAccess,
 ) : ClientSettingsRepository, WorkspacePreferencesConflictResolver {
     private val contexts = WorkspaceSystemV2ContextProvider(
         localRepository,
@@ -64,16 +67,17 @@ class SystemV2ClientSettingsRepository(
         productAccess { saveUncoordinated(settings) }
 
     private fun saveUncoordinated(settings: ClientSettings): ClientSettings {
+        val viewState = settings.workspacePreferencesState
+        val displayed = viewState.displayedSnapshot ?: loadUncoordinated().toPreferenceSnapshot()
+        val requested = settings.toPreferenceSnapshot()
+        val changedFields = preferenceChangedFields(displayed, requested)
+        if (changedFields.isNotEmpty()) workspaceProductAccess.mutate { Unit }
         // Account/session settings remain local, while workspace preferences
         // mutate the day-one local DAG in both PREPARING and ACTIVE lifecycle.
         val context = contexts.openOrNull()?.takeIf {
             it.lifecycle in setOf(SyncEpochLifecycleV2.PREPARING, SyncEpochLifecycleV2.ACTIVE) &&
                 it.health == SyncEpochHealthV2.HEALTHY
         } ?: return localSettings.save(settings)
-        val viewState = settings.workspacePreferencesState
-        val displayed = viewState.displayedSnapshot ?: loadUncoordinated().toPreferenceSnapshot()
-        val requested = settings.toPreferenceSnapshot()
-        val changedFields = preferenceChangedFields(displayed, requested)
         val activeConflict = context.store.loadConflicts(preferenceKeyV2())
             .singleOrNull { it.lifecycle == WorkspaceConflictLifecycleV2.ACTIVE }
         if (changedFields.isNotEmpty() && activeConflict != null) {
@@ -137,7 +141,9 @@ class SystemV2ClientSettingsRepository(
         expectedHeadVersionIds: List<String>,
     ): ClientSettings =
         productAccess {
-            resolveWorkspacePreferencesBranchUncoordinated(conflictId, selectedVersionId, expectedHeadVersionIds)
+            workspaceProductAccess.mutate {
+                resolveWorkspacePreferencesBranchUncoordinated(conflictId, selectedVersionId, expectedHeadVersionIds)
+            }
         }
 
     private fun resolveWorkspacePreferencesBranchUncoordinated(

@@ -27,6 +27,7 @@ export SOMEDAY_MEDIA_S3_BUCKET=container-smoke
 export SOMEDAY_MEDIA_S3_REGION=us-east-1
 export SOMEDAY_MEDIA_S3_ENDPOINT=https://objects.invalid
 export SOMEDAY_MEDIA_S3_PATH_STYLE=false
+export SOMEDAY_ACCOUNT_RESET_ENABLED=false
 
 STANDALONE_COMPOSE=(
     docker compose
@@ -50,6 +51,187 @@ info() {
 
 require_command() {
     command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+smoke_sql() {
+    "${STANDALONE_COMPOSE[@]}" exec --no-TTY postgres psql \
+        --username postgres --dbname "$SOMEDAY_DB_NAME" --no-psqlrc \
+        --set ON_ERROR_STOP=1 --tuples-only --no-align "$@"
+}
+
+maintenance_purge() {
+    "${STANDALONE_COMPOSE[@]}" run --rm --no-deps --no-TTY \
+        --env SOMEDAY_MAINTENANCE_DB_USER=someday_smoke_maintenance \
+        --env SOMEDAY_MAINTENANCE_DB_PASSWORD=container-smoke-maintenance-password \
+        --env SOMEDAY_ACCOUNT_RESET_ENABLED=false \
+        server purge-retired-account-data "$@"
+}
+
+maintenance_field() {
+    local key="$1" report="$2" line value="" found=0
+    case "$key" in
+        database_identity|verification_context|storage_identity) ;;
+        *) die "unknown maintenance report field: $key" ;;
+    esac
+    while IFS= read -r line; do
+        case "$line" in
+            "$key="*) value="${line#*=}"; found=$((found + 1)) ;;
+        esac
+    done <<<"$report"
+    [[ "$found" -eq 1 && -n "$value" ]] || die "maintenance report has no unique $key"
+    printf '%s' "$value"
+}
+
+assert_maintenance_survivors() {
+    "${STANDALONE_COMPOSE[@]}" run --rm --no-deps --no-TTY \
+        --entrypoint /bin/sh server -eu -s -- "$MAINTENANCE_USER_ID" "$MAINTENANCE_CURRENT_ID" "$MAINTENANCE_OTHER_USER_ID" <<'SH'
+root=/var/lib/someday/media
+test "$(cat "$root/.incarnations/v1/$1/$2/workspace-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/current.bin")" = current-incarnation
+test "$(cat "$root/$3/workspace-cccccccccccccccccccccccccccccccc/other.bin")" = other-account
+test "$(cat "$root/.someday-system/startup-probe-v1.bin")" = someday-media-startup-probe-v1
+SH
+}
+
+run_filesystem_maintenance_smoke() {
+    MAINTENANCE_USER_ID=11111111-1111-4111-8111-111111111111
+    MAINTENANCE_OTHER_USER_ID=22222222-2222-4222-8222-222222222222
+    MAINTENANCE_CURRENT_ID=33333333-3333-4333-8333-333333333333
+    local initial_id=00000000-0000-0000-0000-000000000000
+    local report database_identity verification_context storage_identity status marker_state
+    local -a execute_arguments
+
+    info "draining HTTP publishers before isolated Linux filesystem maintenance"
+    "${STANDALONE_COMPOSE[@]}" stop server >/dev/null
+    smoke_sql \
+        --set target_user="$MAINTENANCE_USER_ID" \
+        --set other_user="$MAINTENANCE_OTHER_USER_ID" \
+        --set current_incarnation="$MAINTENANCE_CURRENT_ID" \
+        --set database_name="$SOMEDAY_DB_NAME" >/dev/null <<'SQL'
+CREATE ROLE someday_smoke_maintenance LOGIN PASSWORD 'container-smoke-maintenance-password'
+    NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;
+GRANT CONNECT ON DATABASE :"database_name" TO someday_smoke_maintenance;
+GRANT USAGE ON SCHEMA public TO someday_smoke_maintenance;
+GRANT SELECT ON someday_maintenance_context, someday_account_data_incarnations,
+    someday_entity_workspaces, someday_devices, someday_sessions, someday_refresh_tokens,
+    workspace_pairing_invites, workspace_recovery_envelopes, someday_media_v3_objects,
+    someday_sync_v2_changes, someday_sync_v2_mutations, someday_sync_v2_objects,
+    someday_sync_v2_checkpoint_chunks, someday_sync_v2_checkpoint_manifests,
+    someday_sync_v2_epochs TO someday_smoke_maintenance;
+GRANT DELETE ON someday_sync_v2_changes, someday_sync_v2_mutations, someday_sync_v2_objects,
+    someday_sync_v2_checkpoint_chunks, someday_sync_v2_checkpoint_manifests,
+    someday_sync_v2_epochs, someday_media_v3_objects, workspace_pairing_invites,
+    workspace_recovery_envelopes, someday_refresh_tokens, someday_sessions
+    TO someday_smoke_maintenance;
+GRANT UPDATE (media_audit_id, media_reclaimed_at, media_last_certified_at, media_revalidation_required)
+    ON someday_account_data_incarnations TO someday_smoke_maintenance;
+GRANT UPDATE (verification_context) ON someday_maintenance_context TO someday_smoke_maintenance;
+GRANT UPDATE (name, platform, last_seen_at) ON someday_devices TO someday_smoke_maintenance;
+BEGIN;
+SELECT set_config('someday.user_id', :'target_user', true), set_config('someday.workspace_id', '*', true);
+INSERT INTO someday_users(id, email, password_hash) VALUES
+    (:'target_user', 'retired-filesystem-smoke@example.invalid', 'synthetic-smoke-only'),
+    (:'other_user', 'other-filesystem-smoke@example.invalid', 'synthetic-smoke-only');
+UPDATE someday_account_data_incarnations
+    SET state = 'retired', retired_at = clock_timestamp() - INTERVAL '1 hour'
+    WHERE user_id = :'target_user' AND incarnation = '00000000-0000-0000-0000-000000000000';
+INSERT INTO someday_account_data_incarnations(user_id, incarnation, state, storage_layout, created_at)
+    VALUES (:'target_user', :'current_incarnation', 'active', 'incarnation-v1', clock_timestamp());
+INSERT INTO someday_entity_workspaces(user_id, workspace_id, data_incarnation) VALUES
+    (:'target_user', 'workspace-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', '00000000-0000-0000-0000-000000000000'),
+    (:'target_user', 'workspace-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', :'current_incarnation');
+COMMIT;
+SQL
+    [[ "$(smoke_sql --command "SELECT NOT rolsuper AND NOT rolbypassrls AND NOT rolcreaterole AND NOT rolcreatedb AND NOT rolinherit FROM pg_roles WHERE rolname = 'someday_smoke_maintenance'")" == t ]] ||
+        die "filesystem maintenance role is not restricted"
+
+    "${STANDALONE_COMPOSE[@]}" run --rm --no-deps --no-TTY \
+        --entrypoint /bin/sh server -eu -s -- "$MAINTENANCE_USER_ID" "$MAINTENANCE_CURRENT_ID" "$MAINTENANCE_OTHER_USER_ID" <<'SH'
+root=/var/lib/someday/media
+retired="$root/$1/workspace-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+current="$root/.incarnations/v1/$1/$2/workspace-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+other="$root/$3/workspace-cccccccccccccccccccccccccccccccc"
+mkdir -p "$retired/orphan" "$current" "$other"
+printf '%s' orphan-without-metadata >"$retired/orphan/object.bin"
+printf '%s' unfinished-publication >"$retired/.publication.tmp"
+printf '%s' current-incarnation >"$current/current.bin"
+printf '%s' other-account >"$other/other.bin"
+SH
+
+    info "auditing and reclaiming a retired filesystem namespace with the maintenance identity"
+    # Failure on unsupported SecureDirectoryStream is a smoke failure, never a skip.
+    report="$(maintenance_purge --user "$MAINTENANCE_USER_ID" --incarnation "$initial_id")" ||
+        die "Linux filesystem dry run failed (secure directory streams are required)"
+    [[ "$report" == *' status=dry_run'* && "$report" == *'listed_entries=2 sql_rows_removed=0'* ]] ||
+        die "dry run did not enumerate both unindexed and temporary retired files"
+    database_identity="$(maintenance_field database_identity "$report")"
+    verification_context="$(maintenance_field verification_context "$report")"
+    storage_identity="$(maintenance_field storage_identity "$report")"
+    [[ "$storage_identity" == filesystem:* ]] || die "dry run did not bind the filesystem identity"
+    execute_arguments=(
+        --user "$MAINTENANCE_USER_ID" --incarnation "$initial_id"
+        --database-identity "$database_identity" --verification-context "$verification_context"
+        --storage-identity "$storage_identity" --execute --publishers-drained --profile-attested
+    )
+    [[ "$(smoke_sql --command "SELECT media_reclaimed_at IS NULL AND media_audit_id IS NULL FROM someday_account_data_incarnations WHERE user_id = '$MAINTENANCE_USER_ID' AND incarnation = '$initial_id'")" == t ]] ||
+        die "dry run changed the reclamation marker"
+    "${STANDALONE_COMPOSE[@]}" run --rm --no-deps --no-TTY \
+        --entrypoint /bin/sh server -eu -c \
+        'test -f "/var/lib/someday/media/$1/workspace-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/orphan/object.bin" && test -f "/var/lib/someday/media/$1/workspace-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/.publication.tmp"' \
+        smoke "$MAINTENANCE_USER_ID"
+    report="$(maintenance_purge "${execute_arguments[@]}")" || die "filesystem maintenance execution failed"
+    [[ "$report" == *' status=reclaimed'* && "$report" == *'media_reclaimed_at='* ]] ||
+        die "filesystem maintenance did not certify reclamation"
+    "${STANDALONE_COMPOSE[@]}" run --rm --no-deps --no-TTY \
+        --entrypoint /bin/sh server -eu -c \
+        'test -z "$(find "/var/lib/someday/media/$1" -type f -print -quit)"' \
+        smoke "$MAINTENANCE_USER_ID"
+    assert_maintenance_survivors
+    marker_state="$(smoke_sql --command "SELECT media_reclaimed_at IS NOT NULL AND media_last_certified_at IS NOT NULL AND NOT media_revalidation_required FROM someday_account_data_incarnations WHERE user_id = '$MAINTENANCE_USER_ID' AND incarnation = '$initial_id'")"
+    [[ "$marker_state" == t ]] || die "filesystem completion marker was not committed"
+    [[ "$(smoke_sql --command "SELECT COUNT(*) FROM someday_entity_workspaces WHERE user_id = '$MAINTENANCE_USER_ID'")" == 2 ]] ||
+        die "maintenance removed immutable workspace tombstones"
+
+    info "rejecting a retired-tree symlink without following it into current media"
+    "${STANDALONE_COMPOSE[@]}" run --rm --no-deps --no-TTY \
+        --entrypoint /bin/sh server -eu -c \
+        'ln -s "/var/lib/someday/media/.incarnations/v1/$1/$2" "/var/lib/someday/media/$1/unsafe-link"' \
+        smoke "$MAINTENANCE_USER_ID" "$MAINTENANCE_CURRENT_ID"
+    if report="$(maintenance_purge --user "$MAINTENANCE_USER_ID" --incarnation "$initial_id" 2>&1)"; then status=0; else status=$?; fi
+    [[ "$status" -eq 1 && "$report" == *'unsafe_path'* ]] || die "symlink audit was not rejected safely"
+    assert_maintenance_survivors
+    [[ "$(smoke_sql --command "SELECT media_reclaimed_at IS NOT NULL FROM someday_account_data_incarnations WHERE user_id = '$MAINTENANCE_USER_ID' AND incarnation = '$initial_id'")" == t ]] ||
+        die "rejected symlink dry run modified the completion marker"
+    "${STANDALONE_COMPOSE[@]}" run --rm --no-deps --no-TTY \
+        --entrypoint /bin/sh server -eu -c 'rm "/var/lib/someday/media/$1/unsafe-link"' smoke "$MAINTENANCE_USER_ID"
+
+    info "detecting late retired objects and preserving the operator revalidation gate"
+    "${STANDALONE_COMPOSE[@]}" run --rm --no-deps --no-TTY \
+        --entrypoint /bin/sh server -eu -c \
+        'printf "%s" late-after-certification >"/var/lib/someday/media/$1/late-object.bin"' smoke "$MAINTENANCE_USER_ID"
+    report="$(maintenance_purge --user "$MAINTENANCE_USER_ID" --incarnation "$initial_id")" || die "late-object dry run failed"
+    [[ "$report" == *' status=dry_run'* && "$report" == *'listed_entries=1 sql_rows_removed=0'* ]] ||
+        die "fresh audit did not find the late retired object"
+    execute_arguments=(
+        --user "$MAINTENANCE_USER_ID" --incarnation "$initial_id"
+        --database-identity "$(maintenance_field database_identity "$report")"
+        --verification-context "$(maintenance_field verification_context "$report")"
+        --storage-identity "$(maintenance_field storage_identity "$report")"
+        --execute --publishers-drained --profile-attested
+    )
+    if report="$(maintenance_purge "${execute_arguments[@]}" 2>&1)"; then status=0; else status=$?; fi
+    [[ "$status" -eq 2 && "$report" == *' status=assumption_violation'* ]] ||
+        die "late retired object did not produce the exit-2 assumption violation"
+    marker_state="$(smoke_sql --command "SELECT media_reclaimed_at IS NULL AND media_last_certified_at IS NOT NULL AND media_revalidation_required FROM someday_account_data_incarnations WHERE user_id = '$MAINTENANCE_USER_ID' AND incarnation = '$initial_id'")"
+    [[ "$marker_state" == t ]] || die "late-object violation did not clear and fence the marker"
+    if report="$(maintenance_purge "${execute_arguments[@]}" 2>&1)"; then status=0; else status=$?; fi
+    [[ "$status" -eq 1 && "$report" == *'operator_revalidation_required'* ]] ||
+        die "blind maintenance retry bypassed operator revalidation"
+    [[ "$(smoke_sql --command "SELECT media_reclaimed_at IS NULL AND media_revalidation_required FROM someday_account_data_incarnations WHERE user_id = '$MAINTENANCE_USER_ID' AND incarnation = '$initial_id'")" == t ]] ||
+        die "operator revalidation requirement was not persistent"
+    "${STANDALONE_COMPOSE[@]}" run --rm --no-deps --no-TTY \
+        --entrypoint /bin/sh server -eu -c \
+        'test "$(cat "/var/lib/someday/media/$1/late-object.bin")" = late-after-certification' smoke "$MAINTENANCE_USER_ID"
+    assert_maintenance_survivors
 }
 
 cleanup() {
@@ -133,6 +315,12 @@ info "running the media integrity operator command"
     grep --fixed-strings 'Media integrity verification passed' >/dev/null ||
     die "media integrity command did not complete"
 
+info "checking separate retired-data maintenance launchers"
+"${STANDALONE_COMPOSE[@]}" run --rm --no-deps server purge-retired-account-data --help |
+    grep --fixed-strings 'Default is a read-only' >/dev/null || die "purge launcher is unavailable"
+"${STANDALONE_COMPOSE[@]}" run --rm --no-deps server invalidate-reclamation-attestations --help |
+    grep --fixed-strings 'Default is read-only' >/dev/null || die "restore invalidation launcher is unavailable"
+
 info "running the administrator bootstrap operator command"
 "${STANDALONE_COMPOSE[@]}" run \
     --rm \
@@ -142,5 +330,7 @@ info "running the administrator bootstrap operator command"
     server bootstrap-admin |
     grep --fixed-strings 'Created Someday admin' >/dev/null ||
     die "administrator bootstrap command did not complete"
+
+run_filesystem_maintenance_smoke
 
 info "passed"

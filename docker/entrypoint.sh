@@ -18,9 +18,15 @@ case "$command" in
     verify-media-integrity)
         exec /opt/someday/bin/verify-media-integrity "$@"
         ;;
+    purge-retired-account-data)
+        exec /opt/someday/bin/purge-retired-account-data "$@"
+        ;;
+    invalidate-reclamation-attestations)
+        exec /opt/someday/bin/invalidate-reclamation-attestations "$@"
+        ;;
     *)
         echo "Unknown Someday container command: $command" >&2
-        echo "Supported commands: server, bootstrap-admin, verify-media-integrity" >&2
+        echo "Supported commands: server, bootstrap-admin, verify-media-integrity, purge-retired-account-data, invalidate-reclamation-attestations" >&2
         exit 64
         ;;
 esac

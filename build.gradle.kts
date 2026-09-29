@@ -86,6 +86,7 @@ val sourceHygieneCheck = tasks.register("sourceHygieneCheck") {
             ".kotlin/**",
             "**/build/**",
             "**/DerivedData/**",
+            "**/artifacts/**",
         )
     }
     inputs.files(sourceFiles)

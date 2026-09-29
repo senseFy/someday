@@ -97,9 +97,8 @@ class MediaIntegrityVerifierIntegrationTest {
     private fun put(repository: SystemV3MediaRepository, mediaId: String, bytes: ByteArray) {
         assertIs<SystemV3MediaPutResult.Stored>(
             repository.putObject(
-                userId = identity.userId,
+                request = identity.request,
                 workspaceId = WORKSPACE,
-                deviceId = identity.deviceId,
                 mediaId = mediaId,
                 ciphertextSha256 = sha256(bytes),
                 bytes = bytes,

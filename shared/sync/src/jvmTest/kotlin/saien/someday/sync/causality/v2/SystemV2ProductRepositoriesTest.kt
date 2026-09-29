@@ -26,6 +26,12 @@ import saien.someday.domain.settings.SyncConfiguration
 import saien.someday.domain.settings.SyncMode
 import saien.someday.domain.settings.WorkspacePreferencesSyncStatus
 import saien.someday.sync.WorkspaceLifecycleCoordinator
+import saien.someday.sync.AuthorityCoordinatedNotesRepository
+import saien.someday.sync.CoordinatedWorkspaceProductAccess
+import saien.someday.data.account.SqlDelightAccountStateRepository
+import saien.someday.data.account.AccountNetworkBlockedException
+import saien.someday.domain.workspace.WorkspaceProductReadOnlyException
+import saien.someday.domain.workspace.WorkspaceProductSnapshot
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -850,6 +856,45 @@ class SystemV2ProductRepositoriesTest {
         assertEquals(1, fixture.context().store.loadConflicts(key).count {
             it.lifecycle == WorkspaceConflictLifecycleV2.ACTIVE
         })
+    }
+
+    @Test
+    fun durableAccountGateFreezesProductWritesButOfflineChoiceKeepsNetworkBlocked() = withFixture { fixture ->
+        fixture.createPreferenceRoot()
+        val lifecycle = WorkspaceLifecycleCoordinator()
+        val states = SqlDelightAccountStateRepository(fixture.database)
+        val endpoint = "https://reset.example"
+        val userId = "00000000-0000-4000-8000-000000000071"
+        val incarnation = "00000000-0000-0000-0000-000000000000"
+        val workspace = "workspace-${"71".repeat(16)}"
+        val access = CoordinatedWorkspaceProductAccess(
+            lifecycle,
+            { WorkspaceProductSnapshot(workspace, incarnation, "authority", WRITER_A) },
+            { states.loadGate(endpoint, userId, workspace)?.productReadOnly == true },
+        )
+        val notes = AuthorityCoordinatedNotesRepository(fixture.notes, lifecycle, access)
+        val settings = SystemV2ClientSettingsRepository(
+            fixture.local, fixture.rawSettings, { fixture.workspaceKey }, { WRITER_A }, { PROFILE },
+            clock = { T1 }, workspaceLifecycleCoordinator = lifecycle, workspaceProductAccess = access,
+        )
+        val notebook = notes.createNotebook("Retained")
+        val note = notes.createNote(NoteInput(notebook.id, "Before reset", "Keep this body"))
+        val pending = fixture.context().store.loadPending(PROFILE).size
+        states.markResetRequired(endpoint, userId, workspace, incarnation)
+        assertFailsWith<WorkspaceProductReadOnlyException> { notes.createNotebook("Forbidden") }
+        assertFailsWith<WorkspaceProductReadOnlyException> { notes.createNote(NoteInput(notebook.id, "Forbidden", "")) }
+        assertFailsWith<WorkspaceProductReadOnlyException> { notes.deleteNote(note.id) }
+        assertFailsWith<WorkspaceProductReadOnlyException> { notes.renameNotebook(notebook.id, "Forbidden") }
+        assertFailsWith<WorkspaceProductReadOnlyException> { settings.save(settings.load().copy(theme = ClientTheme.Dark)) }
+        val localOnly = settings.save(settings.load().copy(onThisDayNotifications = OnThisDayNotificationPreferences(true, 9, 15)))
+        assertTrue(localOnly.onThisDayNotifications.enabled)
+        assertEquals("Keep this body", notes.getNoteDetails(note.id)?.markdownBody)
+        assertEquals(pending, fixture.context().store.loadPending(PROFILE).size)
+
+        states.enterOfflineMode(endpoint, userId, workspace)
+        notes.createNote(NoteInput(notebook.id, "Offline edit", "Still local"))
+        assertEquals(2, notes.listNotes(notebook.id).size)
+        assertFailsWith<AccountNetworkBlockedException> { states.requireNetworkAllowed(endpoint, userId, workspace) }
     }
 
     private fun withFixture(block: (Fixture) -> Unit) {

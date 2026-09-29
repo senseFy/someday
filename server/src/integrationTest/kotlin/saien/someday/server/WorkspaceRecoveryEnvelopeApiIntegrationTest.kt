@@ -16,6 +16,7 @@ import java.security.MessageDigest
 import java.sql.DriverManager
 import java.util.Base64
 import java.util.UUID
+import saien.someday.server.auth.ACCOUNT_INITIAL_INCARNATION
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
@@ -289,10 +290,11 @@ class WorkspaceRecoveryEnvelopeApiIntegrationTest {
         DriverManager.getConnection(databaseConnectionUrl, databaseUser, databasePassword).use { connection ->
             setWildcardScope(connection)
             connection.prepareStatement(
-                "INSERT INTO someday_entity_workspaces(user_id, workspace_id) VALUES (?::uuid, ?)",
+                "INSERT INTO someday_entity_workspaces(user_id, workspace_id, data_incarnation) VALUES (?::uuid, ?, ?)",
             ).use { statement ->
                 statement.setString(1, userId)
                 statement.setString(2, workspaceId)
+                statement.setObject(3, ACCOUNT_INITIAL_INCARNATION)
                 statement.executeUpdate()
             }
             connection.prepareStatement(

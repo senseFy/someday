@@ -72,6 +72,12 @@ The process uses one shared bounded database pool. The maximum accepts 1–32
 connections; operators should keep it within the external database's total
 connection budget.
 
+Authentication and media write transactions explicitly select `READ COMMITTED`
+before their first SQL statement. Authentication must observe revocation after row-lock
+waits, and media quota checks must observe uploads committed while waiting for
+the account quota lock. A stricter connection/database default must not pin a
+stale snapshot before those locks.
+
 PostgreSQL 17 must expose a direct connection. Transaction-mode pooling is
 unsupported because RLS scope uses session settings. Production requires
 `verify-full` for external databases and `private` only for loopback or an
@@ -120,17 +126,33 @@ switch the server to another backend.
 Both target backends share the same opaque `MediaBlobStore` boundary. The
 logical object identity remains `(userId, workspaceId, mediaId)`. Physical
 filesystem sharding is an implementation detail; the S3 adapter uses this
-deterministic, server-private object key:
+deterministic, server-private G0 object key:
 
 ```text
 media/v1/<user-id>/<workspace-id>/<media-id>.bin
 ```
 
-The bounded startup probe uses:
+Nonzero incarnations use
+`media/v1/.incarnations/v1/<user-id>/<incarnation>/<workspace-id>/<media-id>.bin`.
+Filesystem storage adds the same `.incarnations/v1/<user-id>/<incarnation>/`
+root before its existing workspace/shard layout. G0 paths remain unchanged.
+The workspace registry selects the layout under
+[account admission](account-data-reset-protocol.md).
+
+The bounded legacy startup probe uses:
 
 ```text
 media/v1/.someday-system/startup-probe-v1.bin
 ```
+
+A fixed nested-layout marker at
+`media/v1/.incarnations/v1/.someday-system/startup-probe-v1.bin` exercises the
+actual nested prefix. Startup always checks the legacy layout, and also requires
+the nested probe whenever reset is enabled or any active nonzero incarnation
+exists. Failure refuses
+startup independently of whether new resets are enabled. Both markers sit
+outside account roots and are reused; starts do not accumulate objects.
+The integrity verifier resolves registry incarnations for both layouts.
 
 An S3-compatible service is supported only if it provides:
 
@@ -245,3 +267,19 @@ operator gate restores content through an intact paired client; explicit
 envelope-row preservation and fresh-code recovery through PostgreSQL restore
 remain required release evidence. The production gate runs the complete media
 journey against both storage backends and the non-root server image.
+
+
+## Account reset maintenance boundary
+
+[Account reset](account-data-reset-protocol.md) defaults off. Enabling it is an
+operator declaration that compatible clients, backup rollback limits and active
+media protection have been reviewed. Startup probes prove only bounded runtime
+read/write behavior; each new reset also rechecks that behavior outside its DB
+transaction. They cannot certify retention policy or future provider settlement.
+
+The separate `purge-retired-account-data` executable uses dedicated maintenance
+credentials for retired SQL and physical media reclamation. It cannot weaken
+retention or change runtime policy, and is absent from HTTP routes. The default
+is a read-only audit; execution is bound to the exact account/incarnation,
+database verification context and storage configuration. See the
+[maintenance guide](../guides/account-data-reset-maintenance.md).

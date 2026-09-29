@@ -178,6 +178,8 @@ data class SelfHostedSessionCredentials(
     val devicePlatform: String,
     val accessToken: String,
     val refreshToken: String,
+    val accountIncarnation: String = INITIAL_ACCOUNT_INCARNATION,
+    val accountProtocolVersion: Int? = null,
 ) {
     init {
         require(isSecureSyncEndpoint(endpoint)) {
@@ -188,6 +190,11 @@ data class SelfHostedSessionCredentials(
         require(deviceId.isNotBlank()) { "Self-hosted device id must be present." }
         require(accessToken.isNotBlank()) { "Self-hosted access token must be present." }
         require(refreshToken.isNotBlank()) { "Self-hosted refresh token must be present." }
+        require(isCanonicalAccountIncarnation(accountIncarnation)) { "Invalid account incarnation." }
+        require(accountProtocolVersion == null || accountProtocolVersion == 1) { "Unsupported account protocol." }
+        require(accountProtocolVersion == 1 || accountIncarnation == INITIAL_ACCOUNT_INCARNATION) {
+            "A noninitial incarnation requires protocol 1 issuance evidence."
+        }
     }
 
     fun toSummary(): SelfHostedSessionSummary =
@@ -201,6 +208,8 @@ data class SelfHostedSessionCredentials(
 
     fun redactedDescription(): String =
         "endpoint=$endpoint user=$userEmail device=$deviceId accessToken=redacted refreshToken=redacted"
+
+    override fun toString(): String = "SelfHostedSessionCredentials(${redactedDescription()}, accountIncarnation=$accountIncarnation)"
 }
 
 fun SelfHostedSessionCredentials.encodeForSecureStorage(): String {
@@ -214,6 +223,8 @@ fun SelfHostedSessionCredentials.encodeForSecureStorage(): String {
         devicePlatform,
         accessToken,
         refreshToken,
+        accountIncarnation,
+        accountProtocolVersion?.toString().orEmpty(),
     ).joinToString(separator = "\n") { value ->
         Base64.encode(value.encodeToByteArray())
     }
@@ -221,7 +232,9 @@ fun SelfHostedSessionCredentials.encodeForSecureStorage(): String {
 }
 
 fun decodeSelfHostedSessionCredentials(value: String): SelfHostedSessionCredentials? {
-    val payload = if (value.startsWith("$SelfHostedSessionCredentialsEnvelopeVersion:")) {
+    val currentEnvelope = value.startsWith("$SelfHostedSessionCredentialsEnvelopeVersion:")
+    val legacyEnvelope = value.startsWith("$LegacySelfHostedSessionCredentialsEnvelopeVersion:")
+    val payload = if (currentEnvelope || legacyEnvelope) {
         val encodedPayload = value.substringAfter(':')
         runCatching {
             Base64.decode(encodedPayload).decodeToString(throwOnInvalidSequence = true)
@@ -241,8 +254,13 @@ fun decodeSelfHostedSessionCredentials(value: String): SelfHostedSessionCredenti
                 add(decodedLine)
             }
     }
-    if (decoded.size != 9 || decoded[0] != SelfHostedSessionCredentialsPayloadVersion) {
-        return null
+    val legacy = decoded.size == 9 && decoded[0] == LegacySelfHostedSessionCredentialsPayloadVersion && !currentEnvelope
+    val current = decoded.size == 11 && decoded[0] == SelfHostedSessionCredentialsPayloadVersion && currentEnvelope
+    if (!legacy && !current) return null
+    val protocolVersion = if (legacy) null else when (decoded[10]) {
+        "" -> null
+        "1" -> 1
+        else -> return null
     }
     return runCatching {
         SelfHostedSessionCredentials(
@@ -254,12 +272,16 @@ fun decodeSelfHostedSessionCredentials(value: String): SelfHostedSessionCredenti
             devicePlatform = decoded[6],
             accessToken = decoded[7],
             refreshToken = decoded[8],
+            accountIncarnation = if (legacy) INITIAL_ACCOUNT_INCARNATION else decoded[9],
+            accountProtocolVersion = protocolVersion,
         )
     }.getOrNull()
 }
 
-private const val SelfHostedSessionCredentialsEnvelopeVersion = "self-hosted-session-v3"
-private const val SelfHostedSessionCredentialsPayloadVersion = "self-hosted-session-v2"
+private const val SelfHostedSessionCredentialsEnvelopeVersion = "self-hosted-session-v4"
+private const val SelfHostedSessionCredentialsPayloadVersion = "self-hosted-session-v4"
+private const val LegacySelfHostedSessionCredentialsEnvelopeVersion = "self-hosted-session-v3"
+private const val LegacySelfHostedSessionCredentialsPayloadVersion = "self-hosted-session-v2"
 
 interface SelfHostedSessionCredentialStore {
     fun load(): SelfHostedSessionCredentials?
@@ -423,6 +445,8 @@ data class SelfHostedSetupInput(
             "device=${deviceName.trim().ifBlank { "missing" }} " +
             "platform=${platform.trim().lowercase().ifBlank { "missing" }} " +
             "mode=${if (createAccount) "register" else "login"}"
+
+    override fun toString(): String = "SelfHostedSetupInput(${redactedDescription()})"
 }
 
 enum class SelfHostedSetupValidationIssue {
@@ -442,6 +466,7 @@ enum class SelfHostedSetupReason {
     AuthorityInvalid,
     EndpointMismatch,
     AuthorityMismatch,
+    AccountIncarnationMismatch,
     DeviceRevoked,
     Unavailable,
     Failed,
@@ -601,19 +626,22 @@ class WorkspaceJoinPackage(
     val recoveryCode: String,
     val workspaceId: String,
     val keyFingerprint: String,
+    val capturedAuthority: WorkspaceJoinAuthorityCapture? = null,
 ) {
     override fun equals(other: Any?): Boolean =
         other is WorkspaceJoinPackage &&
             metadataJson == other.metadataJson &&
             recoveryCode == other.recoveryCode &&
             workspaceId == other.workspaceId &&
-            keyFingerprint == other.keyFingerprint
+            keyFingerprint == other.keyFingerprint &&
+            capturedAuthority == other.capturedAuthority
 
     override fun hashCode(): Int {
         var result = metadataJson.hashCode()
         result = 31 * result + recoveryCode.hashCode()
         result = 31 * result + workspaceId.hashCode()
         result = 31 * result + keyFingerprint.hashCode()
+        result = 31 * result + (capturedAuthority?.hashCode() ?: 0)
         return result
     }
 

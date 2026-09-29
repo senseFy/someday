@@ -141,6 +141,7 @@ interface WorkspaceSyncRemoteV2 {
     val remoteProfile: String
     /** Local-only endpoint/account binding; it is never serialized remotely. */
     val authorityBindingId: String
+    val accountIncarnation: String get() = saien.someday.domain.settings.INITIAL_ACCOUNT_INCARNATION
 
     fun capabilities(): WorkspaceSyncCapabilitiesV2
     fun loadEpochPointer(): EncryptedWorkspaceObjectV2?
@@ -218,9 +219,13 @@ class WorkspaceSyncCoordinatorV2(
         require(remote.remoteProfile == SyncRemoteProfileV2.SELF_HOSTED.wireValue)
     }
 
+    /** Share the product writer barrier for local commits, never for transport work. */
+    private fun <T> localMutation(block: () -> T): T =
+        if (workspaceLifecycleCoordinator != null) workspaceLifecycleCoordinator.productAccess(block) else block()
+
     fun syncOnce(): WorkspaceSyncSummaryV2 {
         val started = clock()
-        val run = protocolStore.startRun(remote.remoteProfile, null, started)
+        val run = localMutation { protocolStore.startRun(remote.remoteProfile, null, started) }
         val counts = MutableWorkspaceSyncCountsV2()
         return try {
             val capabilities = remote.capabilities()
@@ -259,18 +264,22 @@ class WorkspaceSyncCoordinatorV2(
             }
 
             val boundAuthority = protocolStore.loadLocalAuthority()
+            if (boundAuthority != null && boundAuthority.accountIncarnation != remote.accountIncarnation) {
+                return blocked(run.runId, counts, descriptor.syncEpochId, "account_incarnation_mismatch", "The local workspace belongs to another account incarnation.")
+            }
             if (boundAuthority != null && boundAuthority.authorityBindingId != remote.authorityBindingId) {
                 if (boundAuthority.remoteProfile == remote.remoteProfile &&
                     boundAuthority.epochId == descriptor.syncEpochId &&
                     boundAuthority.pointerDigest == pointerOuter.objectDigest
                 ) {
-                    protocolStore.rebindExactAuthority(
+                    localMutation { protocolStore.rebindExactAuthority(
                         remote.remoteProfile,
                         descriptor.syncEpochId,
                         pointerOuter.objectDigest,
                         remote.authorityBindingId,
                         clock(),
-                    )
+                        remote.accountIncarnation,
+                    ) }
                 } else {
                     return blocked(
                         run.runId,
@@ -287,12 +296,12 @@ class WorkspaceSyncCoordinatorV2(
             if (ancestryAnchor?.descriptor?.syncEpochId == descriptor.syncEpochId &&
                 ancestryAnchor.descriptorDigest != pointerOuter.objectDigest
             ) {
-                protocolStore.blockEpoch(
+                localMutation { protocolStore.blockEpoch(
                     ancestryAnchor.remoteProfile,
                     ancestryAnchor.descriptor.syncEpochId,
                     "remote_rollback_detected",
                     "Authenticated epoch pointer changed without a new epoch.",
-                )
+                ) }
                 return blocked(
                     run.runId,
                     counts,
@@ -351,17 +360,17 @@ class WorkspaceSyncCoordinatorV2(
             if (finalPullError != null) return blocked(run.runId, counts, descriptor.syncEpochId, finalPullError.first, finalPullError.second)
 
             counts.captureWorkspaceState(store, protocolStore, remote.remoteProfile, descriptor)
-            protocolStore.finishRun(
+            localMutation { protocolStore.finishRun(
                 run.runId,
                 SyncRunStatusV2.SUCCESS,
                 counts.toStored(),
                 clock(),
                 epochId = descriptor.syncEpochId,
-            )
+            ) }
             counts.summary(SyncCoordinatorStatusV2.SUCCESS, remote.remoteProfile, descriptor.syncEpochId)
         } catch (failure: Exception) {
             val message = (failure.message ?: "Workspace sync failed safely.").safeSyncMessageV2()
-            protocolStore.finishRun(
+            localMutation { protocolStore.finishRun(
                 run.runId,
                 SyncRunStatusV2.FAILED,
                 counts.toStored(),
@@ -369,7 +378,7 @@ class WorkspaceSyncCoordinatorV2(
                 epochId = protocolStore.loadActiveEpoch(remote.remoteProfile)?.descriptor?.syncEpochId,
                 safeErrorCode = "v2_sync_failed",
                 safeErrorMessage = message,
-            )
+            ) }
             counts.summary(
                 SyncCoordinatorStatusV2.FAILED,
                 remote.remoteProfile,
@@ -409,13 +418,14 @@ class WorkspaceSyncCoordinatorV2(
         if (bundle.chunks.size != manifest.chunks.size) {
             return "missing_remote_object" to "Checkpoint chunk set is incomplete."
         }
-        when (protocolStore.persistAuthenticatedRemotePreparingEpoch(
+        when (localMutation { protocolStore.persistAuthenticatedRemotePreparingEpoch(
             remote.remoteProfile,
             descriptor,
             pointerOuter.objectDigest,
             remote.authorityBindingId,
             localWriterDeviceId,
-        )) {
+            remote.accountIncarnation,
+        ) }) {
             is SyncEpochPersistResultV2.ImmutableMismatch ->
                 return "immutable_object_mismatch" to "The checkpoint epoch identity is already bound differently."
             is SyncEpochPersistResultV2.AlreadyStored,
@@ -442,7 +452,7 @@ class WorkspaceSyncCoordinatorV2(
             }
             decodedObjects as DecodeEntityObjectsResultV2.Decoded
             val nextCursor = "${ref.chunkIndex}:${ref.chunkDigest}"
-            val result = store.applyRemoteCursorUnit(
+            val result = localMutation { store.applyRemoteCursorUnit(
                 RemoteWorkspaceCursorUnitV2(
                     remoteProfile = remote.remoteProfile,
                     cursor = WorkspaceRemoteCursorAdvanceV2(
@@ -455,7 +465,7 @@ class WorkspaceSyncCoordinatorV2(
                     mutations = decodedObjects.mutations,
                     appliedAt = clock(),
                 ),
-            )
+            ) }
             if (result is WorkspaceRemoteUnitApplyResultV2.Rejected) {
                 return result.error.code.wireValue to result.error.safeMessage
             }
@@ -527,6 +537,7 @@ class WorkspaceSyncCoordinatorV2(
                         clock(),
                         localWriterDeviceId,
                         remote.authorityBindingId,
+                        remote.accountIncarnation,
                     )
                     hookFailure = bootstrapCommitHook?.invoke()
                     if (hookFailure != null) rollback()
@@ -558,12 +569,12 @@ class WorkspaceSyncCoordinatorV2(
         }
 
         fun markRetryableBlockerResolved(key: Pair<String, String>) {
-            protocolStore.resolveDeadLetter(
+            localMutation { protocolStore.resolveDeadLetter(
                 remote.remoteProfile,
                 descriptor.syncEpochId,
                 key.first,
                 key.second,
-            )
+            ) }
             retryableBlockers.remove(key)
         }
 
@@ -670,7 +681,7 @@ class WorkspaceSyncCoordinatorV2(
                 var candidateCount = candidates.size
                 while (candidateCount > 0 && !committedBatch) {
                     val attempted = candidates.take(candidateCount)
-                    when (val batch = store.applyRemoteCursorUnitsAtomically(attempted.map { it.remoteUnit })) {
+                    when (val batch = localMutation { store.applyRemoteCursorUnitsAtomically(attempted.map { it.remoteUnit }) }) {
                         is WorkspaceRemoteBatchApplyResultV2.Committed -> {
                             check(batch.units.size == attempted.size)
                             batch.units.forEach { committed ->
@@ -726,7 +737,7 @@ class WorkspaceSyncCoordinatorV2(
                         }
                         is DecodeEntityObjectsResultV2.Decoded -> value.also { decodedUnits[unitKey] = it }
                     }
-                    when (val applied = store.applyRemoteCursorUnit(
+                    when (val applied = localMutation { store.applyRemoteCursorUnit(
                         RemoteWorkspaceCursorUnitV2(
                             remote.remoteProfile,
                             WorkspaceRemoteCursorAdvanceV2(
@@ -739,7 +750,7 @@ class WorkspaceSyncCoordinatorV2(
                             decoded.mutations,
                             clock(),
                         ),
-                    )) {
+                    ) }) {
                         is WorkspaceRemoteUnitApplyResultV2.Rejected -> {
                             val synthetic = DecodeEntityObjectsResultV2.Rejected(
                                 unit.objects.firstOrNull(),
@@ -830,7 +841,7 @@ class WorkspaceSyncCoordinatorV2(
                             ) return "mutation_reuse_mismatch" to "Remote acknowledgement does not match the exact outbox tuple."
                         }
                         batch.zip(pushed.acknowledgements).forEach { (pendingValue, ack) ->
-                            check(store.acknowledgePending(remote.remoteProfile, ack.mutationId, ack.objectId, ack.objectDigest))
+                            check(localMutation { store.acknowledgePending(remote.remoteProfile, ack.mutationId, ack.objectId, ack.objectDigest) })
                             counts.pushedObjects++
                             counts.pushedMutations++
                             if (ack.idempotentReplay) counts.replays++
@@ -892,7 +903,7 @@ class WorkspaceSyncCoordinatorV2(
         error: DecodeEntityObjectsResultV2.Rejected,
     ) {
         val persistent = error.code !in setOf("missing_parent", "transport_unavailable")
-        protocolStore.recordDeadLetter(
+        localMutation { protocolStore.recordDeadLetter(
             SyncDeadLetterInputV2(
                 remote.remoteProfile,
                 epochId,
@@ -908,7 +919,7 @@ class WorkspaceSyncCoordinatorV2(
                 error.message,
             ),
             clock(),
-        )
+        ) }
     }
 
     private fun crypto(epochId: String): WorkspaceEpochCryptoV2 {
@@ -962,7 +973,7 @@ class WorkspaceSyncCoordinatorV2(
                 }
             }
         }
-        protocolStore.finishRun(
+        localMutation { protocolStore.finishRun(
             runId,
             SyncRunStatusV2.BLOCKED,
             counts.toStored(),
@@ -970,7 +981,7 @@ class WorkspaceSyncCoordinatorV2(
             epochId = epochId,
             safeErrorCode = code,
             safeErrorMessage = safe,
-        )
+        ) }
         return counts.summary(SyncCoordinatorStatusV2.BLOCKED, remote.remoteProfile, epochId, code, safe)
     }
 
@@ -989,6 +1000,7 @@ private fun sameAuthorityIdentityV2(
             left.remoteProfile == right.remoteProfile &&
                 left.epochId == right.epochId &&
                 left.authorityBindingId == right.authorityBindingId &&
+                left.accountIncarnation == right.accountIncarnation &&
                 left.pointerDigest == right.pointerDigest
     }
 

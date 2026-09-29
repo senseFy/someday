@@ -26,6 +26,9 @@ kotlin {
     iosSimulatorArm64()
 
     sourceSets {
+        if (providers.gradleProperty("someday.resetRenderFixtures").orNull == "true") {
+            commonMain.get().kotlin.srcDir("src/resetRenderFixture/kotlin")
+        }
         commonMain.dependencies {
             implementation(project(":shared:domain"))
             implementation(compose.animation)

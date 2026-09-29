@@ -75,8 +75,12 @@ rg -Fq 'apiBasePath == "/sync/v3/workspaces/{workspaceId}/entities"' "$MEDIA_WIR
     fail "entity capabilities do not advertise the workspace-scoped route"
 rg -Fq 'apiBasePath == "/sync/v3/workspaces/{workspaceId}/media"' "$MEDIA_WIRE" ||
     fail "media capabilities do not advertise the workspace-scoped route"
-rg -q 'fun loadEpoch\(userId: UUID, workspaceId: String\)' "$SERVER_ENTITY_REPOSITORY" ||
-    fail "entity repository entry points are not explicitly account/workspace scoped"
+rg -q 'fun loadEpoch\(request: AccountRequestContext, workspaceId: String\)' "$SERVER_ENTITY_REPOSITORY" ||
+    fail "entity repository entry points do not require authenticated account/workspace scope"
+rg -Fq 'AccountAdmission.admit(connection, request, AccountAccess.SYNC, workspaceId)' "$SERVER_ENTITY_REPOSITORY" ||
+    fail "entity repository does not revalidate authenticated authority under account admission"
+rg -Fq 'data_incarnation' "$SERVER_ENTITY_REPOSITORY" ||
+    fail "entity workspace registration is not incarnation-bound"
 rg -q 'WHERE user_id = \? AND workspace_id = \?' "$SERVER_ENTITY_REPOSITORY" ||
     fail "entity SQL does not carry an explicit account/workspace predicate"
 rg -Fq "set_config('someday.user_id'" "$SERVER_ENTITY_REPOSITORY" ||

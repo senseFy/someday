@@ -11,6 +11,17 @@ Device pairing remains the preferred path when another trusted device is
 available. Recovery is the independent disaster path when no such device
 remains.
 
+Server GET/PUT apply [account incarnation admission](account-data-reset-protocol.md)
+before returning an envelope, replaying or applying CAS. A recovery pointer
+selecting a retired workspace is rejected; new account credentials cannot
+relabel its envelope as current.
+
+The shared client captures the issuing account incarnation with each operation
+and checks durable network gates before content access. Typed errors are handled
+before status-only business branches: an incarnation 409 on PUT cannot become
+`ServerConflict` or discard the in-memory pending recovery candidate. These
+checks add HTTP/local authority metadata, not fields to the encrypted envelope.
+
 ## 1. Security boundary
 
 The workspace master key is 32 random bytes generated on a client. Note,
@@ -300,6 +311,12 @@ An incorrect code, malformed or tampered envelope, authority mismatch,
 secure-storage failure, or database failure before commit preserves the entire
 previous local workspace. Failure of the first sync after commit is retryable;
 it does not restore the discarded workspace.
+
+Before local installation, a protocol-1 recovery revalidates its captured
+account/incarnation and previous workspace. Unresolved reset intent blocks
+replacement; a committed receipt plus fresh consent for the original copy may
+use this existing replacement path. The transaction also reconciles that intent.
+See the [shared reset state contract](account-data-reset-protocol.md#durable-local-reset-state).
 
 ### Client failure classification
 

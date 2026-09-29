@@ -29,7 +29,10 @@ class JdkSelfHostedSyncTransport(
     SelfHostedWorkspaceRecoveryTransport,
     SelfHostedSyncTransportV2,
     SelfHostedMediaTransportV3,
+    SelfHostedAccountControlTransport,
     AutoCloseable {
+    init { require(client.followRedirects() == HttpClient.Redirect.NEVER) { "Self-hosted transport must not follow redirects." } }
+
     override fun close() {
         client.close()
     }
@@ -37,6 +40,7 @@ class JdkSelfHostedSyncTransport(
     override fun register(
         endpoint: String,
         request: SelfHostedAuthRequest,
+        accountContext: SelfHostedAccountRequestContext,
     ): SelfHostedAuthTokensResponse =
         post(
             endpoint = endpoint,
@@ -44,11 +48,13 @@ class JdkSelfHostedSyncTransport(
             bearerToken = null,
             encodedBody = json.encodeToString(request),
             responseSerializer = SelfHostedAuthTokensResponse.serializer(),
+            accountContext = accountContext,
         )
 
     override fun login(
         endpoint: String,
         request: SelfHostedAuthRequest,
+        accountContext: SelfHostedAccountRequestContext,
     ): SelfHostedAuthTokensResponse =
         post(
             endpoint = endpoint,
@@ -56,11 +62,13 @@ class JdkSelfHostedSyncTransport(
             bearerToken = null,
             encodedBody = json.encodeToString(request),
             responseSerializer = SelfHostedAuthTokensResponse.serializer(),
+            accountContext = accountContext,
         )
 
     override fun refresh(
         endpoint: String,
         request: SelfHostedRefreshRequest,
+        accountContext: SelfHostedAccountRequestContext,
     ): SelfHostedAuthTokensResponse =
         post(
             endpoint = endpoint,
@@ -68,12 +76,14 @@ class JdkSelfHostedSyncTransport(
             bearerToken = null,
             encodedBody = json.encodeToString(request),
             responseSerializer = SelfHostedAuthTokensResponse.serializer(),
+            accountContext = accountContext,
         )
 
     override fun registerDevice(
         endpoint: String,
         accessToken: String,
         request: SelfHostedDeviceRegistrationRequest,
+        accountContext: SelfHostedAccountRequestContext,
     ): SelfHostedDeviceRegistrationResponse =
         post(
             endpoint = endpoint,
@@ -81,6 +91,7 @@ class JdkSelfHostedSyncTransport(
             bearerToken = accessToken,
             encodedBody = json.encodeToString(request),
             responseSerializer = SelfHostedDeviceRegistrationResponse.serializer(),
+            accountContext = accountContext,
         )
 
     override fun createPairingInvite(
@@ -88,6 +99,7 @@ class JdkSelfHostedSyncTransport(
         accessToken: String,
         inviteId: String,
         request: SelfHostedPairingInviteCreateRequest,
+        accountContext: SelfHostedAccountRequestContext,
     ): SelfHostedPairingInviteCreateResponse =
         put(
             endpoint = endpoint,
@@ -95,6 +107,7 @@ class JdkSelfHostedSyncTransport(
             bearerToken = accessToken,
             encodedBody = json.encodeToString(request),
             responseSerializer = SelfHostedPairingInviteCreateResponse.serializer(),
+            accountContext = accountContext,
         )
 
     override fun claimPairingInvite(
@@ -102,6 +115,7 @@ class JdkSelfHostedSyncTransport(
         accessToken: String,
         inviteId: String,
         request: SelfHostedPairingInviteClaimRequest,
+        accountContext: SelfHostedAccountRequestContext,
     ): SelfHostedPairingInviteClaimResponse =
         post(
             endpoint = endpoint,
@@ -109,6 +123,7 @@ class JdkSelfHostedSyncTransport(
             bearerToken = accessToken,
             encodedBody = json.encodeToString(request),
             responseSerializer = SelfHostedPairingInviteClaimResponse.serializer(),
+            accountContext = accountContext,
         )
 
     override fun completePairingInvite(
@@ -116,27 +131,32 @@ class JdkSelfHostedSyncTransport(
         accessToken: String,
         inviteId: String,
         request: SelfHostedPairingInviteCompleteRequest,
+        accountContext: SelfHostedAccountRequestContext,
     ) = postNoContent(
         endpoint = endpoint,
         path = "/pairing/invites/${encodePathSegment(inviteId)}/complete",
         bearerToken = accessToken,
         encodedBody = json.encodeToString(request),
+        accountContext = accountContext,
     )
 
     override fun cancelPairingInvite(
         endpoint: String,
         accessToken: String,
         inviteId: String,
+        accountContext: SelfHostedAccountRequestContext,
     ) = postNoContent(
         endpoint = endpoint,
         path = "/pairing/invites/${encodePathSegment(inviteId)}/cancel",
         bearerToken = accessToken,
         encodedBody = "{}",
+        accountContext = accountContext,
     )
 
     override fun getWorkspaceRecoveryEnvelope(
         endpoint: String,
         accessToken: String,
+        accountContext: SelfHostedAccountRequestContext,
     ): SelfHostedWorkspaceRecoveryEnvelopeResponse? =
         try {
             get(
@@ -144,39 +164,44 @@ class JdkSelfHostedSyncTransport(
                 "/workspace/recovery-envelope",
                 accessToken,
                 SelfHostedWorkspaceRecoveryEnvelopeResponse.serializer(),
+                accountContext = accountContext,
             )
         } catch (failure: SelfHostedSyncHttpException) {
-            if (failure.status == 404) null else throw failure
+            if (failure.errorCode == SelfHostedErrorCode.NOT_FOUND || (!failure.protocol1 && !accountContext.protocol1Known && failure.status == 404)) null else throw failure
         }
 
     override fun putWorkspaceRecoveryEnvelope(
         endpoint: String,
         accessToken: String,
         request: SelfHostedWorkspaceRecoveryEnvelopePutRequest,
+        accountContext: SelfHostedAccountRequestContext,
     ): SelfHostedWorkspaceRecoveryEnvelopeResponse = put(
         endpoint,
         "/workspace/recovery-envelope",
         accessToken,
         json.encodeToString(request),
         SelfHostedWorkspaceRecoveryEnvelopeResponse.serializer(),
+        accountContext = accountContext,
     )
 
-    override fun v2Capabilities(endpoint: String, accessToken: String): SelfHostedV2CapabilitiesResponse =
-        systemV3Capabilities(endpoint, accessToken).toInternalEntityV2Capabilities()
+    override fun v2Capabilities(endpoint: String, accessToken: String, accountContext: SelfHostedAccountRequestContext): SelfHostedV2CapabilitiesResponse =
+        systemV3Capabilities(endpoint, accessToken, accountContext = accountContext).toInternalEntityV2Capabilities()
 
     override fun systemV3Capabilities(
         endpoint: String,
         accessToken: String,
+        accountContext: SelfHostedAccountRequestContext,
     ): SelfHostedSystemV3CapabilitiesResponse =
-        get(endpoint, "/sync/v3/capabilities", accessToken, SelfHostedSystemV3CapabilitiesResponse.serializer())
+        get(endpoint, "/sync/v3/capabilities", accessToken, SelfHostedSystemV3CapabilitiesResponse.serializer(), accountContext = accountContext)
 
-    override fun v2Epoch(endpoint: String, accessToken: String, workspaceId: String): SelfHostedV2EpochResponse =
-        get(endpoint, jdkEntityPath(workspaceId, "/epoch"), accessToken, SelfHostedV2EpochResponse.serializer())
+    override fun v2Epoch(endpoint: String, accessToken: String, workspaceId: String, accountContext: SelfHostedAccountRequestContext): SelfHostedV2EpochResponse =
+        get(endpoint, jdkEntityPath(workspaceId, "/epoch"), accessToken, SelfHostedV2EpochResponse.serializer(), accountContext = accountContext)
 
     override fun v2PutCheckpointChunk(
         endpoint: String,
         accessToken: String,
         request: SelfHostedV2CheckpointChunkRequest,
+        accountContext: SelfHostedAccountRequestContext,
     ): SelfHostedV2ImmutablePutResponse = post(
         endpoint,
         jdkEntityPath(request.workspaceId, "/checkpoint/chunk"),
@@ -184,12 +209,14 @@ class JdkSelfHostedSyncTransport(
         json.encodeToString(request),
         SelfHostedV2ImmutablePutResponse.serializer(),
         acceptedStatuses = setOf(409),
+        accountContext = accountContext,
     )
 
     override fun v2PutCheckpointManifest(
         endpoint: String,
         accessToken: String,
         request: SelfHostedV2CheckpointManifestRequest,
+        accountContext: SelfHostedAccountRequestContext,
     ): SelfHostedV2ImmutablePutResponse = post(
         endpoint,
         jdkEntityPath(request.workspaceId, "/checkpoint/manifest"),
@@ -197,24 +224,28 @@ class JdkSelfHostedSyncTransport(
         json.encodeToString(request),
         SelfHostedV2ImmutablePutResponse.serializer(),
         acceptedStatuses = setOf(409),
+        accountContext = accountContext,
     )
 
     override fun v2FetchCheckpoint(
         endpoint: String,
         accessToken: String,
         request: SelfHostedV2CheckpointFetchRequest,
+        accountContext: SelfHostedAccountRequestContext,
     ): SelfHostedV2CheckpointFetchResponse = post(
         endpoint,
         jdkEntityPath(request.workspaceId, "/checkpoint/fetch"),
         accessToken,
         json.encodeToString(request),
         SelfHostedV2CheckpointFetchResponse.serializer(),
+        accountContext = accountContext,
     )
 
     override fun v2CompareAndSetEpoch(
         endpoint: String,
         accessToken: String,
         request: SelfHostedV2EpochCompareAndSetRequest,
+        accountContext: SelfHostedAccountRequestContext,
     ): SelfHostedV2EpochCompareAndSetResponse = post(
         endpoint,
         jdkEntityPath(request.workspaceId, "/epoch/compare-and-set"),
@@ -222,12 +253,14 @@ class JdkSelfHostedSyncTransport(
         json.encodeToString(request),
         SelfHostedV2EpochCompareAndSetResponse.serializer(),
         acceptedStatuses = setOf(409),
+        accountContext = accountContext,
     )
 
     override fun v2CleanupCheckpointDraft(
         endpoint: String,
         accessToken: String,
         request: SelfHostedV2CheckpointCleanupRequest,
+        accountContext: SelfHostedAccountRequestContext,
     ): SelfHostedV2CheckpointCleanupResponse = post(
         endpoint,
         jdkEntityPath(request.workspaceId, "/checkpoint/cleanup"),
@@ -235,12 +268,14 @@ class JdkSelfHostedSyncTransport(
         json.encodeToString(request),
         SelfHostedV2CheckpointCleanupResponse.serializer(),
         acceptedStatuses = setOf(409),
+        accountContext = accountContext,
     )
 
     override fun v2Push(
         endpoint: String,
         accessToken: String,
         request: SelfHostedV2PushRequest,
+        accountContext: SelfHostedAccountRequestContext,
     ): SelfHostedV2PushResponse = post(
         endpoint,
         jdkEntityPath(request.workspaceId, "/push"),
@@ -248,30 +283,35 @@ class JdkSelfHostedSyncTransport(
         json.encodeToString(request),
         SelfHostedV2PushResponse.serializer(),
         acceptedStatuses = setOf(409),
+        accountContext = accountContext,
     )
 
     override fun v2Pull(
         endpoint: String,
         accessToken: String,
         request: SelfHostedV2PullRequest,
+        accountContext: SelfHostedAccountRequestContext,
     ): SelfHostedV2PullResponse = post(
         endpoint,
         jdkEntityPath(request.workspaceId, "/pull"),
         accessToken,
         json.encodeToString(request),
         SelfHostedV2PullResponse.serializer(),
+        accountContext = accountContext,
     )
 
     override fun v2Frontiers(
         endpoint: String,
         accessToken: String,
         request: SelfHostedV2FrontierRequest,
+        accountContext: SelfHostedAccountRequestContext,
     ): SelfHostedV2FrontierResponse = post(
         endpoint,
         jdkEntityPath(request.workspaceId, "/frontiers"),
         accessToken,
         json.encodeToString(request),
         SelfHostedV2FrontierResponse.serializer(),
+        accountContext = accountContext,
     )
 
     override fun putMediaObject(
@@ -280,6 +320,7 @@ class JdkSelfHostedSyncTransport(
         workspaceId: String,
         mediaId: String,
         prepared: SelfHostedPreparedMediaObjectV3,
+        accountContext: SelfHostedAccountRequestContext,
     ): SelfHostedMediaPutResponseV3 {
         requireSystemV3WorkspaceId(workspaceId)
         requireJdkMediaId(mediaId)
@@ -290,6 +331,7 @@ class JdkSelfHostedSyncTransport(
             accessToken,
             prepared.encryptedBytes,
             prepared.encryptedSha256,
+            accountContext = accountContext,
         )
     }
 
@@ -298,10 +340,11 @@ class JdkSelfHostedSyncTransport(
         accessToken: String,
         workspaceId: String,
         mediaId: String,
+        accountContext: SelfHostedAccountRequestContext,
     ): SelfHostedMediaRemoteHeadV3? {
         requireSystemV3WorkspaceId(workspaceId)
         requireJdkMediaId(mediaId)
-        return headMedia(endpoint, "/sync/v3/workspaces/$workspaceId/media/$mediaId", accessToken)
+        return headMedia(endpoint, "/sync/v3/workspaces/$workspaceId/media/$mediaId", accessToken, accountContext = accountContext)
     }
 
     override fun getMediaObject(
@@ -309,6 +352,7 @@ class JdkSelfHostedSyncTransport(
         accessToken: String,
         workspaceId: String,
         mediaId: String,
+        accountContext: SelfHostedAccountRequestContext,
     ): SelfHostedMediaRemoteObjectV3 {
         requireSystemV3WorkspaceId(workspaceId)
         requireJdkMediaId(mediaId)
@@ -317,232 +361,187 @@ class JdkSelfHostedSyncTransport(
             "/sync/v3/workspaces/$workspaceId/media/$mediaId",
             accessToken,
             SYSTEM_V3_MEDIA_MAX_CIPHERTEXT_BYTES,
+            accountContext = accountContext,
         )
     }
 
-    private fun putMediaBytes(
-        endpoint: String,
-        path: String,
-        accessToken: String,
-        bytes: ByteArray,
-        ciphertextSha256: String,
-    ): SelfHostedMediaPutResponseV3 {
-        val builder = HttpRequest.newBuilder(uri(endpoint, path))
-            .timeout(Duration.ofMillis(SELF_HOSTED_REQUEST_TIMEOUT_MILLIS))
+    override fun discoverAccountData(endpoint: String, accessToken: String, accountContext: SelfHostedAccountRequestContext): SelfHostedAccountDiscoveryResult {
+        val response = exchange("GET", endpoint, "/account/data-state", accessToken, null, accountContext, maxBody = SELF_HOSTED_ACCOUNT_BODY_LIMIT, sendIncarnation = false)
+        if (SelfHostedAccountWire.legacyCandidate(response.status, response.errorHeaders, response.issuanceHeaders, response.body, response.contentType, accountContext)) {
+            return SelfHostedAccountDiscoveryResult.LegacyCandidate404
+        }
+        return SelfHostedAccountDiscoveryResult.Protocol1(SelfHostedAccountWire.validateState(decode(response, SelfHostedAccountDataStateResponse.serializer(), accountContext, limit = SELF_HOSTED_ACCOUNT_BODY_LIMIT)))
+    }
+
+    override fun accountMe(endpoint: String, accessToken: String, accountContext: SelfHostedAccountRequestContext): SelfHostedAccountMeResponse =
+        SelfHostedAccountWire.validateMe(decode(exchange("GET", endpoint, "/me", accessToken, null, accountContext, maxBody = SELF_HOSTED_ACCOUNT_BODY_LIMIT, sendIncarnation = false), SelfHostedAccountMeResponse.serializer(), accountContext, limit = SELF_HOSTED_ACCOUNT_BODY_LIMIT))
+
+    override fun getAccountResetReceipt(endpoint: String, accessToken: String, operationId: String, accountContext: SelfHostedAccountRequestContext): SelfHostedAccountResetReceiptResponse? {
+        require(SelfHostedAccountWire.isOperationId(operationId))
+        return try {
+            SelfHostedAccountWire.validateReceipt(decode(exchange("GET", endpoint, "/account/data-resets/$operationId", accessToken, null, accountContext, maxBody = SELF_HOSTED_ACCOUNT_BODY_LIMIT, sendIncarnation = false), SelfHostedAccountResetReceiptResponse.serializer(), accountContext, limit = SELF_HOSTED_ACCOUNT_BODY_LIMIT), operationId)
+        } catch (failure: SelfHostedSyncHttpException) {
+            if (failure.errorCode == SelfHostedErrorCode.NOT_FOUND) null else throw failure
+        }
+    }
+
+    override fun resetAccountData(endpoint: String, accessToken: String, request: SelfHostedAccountResetRequest, accountContext: SelfHostedAccountRequestContext): SelfHostedAccountResetReceiptResponse {
+        SelfHostedAccountWire.validateResetRequest(request)
+        val encoded = json.encodeToString(request)
+        require(encoded.encodeToByteArray().size <= SELF_HOSTED_ACCOUNT_BODY_LIMIT)
+        val expected = SelfHostedAccountRequestContext(request.expectedIncarnation, protocol1Known = true)
+        val receipt = SelfHostedAccountWire.validateReceipt(decode(exchange("POST", endpoint, "/account/data-resets", accessToken, encoded, expected, maxBody = SELF_HOSTED_ACCOUNT_BODY_LIMIT), SelfHostedAccountResetReceiptResponse.serializer(), expected, limit = SELF_HOSTED_ACCOUNT_BODY_LIMIT), request.operationId)
+        if (receipt.previousIncarnation != request.expectedIncarnation) SelfHostedAccountWire.fail(SelfHostedProtocolFailureReason.INVALID_CONTROL_RESPONSE)
+        return receipt
+    }
+
+    private fun putMediaBytes(endpoint: String, path: String, accessToken: String, bytes: ByteArray, ciphertextSha256: String, accountContext: SelfHostedAccountRequestContext): SelfHostedMediaPutResponseV3 {
+        val request = builder(endpoint, path, accessToken, accountContext)
             .header("Content-Type", SYSTEM_V3_MEDIA_OBJECT_CONTENT_TYPE)
-            .header("Authorization", "Bearer $accessToken")
             .header(SYSTEM_V3_MEDIA_CIPHERTEXT_SHA256_HEADER, ciphertextSha256)
-            .PUT(HttpRequest.BodyPublishers.ofByteArray(bytes))
-        return execute(
-            builder.build(),
-            SelfHostedMediaPutResponseV3.serializer(),
-            acceptedStatuses = setOf(409),
-        )
+            .PUT(HttpRequest.BodyPublishers.ofByteArray(bytes)).build()
+        return decode(readResponse(send(request), setOf(409)), SelfHostedMediaPutResponseV3.serializer(), accountContext, setOf(409))
     }
 
-    private fun headMedia(
-        endpoint: String,
-        path: String,
-        accessToken: String,
-    ): SelfHostedMediaRemoteHeadV3? {
-        val request = HttpRequest.newBuilder(uri(endpoint, path))
-            .timeout(Duration.ofMillis(SELF_HOSTED_REQUEST_TIMEOUT_MILLIS))
-            .header("Authorization", "Bearer $accessToken")
-            .method("HEAD", HttpRequest.BodyPublishers.noBody())
-            .build()
+    private fun headMedia(endpoint: String, path: String, accessToken: String, accountContext: SelfHostedAccountRequestContext): SelfHostedMediaRemoteHeadV3? {
+        val request = builder(endpoint, path, accessToken, accountContext).method("HEAD", HttpRequest.BodyPublishers.noBody()).build()
         val response = client.send(request, HttpResponse.BodyHandlers.discarding())
-        if (response.statusCode() == 404) return null
-        requireJdkSuccessful(response.statusCode())
+        requireUnredirected(response, request)
+        try {
+            SelfHostedAccountWire.classify(response.statusCode(), response.headerValues(SELF_HOSTED_ERROR_CODE_HEADER), "", accountContext, head = true)
+        } catch (failure: SelfHostedSyncHttpException) {
+            if (failure.errorCode in setOf(SelfHostedErrorCode.MEDIA_OBJECT_NOT_FOUND, SelfHostedErrorCode.MEDIA_OBJECT_UNAVAILABLE) ||
+                (!failure.protocol1 && !accountContext.protocol1Known && failure.status == 404)
+            ) return null
+            throw failure
+        }
         return response.mediaHead()
     }
 
-    private fun getMediaBytes(
-        endpoint: String,
-        path: String,
-        accessToken: String,
-        maxBytes: Int,
-    ): SelfHostedMediaRemoteObjectV3 {
-        val request = HttpRequest.newBuilder(uri(endpoint, path))
-            .timeout(Duration.ofMillis(SELF_HOSTED_REQUEST_TIMEOUT_MILLIS))
-            .header("Authorization", "Bearer $accessToken")
-            .GET()
-            .build()
-        val response = client.send(request, HttpResponse.BodyHandlers.ofInputStream())
-        if (response.statusCode() !in 200..299) {
-            response.body().use { readBoundedBytes(it, MEDIA_ERROR_BODY_LIMIT) }
-            requireJdkSuccessful(response.statusCode())
+    private fun getMediaBytes(endpoint: String, path: String, accessToken: String, maxBytes: Int, accountContext: SelfHostedAccountRequestContext): SelfHostedMediaRemoteObjectV3 {
+        val response = send(builder(endpoint, path, accessToken, accountContext).GET().build())
+        val errorHeaders = response.headerValues(SELF_HOSTED_ERROR_CODE_HEADER)
+        if (errorHeaders != null || response.statusCode() !in 200..299) {
+            val body = response.body().use { readBoundedText(it, SELF_HOSTED_ACCOUNT_BODY_LIMIT) }
+            SelfHostedAccountWire.classify(response.statusCode(), errorHeaders, body, accountContext)
         }
-        require(response.headers().firstValue("Content-Type").orElse("").substringBefore(';').trim() ==
-            SYSTEM_V3_MEDIA_OBJECT_CONTENT_TYPE)
-        val declared = response.headers().firstValueAsLong("Content-Length")
-        require(declared.isEmpty || declared.asLong in 0..maxBytes.toLong()) {
-            response.body().close()
-            "Self-hosted media response exceeds its configured body limit."
+        require(response.headers().firstValue("Content-Type").orElse("").substringBefore(';').trim() == SYSTEM_V3_MEDIA_OBJECT_CONTENT_TYPE) {
+            response.body().close(); "Self-hosted media response has invalid content type."
+        }
+        val declared = response.headers().firstValue("Content-Length").orElse(null)?.toLongOrNull()
+        if (declared != null && declared !in 0..maxBytes.toLong()) {
+            response.body().close(); SelfHostedAccountWire.fail(SelfHostedProtocolFailureReason.BODY_TOO_LARGE)
         }
         val bytes = response.body().use { readBoundedBytes(it, maxBytes) }
-        require(declared.isEmpty || declared.asLong == bytes.size.toLong())
+        if (declared != null && declared != bytes.size.toLong()) SelfHostedAccountWire.fail(SelfHostedProtocolFailureReason.MALFORMED_BODY)
         val head = response.mediaHead()
         require(head.ciphertextBytes == bytes.size)
-        return SelfHostedMediaRemoteObjectV3(
-            head.ciphertextBytes,
-            head.ciphertextSha256,
-            bytes,
-        )
+        return SelfHostedMediaRemoteObjectV3(head.ciphertextBytes, head.ciphertextSha256, bytes)
     }
 
     private fun HttpResponse<*>.mediaHead(): SelfHostedMediaRemoteHeadV3 {
-        val ciphertextBytes = headers().firstValue(SYSTEM_V3_MEDIA_CIPHERTEXT_BYTES_HEADER).orElse(null)
-            ?.canonicalPositiveIntOrNullForJdk()
+        val bytes = headers().firstValue(SYSTEM_V3_MEDIA_CIPHERTEXT_BYTES_HEADER).orElse(null)?.canonicalPositiveIntOrNullForJdk()
             ?: error("Self-hosted media response has invalid size metadata.")
-        val ciphertextSha256 = headers().firstValue(SYSTEM_V3_MEDIA_CIPHERTEXT_SHA256_HEADER).orElse(null)
-            ?.takeIf(MEDIA_DIGEST::matches)
+        val digest = headers().firstValue(SYSTEM_V3_MEDIA_CIPHERTEXT_SHA256_HEADER).orElse(null)?.takeIf(MEDIA_DIGEST::matches)
             ?: error("Self-hosted media response has invalid digest metadata.")
-        return SelfHostedMediaRemoteHeadV3(ciphertextBytes, ciphertextSha256)
+        return SelfHostedMediaRemoteHeadV3(bytes, digest)
     }
 
-    private fun <T> post(
-        endpoint: String,
-        path: String,
-        bearerToken: String?,
-        encodedBody: String,
-        responseSerializer: KSerializer<T>,
-        acceptedStatuses: Set<Int> = emptySet(),
-    ): T {
-        require(encodedBody.encodeToByteArray().size <= MAX_ENCODED_BODY_BYTES) {
-            "Self-hosted request exceeds the V2 encoded body limit."
+    private fun <T> post(endpoint: String, path: String, bearerToken: String?, encodedBody: String, responseSerializer: KSerializer<T>, acceptedStatuses: Set<Int> = emptySet(), accountContext: SelfHostedAccountRequestContext): T =
+        decode(exchange("POST", endpoint, path, bearerToken, encodedBody, accountContext, acceptedStatuses), responseSerializer, accountContext, acceptedStatuses)
+
+    private fun <T> put(endpoint: String, path: String, bearerToken: String?, encodedBody: String, responseSerializer: KSerializer<T>, acceptedStatuses: Set<Int> = emptySet(), accountContext: SelfHostedAccountRequestContext): T =
+        decode(exchange("PUT", endpoint, path, bearerToken, encodedBody, accountContext, acceptedStatuses), responseSerializer, accountContext, acceptedStatuses)
+
+    private fun <T> get(endpoint: String, path: String, bearerToken: String, responseSerializer: KSerializer<T>, accountContext: SelfHostedAccountRequestContext): T =
+        decode(exchange("GET", endpoint, path, bearerToken, null, accountContext), responseSerializer, accountContext)
+
+    private fun postNoContent(endpoint: String, path: String, bearerToken: String, encodedBody: String, accountContext: SelfHostedAccountRequestContext) {
+        val response = exchange("POST", endpoint, path, bearerToken, encodedBody, accountContext)
+        SelfHostedAccountWire.classify(response.status, response.errorHeaders, response.body, accountContext)
+    }
+
+    private fun exchange(method: String, endpoint: String, path: String, bearerToken: String?, body: String?, accountContext: SelfHostedAccountRequestContext, acceptedStatuses: Set<Int> = emptySet(), maxBody: Int = MAX_ENCODED_BODY_BYTES, sendIncarnation: Boolean = true): SelfHostedWireResponse {
+        require(body == null || body.encodeToByteArray().size <= maxBody)
+        val builder = builder(endpoint, path, bearerToken, accountContext, sendIncarnation)
+        if (body != null) builder.header("Content-Type", "application/json")
+        val request = builder.method(method, body?.let(HttpRequest.BodyPublishers::ofString) ?: HttpRequest.BodyPublishers.noBody()).build()
+        return readResponse(send(request), acceptedStatuses, maxBody)
+    }
+
+    private fun builder(endpoint: String, path: String, bearerToken: String?, context: SelfHostedAccountRequestContext, sendIncarnation: Boolean = true): HttpRequest.Builder {
+        val builder = HttpRequest.newBuilder(uri(endpoint, path)).timeout(Duration.ofMillis(SELF_HOSTED_REQUEST_TIMEOUT_MILLIS))
+        bearerToken?.let {
+            builder.header("Authorization", "Bearer $it")
+            if (sendIncarnation) builder.header(SELF_HOSTED_ACCOUNT_PROTOCOL_HEADER, "1").header(SELF_HOSTED_ACCOUNT_INCARNATION_HEADER, context.accountIncarnation)
         }
-        val builder = HttpRequest.newBuilder(uri(endpoint, path))
-            .timeout(Duration.ofMillis(SELF_HOSTED_REQUEST_TIMEOUT_MILLIS))
-            .header("Content-Type", "application/json")
-            .POST(HttpRequest.BodyPublishers.ofString(encodedBody))
-        bearerToken?.let { builder.header("Authorization", "Bearer $it") }
-        return execute(builder.build(), responseSerializer, acceptedStatuses)
+        return builder
     }
 
-    private fun <T> put(
-        endpoint: String,
-        path: String,
-        bearerToken: String?,
-        encodedBody: String,
-        responseSerializer: KSerializer<T>,
-        acceptedStatuses: Set<Int> = emptySet(),
-    ): T {
-        require(encodedBody.encodeToByteArray().size <= MAX_ENCODED_BODY_BYTES) {
-            "Self-hosted request exceeds the V2 encoded body limit."
-        }
-        val builder = HttpRequest.newBuilder(uri(endpoint, path))
-            .timeout(Duration.ofMillis(SELF_HOSTED_REQUEST_TIMEOUT_MILLIS))
-            .header("Content-Type", "application/json")
-            .PUT(HttpRequest.BodyPublishers.ofString(encodedBody))
-        bearerToken?.let { builder.header("Authorization", "Bearer $it") }
-        return execute(builder.build(), responseSerializer, acceptedStatuses)
-    }
-
-    private fun postNoContent(
-        endpoint: String,
-        path: String,
-        bearerToken: String,
-        encodedBody: String,
-    ) {
-        require(encodedBody.encodeToByteArray().size <= MAX_ENCODED_BODY_BYTES)
-        val request = HttpRequest.newBuilder(uri(endpoint, path))
-            .timeout(Duration.ofMillis(SELF_HOSTED_REQUEST_TIMEOUT_MILLIS))
-            .header("Content-Type", "application/json")
-            .header("Authorization", "Bearer $bearerToken")
-            .POST(HttpRequest.BodyPublishers.ofString(encodedBody))
-            .build()
-        val response = client.send(request, HttpResponse.BodyHandlers.discarding())
-        if (response.statusCode() !in 200..299) {
-            throw SelfHostedSyncHttpException(
-                status = response.statusCode(),
-                safeMessage = "Self-hosted request failed with HTTP ${response.statusCode()}; credentials redacted.",
-            )
-        }
-    }
-
-    private fun <T> get(
-        endpoint: String,
-        path: String,
-        bearerToken: String,
-        responseSerializer: KSerializer<T>,
-    ): T {
-        val request = HttpRequest.newBuilder(uri(endpoint, path))
-            .timeout(Duration.ofMillis(SELF_HOSTED_REQUEST_TIMEOUT_MILLIS))
-            .header("Authorization", "Bearer $bearerToken")
-            .GET()
-            .build()
-        return execute(request, responseSerializer)
-    }
-
-    private fun <T> execute(
-        request: HttpRequest,
-        responseSerializer: KSerializer<T>,
-        acceptedStatuses: Set<Int> = emptySet(),
-    ): T {
+    private fun send(request: HttpRequest): HttpResponse<InputStream> {
         val response = client.send(request, HttpResponse.BodyHandlers.ofInputStream())
-        val declaredLength = response.headers().firstValueAsLong("Content-Length")
-        require(declaredLength.isEmpty || declaredLength.asLong in 0..MAX_ENCODED_BODY_BYTES.toLong()) {
-            response.body().close()
-            "Self-hosted response exceeds the V2 encoded body limit."
+        if (response.uri() != request.uri()) {
+            response.body().close(); SelfHostedAccountWire.fail(SelfHostedProtocolFailureReason.REDIRECTED_RESPONSE)
         }
-        val body = response.body().use(::readBoundedBody)
-        if (response.statusCode() !in 200..299 && response.statusCode() !in acceptedStatuses) {
-            throw SelfHostedSyncHttpException(
-                status = response.statusCode(),
-                safeMessage = "Self-hosted request failed with HTTP ${response.statusCode()}; credentials redacted.",
-            )
+        return response
+    }
+
+    private fun requireUnredirected(response: HttpResponse<*>, request: HttpRequest) {
+        if (response.uri() != request.uri()) SelfHostedAccountWire.fail(SelfHostedProtocolFailureReason.REDIRECTED_RESPONSE)
+    }
+
+    private fun readResponse(response: HttpResponse<InputStream>, acceptedStatuses: Set<Int> = emptySet(), maxBody: Int = MAX_ENCODED_BODY_BYTES): SelfHostedWireResponse {
+        val errorHeaders = response.headerValues(SELF_HOSTED_ERROR_CODE_HEADER)
+        val limit = if (SelfHostedAccountWire.errorBodyLimit(response.statusCode(), errorHeaders, acceptedStatuses)) SELF_HOSTED_ACCOUNT_BODY_LIMIT else maxBody
+        val body = response.body().use { input ->
+            val declared = response.headers().firstValue("Content-Length").orElse(null)?.toLongOrNull()
+            if (declared != null && declared !in 0..limit.toLong()) SelfHostedAccountWire.fail(SelfHostedProtocolFailureReason.BODY_TOO_LARGE)
+            val bytes = readBoundedBytes(input, limit)
+            if (declared != null && declared != bytes.size.toLong()) SelfHostedAccountWire.fail(SelfHostedProtocolFailureReason.MALFORMED_BODY)
+            decodeUtf8(bytes)
         }
-        StrictJsonV2.requireValidObjectKeys(body, MAX_ENCODED_BODY_BYTES)
-        return json.decodeFromString(responseSerializer, body)
+        return SelfHostedWireResponse(response.statusCode(), body, errorHeaders, response.headerValues(SELF_HOSTED_ACCOUNT_INCARNATION_HEADER), response.headers().firstValue("Content-Type").orElse(null))
+    }
+
+    private fun HttpResponse<*>.headerValues(name: String): List<String>? = headers().allValues(name).takeIf { it.isNotEmpty() }
+
+    private fun <T> decode(response: SelfHostedWireResponse, serializer: KSerializer<T>, context: SelfHostedAccountRequestContext, acceptedStatuses: Set<Int> = emptySet(), limit: Int = MAX_ENCODED_BODY_BYTES): T {
+        SelfHostedAccountWire.classify(response.status, response.errorHeaders, response.body, context, acceptedStatuses)
+        return SelfHostedAccountWire.captureIssuance(SelfHostedAccountWire.decode(serializer, response.body, limit), response.issuanceHeaders, context)
     }
 
     private fun uri(endpoint: String, path: String): URI {
-        require(isSecureSyncEndpoint(endpoint)) {
-            "Self-hosted requires HTTPS unless the server is on this device's loopback interface."
-        }
+        require(isSecureSyncEndpoint(endpoint)) { "Self-hosted requires HTTPS unless the server is on this device's loopback interface." }
         return URI.create("${endpoint.trim().trimEnd('/')}$path")
     }
 
-    private fun encodePathSegment(value: String): String =
-        buildString(value.length + 8) {
-            value.forEach { ch ->
-                when {
-                    ch.isLetterOrDigit() || ch == '-' || ch == '_' || ch == '.' || ch == '~' || ch == ':' -> append(ch)
-                    else -> append('%').append(ch.code.toString(16).uppercase().padStart(2, '0'))
-                }
-            }
+    private fun encodePathSegment(value: String): String = buildString(value.length + 8) {
+        value.forEach { ch ->
+            if (ch.isLetterOrDigit() || ch in "-_.~:") append(ch)
+            else append('%').append(ch.code.toString(16).uppercase().padStart(2, '0'))
         }
+    }
 
-    private fun readBoundedBody(input: InputStream): String {
-        return readBoundedBytes(input, MAX_ENCODED_BODY_BYTES).decodeToString(throwOnInvalidSequence = true)
+    private fun readBoundedText(input: InputStream, limit: Int): String = decodeUtf8(readBoundedBytes(input, limit))
+
+    private fun decodeUtf8(bytes: ByteArray): String = try { bytes.decodeToString(throwOnInvalidSequence = true) } catch (_: Exception) {
+        SelfHostedAccountWire.fail(SelfHostedProtocolFailureReason.MALFORMED_BODY)
     }
 
     private fun readBoundedBytes(input: InputStream, maxBytes: Int): ByteArray {
-        val output = ByteArrayOutputStream(16 * 1024)
+        val output = ByteArrayOutputStream(minOf(maxBytes, 16 * 1024))
         val buffer = ByteArray(8 * 1024)
         while (true) {
             val read = input.read(buffer)
             if (read < 0) break
-            require(output.size() + read <= maxBytes) {
-                "Self-hosted response exceeds its configured body limit."
-            }
+            if (output.size() + read > maxBytes) SelfHostedAccountWire.fail(SelfHostedProtocolFailureReason.BODY_TOO_LARGE)
             output.write(buffer, 0, read)
         }
         return output.toByteArray()
     }
 
-    private fun requireJdkSuccessful(status: Int) {
-        if (status !in 200..299) {
-            throw SelfHostedSyncHttpException(
-                status = status,
-                safeMessage = "Self-hosted request failed with HTTP $status; credentials redacted.",
-            )
-        }
-    }
-
     private companion object {
         const val MAX_ENCODED_BODY_BYTES: Int = 16 * 1024 * 1024
-        const val MEDIA_ERROR_BODY_LIMIT: Int = 64 * 1024
         val MEDIA_DIGEST = Regex("^sha256:[0-9a-f]{64}$")
     }
 }

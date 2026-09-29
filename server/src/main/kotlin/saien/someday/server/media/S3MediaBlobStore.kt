@@ -1,5 +1,7 @@
 package saien.someday.server.media
 
+import java.util.UUID
+import saien.someday.server.auth.ACCOUNT_INITIAL_INCARNATION
 import java.net.URI
 import java.security.MessageDigest
 import java.time.Duration
@@ -77,19 +79,19 @@ class S3MediaBlobStore private constructor(
     override fun read(key: MediaBlobKey, maxBytes: Int): MediaBlobValue? =
         readObjectKey(objectKey(key), maxBytes)
 
-    internal fun putStartupProbe(bytes: ByteArray, expectedSha256: String): MediaBlobPutResult =
-        putObjectKeyImmutable(STARTUP_PROBE_OBJECT_KEY, bytes, expectedSha256)
+    internal fun putStartupProbe(bytes: ByteArray, expectedSha256: String, incarnation: UUID): MediaBlobPutResult =
+        putObjectKeyImmutable(startupProbeKey(incarnation), bytes, expectedSha256)
 
-    internal fun headStartupProbe(): MediaBlobMetadata? = headObjectKey(STARTUP_PROBE_OBJECT_KEY)
+    internal fun headStartupProbe(incarnation: UUID): MediaBlobMetadata? = headObjectKey(startupProbeKey(incarnation))
 
-    internal fun readStartupProbe(maxBytes: Int): MediaBlobValue? =
-        readObjectKey(STARTUP_PROBE_OBJECT_KEY, maxBytes)
+    internal fun readStartupProbe(maxBytes: Int, incarnation: UUID): MediaBlobValue? =
+        readObjectKey(startupProbeKey(incarnation), maxBytes)
 
-    internal fun isStartupProbeMissingByMetadata(): Boolean =
-        isObjectAbsentByHead(MISSING_STARTUP_PROBE_OBJECT_KEY)
+    internal fun isStartupProbeMissingByMetadata(incarnation: UUID): Boolean =
+        isObjectAbsentByHead(startupProbeKey(incarnation, missing = true))
 
-    internal fun isStartupProbeMissingByRead(): Boolean =
-        isObjectAbsentByBoundedGet(MISSING_STARTUP_PROBE_OBJECT_KEY)
+    internal fun isStartupProbeMissingByRead(incarnation: UUID): Boolean =
+        isObjectAbsentByBoundedGet(startupProbeKey(incarnation, missing = true))
 
     override fun close() {
         client.close()
@@ -231,7 +233,17 @@ class S3MediaBlobStore private constructor(
     }
 
     private fun objectKey(key: MediaBlobKey): String =
-        "media/v1/${key.userId}/${key.workspaceId}/${key.mediaId}.bin"
+        if (key.incarnation == ACCOUNT_INITIAL_INCARNATION) {
+            "media/v1/${key.userId}/${key.workspaceId}/${key.mediaId}.bin"
+        } else {
+            "media/v1/.incarnations/v1/${key.userId}/${key.incarnation}/${key.workspaceId}/${key.mediaId}.bin"
+        }
+
+    private fun startupProbeKey(incarnation: UUID, missing: Boolean = false): String {
+        val filename = if (missing) "startup-probe-missing-v1.bin" else "startup-probe-v1.bin"
+        val prefix = if (incarnation == ACCOUNT_INITIAL_INCARNATION) "media/v1" else "media/v1/.incarnations/v1"
+        return "$prefix/.someday-system/$filename"
+    }
 
     private data class StoredObject(
         val storedSha256: String?,
@@ -242,9 +254,6 @@ class S3MediaBlobStore private constructor(
     private companion object {
         const val BINARY_CONTENT_TYPE = "application/octet-stream"
         const val SHA256_METADATA_KEY = "someday-ciphertext-sha256"
-        const val STARTUP_PROBE_OBJECT_KEY = "media/v1/.someday-system/startup-probe-v1.bin"
-        const val MISSING_STARTUP_PROBE_OBJECT_KEY =
-            "media/v1/.someday-system/startup-probe-missing-v1.bin"
         const val MISSING_PROBE_READ_RANGE = "bytes=0-0"
         const val NOT_FOUND = 404
         const val PRECONDITION_FAILED = 412

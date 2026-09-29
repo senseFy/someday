@@ -5,6 +5,8 @@
 
 package saien.someday.app.ios
 
+import saien.someday.domain.workspace.WorkspaceProductSnapshot
+
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -21,6 +23,7 @@ import saien.someday.ui.SomedayBootstrapScreen
 import saien.someday.ui.media.MediaImportRunner
 import saien.someday.ui.media.MediaMaterializationRunner
 import saien.someday.ui.media.MediaMaterializationUiResult
+import saien.someday.ui.media.MediaPreviewUiResult
 import saien.someday.ui.media.MediaPreviewLoader
 import saien.someday.ui.media.MediaUiFailureReason
 import saien.someday.ui.media.MediaUiPorts
@@ -138,9 +141,11 @@ fun MainViewController(): UIViewController {
                     store = clientRepositories.localMediaAssetStore,
                 ),
                 previewLoader = MediaPreviewLoader { assetId ->
-                    withContext(Dispatchers.Default) {
-                        clientRepositories.localMediaAssetStore.loadMediaPreview(assetId)
+                    val (snapshot, preview) = withContext(Dispatchers.Default) {
+                        clientRepositories.localMediaAssetStore.captureWorkspace() to
+                            clientRepositories.localMediaAssetStore.loadMediaPreview(assetId)
                     }
+                    if (clientRepositories.workspaceProductAccess.isCurrent(snapshot)) preview else MediaPreviewUiResult.Missing
                 },
                 materializationRunner = MediaMaterializationRunner { assetId, onResult ->
                     mediaCoroutineScope.launch {
@@ -197,6 +202,8 @@ fun MainViewController(): UIViewController {
             workspacePairingInvitationJoiner = clientRepositories.workspacePairingInvitationJoiner,
             workspacePairingInvitationCanceller = clientRepositories.workspacePairingInvitationCanceller,
             workspaceRecoveryManager = clientRepositories.workspaceRecoveryManager,
+            accountDataResetManager = clientRepositories.accountDataResetManager,
+            workspaceProductAccess = clientRepositories.workspaceProductAccess,
             workspacePairingScanner = workspacePairingScanner,
             foregroundSyncSignal = foregroundSyncSignal,
             startupTrace = traceMark,
@@ -245,27 +252,35 @@ private class IosDayOneImportRunner(
     private val clientRepositories: IosClientRepositories,
 ) : DayOneImportRunner {
     private var activeDelegate: DayOneDocumentPickerDelegate? = null
+    private var starting = false
 
     override fun start(onResult: (SettingsImportSummary) -> Unit) {
         val rootController = rootControllerProvider()
-        if (rootController == null) {
+        if (rootController == null || activeDelegate != null || starting) {
             onResult(SettingsImportSummary(SettingsImportOutcome.Unavailable))
             return
         }
-        val delegate = DayOneDocumentPickerDelegate(
-            clientRepositories = clientRepositories,
-            onComplete = { summary ->
-                activeDelegate = null
-                onResult(summary)
-            },
-        )
-        activeDelegate = delegate
-        val picker = UIDocumentPickerViewController(
-            forOpeningContentTypes = dayOneImportContentTypes(),
-            asCopy = true,
-        )
-        picker.setDelegate(delegate)
-        rootController.presentViewController(picker, animated = true, completion = null)
+        starting = true
+        CoroutineScope(Dispatchers.Main).launch {
+            val captured = withContext(Dispatchers.Default) { runCatching { clientRepositories.workspaceProductAccess.capture() } }
+            starting = false
+            val snapshot = captured.getOrElse {
+                onResult(SettingsImportSummary(SettingsImportOutcome.Failed))
+                return@launch
+            }
+            val delegate = DayOneDocumentPickerDelegate(
+                clientRepositories = clientRepositories,
+                expectedWorkspace = snapshot,
+                onComplete = { summary ->
+                    activeDelegate = null
+                    onResult(summary)
+                },
+            )
+            activeDelegate = delegate
+            val picker = UIDocumentPickerViewController(forOpeningContentTypes = dayOneImportContentTypes(), asCopy = true)
+            picker.setDelegate(delegate)
+            rootController.presentViewController(picker, animated = true, completion = null)
+        }
     }
 
     private fun dayOneImportContentTypes(): List<*> =
@@ -279,6 +294,7 @@ private class IosDayOneImportRunner(
 @OptIn(ExperimentalForeignApi::class)
 private class DayOneDocumentPickerDelegate(
     private val clientRepositories: IosClientRepositories,
+    private val expectedWorkspace: WorkspaceProductSnapshot,
     private val onComplete: (SettingsImportSummary) -> Unit,
 ) : NSObject(), UIDocumentPickerDelegateProtocol {
     override fun documentPicker(
@@ -296,6 +312,7 @@ private class DayOneDocumentPickerDelegate(
                     clientRepositories.importDayOneArchive(
                         archiveBytes = url.readBytes(),
                         fallbackJournalTitle = url.lastPathComponent ?: "Day One",
+                        expectedWorkspace = expectedWorkspace,
                     )
                 }.getOrElse {
                     SettingsImportSummary(SettingsImportOutcome.Failed)

@@ -10,11 +10,13 @@ import java.nio.file.Path
 import java.nio.file.StandardOpenOption
 import java.security.MessageDigest
 import java.util.UUID
+import saien.someday.server.auth.ACCOUNT_INITIAL_INCARNATION
 
 data class MediaBlobKey(
     val userId: UUID,
     val workspaceId: String,
     val mediaId: String,
+    val incarnation: UUID = ACCOUNT_INITIAL_INCARNATION,
 ) {
     init {
         require(workspaceId.matches(Regex("^workspace-[0-9a-f]{32}$")))
@@ -75,19 +77,19 @@ class FileSystemMediaBlobStore(root: Path) : MediaBlobStore {
     override fun read(key: MediaBlobKey, maxBytes: Int): MediaBlobValue? =
         readPath(pathFor(key), maxBytes)
 
-    internal fun putStartupProbe(bytes: ByteArray, expectedSha256: String): MediaBlobPutResult {
+    internal fun putStartupProbe(bytes: ByteArray, expectedSha256: String, incarnation: UUID): MediaBlobPutResult {
         require(bytes.isNotEmpty())
         require(expectedSha256 == sha256(bytes))
-        return putPathImmutable(startupProbePath(), bytes, expectedSha256)
+        return putPathImmutable(startupProbePath(incarnation), bytes, expectedSha256)
     }
 
-    internal fun headStartupProbe(): MediaBlobMetadata? = headPath(startupProbePath())
+    internal fun headStartupProbe(incarnation: UUID): MediaBlobMetadata? = headPath(startupProbePath(incarnation))
 
-    internal fun readStartupProbe(maxBytes: Int): MediaBlobValue? = readPath(startupProbePath(), maxBytes)
+    internal fun readStartupProbe(maxBytes: Int, incarnation: UUID): MediaBlobValue? = readPath(startupProbePath(incarnation), maxBytes)
 
-    internal fun isStartupProbeMissingByMetadata(): Boolean = isPathAbsent(missingStartupProbePath())
+    internal fun isStartupProbeMissingByMetadata(incarnation: UUID): Boolean = isPathAbsent(missingStartupProbePath(incarnation))
 
-    internal fun isStartupProbeMissingByRead(): Boolean = isPathAbsent(missingStartupProbePath())
+    internal fun isStartupProbeMissingByRead(incarnation: UUID): Boolean = isPathAbsent(missingStartupProbePath(incarnation))
 
     private fun putPathImmutable(
         target: Path,
@@ -149,8 +151,12 @@ class FileSystemMediaBlobStore(root: Path) : MediaBlobStore {
     }
 
     private fun pathFor(key: MediaBlobKey): Path {
-        val mediaDirectory = root
-            .resolve(key.userId.toString())
+        val accountRoot = if (key.incarnation == ACCOUNT_INITIAL_INCARNATION) {
+            root.resolve(key.userId.toString())
+        } else {
+            root.resolve(".incarnations/v1").resolve(key.userId.toString()).resolve(key.incarnation.toString())
+        }
+        val mediaDirectory = accountRoot
             .resolve(key.workspaceId)
             .resolve(key.mediaId.substring(0, 2))
             .resolve(key.mediaId.substring(2, 4))
@@ -160,17 +166,18 @@ class FileSystemMediaBlobStore(root: Path) : MediaBlobStore {
         }
     }
 
-    private fun startupProbePath(): Path = systemPath("startup-probe-v1.bin")
+    private fun startupProbePath(incarnation: UUID): Path = systemPath("startup-probe-v1.bin", incarnation)
 
-    private fun missingStartupProbePath(): Path = systemPath("startup-probe-missing-v1.bin")
+    private fun missingStartupProbePath(incarnation: UUID): Path = systemPath("startup-probe-missing-v1.bin", incarnation)
 
     private fun isPathAbsent(path: Path): Boolean = Files.notExists(path, LinkOption.NOFOLLOW_LINKS)
 
-    private fun systemPath(fileName: String): Path = root
-        .resolve(".someday-system")
-        .resolve(fileName)
-        .normalize()
-        .also { path -> require(path.startsWith(root)) }
+    private fun systemPath(fileName: String, incarnation: UUID): Path =
+        (if (incarnation == ACCOUNT_INITIAL_INCARNATION) root else root.resolve(".incarnations/v1"))
+            .resolve(".someday-system")
+            .resolve(fileName)
+            .normalize()
+            .also { path -> require(path.startsWith(root)) }
 
     private fun forceDirectory(directory: Path) {
         runCatching {

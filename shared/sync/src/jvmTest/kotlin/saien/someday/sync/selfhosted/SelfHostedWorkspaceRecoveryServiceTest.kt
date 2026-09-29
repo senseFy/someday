@@ -35,6 +35,22 @@ import kotlin.test.assertTrue
 
 class SelfHostedWorkspaceRecoveryServiceTest {
     @Test
+    fun typedIncarnationPutConflictPersistsGateAndPreservesPreparedEnvelope() {
+        var persisted = 0
+        val fixture = fixture(persistGate = { persisted++ })
+        val code = assertNotNull(fixture.service.prepareCode().recoveryCode).revealForUserConfirmation()
+        fixture.transport.failNextPut = SelfHostedSyncHttpException(409, "retired", SelfHostedErrorCode.WORKSPACE_INCARNATION_RETIRED, true)
+        val failed = fixture.service.confirmPreparedCode(code)
+        assertEquals(WorkspaceRecoveryReason.AuthorityMismatch, failed.reason)
+        assertEquals(1, persisted)
+        assertEquals(0, fixture.transport.putCount)
+        // The test gate observer does not block a second call: retaining the same
+        // prepared request is observable independently of the durable network gate.
+        assertTrue(fixture.service.confirmPreparedCode(code).success)
+        assertEquals(1, fixture.packageRequests)
+    }
+
+    @Test
     fun preparationRequiresConfirmationBeforePublishingAndNeverUploadsTheCode() {
         val fixture = fixture()
 
@@ -543,6 +559,7 @@ class SelfHostedWorkspaceRecoveryServiceTest {
         transport: MemoryRecoveryTransport = MemoryRecoveryTransport(),
         requirement: ActiveWorkspaceSessionRequirement? = requirement(WORKSPACE_ID),
         activeWorkspaceRequirementProvider: () -> ActiveWorkspaceSessionRequirement? = { requirement },
+        persistGate: (ActiveWorkspaceSessionRequirement) -> Unit = {},
         publisherReady: Boolean = true,
         localKeyFingerprint: String? = if (requirement == null) null else KEY_FINGERPRINT,
         localKeyFingerprintProvider: () -> String? = { localKeyFingerprint },
@@ -582,7 +599,7 @@ class SelfHostedWorkspaceRecoveryServiceTest {
             },
             workspaceJoiner = joiner,
             workspaceLifecycleCoordinator = WorkspaceLifecycleCoordinator(),
-            activeWorkspaceSessionGuard = ActiveWorkspaceSessionGuard(activeWorkspaceRequirementProvider),
+            activeWorkspaceSessionGuard = ActiveWorkspaceSessionGuard(persistIncarnationGate = persistGate, requirementProvider = activeWorkspaceRequirementProvider),
             workspaceRecoveryPublisherReady = { publisherReady },
             localWorkspaceKeyFingerprint = localKeyFingerprintProvider,
         )
@@ -642,13 +659,15 @@ private class MemoryRecoveryTransport(
         private set
     var getCount: Int = 0
         private set
+    var failNextPut: Throwable? = null
     private var failAfterStore: Boolean = false
     private var loadFailuresEnabled: Boolean = false
 
     override fun getWorkspaceRecoveryEnvelope(
         endpoint: String,
         accessToken: String,
-    ): SelfHostedWorkspaceRecoveryEnvelopeResponse? {
+            accountContext: saien.someday.sync.selfhosted.SelfHostedAccountRequestContext,
+        ): SelfHostedWorkspaceRecoveryEnvelopeResponse? {
         getCount += 1
         if (loadFailuresEnabled) throw SelfHostedSyncHttpException(429, "recovery status rate limited")
         return current
@@ -658,13 +677,15 @@ private class MemoryRecoveryTransport(
         endpoint: String,
         accessToken: String,
         request: SelfHostedWorkspaceRecoveryEnvelopePutRequest,
-    ): SelfHostedWorkspaceRecoveryEnvelopeResponse {
+            accountContext: saien.someday.sync.selfhosted.SelfHostedAccountRequestContext,
+        ): SelfHostedWorkspaceRecoveryEnvelopeResponse {
+        failNextPut?.let { failure -> failNextPut = null; throw failure }
         val existing = current
         if (existing != null && existing.matches(request)) return existing
         if (existing == null) {
-            if (request.expectedRevision != null) throw SelfHostedSyncHttpException(409, "conflict")
+            if (request.expectedRevision != null) throw SelfHostedSyncHttpException(409, "conflict", SelfHostedErrorCode.RECOVERY_ENVELOPE_CONFLICT, true)
         } else if (request.expectedRevision != existing.revision) {
-            throw SelfHostedSyncHttpException(409, "conflict")
+            throw SelfHostedSyncHttpException(409, "conflict", SelfHostedErrorCode.RECOVERY_ENVELOPE_CONFLICT, true)
         }
         putCount += 1
         lastPut = request
@@ -708,39 +729,51 @@ private class MemoryRecoveryTransport(
         )
     }
 
-    override fun register(endpoint: String, request: SelfHostedAuthRequest): SelfHostedAuthTokensResponse = error("unused")
-    override fun login(endpoint: String, request: SelfHostedAuthRequest): SelfHostedAuthTokensResponse = error("unused")
-    override fun refresh(endpoint: String, request: SelfHostedRefreshRequest): SelfHostedAuthTokensResponse =
+    override fun register(endpoint: String, request: SelfHostedAuthRequest,
+            accountContext: saien.someday.sync.selfhosted.SelfHostedAccountRequestContext,
+        ): SelfHostedAuthTokensResponse = error("unused")
+    override fun login(endpoint: String, request: SelfHostedAuthRequest,
+            accountContext: saien.someday.sync.selfhosted.SelfHostedAccountRequestContext,
+        ): SelfHostedAuthTokensResponse = error("unused")
+    override fun refresh(endpoint: String, request: SelfHostedRefreshRequest,
+            accountContext: saien.someday.sync.selfhosted.SelfHostedAccountRequestContext,
+        ): SelfHostedAuthTokensResponse =
         error("unused")
 
     override fun registerDevice(
         endpoint: String,
         accessToken: String,
         request: SelfHostedDeviceRegistrationRequest,
-    ): SelfHostedDeviceRegistrationResponse = error("unused")
+            accountContext: saien.someday.sync.selfhosted.SelfHostedAccountRequestContext,
+        ): SelfHostedDeviceRegistrationResponse = error("unused")
 
     override fun createPairingInvite(
         endpoint: String,
         accessToken: String,
         inviteId: String,
         request: SelfHostedPairingInviteCreateRequest,
-    ): SelfHostedPairingInviteCreateResponse = error("unused")
+            accountContext: saien.someday.sync.selfhosted.SelfHostedAccountRequestContext,
+        ): SelfHostedPairingInviteCreateResponse = error("unused")
 
     override fun claimPairingInvite(
         endpoint: String,
         accessToken: String,
         inviteId: String,
         request: SelfHostedPairingInviteClaimRequest,
-    ): SelfHostedPairingInviteClaimResponse = error("unused")
+            accountContext: saien.someday.sync.selfhosted.SelfHostedAccountRequestContext,
+        ): SelfHostedPairingInviteClaimResponse = error("unused")
 
     override fun completePairingInvite(
         endpoint: String,
         accessToken: String,
         inviteId: String,
         request: SelfHostedPairingInviteCompleteRequest,
-    ) = error("unused")
+            accountContext: saien.someday.sync.selfhosted.SelfHostedAccountRequestContext,
+        ) = error("unused")
 
-    override fun cancelPairingInvite(endpoint: String, accessToken: String, inviteId: String) = error("unused")
+    override fun cancelPairingInvite(endpoint: String, accessToken: String, inviteId: String,
+            accountContext: saien.someday.sync.selfhosted.SelfHostedAccountRequestContext,
+        ) = error("unused")
 
     private fun SelfHostedWorkspaceRecoveryEnvelopeResponse.matches(
         request: SelfHostedWorkspaceRecoveryEnvelopePutRequest,

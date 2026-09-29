@@ -107,11 +107,12 @@ data class SyncUiState(
     val issue: SyncIssueUi? = null,
     val invitation: WorkspacePairingInvitationUi? = null,
     val recovery: WorkspaceRecoveryUiState = WorkspaceRecoveryUiState(),
+    val accountReset: AccountResetUiState = AccountResetUiState(),
 ) {
     val syncing: Boolean get() = operation == SyncUiOperation.Syncing
-    val busy: Boolean get() = operation != null
+    val busy: Boolean get() = operation != null || accountReset.busy
     val pairingAvailable: Boolean
-        get() = connection is SyncConnectionUi.Connected && when (issue?.reason) {
+        get() = !accountReset.blocksSync && connection is SyncConnectionUi.Connected && when (issue?.reason) {
             null,
             SyncIssueReason.WorkspaceLocked,
             SyncIssueReason.RemoteHistoryConflict,

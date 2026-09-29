@@ -26,6 +26,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
+import saien.someday.domain.workspace.WorkspaceProductSnapshot
 import saien.someday.domain.settings.AppLanguage
 import saien.someday.domain.settings.ClientSettings
 import saien.someday.domain.settings.ClientTheme
@@ -37,6 +38,7 @@ import saien.someday.ui.media.MediaImportRunner
 import saien.someday.ui.media.MediaImportUiResult
 import saien.someday.ui.media.MediaMaterializationRunner
 import saien.someday.ui.media.MediaMaterializationUiResult
+import saien.someday.ui.media.MediaPreviewUiResult
 import saien.someday.ui.media.MediaPreviewLoader
 import saien.someday.ui.media.MediaUiFailureReason
 import saien.someday.ui.media.MediaUiPorts
@@ -55,7 +57,9 @@ class MainActivity : ComponentActivity() {
     private var hasDeliveredInitialResume = false
     private var foregroundSyncSignal by mutableIntStateOf(0)
     private var pendingOpenMemories by mutableStateOf(false)
+    private var pendingDayOneImportWorkspace: WorkspaceProductSnapshot? = null
     private var pendingDayOneImportCallback: ((SettingsImportSummary) -> Unit)? = null
+    private var pendingMediaImportWorkspace: WorkspaceProductSnapshot? = null
     private var pendingMediaImportCallback: ((MediaImportUiResult) -> Unit)? = null
     private var pendingPairingScanResult: ((String) -> Unit)? = null
     private var pendingPairingScanCancelled: (() -> Unit)? = null
@@ -111,8 +115,14 @@ class MainActivity : ComponentActivity() {
     private val dayOneImportLauncher = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         val callback = pendingDayOneImportCallback ?: return@registerForActivityResult
         pendingDayOneImportCallback = null
+        val expectedWorkspace = pendingDayOneImportWorkspace
+        pendingDayOneImportWorkspace = null
         if (uri == null) {
             callback(SettingsImportSummary(SettingsImportOutcome.Cancelled))
+            return@registerForActivityResult
+        }
+        if (expectedWorkspace == null) {
+            callback(SettingsImportSummary(SettingsImportOutcome.Failed))
             return@registerForActivityResult
         }
         Thread {
@@ -122,6 +132,7 @@ class MainActivity : ComponentActivity() {
                 clientRepositories.importDayOneArchive(
                     archiveBytes = archiveBytes,
                     fallbackJournalTitle = uri.lastPathSegment ?: "Day One",
+                    expectedWorkspace = expectedWorkspace,
                 )
             }.getOrElse {
                 SettingsImportSummary(SettingsImportOutcome.Failed)
@@ -132,12 +143,18 @@ class MainActivity : ComponentActivity() {
     private val mediaImportLauncher = registerForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
         val callback = pendingMediaImportCallback ?: return@registerForActivityResult
         pendingMediaImportCallback = null
+        val expectedWorkspace = pendingMediaImportWorkspace
+        pendingMediaImportWorkspace = null
         if (uri == null) {
             callback(MediaImportUiResult.Cancelled)
             return@registerForActivityResult
         }
+        if (expectedWorkspace == null) {
+            callback(MediaImportUiResult.Failed(MediaUiFailureReason.ImportFailed))
+            return@registerForActivityResult
+        }
         Thread {
-            val result = contentResolver.importSelectedImage(uri, clientRepositories.localMediaAssetStore)
+            val result = contentResolver.importSelectedImage(uri, clientRepositories.localMediaAssetStore, expectedWorkspace)
             runOnUiThread { callback(result) }
         }.start()
     }
@@ -236,27 +253,53 @@ class MainActivity : ComponentActivity() {
                 },
                 onLocalExport = loaded.repositories::exportLocalDataSummary,
                 dayOneImportRunner = DayOneImportRunner { onResult ->
-                    pendingDayOneImportCallback = onResult
-                    dayOneImportLauncher.launch(
-                        arrayOf(
-                            "application/zip",
-                            "application/x-zip-compressed",
-                            "application/octet-stream",
-                        ),
-                    )
+                    if (pendingDayOneImportCallback != null) {
+                        onResult(SettingsImportSummary(SettingsImportOutcome.Unavailable))
+                    } else {
+                        pendingDayOneImportCallback = onResult
+                        Thread {
+                            val captured = runCatching { loaded.repositories.workspaceProductAccess.capture() }
+                            runOnUiThread {
+                                captured.onSuccess { snapshot ->
+                                    pendingDayOneImportWorkspace = snapshot
+                                    dayOneImportLauncher.launch(arrayOf("application/zip", "application/x-zip-compressed", "application/octet-stream"))
+                                }.onFailure {
+                                    pendingDayOneImportCallback = null
+                                    onResult(SettingsImportSummary(SettingsImportOutcome.Failed))
+                                }
+                            }
+                        }.start()
+                    }
                 },
                 mediaUiPorts = remember(loaded.repositories) {
                     MediaUiPorts(
                         importRunner = MediaImportRunner { _, onResult ->
-                            pendingMediaImportCallback = onResult
-                            mediaImportLauncher.launch(
-                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),
-                            )
+                            if (pendingMediaImportCallback != null) {
+                                onResult(MediaImportUiResult.Failed(MediaUiFailureReason.Unavailable))
+                            } else {
+                                pendingMediaImportCallback = onResult
+                                Thread {
+                                    val captured = runCatching { loaded.repositories.localMediaAssetStore.captureWorkspace() }
+                                    runOnUiThread {
+                                        captured.onSuccess { snapshot ->
+                                            pendingMediaImportWorkspace = snapshot
+                                            mediaImportLauncher.launch(
+                                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),
+                                            )
+                                        }.onFailure {
+                                            pendingMediaImportCallback = null
+                                            onResult(MediaImportUiResult.Failed(MediaUiFailureReason.ImportFailed))
+                                        }
+                                    }
+                                }.start()
+                            }
                         },
                         previewLoader = MediaPreviewLoader { assetId ->
-                            withContext(Dispatchers.IO) {
-                                loaded.repositories.localMediaAssetStore.loadMediaPreview(assetId)
+                            val (snapshot, preview) = withContext(Dispatchers.IO) {
+                                loaded.repositories.localMediaAssetStore.captureWorkspace() to
+                                    loaded.repositories.localMediaAssetStore.loadMediaPreview(assetId)
                             }
+                            if (loaded.repositories.workspaceProductAccess.isCurrent(snapshot)) preview else MediaPreviewUiResult.Missing
                         },
                         materializationRunner = MediaMaterializationRunner { assetId, onResult ->
                             Thread {
@@ -282,6 +325,8 @@ class MainActivity : ComponentActivity() {
                 workspacePairingInvitationJoiner = loaded.repositories.workspacePairingInvitationJoiner,
                 workspacePairingInvitationCanceller = loaded.repositories.workspacePairingInvitationCanceller,
                 workspaceRecoveryManager = loaded.repositories.workspaceRecoveryManager,
+                accountDataResetManager = loaded.repositories.accountDataResetManager,
+                workspaceProductAccess = loaded.repositories.workspaceProductAccess,
                 workspacePairingScanner = workspacePairingScanner,
                 foregroundSyncSignal = foregroundSyncSignal,
                 startupTrace = traceMark,

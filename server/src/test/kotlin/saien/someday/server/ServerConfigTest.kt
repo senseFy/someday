@@ -48,6 +48,20 @@ class ServerConfigTest {
     }
 
     @Test
+    fun resetOptInAcceptsOnlyExactBooleansInBothDeploymentModes() {
+        for (base in listOf(emptyMap(), productionEnvironment())) {
+            assertFalse(ServerConfig.fromEnvironment(base).accountResetEnabled)
+            assertFalse(ServerConfig.fromEnvironment(base + ("SOMEDAY_ACCOUNT_RESET_ENABLED" to "false")).accountResetEnabled)
+            assertTrue(ServerConfig.fromEnvironment(base + ("SOMEDAY_ACCOUNT_RESET_ENABLED" to "true")).accountResetEnabled)
+            for (invalid in listOf("", "TRUE", "False", "yes", " true ")) {
+                assertFailsWith<IllegalStateException> {
+                    ServerConfig.fromEnvironment(base + ("SOMEDAY_ACCOUNT_RESET_ENABLED" to invalid))
+                }
+            }
+        }
+    }
+
+    @Test
     fun publicOriginNormalizesDefaultPorts() {
         val config = ServerConfig.fromEnvironment(
             productionEnvironment() + ("SOMEDAY_PUBLIC_BASE_URL" to "HTTPS://Notes.Example.com:443/"),

@@ -1,5 +1,8 @@
 package saien.someday.sync
 
+import saien.someday.data.account.SqlDelightAccountStateRepository
+import saien.someday.data.account.AccountResetIntentState
+import saien.someday.data.account.AccountStateMutationBoundary
 import saien.someday.data.crypto.WorkspaceMasterKey
 import saien.someday.data.export.LocalDataExportDocument
 import saien.someday.data.export.LocalDataImportSummary
@@ -43,9 +46,26 @@ import saien.someday.sync.selfhosted.SelfHostedSyncTransportV2
 import saien.someday.sync.selfhosted.SystemV3MediaCoordinator
 import saien.someday.sync.selfhosted.ActiveWorkspaceSessionGuard
 import saien.someday.sync.selfhosted.ActiveWorkspaceSessionRequirement
+import saien.someday.sync.selfhosted.SelfHostedAccountControlTransport
+import saien.someday.sync.selfhosted.SelfHostedAccountDiscoveryService
+import saien.someday.sync.selfhosted.SelfHostedAccountDiscoveryResult
+import saien.someday.sync.selfhosted.SelfHostedErrorCode
+import saien.someday.sync.selfhosted.SelfHostedSyncHttpException
+import saien.someday.sync.selfhosted.accountRequestContext
+import saien.someday.sync.selfhosted.SelfHostedAccountResetService
+import saien.someday.sync.selfhosted.AccountResetLocalWorkspace
+import saien.someday.domain.settings.INITIAL_ACCOUNT_INCARNATION
+import saien.someday.domain.settings.selfHostedAuthorityBindingId
+import saien.someday.domain.settings.parseSelfHostedAuthorityBindingId
+import saien.someday.domain.settings.WorkspaceJoinAuthorityCapture
+import saien.someday.domain.workspace.WorkspaceProductAccess
+import saien.someday.domain.workspace.WorkspaceProductSnapshot
 
 data class SystemV3ClientServices(
     val notesRepository: NotesRepository,
+    val accountStateRepository: SqlDelightAccountStateRepository,
+    val accountDiscoveryService: SelfHostedAccountDiscoveryService?,
+    val accountResetService: SelfHostedAccountResetService?,
     val settingsRepository: ClientSettingsRepository,
     val manualSyncRunner: ManualSyncRunner,
     val automaticSyncEligible: () -> Boolean,
@@ -54,13 +74,15 @@ data class SystemV3ClientServices(
     val localMediaAssetStore: AuthorityCoordinatedMediaAssetStore,
     val mediaCoordinator: SystemV3MediaCoordinator,
     val workspaceLifecycleCoordinator: WorkspaceLifecycleCoordinator,
+    val workspaceProductAccess: WorkspaceProductAccess,
     val discardLocalWorkspaceForReplacement: () -> Boolean,
     val finalizeLocalWorkspaceReplacement: () -> Unit,
     val bindReplacementWorkspaceToCurrentSession: (WorkspaceJoinPackage, WorkspaceMasterKey, String) -> Boolean,
+    val bindFreshWorkspaceAfterAccountReset: (WorkspaceMasterKey, String, WorkspaceJoinAuthorityCapture) -> Boolean,
     val workspacePairingInviterReady: () -> Boolean,
     val localDataExportProvider: (kotlin.time.Instant) -> LocalDataExportDocument,
-    val localDataImportProvider: (LocalDataExportDocument) -> LocalDataImportSummary,
-    val dayOneArchiveImporter: (ByteArray, String, MediaImageNormalizer) -> DayOneImportSummary,
+    val localDataImportProvider: (LocalDataExportDocument, WorkspaceProductSnapshot?) -> LocalDataImportSummary,
+    val dayOneArchiveImporter: (ByteArray, String, MediaImageNormalizer, WorkspaceProductSnapshot?) -> DayOneImportSummary,
 )
 
 fun createSystemV3ClientServices(
@@ -74,22 +96,162 @@ fun createSystemV3ClientServices(
     selfHostedMediaTransportV3: SelfHostedMediaTransportV3,
     selfHostedSessionStore: SelfHostedSessionCredentialStore,
 ): SystemV3ClientServices {
-    val activeSelfHostedSessionExecutor = RefreshingSelfHostedSessionExecutor(
-        authenticationTransport = selfHostedTransport,
-        sessionStore = selfHostedSessionStore,
-    )
     val workspaceLifecycleCoordinator = WorkspaceLifecycleCoordinator()
-    val coordinatedMediaAssetStore = AuthorityCoordinatedMediaAssetStore(
-        delegate = localMediaAssetStore,
-        workspaceLifecycleCoordinator = workspaceLifecycleCoordinator,
+    val accountStates = SqlDelightAccountStateRepository(
+        localRepository.database,
+        mutationBoundary = object : AccountStateMutationBoundary {
+            override fun <T> mutate(block: () -> T): T = workspaceLifecycleCoordinator.productAccess(block)
+        },
     )
+    val accountDiscovery = (selfHostedTransport as? SelfHostedAccountControlTransport)?.let {
+        SelfHostedAccountDiscoveryService(it, accountStates)
+    }
     val protocolStore = SqlDelightSyncProtocolStoreV2(localRepository.database)
     workspaceKeyProvider()?.let { key ->
         ensureWorkspaceLocalDraftV2(localRepository, settingsRepository, key)
     }
-    val activeWorkspaceSessionGuard = ActiveWorkspaceSessionGuard {
-        resolveActiveWorkspaceSessionRequirement(protocolStore, workspaceIdProvider)
+    fun localAccountGate(): saien.someday.data.account.AccountWorkspaceGate? {
+        val workspace = workspaceIdProvider() ?: return null
+        val intent = accountStates.loadIntent()?.takeIf { it.originalWorkspaceId == workspace }
+        val pendingGate = intent?.let { accountStates.loadGate(it.endpoint, it.userId, workspace) }
+        check(pendingGate == null || pendingGate.expectedIncarnation == intent?.originalIncarnation) {
+            "The pending reset gate does not match this local copy."
+        }
+        if (intent != null && pendingGate == null) {
+            // The independent intent survives damaged/missing gate state. Rebuild only a frozen
+            // gate, never infer an old offline choice or resurrect saved discard consent.
+            if (intent.receiptIncarnation != null) {
+                accountStates.freezeForLocalDiscardConfirmation(intent.operationId)
+            } else {
+                accountStates.markOutcomeUnknown(intent.operationId)
+            }
+        }
+        val localAuthority = protocolStore.loadLocalAuthority()
+        val boundAuthority = localAuthority?.authorityBindingId?.let(::parseSelfHostedAuthorityBindingId)
+        if (localAuthority != null && boundAuthority != null) {
+            val knownCredentials = listOfNotNull(
+                selfHostedSessionStore.load()?.takeIf { it.authorityBindingId == localAuthority.authorityBindingId },
+                selfHostedSessionStore.loadForAuthority(localAuthority.authorityBindingId)
+                    ?.takeIf { it.authorityBindingId == localAuthority.authorityBindingId },
+            )
+            if (knownCredentials.any { it.accountIncarnation != localAuthority.accountIncarnation }) {
+                val existing = accountStates.loadGate(boundAuthority.endpoint, boundAuthority.authenticatedUserId, workspace)
+                if (existing?.reason != saien.someday.data.account.AccountWorkspaceGateReason.ResetRequired ||
+                    existing?.expectedIncarnation != localAuthority.accountIncarnation) {
+                    // This admission runs before every product write, even before Settings opens.
+                    // markResetRequired preserves a deliberately selected offline-editing state.
+                    accountStates.markResetRequired(boundAuthority.endpoint, boundAuthority.authenticatedUserId,
+                        workspace, localAuthority.accountIncarnation)
+                }
+            }
+        }
+        val binding = localAuthority?.authorityBindingId
+            ?: intent?.let { selfHostedAuthorityBindingId(it.endpoint, it.userId) }
+            ?: selfHostedSessionStore.load()?.authorityBindingId
+        val authority = binding?.let(::parseSelfHostedAuthorityBindingId)
+        return authority?.let { accountStates.loadGate(it.endpoint, it.authenticatedUserId, workspace) }
+            ?: intent?.let { accountStates.loadGate(it.endpoint, it.userId, workspace) }
     }
+    // Bootstrap runs off-main. Reconstruct durable admission before any controller can observe
+    // the installation; capture/isCurrent still retain their IO/pure-memory split below.
+    workspaceLifecycleCoordinator.productAccess { localAccountGate() }
+    val workspaceProductAccess = CoordinatedWorkspaceProductAccess(
+        workspaceLifecycleCoordinator,
+        snapshotProvider = {
+            val binding = protocolStore.loadLocalAuthority()
+            WorkspaceProductSnapshot(checkNotNull(workspaceIdProvider()), binding?.accountIncarnation ?: INITIAL_ACCOUNT_INCARNATION,
+                binding?.authorityBindingId, normalizeWriterDeviceIdV2(localRepository.localDeviceId))
+        },
+        productReadOnly = {
+            // A pending operation for a different local copy is an inconsistent installation,
+            // not permission to edit a replacement that never completed reconciliation.
+            val pending = accountStates.loadIntent()
+            (pending != null && pending.originalWorkspaceId != workspaceIdProvider()) ||
+                localAccountGate()?.productReadOnly == true
+        },
+    )
+    val coordinatedMediaAssetStore = AuthorityCoordinatedMediaAssetStore(
+        delegate = localMediaAssetStore,
+        workspaceLifecycleCoordinator = workspaceLifecycleCoordinator,
+        workspaceProductAccess = workspaceProductAccess,
+    )
+    val activeWorkspaceSessionGuard = ActiveWorkspaceSessionGuard(
+        requireNetworkAccess = { credentials, workspaceId ->
+            accountStates.requireNetworkAllowed(credentials.endpoint, credentials.userId, workspaceId)
+        },
+        persistIncarnationGate = { requirement ->
+            val authority = checkNotNull(parseSelfHostedAuthorityBindingId(requirement.authorityBindingId)) {
+                "The bound account identity is unavailable."
+            }
+            // The durable binding already identifies the account. Missing/expired secure
+            // credentials must not prevent recording a verified incarnation failure.
+            accountStates.markResetRequired(authority.endpoint, authority.authenticatedUserId,
+                requirement.workspaceId, requirement.accountIncarnation)
+        },
+        replacementWorkspaceProvider = {
+            workspaceIdProvider()?.let { it to (protocolStore.loadLocalAuthority()?.accountIncarnation ?: INITIAL_ACCOUNT_INCARNATION) }
+        },
+        protocol1Known = accountStates::hasProtocol1,
+        onProtocol1 = accountStates::markProtocol1,
+        requireReplacementAllowed = { credentials ->
+            localAccountGate()?.let { gate ->
+                check(!gate.offlineEditing && gate.discardTargetIncarnation == credentials.accountIncarnation) {
+                    "Fresh consent for the current account incarnation is required."
+                }
+            }
+            accountStates.loadIntent()?.takeIf {
+                selfHostedAuthorityBindingId(it.endpoint, it.userId) == credentials.authorityBindingId
+            }?.let { intent ->
+                val original = resolveActiveWorkspaceSessionRequirement(protocolStore, workspaceIdProvider)
+                val originalIncarnation = original?.accountIncarnation ?: INITIAL_ACCOUNT_INCARNATION
+                val currentWriter = original?.localWriterDeviceId ?: normalizeWriterDeviceIdV2(localRepository.localDeviceId)
+                if (intent.state != AccountResetIntentState.RemoteCommittedLocalPending ||
+                    intent.consentTargetIncarnation != credentials.accountIncarnation ||
+                    intent.originalWorkspaceId != workspaceIdProvider() || intent.originalIncarnation != originalIncarnation ||
+                    intent.originalWriterId != currentWriter
+                ) accountStates.requireNetworkAllowed(credentials.endpoint, credentials.userId, intent.originalWorkspaceId)
+            }
+        },
+        revalidateReplacement = { credentials ->
+            when (val discovered = accountDiscovery?.discover(credentials)) {
+                is SelfHostedAccountDiscoveryResult.Protocol1 -> if (discovered.state.accountIncarnation != credentials.accountIncarnation) {
+                    throw SelfHostedSyncHttpException(409, "The replacement account incarnation changed.", SelfHostedErrorCode.ACCOUNT_INCARNATION_MISMATCH, true)
+                }
+                else -> Unit
+            }
+        },
+    ) { resolveActiveWorkspaceSessionRequirement(protocolStore, workspaceIdProvider) }
+    val activeSelfHostedSessionExecutor = RefreshingSelfHostedSessionExecutor(
+        authenticationTransport = selfHostedTransport,
+        sessionStore = selfHostedSessionStore,
+        protocol1Known = accountStates::hasProtocol1,
+        verifyLegacy = { accountDiscovery?.isVerifiedLegacy(it) == true },
+        onIssuance = { credentials -> accountDiscovery?.recordIssuance(credentials) },
+        onAccountFailure = { endpoint, userId, capturedContext, failure ->
+            if (failure.protocol1) accountStates.markProtocol1(endpoint, userId)
+            if (failure.errorCode in setOf(SelfHostedErrorCode.ACCOUNT_SESSION_STALE,
+                    SelfHostedErrorCode.ACCOUNT_INCARNATION_MISMATCH, SelfHostedErrorCode.WORKSPACE_INCARNATION_RETIRED)) {
+                activeWorkspaceSessionGuard.currentRequirement()?.takeIf {
+                    it.authorityBindingId == selfHostedAuthorityBindingId(endpoint, userId) &&
+                        it.accountIncarnation == capturedContext.accountIncarnation
+                }?.let { requirement ->
+                    accountStates.markResetRequired(endpoint, userId, requirement.workspaceId, requirement.accountIncarnation)
+                }
+            }
+        },
+    )
+    val accountResetService = if (accountDiscovery != null && selfHostedTransport is SelfHostedAccountControlTransport) {
+        SelfHostedAccountResetService(accountStates, selfHostedSessionStore, selfHostedTransport, accountDiscovery,
+            workspaceLifecycleCoordinator) {
+            val requirement = activeWorkspaceSessionGuard.currentRequirement()
+            AccountResetLocalWorkspace(
+                workspaceId = requirement?.workspaceId ?: checkNotNull(workspaceIdProvider()),
+                writerDeviceId = requirement?.localWriterDeviceId ?: normalizeWriterDeviceIdV2(localRepository.localDeviceId),
+                authorityBindingId = requirement?.authorityBindingId,
+                accountIncarnation = requirement?.accountIncarnation ?: INITIAL_ACCOUNT_INCARNATION,
+            )
+        }
+    } else null
     val mediaCoordinator = SystemV3MediaCoordinator(
         localStore = coordinatedMediaAssetStore,
         transport = selfHostedMediaTransportV3,
@@ -111,7 +273,7 @@ fun createSystemV3ClientServices(
             }
         }
         val binding = credentials.authorityBindingId
-        activeWorkspaceSessionGuard.requireCompatible(credentials)
+        activeWorkspaceSessionGuard.requireCompatible(credentials, workspaceId)
         selfHostedSessionStore.saveForAuthority(binding, credentials)
         val boundSessionStore = object : SelfHostedSessionCredentialStore {
             override fun load() = selfHostedSessionStore.loadForAuthority(binding)
@@ -137,11 +299,14 @@ fun createSystemV3ClientServices(
             authenticatedUserId = credentials.userId,
             workspaceId = workspaceId,
             accessTokenProvider = {
-                boundSessionStore.load()?.accessToken
-                    ?: error("Self-hosted session is missing; tokens redacted.")
+                activeWorkspaceSessionGuard.requireCompatible(credentials, workspaceId)
+                boundSessionStore.load()?.also { current ->
+                    require(current.accountIncarnation == credentials.accountIncarnation) { "The captured account incarnation changed." }
+                }?.accessToken ?: error("Self-hosted session is missing; tokens redacted.")
             },
             transport = refreshingSelfHostedV2,
             workspaceKey = key,
+            accountContext = credentials.accountRequestContext(),
         )
     }
 
@@ -193,6 +358,7 @@ fun createSystemV3ClientServices(
         },
         remoteProfileProvider = { SyncRemoteProfileV2.SELF_HOSTED.wireValue },
         workspaceLifecycleCoordinator = workspaceLifecycleCoordinator,
+        workspaceProductAccess = workspaceProductAccess,
     )
     val v2LocalDataTransfer = WorkspaceLocalDataTransferV2(
         localRepository = localRepository,
@@ -203,47 +369,85 @@ fun createSystemV3ClientServices(
         },
         remoteProfileProvider = { SyncRemoteProfileV2.SELF_HOSTED.wireValue },
     )
+    val bindInstalledWorkspace: (WorkspaceMasterKey, String, WorkspaceJoinAuthorityCapture) -> Boolean = { key, workspaceId, capture ->
+    runCatching {
+        val credentials = selfHostedSessionStore.load()
+            ?: error("The authenticated self-hosted session is unavailable.")
+        require(workspaceId == workspaceIdProvider()) {
+            "The restored workspace id does not match the authenticated pairing package."
+        }
+        require(capture.authorityBindingId == credentials.authorityBindingId &&
+            capture.deviceId == credentials.deviceId && capture.accountIncarnation == credentials.accountIncarnation) {
+            "The authenticated replacement account changed."
+        }
+        val writer = normalizeWriterDeviceIdV2(localRepository.localDeviceId)
+        require(credentials.deviceId == writer) {
+            "The authenticated device does not match this installation writer."
+        }
+        val draft = ensureWorkspaceLocalDraftV2(localRepository, settingsRepository, key)
+        val persisted = protocolStore.persistPreparingEpoch(
+            remoteProfile = draft.remoteProfile,
+            descriptor = draft.descriptor,
+            descriptorDigest = draft.descriptorDigest,
+            authorityBindingId = credentials.authorityBindingId,
+            localWriterDeviceId = writer,
+            accountIncarnation = capture.accountIncarnation,
+        )
+        val accepted = persisted !is saien.someday.sync.causality.v2.SyncEpochPersistResultV2.ImmutableMismatch
+        val previousWorkspaceId = capture.previousWorkspaceId
+        val previousIncarnation = capture.previousAccountIncarnation
+        if (accepted && previousWorkspaceId != null && previousIncarnation != null) {
+            val intent = accountStates.loadIntent()?.takeIf {
+                selfHostedAuthorityBindingId(it.endpoint, it.userId) == credentials.authorityBindingId &&
+                    it.originalWorkspaceId == previousWorkspaceId && it.originalIncarnation == previousIncarnation &&
+                    it.originalWriterId == writer
+            }
+            if (intent != null) {
+                check(accountStates.completeLocalReconciliation(intent.operationId, capture.accountIncarnation)) {
+                    "The reset replacement consent is unavailable."
+                }
+            } else {
+                accountStates.clearGateAfterReplacement(credentials.endpoint, credentials.userId,
+                    previousWorkspaceId, previousIncarnation)
+            }
+        }
+        accepted
+    }.getOrDefault(false)
+    }
     return SystemV3ClientServices(
-        notesRepository = AuthorityCoordinatedNotesRepository(v2Notes, workspaceLifecycleCoordinator),
+        notesRepository = AuthorityCoordinatedNotesRepository(v2Notes, workspaceLifecycleCoordinator, workspaceProductAccess),
+        accountStateRepository = accountStates,
+        accountDiscoveryService = accountDiscovery,
+        accountResetService = accountResetService,
         settingsRepository = v2Settings,
         manualSyncRunner = manual,
-        automaticSyncEligible = { isAutomaticSyncEligible(protocolStore) },
+        automaticSyncEligible = {
+            isAutomaticSyncEligible(protocolStore) && selfHostedSessionStore.load()?.let {
+                activeWorkspaceSessionGuard.isCompatible(it)
+            } == true
+        },
         selfHostedSessionExecutor = activeSelfHostedSessionExecutor,
         activeWorkspaceSessionGuard = activeWorkspaceSessionGuard,
         localMediaAssetStore = coordinatedMediaAssetStore,
         mediaCoordinator = mediaCoordinator,
         workspaceLifecycleCoordinator = workspaceLifecycleCoordinator,
+        workspaceProductAccess = workspaceProductAccess,
         discardLocalWorkspaceForReplacement = {
             discardLocalWorkspaceForReplacementV2(localRepository, settingsRepository)
         },
         finalizeLocalWorkspaceReplacement = {
+            workspaceProductAccess.invalidate()
             runCatching {
                 localMediaAssetStore.purgeUnreferencedFilesWithoutGracePeriod()
             }
             Unit
         },
         bindReplacementWorkspaceToCurrentSession = { packageData, key, workspaceId ->
-            runCatching {
-                val credentials = selfHostedSessionStore.load()
-                    ?: error("The authenticated self-hosted session is unavailable.")
-                require(packageData.workspaceId == workspaceId && workspaceId == workspaceIdProvider()) {
-                    "The restored workspace id does not match the authenticated pairing package."
-                }
-                val writer = normalizeWriterDeviceIdV2(localRepository.localDeviceId)
-                require(credentials.deviceId == writer) {
-                    "The authenticated device does not match this installation writer."
-                }
-                val draft = ensureWorkspaceLocalDraftV2(localRepository, settingsRepository, key)
-                val persisted = protocolStore.persistPreparingEpoch(
-                    remoteProfile = draft.remoteProfile,
-                    descriptor = draft.descriptor,
-                    descriptorDigest = draft.descriptorDigest,
-                    authorityBindingId = credentials.authorityBindingId,
-                    localWriterDeviceId = writer,
-                )
-                persisted !is saien.someday.sync.causality.v2.SyncEpochPersistResultV2.ImmutableMismatch
-            }.getOrDefault(false)
+            packageData.workspaceId == workspaceId && packageData.capturedAuthority?.let {
+                bindInstalledWorkspace(key, workspaceId, it)
+            } == true
         },
+        bindFreshWorkspaceAfterAccountReset = bindInstalledWorkspace,
         workspacePairingInviterReady = {
             protocolStore.loadAuthoritativeEpoch()?.let { epoch ->
                 epoch.lifecycle == SyncEpochLifecycleV2.ACTIVE &&
@@ -258,17 +462,20 @@ fun createSystemV3ClientServices(
                 }
             }
         },
-        localDataImportProvider = { document ->
+        localDataImportProvider = { document, capturedWorkspace ->
+            val captured = capturedWorkspace ?: workspaceProductAccess.capture()
             workspaceLifecycleCoordinator.exclusive {
-                workspaceLifecycleCoordinator.productAccess {
+                workspaceProductAccess.mutate(captured) {
                     v2LocalDataTransfer.importDocument(document)
                 }
             }
         },
-        dayOneArchiveImporter = { bytes, title, normalizer ->
+        dayOneArchiveImporter = { bytes, title, normalizer, capturedWorkspace ->
+            val captured = capturedWorkspace ?: workspaceProductAccess.capture()
             // One workspace identity from the first asset through the last note. Do not call
             // localDataImportProvider here: the lifecycle mutex is deliberately non-reentrant.
             workspaceLifecycleCoordinator.exclusive {
+                workspaceProductAccess.mutate(captured) { Unit }
                 DayOneImportService(
                     importPhoto = { image, fileName ->
                         try {
@@ -280,7 +487,7 @@ fun createSystemV3ClientServices(
                         }
                     },
                     authoritativeImporter = { document ->
-                        workspaceLifecycleCoordinator.productAccess {
+                        workspaceProductAccess.mutate(captured) {
                             v2LocalDataTransfer.importDocument(document)
                         }
                     },
@@ -331,6 +538,7 @@ internal fun resolveActiveWorkspaceSessionRequirement(
     return ActiveWorkspaceSessionRequirement(
         authorityBindingId = authorityBindingId,
         localWriterDeviceId = localAuthority.localWriterDeviceId,
+        accountIncarnation = localAuthority.accountIncarnation,
         workspaceId = workspaceIdProvider()
             ?: error("The bound workspace id is unavailable."),
     )

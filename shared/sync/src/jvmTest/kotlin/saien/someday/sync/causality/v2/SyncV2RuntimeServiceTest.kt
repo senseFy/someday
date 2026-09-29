@@ -188,6 +188,63 @@ class SyncV2RuntimeServiceTest {
     }
 
     @Test
+    fun syncLocalBookkeepingWaitsForAProductOperationBeforeItsRemoteRoundTrip() {
+        val remote = InMemoryWorkspaceSyncRemoteV2(SyncRemoteProfileV2.SELF_HOSTED.wireValue)
+        withFileBackedRuntimeFixture(remote) { fixture ->
+            assertTrue(fixture.runtime().run().success)
+            val productEntered = CountDownLatch(1)
+            val releaseProduct = CountDownLatch(1)
+            val syncStarting = CountDownLatch(1)
+            val remoteEntered = CountDownLatch(1)
+            val observedRemote = object : WorkspaceSyncRemoteV2 by remote {
+                override fun capabilities(): WorkspaceSyncCapabilitiesV2 {
+                    remoteEntered.countDown()
+                    return remote.capabilities()
+                }
+            }
+            val notes = saien.someday.sync.AuthorityCoordinatedNotesRepository(
+                SystemV2NotesRepository(fixture.localRepository, { WORKSPACE_KEY }, { fixture.writerDeviceId },
+                    { remote.remoteProfile }, clock = {
+                        productEntered.countDown()
+                        check(releaseProduct.await(5, TimeUnit.SECONDS))
+                        NOW
+                    }),
+                fixture.workspaceLifecycleCoordinator,
+            )
+            val executor = Executors.newFixedThreadPool(2)
+            try {
+                val mutation = executor.submit(java.util.concurrent.Callable { notes.createNotebook("Concurrent product write") })
+                assertTrue(productEntered.await(5, TimeUnit.SECONDS))
+                val sync = executor.submit(java.util.concurrent.Callable {
+                    fixture.workspaceLifecycleCoordinator.exclusive {
+                        WorkspaceSyncCoordinatorV2(
+                            localRepository = fixture.localRepository,
+                            workspaceKey = WORKSPACE_KEY,
+                            localWriterDeviceId = fixture.writerDeviceId,
+                            remote = observedRemote,
+                            beforeEntityPublication = {},
+                            workspaceLifecycleCoordinator = fixture.workspaceLifecycleCoordinator,
+                            clock = { syncStarting.countDown(); NOW },
+                        ).syncOnce()
+                    }
+                })
+                assertTrue(syncStarting.await(5, TimeUnit.SECONDS))
+                // startRun is a local write preceding capabilities. It must wait
+                // for the same barrier as the product read/modify/write operation.
+                assertFalse(remoteEntered.await(150, TimeUnit.MILLISECONDS), "Sync bookkeeping bypassed the product writer barrier.")
+                releaseProduct.countDown()
+                assertEquals("Concurrent product write", mutation.get(10, TimeUnit.SECONDS).title)
+                assertEquals(SyncCoordinatorStatusV2.SUCCESS, sync.get(10, TimeUnit.SECONDS).status)
+                assertEquals(0L, remoteEntered.count)
+                assertTrue(fixture.notes(NOW).listNotebooks().any { it.title == "Concurrent product write" })
+            } finally {
+                releaseProduct.countDown()
+                executor.shutdownNow()
+            }
+        }
+    }
+
+    @Test
     fun productMutationAtPointerCommitWaitsAndRoutesToActivatedV2() {
         val remote = InMemoryWorkspaceSyncRemoteV2(SyncRemoteProfileV2.SELF_HOSTED.wireValue)
         withFileBackedRuntimeFixture(remote) { fixture ->

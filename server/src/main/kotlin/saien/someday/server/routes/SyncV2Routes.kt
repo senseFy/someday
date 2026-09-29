@@ -64,7 +64,7 @@ private fun Route.syncV2EntityDagRouteBody(
             val workspaceId = call.entityWorkspaceIdOrNull() ?: return@get call.respondError(HttpStatusCode.BadRequest, "invalid_workspace_scope")
             val deviceId = auth.tokenDeviceId ?: return@get call.respondError(HttpStatusCode.Forbidden, "device_required")
             if (!call.requireSystemV3RateLimit(context, deviceId)) return@get
-            call.respond(context.syncV2Repository.loadEpoch(auth.userId, workspaceId).toResponse())
+            call.respond(context.syncV2Repository.loadEpoch(auth.requestContext, workspaceId).toResponse())
         }
 
         post("/checkpoint/chunk") {
@@ -75,7 +75,7 @@ private fun Route.syncV2EntityDagRouteBody(
             val request = call.receiveJsonOrNull<SyncV2CheckpointChunkRequest>(MAX_ENCODED_BODY_BYTES.toInt()) ?: return@post
             if (!request.validFor(deviceId)) return@post call.respondError(HttpStatusCode.BadRequest, "invalid_checkpoint_chunk")
             val result = context.syncV2Repository.putCheckpointChunk(
-                auth.userId,
+                auth.requestContext,
                 workspaceId,
                 SyncV2CheckpointChunkInput(
                     request.epochId,
@@ -95,7 +95,7 @@ private fun Route.syncV2EntityDagRouteBody(
             val request = call.receiveJsonOrNull<SyncV2CheckpointManifestRequest>(MAX_ENCODED_BODY_BYTES.toInt()) ?: return@post
             if (!request.validFor(deviceId)) return@post call.respondError(HttpStatusCode.BadRequest, "invalid_checkpoint_manifest")
             val result = context.syncV2Repository.putCheckpointManifest(
-                auth.userId,
+                auth.requestContext,
                 workspaceId,
                 SyncV2CheckpointManifestInput(
                     request.epochId,
@@ -122,12 +122,12 @@ private fun Route.syncV2EntityDagRouteBody(
             }
             val response = if (request.chunkIndex == null) {
                 val manifest = context.syncV2Repository.loadCheckpointManifest(
-                    auth.userId, workspaceId, request.epochId, request.checkpointId,
+                    auth.requestContext, workspaceId, request.epochId, request.checkpointId,
                 ) ?: return@post call.respondError(HttpStatusCode.NotFound, "checkpoint_not_found")
                 SyncV2CheckpointFetchResponse(manifest = JSON.decodeFromString(manifest))
             } else {
                 val chunk = context.syncV2Repository.loadCheckpointChunk(
-                    auth.userId, workspaceId, request.epochId, request.checkpointId, request.chunkIndex,
+                    auth.requestContext, workspaceId, request.epochId, request.checkpointId, request.chunkIndex,
                 ) ?: return@post call.respondError(HttpStatusCode.NotFound, "checkpoint_chunk_not_found")
                 SyncV2CheckpointFetchResponse(chunk = JSON.decodeFromString(chunk))
             }
@@ -145,7 +145,7 @@ private fun Route.syncV2EntityDagRouteBody(
                 return@post call.respondError(HttpStatusCode.BadRequest, "invalid_checkpoint_cleanup")
             }
             val result = context.syncV2Repository.cleanupCheckpointDraft(
-                auth.userId,
+                auth.requestContext,
                 workspaceId,
                 SyncV2CheckpointCleanupInput(
                     request.epochId,
@@ -180,7 +180,7 @@ private fun Route.syncV2EntityDagRouteBody(
             val request = call.receiveJsonOrNull<SyncV2EpochCompareAndSetRequest>(MAX_ENCODED_BODY_BYTES.toInt()) ?: return@post
             if (!request.validFor(deviceId)) return@post call.respondError(HttpStatusCode.BadRequest, "invalid_epoch_pointer")
             val result = context.syncV2Repository.compareAndSetEpoch(
-                auth.userId,
+                auth.requestContext,
                 workspaceId,
                 request.expectedCurrentDigest,
                 request.metadata.toRecord(),
@@ -207,9 +207,8 @@ private fun Route.syncV2EntityDagRouteBody(
                 request.objects.all { it.validForEntityPush(request.epochId, deviceId) }
             if (!valid) return@post call.respondError(HttpStatusCode.BadRequest, "invalid_v2_push")
             val result = context.syncV2Repository.push(
-                auth.userId,
+                auth.requestContext,
                 workspaceId,
-                deviceId,
                 request.epochId,
                 request.writerProtocolVersion,
                 request.objects.map { it.toInput() },
@@ -240,7 +239,7 @@ private fun Route.syncV2EntityDagRouteBody(
             if (!request.epochId.isUuidV4() || after < 0 || request.limit !in 1..MAX_V2_PULL_UNITS) {
                 return@post call.respondError(HttpStatusCode.BadRequest, "invalid_cursor")
             }
-            val result = context.syncV2Repository.pull(auth.userId, workspaceId, request.epochId, after, request.limit)
+            val result = context.syncV2Repository.pull(auth.requestContext, workspaceId, request.epochId, after, request.limit)
             var previous = request.afterCursor?.toString()
             val units = result.changes.map { change ->
                 val outer = JSON.decodeFromString<SyncV2ObjectPayload>(change.encodedObjectJson)
@@ -254,7 +253,6 @@ private fun Route.syncV2EntityDagRouteBody(
                     listOf(outer),
                 ).also { previous = change.cursor.toString() }
             }
-            context.repository.touchDevice(deviceId)
             val response = largestBoundedPullResponse(
                 units = units,
                 repositoryComplete = result.complete,
@@ -270,7 +268,7 @@ private fun Route.syncV2EntityDagRouteBody(
             if (!call.requestWithinV2Bound() || !call.requireSystemV3RateLimit(context, deviceId)) return@post
             val request = call.receiveJsonOrNull<SyncV2FrontierRequest>(MAX_ENCODED_BODY_BYTES.toInt()) ?: return@post
             if (!request.epochId.isUuidV4()) return@post call.respondError(HttpStatusCode.BadRequest, "invalid_epoch")
-            val frontier = context.syncV2Repository.frontier(auth.userId, workspaceId, request.epochId)
+            val frontier = context.syncV2Repository.frontier(auth.requestContext, workspaceId, request.epochId)
                 ?: return@post call.respondError(HttpStatusCode.NotFound, "epoch_not_found")
             call.respond(
                 SyncV2FrontierResponse(
@@ -284,7 +282,7 @@ private fun Route.syncV2EntityDagRouteBody(
             val workspaceId = call.entityWorkspaceIdOrNull() ?: return@get call.respondError(HttpStatusCode.BadRequest, "invalid_workspace_scope")
             val deviceId = auth.tokenDeviceId ?: return@get call.respondError(HttpStatusCode.Forbidden, "device_required")
             if (!call.requireSystemV3RateLimit(context, deviceId)) return@get
-            val status = context.syncV2Repository.status(auth.userId, workspaceId)
+            val status = context.syncV2Repository.status(auth.requestContext, workspaceId)
             call.respond(
                 SyncV2StatusResponse(
                     if (status.activeEpochId == null) "uninitialized" else "ready",

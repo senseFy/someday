@@ -65,6 +65,7 @@ data class ServerConfig(
     val rateLimitMaxBuckets: Int,
     val systemV3RateLimitMaxAttempts: Int,
     val argon2MaxConcurrent: Int,
+    val accountResetEnabled: Boolean = false,
 ) {
     val secureAdminCookies: Boolean
         get() = deploymentMode == ServerDeploymentMode.PRODUCTION
@@ -216,6 +217,9 @@ data class ServerConfig(
                 systemV3RateLimitMaxAttempts =
                     environment.intValue("SOMEDAY_SYSTEM_V3_RATE_LIMIT_MAX_ATTEMPTS", 256),
                 argon2MaxConcurrent = environment.intValue("SOMEDAY_ARGON2_MAX_CONCURRENT", 2),
+                accountResetEnabled = environment["SOMEDAY_ACCOUNT_RESET_ENABLED"]?.let {
+                    it.toBooleanStrictOrNull() ?: error("SOMEDAY_ACCOUNT_RESET_ENABLED must be true or false.")
+                } ?: false,
             )
         }
     }
