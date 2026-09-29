@@ -287,6 +287,14 @@ PostgreSQL, installed-server, and real self-hosted journey evidence.
 behavior plus app-shell execution evidence on the iOS simulator. The real HTTP
 transport journey runs in the Ubuntu gate, which provisions pinned PostgreSQL
 17 and HTTPS MinIO. Its generated test CA is injected only into gate processes.
+
+`scripts/build-minio-test-image` builds the MinIO server and client fixtures
+from checksum-verified upstream source archives with pinned Go and runtime
+images. It preserves the previously tested upstream versions without depending
+on the unavailable prebuilt MinIO images. Docker caches the builds locally; the
+gate report records the recipe-specific tags and actual image IDs. These are
+test fixtures, not images shipped with Someday Server.
+
 Together the gates:
 
 - create a dedicated application role with `NOSUPERUSER` and `NOBYPASSRLS`,

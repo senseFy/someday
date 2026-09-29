@@ -56,6 +56,11 @@ a separate bucket-scoped `Object Read & Write` token. Objects written by this
 gate cannot be removed while the indefinite lock remains. Policy inspection is
 pinned to Wrangler `4.78.0`.
 
+The R2 gate builds its MinIO client through `scripts/build-minio-test-image mc`
+from pinned, checksum-verified upstream source. Docker and access to the pinned
+base images, GitHub source archive and Go modules are required on the first
+build; subsequent invocations reuse Docker's build cache.
+
 ```bash
 export CLOUDFLARE_API_TOKEN=...
 export CLOUDFLARE_ACCOUNT_ID=...

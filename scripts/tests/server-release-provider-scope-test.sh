@@ -140,6 +140,22 @@ result="$(scope_check requirement r2 1.2.8 HEAD)"
     fail "PostgreSQL-only dependency change unexpectedly required R2: $result"
 git -C "$TEST_ROOT" tag server-v1.2.8
 
+for r2_fixture_path in \
+    scripts/build-minio-test-image \
+    scripts/fixtures/minio/Dockerfile; do
+    mkdir -p "$(dirname "$TEST_ROOT/$r2_fixture_path")"
+    printf 'managed S3 fixture build\n' >"$TEST_ROOT/$r2_fixture_path"
+    git -C "$TEST_ROOT" add .
+    git -C "$TEST_ROOT" commit -qm "r2-fixture-$r2_fixture_path"
+    result="$(scope_check changes r2 HEAD^ HEAD)" ||
+        fail "$r2_fixture_path did not invalidate R2 evidence"
+    [[ "$result" == "$r2_fixture_path" ]] ||
+        fail "$r2_fixture_path produced an unexpected R2 scope: $result"
+    if result="$(scope_check changes planetscale HEAD^ HEAD)"; then
+        fail "$r2_fixture_path unexpectedly required PlanetScale: $result"
+    fi
+done
+
 for common_path in \
     server/src/main/kotlin/saien/someday/server/ServerConfig.kt \
     server/build.gradle.kts \

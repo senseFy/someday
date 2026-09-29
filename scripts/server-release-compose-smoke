@@ -281,6 +281,9 @@ write_external_smoke_override() {
 
 run_external() {
     local config server_id published_address published_port untrusted_log
+    SOMEDAY_TEST_MINIO_IMAGE="$("$ROOT_DIR/scripts/build-minio-test-image" minio --platform "$PLATFORM")"
+    SOMEDAY_TEST_MINIO_MC_IMAGE="$("$ROOT_DIR/scripts/build-minio-test-image" mc --platform "$PLATFORM")"
+    export SOMEDAY_TEST_MINIO_IMAGE SOMEDAY_TEST_MINIO_MC_IMAGE
     generate_tls_material
     write_external_environment
     write_external_smoke_override

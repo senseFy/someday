@@ -4,7 +4,7 @@
 GRADLEW="${GRADLEW:-$ROOT_DIR/gradlew}"
 GATE_PROPERTY="-Psomeday.systemV3ReliabilityGate=true"
 POSTGRES_IMAGE="postgres@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73"
-MINIO_MC_IMAGE="minio/mc@sha256:aead63c77f9db9107f1696fb08ecb0faeda23729cde94b0f663edf4fe09728e3"
+MINIO_MC_IMAGE=""
 
 RUN_DIR=""
 FINAL_DIR=""

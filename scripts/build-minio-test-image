@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RECIPE="$SCRIPT_DIR/fixtures/minio/Dockerfile"
+
+die() {
+    printf 'MinIO test image error: %s\n' "$*" >&2
+    exit 1
+}
+
+[[ $# -ge 1 ]] || die 'usage: build-minio-test-image minio|mc [--platform linux/amd64|linux/arm64]'
+target="$1"
+shift
+[[ "$target" == minio || "$target" == mc ]] || die "unsupported target: $target"
+platform="${DOCKER_DEFAULT_PLATFORM:-}"
+if (($# > 0)); then
+    [[ $# -eq 2 && "$1" == --platform ]] || die 'expected --platform linux/amd64|linux/arm64'
+    platform="$2"
+fi
+if [[ -z "$platform" ]]; then
+    platform="$(docker version --format '{{.Server.Os}}/{{.Server.Arch}}')"
+fi
+[[ "$platform" == linux/amd64 || "$platform" == linux/arm64 ]] ||
+    die "unsupported platform: $platform"
+
+recipe_hash="$(python3 - "$RECIPE" <<'PY'
+import hashlib
+import pathlib
+import sys
+
+print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())
+PY
+)"
+image="someday-test-$target:$recipe_hash-${platform#linux/}"
+
+# An empty build context keeps local files out of the fixture. Always let Docker
+# validate its build cache instead of trusting a pre-existing local image tag.
+docker build --platform "$platform" --target "$target" --tag "$image" - <"$RECIPE" >&2
+actual_platform="$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$image")"
+[[ "$actual_platform" == "$platform" ]] || die "built $actual_platform instead of $platform"
+printf '%s\n' "$image"

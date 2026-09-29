@@ -37,6 +37,8 @@ R2_EXACT = COMMON_EXACT | {
     "deploy/external/.env.example",
     "deploy/external/compose.yaml",
     "deploy/external/compose.source.yaml",
+    "scripts/build-minio-test-image",
+    "scripts/fixtures/minio/Dockerfile",
     "scripts/lib/managed-storage-common.sh",
     "scripts/lib/managed-storage-r2.sh",
     "scripts/server-recovery-gate",

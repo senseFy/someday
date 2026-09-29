@@ -5,8 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 GRADLEW="${GRADLEW:-$ROOT_DIR/gradlew}"
 POSTGRES_IMAGE="postgres@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73"
-MINIO_IMAGE="minio/minio@sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e"
-MINIO_MC_IMAGE="minio/mc@sha256:aead63c77f9db9107f1696fb08ecb0faeda23729cde94b0f663edf4fe09728e3"
+MINIO_IMAGE=""
+MINIO_MC_IMAGE=""
 GATE_PROPERTY="-Psomeday.systemV3ReliabilityGate=true"
 
 mkdir -p "$ROOT_DIR/build"
@@ -170,7 +170,9 @@ start_installed_server() {
 validate_and_report() {
     local finished_at="$1"
     python3 - "$ROOT_DIR" "$PHASES" "$REPORT" "$ARCHITECTURE_LOG" \
-        "$GATE_STARTED_AT" "$finished_at" <<'PY'
+        "$GATE_STARTED_AT" "$finished_at" \
+        "$POSTGRES_IMAGE" "$MINIO_IMAGE" "$MINIO_MC_IMAGE" \
+        "$POSTGRES_IMAGE_ID" "$MINIO_IMAGE_ID" "$MINIO_MC_IMAGE_ID" <<'PY'
 import json
 import pathlib
 import subprocess
@@ -183,6 +185,9 @@ report_path = pathlib.Path(sys.argv[3])
 architecture_path = pathlib.Path(sys.argv[4])
 started = int(sys.argv[5])
 finished = int(sys.argv[6])
+image_names = ("postgres", "minio", "minioClient")
+container_images = dict(zip(image_names, sys.argv[7:10], strict=True))
+container_image_ids = dict(zip(image_names, sys.argv[10:13], strict=True))
 
 targets = {
     "data-jvm": root / "shared/data/build/test-results/jvmTest",
@@ -270,11 +275,8 @@ report = {
     "finishedAtEpochSeconds": finished,
     "durationSeconds": finished - started,
     "flakyRetries": 0,
-    "containerImages": {
-        "postgres": "postgres@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73",
-        "minio": "minio/minio@sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e",
-        "minioClient": "minio/mc@sha256:aead63c77f9db9107f1696fb08ecb0faeda23729cde94b0f663edf4fe09728e3",
-    },
+    "containerImages": container_images,
+    "containerImageIds": container_image_ids,
     "phases": phases,
     "architectureEvidence": architecture_evidence,
     "suiteEvidence": suite_evidence,
@@ -334,14 +336,11 @@ if ! docker image inspect "$POSTGRES_IMAGE" >/dev/null 2>&1; then
     info "pulling pinned PostgreSQL image"
     docker pull "$POSTGRES_IMAGE" >/dev/null
 fi
-if ! docker image inspect "$MINIO_IMAGE" >/dev/null 2>&1; then
-    info "pulling pinned MinIO image"
-    docker pull "$MINIO_IMAGE" >/dev/null
-fi
-if ! docker image inspect "$MINIO_MC_IMAGE" >/dev/null 2>&1; then
-    info "pulling pinned MinIO client image"
-    docker pull "$MINIO_MC_IMAGE" >/dev/null
-fi
+MINIO_IMAGE="$("$ROOT_DIR/scripts/build-minio-test-image" minio)"
+MINIO_MC_IMAGE="$("$ROOT_DIR/scripts/build-minio-test-image" mc)"
+POSTGRES_IMAGE_ID="$(docker image inspect --format '{{.Id}}' "$POSTGRES_IMAGE")"
+MINIO_IMAGE_ID="$(docker image inspect --format '{{.Id}}' "$MINIO_IMAGE")"
+MINIO_MC_IMAGE_ID="$(docker image inspect --format '{{.Id}}' "$MINIO_MC_IMAGE")"
 docker network create "$NETWORK_NAME" >/dev/null
 docker run -d --rm \
     --name "$POSTGRES_NAME" \

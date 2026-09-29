@@ -49,7 +49,8 @@ services:
       retries: 60
 
   minio:
-    image: minio/minio@sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e
+    image: ${SOMEDAY_TEST_MINIO_IMAGE:?Build the MinIO test image with server-release-compose-smoke}
+    pull_policy: never
     command: server /data
     environment:
       MINIO_ROOT_USER: someday-minio-smoke
@@ -61,7 +62,8 @@ services:
       - /data
 
   minio-bootstrap:
-    image: minio/mc@sha256:aead63c77f9db9107f1696fb08ecb0faeda23729cde94b0f663edf4fe09728e3
+    image: ${SOMEDAY_TEST_MINIO_MC_IMAGE:?Build the MinIO client test image with server-release-compose-smoke}
+    pull_policy: never
     depends_on:
       - minio
     entrypoint:

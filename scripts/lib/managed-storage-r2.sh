@@ -346,7 +346,7 @@ PY
         die "restore R2 S3 endpoint did not reject an anonymous request"
 
     if ! docker image inspect "$POSTGRES_IMAGE" >/dev/null 2>&1; then docker pull "$POSTGRES_IMAGE" >/dev/null; fi
-    if ! docker image inspect "$MINIO_MC_IMAGE" >/dev/null 2>&1; then docker pull "$MINIO_MC_IMAGE" >/dev/null; fi
+    MINIO_MC_IMAGE="$("$ROOT_DIR/scripts/build-minio-test-image" mc)"
     r2_assert_bucket_empty \
         source "$SOMEDAY_R2_SOURCE_ENDPOINT" "$SOMEDAY_R2_SOURCE_BUCKET" \
         "$SOMEDAY_R2_SOURCE_ACCESS_KEY_ID" "$SOMEDAY_R2_SOURCE_SECRET_ACCESS_KEY"
