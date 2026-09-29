@@ -334,8 +334,8 @@ same recovery boundary when its scoped changes require that gate.
 `scripts/managed-storage-profile-gate planetscale|r2` applies the focused
 paired-client recovery journey to dedicated managed resources. A named profile
 is verified only when a current `result.json` records a complete passing live run.
-The release controller consumes that evidence as described in
-[Server release](server-release.md).
+The independent `server-release providers` check consumes that evidence as
+described in [Managed storage profile gates](managed-storage-profile-gates.md).
 
 `scripts/server-container-smoke` owns the separate packaging boundary: it
 builds the production image, starts the standalone Compose topology with a

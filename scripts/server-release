@@ -31,12 +31,14 @@ Usage:
   scripts/server-release plan X.Y.Z
   scripts/server-release status X.Y.Z
   scripts/server-release rehearse X.Y.Z
+  scripts/server-release providers X.Y.Z
 
 Commands:
   plan       Print the complete workflow without running checks.
   status     Read local evidence and remote GitHub state without changing it.
-  rehearse  Run local checks and both deployment topologies. It never runs
+  rehearse   Run local checks and both deployment topologies. It never runs
              managed-provider gates or performs a remote write.
+  providers  Inspect independent provider certification for HEAD (read-only).
 
 This script never creates or pushes a tag, publishes a release or image, or
 changes repository/package visibility. The final annotated-tag commands are
@@ -138,7 +140,7 @@ expected = {
 }
 for key, wanted in expected.items():
     if value.get(key) != wanted:
-        print(f"{profile}: {key} is not release eligible")
+        print(f"{profile}: {key} is not certification eligible")
         raise SystemExit(1)
 commit = value.get("commit")
 if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit):
@@ -166,7 +168,7 @@ provider_evidence_detail() {
     local commit="$2"
     local coverage_base="$3"
     local path="$MANAGED_REPORT_ROOT/$profile/result.json"
-    local evidence_commit detail
+    local evidence_commit detail code
     if ! evidence_commit="$(managed_evidence_commit "$path" "$profile")"; then
         printf '%s\n' "$evidence_commit"
         return 1
@@ -184,6 +186,12 @@ provider_evidence_detail() {
         if detail="$($PROVIDER_SCOPE_CHECK changes "$profile" "$evidence_commit" "$commit")"; then
             printf '%s: relevant changes after evidence %.12s (%s)\n' \
                 "$profile" "$evidence_commit" "$(head -n 1 <<<"$detail")"
+            return 1
+        else
+            code=$?
+        fi
+        if [[ "$code" -ne 1 ]]; then
+            printf '%s: scope comparison failed\n' "$profile"
             return 1
         fi
     fi
@@ -429,11 +437,10 @@ github_publish_detail() {
 run_status() {
     local commit head_commit short branch tree_clean=true identity identity_detail history_ready=true
     local local_tag_state=absent remote_tag_state=absent remote_main="" remote_tag=""
-    local identity_ready=true policy_ready=true ci_ready=true rehearsal_ready=true providers_ready=true
+    local identity_ready=true policy_ready=true ci_ready=true rehearsal_ready=true
     local publish_state publish_detail policy_detail ci_detail repository
     local rehearsal_path="$REPORT_ROOT/$VERSION/rehearsal.json"
-    local detail code planetscale_detail r2_detail visibility
-    local planetscale_requirement r2_requirement provider_state provider_base provider_reason
+    local detail code visibility
 
     require_command git
     require_command python3
@@ -551,47 +558,6 @@ run_status() {
         rehearsal_ready=false
     fi
 
-    if planetscale_requirement="$(provider_requirement planetscale "$commit")"; then
-        IFS=$'\t' read -r provider_state provider_base provider_reason <<<"$planetscale_requirement"
-    else
-        provider_state=error
-        provider_reason='scope classification failed'
-    fi
-    if [[ "$provider_state" == required ]]; then
-        if ! planetscale_detail="$(provider_evidence_detail planetscale "$commit" "$provider_base")"; then
-            providers_ready=false
-        fi
-        planetscale_detail+="; required: $provider_reason"
-    elif [[ "$provider_state" == skipped ]]; then
-        planetscale_detail="planetscale: not required; $provider_reason"
-    else
-        planetscale_detail="planetscale: $provider_reason"
-        providers_ready=false
-    fi
-
-    if r2_requirement="$(provider_requirement r2 "$commit")"; then
-        IFS=$'\t' read -r provider_state provider_base provider_reason <<<"$r2_requirement"
-    else
-        provider_state=error
-        provider_reason='scope classification failed'
-    fi
-    if [[ "$provider_state" == required ]]; then
-        if ! r2_detail="$(provider_evidence_detail r2 "$commit" "$provider_base")"; then
-            providers_ready=false
-        fi
-        r2_detail+="; required: $provider_reason"
-    elif [[ "$provider_state" == skipped ]]; then
-        r2_detail="r2: not required; $provider_reason"
-    else
-        r2_detail="r2: $provider_reason"
-        providers_ready=false
-    fi
-    if [[ "$providers_ready" == true ]]; then
-        status_line PASS providers "$planetscale_detail; $r2_detail"
-    else
-        status_line ACTION providers "$planetscale_detail; $r2_detail"
-    fi
-
     if [[ "$remote_tag_state" == absent ]]; then
         status_line CI publish "explicit $TAG push starts the immutable GitHub workflow"
     else
@@ -609,7 +575,7 @@ run_status() {
 
     if [[ "$identity_ready" == true && "$policy_ready" == true && "$ci_ready" == true && \
         "$history_ready" == true && \
-        "$rehearsal_ready" == true && "$providers_ready" == true && \
+        "$rehearsal_ready" == true && \
         "$remote_tag_state" == absent ]]; then
         printf 'READY TO TAG\n'
         return 0
@@ -635,11 +601,53 @@ run_status() {
         printf 'Next: %s\n' "$HISTORY_CHECK"
     elif [[ "$rehearsal_ready" != true ]]; then
         printf 'Next: scripts/server-release rehearse %s\n' "$VERSION"
-    elif [[ "$providers_ready" != true ]]; then
-        printf 'Next: run the missing managed gate from docs/guides/managed-storage-profile-gates.md.\n'
     else
         printf 'Next: inspect the Server Release workflow, fix the failure, and rerun status.\n'
     fi
+    return 1
+}
+
+run_providers() {
+    local commit profile requirement state base reason detail providers_ready=true
+
+    require_command git
+    require_command python3
+    commit="$(head_sha)"
+    printf 'Someday provider certification %s  commit %.12s\n' "$VERSION" "$commit"
+    if [[ -n "$(git -C "$ROOT_DIR" status --porcelain --untracked-files=all)" ]]; then
+        status_line ACTION identity 'provider certification requires a clean worktree'
+        printf 'PROVIDERS NOT VERIFIED\n'
+        return 1
+    fi
+
+    for profile in planetscale r2; do
+        if requirement="$(provider_requirement "$profile" "$commit")"; then
+            IFS=$'\t' read -r state base reason <<<"$requirement"
+        else
+            state=error
+            reason='scope classification failed'
+        fi
+        case "$state" in
+            required|skipped)
+                if detail="$(provider_evidence_detail "$profile" "$commit" "$base")"; then
+                    status_line PASS "$profile" "$detail; scope: $reason"
+                else
+                    status_line ACTION "$profile" "$detail; scope: $reason"
+                    providers_ready=false
+                fi
+                ;;
+            *)
+                status_line ACTION "$profile" "$reason"
+                providers_ready=false
+                ;;
+        esac
+    done
+    if [[ "$providers_ready" == true ]]; then
+        printf 'PROVIDERS VERIFIED\n'
+        return 0
+    fi
+    printf 'PROVIDERS NOT VERIFIED\n'
+    printf 'Next: follow docs/guides/managed-storage-profile-gates.md for the indicated profiles.\n'
     return 1
 }
 
@@ -649,19 +657,17 @@ Someday server release $VERSION
 
 1. Confirm the one-time GitHub controls in docs/guides/server-release.md.
 2. Merge the reviewed commit to main and wait for CI.
-3. Run status to classify the live managed-provider gates from the server diff.
-   Configure dedicated resources and run only the profiles reported as required:
-   scripts/managed-storage-profile-gate planetscale
-   scripts/managed-storage-profile-gate r2
-   Set SOMEDAY_SERVER_RELEASE_FORCE_MANAGED=all for a scheduled full certification.
-4. Run: scripts/server-release rehearse $VERSION
-5. For the second and later releases, complete the previous-version upgrade
+3. Run: scripts/server-release rehearse $VERSION
+4. For the second and later releases, complete the previous-version upgrade
    acceptance in docs/guides/server-upgrades.md.
-6. Run: scripts/server-release status $VERSION
-7. Only after status prints READY TO TAG, create and push the immutable tag:
+5. Run: scripts/server-release status $VERSION
+6. Only after status prints READY TO TAG, create and push the immutable tag:
    git tag -a $TAG -m "Someday Server $VERSION"
    git push $REMOTE refs/tags/$TAG:refs/tags/$TAG
-8. Run: scripts/server-release status $VERSION
+7. Run: scripts/server-release status $VERSION
+
+Provider certification is independent of publication:
+  scripts/server-release providers $VERSION
 
 The tag starts .github/workflows/server-release.yml. It builds and tests the
 multi-architecture image, verifies anonymous pulls and both deployment
@@ -803,7 +809,7 @@ case "$command_name" in
         [[ $# -eq 0 ]] || die 'help accepts no arguments'
         usage
         ;;
-    plan|status|rehearse)
+    plan|status|rehearse|providers)
         [[ $# -eq 1 ]] || die "$command_name requires exactly one X.Y.Z version"
         set_version "$1"
         cd "$ROOT_DIR"
@@ -811,6 +817,7 @@ case "$command_name" in
             plan) run_plan ;;
             status) run_status ;;
             rehearse) run_rehearsal ;;
+            providers) run_providers ;;
         esac
         ;;
     *)

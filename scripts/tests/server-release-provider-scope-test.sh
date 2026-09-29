@@ -15,6 +15,20 @@ scope_check() {
     SOMEDAY_SERVER_RELEASE_SCOPE_ROOT="$TEST_ROOT" "$CHECK" "$@"
 }
 
+expect_scope_error() {
+    local status
+    if scope_check "$@" >"$TEST_ROOT/scope-error.out" 2>"$TEST_ROOT/scope-error.err"; then
+        fail "scope check unexpectedly accepted: $*"
+    else
+        status=$?
+    fi
+    [[ "$status" -eq 2 ]] || fail "scope error returned $status instead of 2: $*"
+    [[ ! -s "$TEST_ROOT/scope-error.out" ]] || fail 'scope error produced classification output'
+    grep -Fq 'server release provider scope error:' "$TEST_ROOT/scope-error.err" ||
+        fail 'scope error omitted its diagnostic'
+    rm "$TEST_ROOT/scope-error.out" "$TEST_ROOT/scope-error.err"
+}
+
 git -C "$TEST_ROOT" init -q
 git -C "$TEST_ROOT" config user.name Test
 git -C "$TEST_ROOT" config user.email test@example.invalid
@@ -35,6 +49,18 @@ printf '<verification-metadata/>\n' >"$TEST_ROOT/gradle/verification-metadata.xm
 git -C "$TEST_ROOT" add .
 git -C "$TEST_ROOT" commit -qm baseline
 git -C "$TEST_ROOT" tag server-v1.2.3
+
+if result="$(scope_check changes r2 HEAD HEAD)"; then
+    fail 'unchanged provider scope unexpectedly reported changes'
+else
+    status=$?
+fi
+[[ "$status" -eq 1 && -z "$result" ]] ||
+    fail "unchanged provider scope did not return 1 with no output: $status $result"
+expect_scope_error changes r2 missing-scope-ref HEAD
+expect_scope_error changes unknown HEAD HEAD
+expect_scope_error requirement r2 invalid-version HEAD
+expect_scope_error changes r2 HEAD
 
 printf 'documentation only\n' >>"$TEST_ROOT/README.md"
 git -C "$TEST_ROOT" commit -qam docs

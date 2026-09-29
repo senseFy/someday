@@ -6,10 +6,35 @@ and S3 requirements. They require JDK 21 and retain evidence under
 `result.json` records the repository commit and source/restore resource names.
 The gate does not write this file for a dirty worktree.
 
-The server release controller decides which profiles are required from the
-server-scoped diff. It may accept passing evidence from an ancestor commit only
-when `scripts/server-release-provider-scope` proves that the corresponding
-provider implementation and deployment contract are unchanged afterward.
+Check certification independently of [public image publication](server-release.md):
+
+```bash
+scripts/server-release providers X.Y.Z
+```
+
+This read-only command checks both profiles and returns nonzero when either
+profile lacks valid evidence. It does not run live gates or affect `READY TO TAG`.
+`scripts/server-release-provider-scope` compares the candidate with the newest
+reachable earlier `server-v*` tag. First, major and minor versions require full
+certification; patch versions classify evidence updates from relevant server,
+deployment, recovery or dependency changes:
+
+| Change | Profile evidence to refresh |
+| --- | --- |
+| PostgreSQL persistence, migrations, database wiring, or recovery | PlanetScale |
+| Server S3/media adapter, external S3 deployment, or media recovery | R2 |
+| Unrelated application, UI, documentation, or release-controller code | Reuse valid evidence |
+
+Passing evidence is read from `build/managed-storage-profile-gate/<profile>/result.json`.
+Full certification requires evidence from the candidate commit. For patch
+certification, ancestor evidence remains valid only when the scope checker
+confirms the implementation and deployment contract are unchanged. An unchanged
+scope never substitutes for missing or stale evidence.
+Prepare the disposable resources below, refresh evidence as needed, then rerun
+`providers`. At least quarterly or when provider behavior is in doubt, use
+`SOMEDAY_SERVER_RELEASE_FORCE_MANAGED=all scripts/server-release providers X.Y.Z`
+to require full certification of both profiles; the override applies only to
+this certification check.
 
 ## PlanetScale PostgreSQL
 
@@ -86,5 +111,5 @@ canonical ciphertext SHA-256 metadata to each object. The gate also proves
 cross-bucket read and write access is denied, tests Bucket Lock, restores into
 the second bucket, and compares it again after paired-client recovery checks.
 
-A profile is release-verified when its live gate retains passing evidence.
+A profile is verified when its live gate retains passing evidence.
 Missing credentials or dedicated resources leave the profile unverified.

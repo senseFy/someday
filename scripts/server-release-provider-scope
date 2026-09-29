@@ -70,7 +70,8 @@ ROOT_DIR = Path(
 
 
 def fail(message: str) -> None:
-    raise SystemExit(f"server release provider scope error: {message}")
+    print(f"server release provider scope error: {message}", file=sys.stderr)
+    raise SystemExit(2)
 
 
 def git(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[bytes]:
@@ -189,4 +190,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except Exception as error:
+        fail(str(error))
