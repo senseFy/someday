@@ -118,7 +118,7 @@ commit_all "$token_repo" "Create token fixture"
 token_prefix='AK'
 token_prefix+='IA'
 fake_token="${token_prefix}0000000000000000"
-printf 'token=%s\n' "$fake_token" > "$token_repo/config.txt"
+printf '非 ASCII 前缀 token=%s 后缀\n' "$fake_token" > "$token_repo/config.txt"
 commit_all "$token_repo" "Add token fixture"
 git -C "$token_repo" rm -q -- config.txt
 git -C "$token_repo" commit -q -m "Remove token fixture"

@@ -700,7 +700,7 @@ PY
 }
 
 run_rehearsal() {
-    local commit branch remote_main remote_tag code platform architecture
+    local commit branch remote_main remote_tag code platform architecture cleanup_command
     local report="$REPORT_ROOT/$VERSION/rehearsal.json"
     local temporary_image="someday-server:release-rehearsal-$VERSION-$(short_sha)-$$"
 
@@ -744,10 +744,11 @@ run_rehearsal() {
     cleanup_rehearsal() {
         local status=$?
         trap - EXIT INT TERM
-        "$DOCKER_COMMAND" image rm --force "$temporary_image" >/dev/null 2>&1 || true
+        "$DOCKER_COMMAND" image rm --force "$1" >/dev/null 2>&1 || true
         exit "$status"
     }
-    trap cleanup_rehearsal EXIT
+    printf -v cleanup_command 'cleanup_rehearsal %q' "$temporary_image"
+    trap "$cleanup_command" EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
 

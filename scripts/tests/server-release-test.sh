@@ -193,6 +193,11 @@ printf ' %q' "$@" >>"$FAKE_CALL_LOG"
 printf '\n' >>"$FAKE_CALL_LOG"
 SH
 
+cat >"$STUB_BIN/fail" <<'SH'
+#!/usr/bin/env bash
+exit 37
+SH
+
 cat >"$STUB_BIN/system-gate" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -271,11 +276,11 @@ run_release() {
     FAKE_SYSTEM_DIRTY="${FAKE_SYSTEM_DIRTY:-false}" \
     FAKE_SYSTEM_RESULT="${FAKE_SYSTEM_RESULT:-passed}" \
     GRADLEW="$STUB_BIN/pass" \
-    SOMEDAY_SERVER_RELEASE_HISTORY_CHECK="$STUB_BIN/pass" \
+    SOMEDAY_SERVER_RELEASE_HISTORY_CHECK="${FAKE_HISTORY_CHECK:-$STUB_BIN/pass}" \
     SOMEDAY_SERVER_RELEASE_PRIVATE_CHECK="$STUB_BIN/pass" \
     SOMEDAY_SERVER_RELEASE_CONTRACT_CHECK="$STUB_BIN/pass" \
     SOMEDAY_SERVER_RELEASE_SYSTEM_GATE="$STUB_BIN/system-gate" \
-    SOMEDAY_SERVER_RELEASE_COMPOSE_SMOKE="$STUB_BIN/pass" \
+    SOMEDAY_SERVER_RELEASE_COMPOSE_SMOKE="${FAKE_COMPOSE_SMOKE:-$STUB_BIN/pass}" \
     SOMEDAY_SERVER_RELEASE_SYSTEM_REPORT="$SYSTEM_REPORT" \
     SOMEDAY_SERVER_RELEASE_MANAGED_REPORT_ROOT="$MANAGED_REPORT_ROOT" \
     SOMEDAY_SERVER_RELEASE_PROVIDER_SCOPE_CHECK="$STUB_BIN/provider-scope" \
@@ -316,6 +321,20 @@ assert_rehearsal_guard() {
     if grep -Fq 'docker build' "$CALL_LOG"; then
         fail "$label reached the image build"
     fi
+}
+
+assert_rehearsal_cleanup() {
+    local label="$1"
+    local prefix="someday-server:release-rehearsal-$VERSION-${SHA:0:12}-"
+    local image
+    image="$(sed -n 's/^docker image rm --force //p' "$CALL_LOG")"
+    [[ "$image" == "$prefix"* && "${image#"$prefix"}" =~ ^[0-9]+$ ]] ||
+        fail "$label did not clean exactly one task-owned image"
+    if grep -Fq 'unbound variable' "$TEST_ROOT/$label.out"; then
+        fail "$label lost its cleanup state"
+    fi
+    [[ ! -f "$REPORT_ROOT/$VERSION/rehearsal.json" ]] ||
+        fail "$label wrote passing rehearsal evidence"
 }
 
 [[ -x "$RELEASE_SCRIPT" ]] || fail "release script is not executable: $RELEASE_SCRIPT"
@@ -397,6 +416,33 @@ for field in commit dirty result; do
             ;;
     esac
     assert_rehearsal_guard "system-$field"
+    assert_rehearsal_cleanup "system-$field"
+done
+
+for phase in history compose; do
+    prepare_rehearsal_guard
+    history_check="$STUB_BIN/pass"
+    compose_smoke="$STUB_BIN/pass"
+    case "$phase" in
+        history) history_check="$STUB_BIN/fail" ;;
+        compose) compose_smoke="$STUB_BIN/fail" ;;
+    esac
+    if FAKE_HISTORY_CHECK="$history_check" FAKE_COMPOSE_SMOKE="$compose_smoke" \
+        run_release rehearse "$VERSION" >"$TEST_ROOT/$phase-failure.out" 2>&1; then
+        fail "$phase failure unexpectedly succeeded"
+    else
+        failure_status=$?
+    fi
+    [[ "$failure_status" -eq 37 ]] ||
+        fail "$phase failure lost its original exit status: $failure_status"
+    assert_rehearsal_cleanup "$phase-failure"
+    if [[ "$phase" == history ]]; then
+        assert_rehearsal_guard history-failure
+    else
+        cleanup_image="$(sed -n 's/^docker image rm --force //p' "$CALL_LOG")"
+        grep -Fq -- "--tag $cleanup_image " "$CALL_LOG" ||
+            fail 'compose failure did not clean the image it built'
+    fi
 done
 
 write_managed_report planetscale

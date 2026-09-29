@@ -167,7 +167,9 @@ done < "$OBJECT_INFO_FILE"
 scan_blob_batch() {
   local grep_status
 
-  if git grep -a -l -E -e "$sensitive_content_pattern" "$@" -- \
+  # Credential markers are ASCII; byte matching avoids locale-dependent regex
+  # memory growth when scanning Unicode or binary historical content on macOS.
+  if LC_ALL=C git grep -a -l -E -e "$sensitive_content_pattern" "$@" -- \
     >> "$BLOB_MATCHES_FILE"; then
     return 0
   else
