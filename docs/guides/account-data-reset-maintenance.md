@@ -4,7 +4,7 @@ This guide covers the implemented server reset and maintenance boundary.
 [The protocol](../specs/account-data-reset-protocol.md) owns admission, API,
 retention and certification semantics. Client reset/rejoin UI is implemented;
 coordinated rollout and deployment-specific storage certification remain
-pending. Keep deployments disabled until that rollout is ready.
+pending. Keep account reset disabled until that rollout is ready.
 
 ## Enabling logical reset
 

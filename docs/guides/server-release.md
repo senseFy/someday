@@ -54,6 +54,12 @@ below.
 
 ## Managed evidence
 
+`server-release status` requires applicable PlanetScale/R2 evidence for
+`READY TO TAG` under the current release policy; the tag workflow does not
+run those live gates or read their local evidence. Operators can use either
+[storage topology](self-hosting.md) without those vendors. Publishing the
+public image neither deploys it nor enables account reset.
+
 `scripts/server-release-provider-scope` compares the release with the newest
 reachable earlier `server-v*` tag. Patch releases require a live provider gate
 only when that provider's server, deployment, recovery, or relevant dependency
@@ -103,9 +109,10 @@ Run the complete non-publishing exercise:
 make server-release-rehearse SERVER_RELEASE_VERSION=X.Y.Z
 ```
 
-The rehearsal reuses the repository's existing checks and exercises both
-deployment topologies with a local image. CI later supplies AMD64/ARM64,
-Docker Engine 24, anonymous GHCR, and GitHub Release results.
+The rehearsal uses a local image and isolated PostgreSQL/S3 fixtures for both
+deployment topologies; PlanetScale/R2 credentials are not needed. The tag
+workflow supplies AMD64/ARM64, Docker Engine 24, anonymous GHCR, and GitHub
+Release results.
 Inspect the final summary and rerun `status`; do not tag while it reports an
 action or failure.
 
@@ -145,8 +152,8 @@ checks run inside that workflow; `status` does not query the registry itself.
 
 ## Failure recovery
 
-- Before pushing the tag, fix the issue, commit it, refresh commit-bound managed
-  evidence, and rehearse again.
+- Before pushing the tag, fix the issue, commit it, refresh required managed
+  evidence invalidated by the change, and rehearse again.
 - If validation fails before an image exists because the release workflow itself
   is defective, fix the workflow on `main`, wait for main CI on that
   workflow-fix commit, then resume the unchanged protected tag:

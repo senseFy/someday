@@ -467,15 +467,15 @@ and gate results are recorded under `build/account-reset-commit-review/`.
 
 These results do not certify actual provider permissions/retention, signed
 device/store packages, missing released-old-client provenance, or coordinated
-deployment. The following release steps remain independently required.
+deployment. The remaining account-reset rollout and enablement work is:
 
-1. Ship server migration/admission with reset disabled and pass a nonempty V9
-   upgrade. Complete the owning spec/guide changes with their implementation.
-2. Certify legacy and actual nested-path storage access/protection on disposable
-   resources. Choose logical-only retention or certified reclamation. B1 plus
-   C/D can enable the first logical reset before B2; null reclamation markers
-   continue to block repeated resets. Drill the documented backup rollback
-   behavior without claiming anti-rollback protection.
+1. Publish the server with reset disabled through the
+   [server release process](../../guides/server-release.md).
+2. Certify the deployment's legacy and nested-path storage access/protection on
+   disposable resources. Choose logical-only retention or certified reclamation.
+   B1 plus C/D can enable the first logical reset before B2; null reclamation
+   markers continue to block repeated resets. Drill the documented backup
+   rollback behavior without claiming anti-rollback protection.
 3. Ship all three clients and exercise real old binaries against the server,
    as well as the new Desktop/JDK path. Record local downgrade limits.
 4. Obtain operator opt-in after storage, retention and backup review. Keep reset
