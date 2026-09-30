@@ -26,7 +26,7 @@ internal object DesktopMediaImageNormalizer : MediaImageNormalizer {
         var image = decodeOrientedBounded(encoded, request)
         try {
             val outputFormat = if (
-                request.sourceInspection.mediaType == "image/png" || !image.image.isOpaque
+                request.sourceInspection.mediaType == "image/png" || !image.sourceIsOpaque
             ) {
                 EncodedImageFormat.PNG
             } else {
@@ -68,6 +68,8 @@ internal object DesktopMediaImageNormalizer : MediaImageNormalizer {
         request: MediaImageNormalizationRequest,
     ): ManagedImage = Data.makeFromBytes(encoded).use { data ->
         Codec.makeFromData(data).use codecUse@{ codec ->
+            // Rendering into PREMUL surfaces loses the source's opacity metadata.
+            val sourceIsOpaque = codec.imageInfo.isOpaque
             val origin = codec.encodedOrigin
             val orientedWidth = if (origin.swapsWidthHeight()) codec.size.y else codec.size.x
             val orientedHeight = if (origin.swapsWidthHeight()) codec.size.x else codec.size.y
@@ -89,25 +91,23 @@ internal object DesktopMediaImageNormalizer : MediaImageNormalizer {
                     if (!failure.isUnsupportedCodecScale()) throw failure
                     return@codecUse renderEncodedAtTarget(
                         encoded = encoded,
-                        origin = origin,
                         target = target,
-                        rawTargetWidth = requestedRawWidth,
-                        rawTargetHeight = requestedRawHeight,
+                        sourceIsOpaque = sourceIsOpaque,
                     )
                 }
                 val rawWidth = requestedRawWidth
                 val rawHeight = requestedRawHeight
                 val rawImage = Image.makeFromBitmap(bitmap)
                 val oriented = if (origin == EncodedOrigin.TOP_LEFT) {
-                    ManagedImage(rawImage)
+                    ManagedImage(rawImage, sourceIsOpaque)
                 } else {
                     rawImage.use {
                         val decodedOrientedWidth = if (origin.swapsWidthHeight()) rawHeight else rawWidth
                         val decodedOrientedHeight = if (origin.swapsWidthHeight()) rawWidth else rawHeight
                         Surface.makeRasterN32Premul(decodedOrientedWidth, decodedOrientedHeight).use { surface ->
-                            surface.canvas.concat(origin.toMatrix(rawWidth, rawHeight))
+                            surface.canvas.concat(origin.toMatrix(decodedOrientedWidth, decodedOrientedHeight))
                             surface.canvas.drawImage(rawImage, 0f, 0f)
-                            ManagedImage(surface.makeImageSnapshot())
+                            ManagedImage(surface.makeImageSnapshot(), sourceIsOpaque)
                         }
                     }
                 }
@@ -122,20 +122,16 @@ internal object DesktopMediaImageNormalizer : MediaImageNormalizer {
 
     private fun renderEncodedAtTarget(
         encoded: ByteArray,
-        origin: EncodedOrigin,
         target: PixelDimensions,
-        rawTargetWidth: Int,
-        rawTargetHeight: Int,
+        sourceIsOpaque: Boolean,
     ): ManagedImage = Image.makeFromEncoded(encoded).use { image ->
         Surface.makeRasterN32Premul(target.width, target.height).use { surface ->
-            if (origin != EncodedOrigin.TOP_LEFT) {
-                surface.canvas.concat(origin.toMatrix(rawTargetWidth, rawTargetHeight))
-            }
+            // makeFromEncoded already applies EXIF orientation, including mirroring.
             surface.canvas.drawImageRect(
                 image,
-                Rect.makeWH(rawTargetWidth.toFloat(), rawTargetHeight.toFloat()),
+                Rect.makeWH(target.width.toFloat(), target.height.toFloat()),
             )
-            ManagedImage(surface.makeImageSnapshot())
+            ManagedImage(surface.makeImageSnapshot(), sourceIsOpaque)
         }
     }
 
@@ -149,7 +145,7 @@ internal object DesktopMediaImageNormalizer : MediaImageNormalizer {
             surface.makeImageSnapshot()
         }
         close()
-        return ManagedImage(scaled)
+        return ManagedImage(scaled, sourceIsOpaque)
     }
 
     private fun ManagedImage.encode(format: EncodedImageFormat, jpegQuality: Int): ByteArray? =
@@ -175,6 +171,7 @@ internal object DesktopMediaImageNormalizer : MediaImageNormalizer {
 
     private class ManagedImage(
         val image: Image,
+        val sourceIsOpaque: Boolean,
     ) : AutoCloseable {
         override fun close() = image.close()
     }

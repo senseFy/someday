@@ -144,6 +144,11 @@ atomically promote bytes into app-private storage.
 Supported content is static JPEG, PNG, and WebP. SVG, animation, video, general
 attachments, and automatic URL fetching are unsupported.
 
+When normalization is required, apply encoded orientation exactly once. Preserve
+PNG sources and source transparency as PNG; encode opaque JPEG/WebP sources as
+JPEG. Determine transparency from the source codec, not an intermediate raster's
+alpha storage format.
+
 Portable JSON export and restore do not contain media bytes.
 Self-hosted operators must protect PostgreSQL and the configured blob store as
 one logical recovery unit. Standalone uses coordinated database and off-host

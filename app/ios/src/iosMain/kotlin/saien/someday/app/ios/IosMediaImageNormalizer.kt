@@ -26,7 +26,7 @@ internal object IosMediaImageNormalizer : MediaImageNormalizer {
         var image = decodeOrientedBounded(encoded, request)
         try {
             val outputFormat = if (
-                request.sourceInspection.mediaType == "image/png" || !image.image.isOpaque
+                request.sourceInspection.mediaType == "image/png" || !image.sourceIsOpaque
             ) {
                 EncodedImageFormat.PNG
             } else {
@@ -71,6 +71,9 @@ internal object IosMediaImageNormalizer : MediaImageNormalizer {
         try {
             val codec = Codec.makeFromData(data)
             try {
+                // Raster intermediates use PREMUL even for opaque sources. Preserve
+                // the codec's alpha information when choosing the output encoding.
+                val sourceIsOpaque = codec.imageInfo.isOpaque
                 val origin = codec.encodedOrigin
                 val orientedWidth = if (origin.swapsWidthHeight()) codec.size.y else codec.size.x
                 val orientedHeight = if (origin.swapsWidthHeight()) codec.size.x else codec.size.y
@@ -92,20 +95,18 @@ internal object IosMediaImageNormalizer : MediaImageNormalizer {
                         if (!failure.isUnsupportedCodecScale()) throw failure
                         return renderEncodedAtTarget(
                             encoded = encoded,
-                            origin = origin,
+                            sourceIsOpaque = sourceIsOpaque,
                             target = target,
-                            rawTargetWidth = requestedRawWidth,
-                            rawTargetHeight = requestedRawHeight,
                         )
                     }
                     val rawImage = Image.makeFromBitmap(bitmap)
-                    if (origin == EncodedOrigin.TOP_LEFT) return ManagedImage(rawImage)
+                    if (origin == EncodedOrigin.TOP_LEFT) return ManagedImage(rawImage, sourceIsOpaque)
                     try {
                         val surface = Surface.makeRasterN32Premul(target.width, target.height)
                         try {
-                            surface.canvas.concat(origin.toMatrix(requestedRawWidth, requestedRawHeight))
+                            surface.canvas.concat(origin.toMatrix(target.width, target.height))
                             surface.canvas.drawImage(rawImage, 0f, 0f)
-                            return ManagedImage(surface.makeImageSnapshot())
+                            return ManagedImage(surface.makeImageSnapshot(), sourceIsOpaque)
                         } finally {
                             surface.close()
                         }
@@ -125,23 +126,19 @@ internal object IosMediaImageNormalizer : MediaImageNormalizer {
 
     private fun renderEncodedAtTarget(
         encoded: ByteArray,
-        origin: EncodedOrigin,
+        sourceIsOpaque: Boolean,
         target: PixelDimensions,
-        rawTargetWidth: Int,
-        rawTargetHeight: Int,
     ): ManagedImage {
         val image = Image.makeFromEncoded(encoded)
         try {
             val surface = Surface.makeRasterN32Premul(target.width, target.height)
             try {
-                if (origin != EncodedOrigin.TOP_LEFT) {
-                    surface.canvas.concat(origin.toMatrix(rawTargetWidth, rawTargetHeight))
-                }
+                // Unlike Codec.readPixels, makeFromEncoded already applies EXIF orientation.
                 surface.canvas.drawImageRect(
                     image,
-                    Rect.makeWH(rawTargetWidth.toFloat(), rawTargetHeight.toFloat()),
+                    Rect.makeWH(target.width.toFloat(), target.height.toFloat()),
                 )
-                return ManagedImage(surface.makeImageSnapshot())
+                return ManagedImage(surface.makeImageSnapshot(), sourceIsOpaque)
             } finally {
                 surface.close()
             }
@@ -163,7 +160,7 @@ internal object IosMediaImageNormalizer : MediaImageNormalizer {
             surface.close()
         }
         close()
-        return ManagedImage(scaled)
+        return ManagedImage(scaled, sourceIsOpaque)
     }
 
     private fun ManagedImage.encode(format: EncodedImageFormat, jpegQuality: Int): ByteArray? =
@@ -195,6 +192,7 @@ internal object IosMediaImageNormalizer : MediaImageNormalizer {
 
     private class ManagedImage(
         val image: Image,
+        val sourceIsOpaque: Boolean,
     ) : AutoCloseable {
         override fun close() = image.close()
     }
