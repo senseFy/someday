@@ -14,8 +14,10 @@ import saien.someday.sync.WorkspaceLifecycleCoordinator
 import saien.someday.sync.causality.v2.testkit.FileBackedSyncDevice
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
 import kotlin.test.assertNotNull
+import kotlin.test.assertSame
 import kotlin.test.assertTrue
 import kotlin.time.Instant
 
@@ -134,6 +136,46 @@ class WorkspaceSyncCoordinatorV2Test {
             assertEquals(listOf(child.versionId), gatedVersionIds)
             assertEquals(1, context.store.loadPending(remote.remoteProfile).size)
             assertTrue(remote.allChanges().isEmpty())
+            val protocolStore = SqlDelightSyncProtocolStoreV2(fixture.local.database)
+            WorkspacePublicationFailureV2.entries.forEach { failure ->
+                val interrupted = WorkspaceSyncCoordinatorV2(
+                    fixture.local, key, WRITER_A, remote,
+                    beforeEntityPublication = { throw WorkspacePublicationExceptionV2(failure) },
+                ).syncOnce()
+                assertEquals(
+                    if (failure.retryable) SyncCoordinatorStatusV2.FAILED else SyncCoordinatorStatusV2.BLOCKED,
+                    interrupted.status,
+                )
+                assertEquals(failure.safeCode, interrupted.safeErrorCode)
+                assertEquals(failure.safeMessage, interrupted.safeMessage)
+                val recorded = protocolStore.loadRuns(remote.remoteProfile).first { it.safeErrorCode == failure.safeCode }
+                assertEquals(
+                    if (failure.retryable) SyncRunStatusV2.FAILED else SyncRunStatusV2.BLOCKED,
+                    recorded.status,
+                )
+                assertEquals(failure.safeMessage, recorded.safeErrorMessage)
+                assertEquals(SyncEpochHealthV2.HEALTHY, protocolStore.loadActiveEpoch(remote.remoteProfile)?.health)
+                assertEquals(1, context.store.loadPending(remote.remoteProfile).size)
+                assertTrue(remote.allChanges().isEmpty())
+            }
+            val cancellation = kotlinx.coroutines.CancellationException("token=must-not-leak /private/photo.jpg")
+            val thrown = assertFailsWith<kotlinx.coroutines.CancellationException> {
+                WorkspaceSyncCoordinatorV2(
+                    fixture.local, key, WRITER_A, remote,
+                    beforeEntityPublication = { throw cancellation },
+                ).syncOnce()
+            }
+            assertSame(cancellation, thrown)
+            val cancelledRun = protocolStore.loadRuns(remote.remoteProfile).single { it.safeErrorCode == "sync_cancelled" }
+            assertEquals(SyncRunStatusV2.FAILED, cancelledRun.status)
+            assertEquals("Sync was cancelled.", cancelledRun.safeErrorMessage)
+            assertNotNull(cancelledRun.finishedAtEpochMilliseconds)
+            assertTrue(protocolStore.loadRuns(remote.remoteProfile).none { it.status == SyncRunStatusV2.RUNNING })
+            assertEquals(1, context.store.loadPending(remote.remoteProfile).size)
+            val recovered = WorkspaceSyncCoordinatorV2(fixture.local, key, WRITER_A, remote, {}).syncOnce()
+            assertEquals(SyncCoordinatorStatusV2.SUCCESS, recovered.status)
+            assertEquals(1, recovered.pushedObjects)
+            assertTrue(context.store.loadPending(remote.remoteProfile).isEmpty())
         } finally {
             fixture.close()
         }

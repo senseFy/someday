@@ -1717,6 +1717,11 @@ class SettingsUiController(
             ManualSyncReason.RemoteHistoryConflict -> uiStrings.syncRemoteHistoryConflict
             ManualSyncReason.RetryRequired -> uiStrings.syncRetryRequired
             ManualSyncReason.Blocked -> uiStrings.syncBlocked
+            ManualSyncReason.MediaTransferPending -> uiStrings.syncMediaTransferPending
+            ManualSyncReason.MediaRateLimited -> uiStrings.syncMediaRateLimited
+            ManualSyncReason.MediaStorageFull -> uiStrings.syncMediaStorageFull
+            ManualSyncReason.MediaUnavailable -> uiStrings.syncMediaUnavailable
+            ManualSyncReason.MediaPublicationFailed -> uiStrings.syncMediaPublicationFailed
             ManualSyncReason.CheckpointInvalid -> uiStrings.syncCheckpointInvalid
             ManualSyncReason.Failed -> uiStrings.syncFailed
         }
@@ -1729,6 +1734,11 @@ class SettingsUiController(
             ManualSyncReason.CheckpointInvalid -> SyncIssueReason.CheckpointInvalid
             ManualSyncReason.RetryRequired -> SyncIssueReason.RetryRequired
             ManualSyncReason.Blocked -> SyncIssueReason.Blocked
+            ManualSyncReason.MediaTransferPending -> SyncIssueReason.MediaTransferPending
+            ManualSyncReason.MediaRateLimited -> SyncIssueReason.MediaRateLimited
+            ManualSyncReason.MediaStorageFull -> SyncIssueReason.MediaStorageFull
+            ManualSyncReason.MediaUnavailable -> SyncIssueReason.MediaUnavailable
+            ManualSyncReason.MediaPublicationFailed -> SyncIssueReason.MediaPublicationFailed
             ManualSyncReason.Disabled,
             ManualSyncReason.Unavailable,
             -> SyncIssueReason.SyncUnavailable
@@ -1755,6 +1765,11 @@ class SettingsUiController(
             SyncIssueReason.CheckpointInvalid -> uiStrings.syncCheckpointInvalid
             SyncIssueReason.RetryRequired -> uiStrings.syncRetryRequired
             SyncIssueReason.Blocked -> uiStrings.syncBlocked
+            SyncIssueReason.MediaTransferPending -> uiStrings.syncMediaTransferPending
+            SyncIssueReason.MediaRateLimited -> uiStrings.syncMediaRateLimited
+            SyncIssueReason.MediaStorageFull -> uiStrings.syncMediaStorageFull
+            SyncIssueReason.MediaUnavailable -> uiStrings.syncMediaUnavailable
+            SyncIssueReason.MediaPublicationFailed -> uiStrings.syncMediaPublicationFailed
             SyncIssueReason.SyncFailed -> uiStrings.syncFailed
             SyncIssueReason.WorkspaceSettingsReloadRequired -> uiStrings.pairingSettingsReloadFailed
         }
@@ -2056,6 +2071,11 @@ private fun syncIssueFromLastError(lastError: String?): SyncIssueUi? {
             ManualSyncReason.CheckpointInvalid.name -> SyncIssueReason.CheckpointInvalid
             ManualSyncReason.RetryRequired.name -> SyncIssueReason.RetryRequired
             ManualSyncReason.Blocked.name -> SyncIssueReason.Blocked
+            ManualSyncReason.MediaTransferPending.name -> SyncIssueReason.MediaTransferPending
+            ManualSyncReason.MediaRateLimited.name -> SyncIssueReason.MediaRateLimited
+            ManualSyncReason.MediaStorageFull.name -> SyncIssueReason.MediaStorageFull
+            ManualSyncReason.MediaUnavailable.name -> SyncIssueReason.MediaUnavailable
+            ManualSyncReason.MediaPublicationFailed.name -> SyncIssueReason.MediaPublicationFailed
             ManualSyncReason.Disabled.name,
             ManualSyncReason.Unavailable.name,
             -> SyncIssueReason.SyncUnavailable

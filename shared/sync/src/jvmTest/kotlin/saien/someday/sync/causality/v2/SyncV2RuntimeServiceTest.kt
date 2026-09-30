@@ -39,6 +39,50 @@ import kotlin.time.Instant
 
 class SyncV2RuntimeServiceTest {
     @Test
+    fun mediaPrerequisiteReasonsSurviveInitializationAndIncrementalSync() {
+        WorkspacePublicationFailureV2.entries.forEach { failure ->
+            val remote = InMemoryWorkspaceSyncRemoteV2(SyncRemoteProfileV2.SELF_HOSTED.wireValue)
+            withRuntimeFixture(remote, WRITER_A) { fixture ->
+                ensureWorkspaceLocalDraftV2(fixture.localRepository, fixture.settings, WORKSPACE_KEY)
+                fixture.notes(NOW).createNotebook("Pending publication")
+                val failedGate: (List<WorkspaceEntityVersionV2>) -> Unit = {
+                    if (failure == WorkspacePublicationFailureV2.UNKNOWN) error("token=must-not-leak /private/photo.jpg")
+                    throw WorkspacePublicationExceptionV2(failure)
+                }
+                val initial = fixture.runtime(beforeEntityPublication = failedGate).run()
+                assertFalse(initial.success)
+                assertEquals(failure.manualSyncReason, initial.reason)
+                assertEquals(failure.safeMessage, initial.diagnosticMessage)
+                assertTrue(fixture.runtime().run().success)
+
+                val context = WorkspaceSystemV2ContextProvider(
+                    fixture.localRepository, { WORKSPACE_KEY }, { WRITER_A }, { remote.remoteProfile },
+                ).requireActive()
+                val preferenceKey = WorkspaceEntityKeyV2(
+                    WorkspaceEntityTypeV2.WORKSPACE_PREFERENCES, WORKSPACE_PREFERENCES_ENTITY_ID_V2,
+                )
+                val parent = context.store.loadHeads(preferenceKey).single()
+                val child = context.factory.createContentChild(
+                    parent,
+                    (parent.contentPayload as WorkspacePreferencesV2).copy(previewByDefault = true),
+                    context.deviceActorId,
+                    NOW,
+                )
+                assertIs<WorkspaceLocalCommitResultV2.Committed>(context.store.commitLocalMutations(listOf(
+                    LocalWorkspaceMutationV2(remote.remoteProfile, context.factory.newMutationId(), child, NOW),
+                )))
+                val incremental = fixture.runtime(beforeEntityPublication = failedGate).run()
+                assertFalse(incremental.success)
+                assertEquals(failure.manualSyncReason, incremental.reason)
+                assertEquals(failure.safeMessage, incremental.diagnosticMessage)
+                assertEquals(1, context.store.loadPending(remote.remoteProfile).size)
+                assertTrue(fixture.runtime().run().success)
+                assertTrue(context.store.loadPending(remote.remoteProfile).isEmpty())
+            }
+        }
+    }
+
+    @Test
     fun dayOneDraftPublishesSameGenerationAndKeepsOfflineMutation() {
         val remote = InMemoryWorkspaceSyncRemoteV2(SyncRemoteProfileV2.SELF_HOSTED.wireValue)
         withRuntimeFixture(remote) { fixture ->
@@ -551,6 +595,7 @@ class SyncV2RuntimeServiceTest {
         fun runtime(
             clockValue: Instant = NOW,
             transportRemote: WorkspaceSyncRemoteV2 = remote,
+            beforeEntityPublication: (List<WorkspaceEntityVersionV2>) -> Unit = {},
         ): SyncV2RuntimeService = SyncV2RuntimeService(
             mode = SyncMode.SelfHosted,
             localRepository = localRepository,
@@ -560,7 +605,7 @@ class SyncV2RuntimeServiceTest {
             transportFactory = SyncRemoteTransportFactoryV2 { transportRemote },
             workspaceLifecycleCoordinator = workspaceLifecycleCoordinator,
             clock = { clockValue },
-            beforeEntityPublication = {},
+            beforeEntityPublication = beforeEntityPublication,
         )
 
         fun localDataTransfer(

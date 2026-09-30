@@ -220,11 +220,7 @@ class SyncV2RuntimeService(
             return failedInitialization(
                 diagnosticMessage =
                     summary.safeMessage ?: "Sync initialization stopped before local bootstrap completed.",
-                reason = if (summary.status == SyncCoordinatorStatusV2.BLOCKED) {
-                    ManualSyncReason.Blocked
-                } else {
-                    ManualSyncReason.Failed
-                },
+                reason = summary.manualSyncReason,
                 conflicts = summary.activeConflicts,
                 pushedObjects = pushedObjects,
                 pulledObjects = pulledObjects,
@@ -375,11 +371,7 @@ class SyncV2RuntimeService(
         } else {
             ManualSyncResult.failure(
                 mode = mode,
-                reason = if (summary.status == SyncCoordinatorStatusV2.BLOCKED) {
-                    ManualSyncReason.Blocked
-                } else {
-                    ManualSyncReason.Failed
-                },
+                reason = summary.manualSyncReason,
                 diagnosticMessage = summary.safeMessage ?: summary.safeErrorCode,
                 pushedObjects = summary.pushedObjects,
                 pulledObjects = summary.pulledObjects,
@@ -765,11 +757,20 @@ private sealed interface FirstEpochPublishAttemptV2 {
 }
 
 private val FirstEpochPublishAttemptV2.Failed.manualSyncReason: ManualSyncReason
-    get() = if (safeErrorCode == "workspace_recovery_required") {
-        ManualSyncReason.RemoteHistoryConflict
-    } else {
-        ManualSyncReason.Failed
-    }
+    get() = WorkspacePublicationFailureV2.fromCode(safeErrorCode)?.manualSyncReason
+        ?: if (safeErrorCode == "workspace_recovery_required") {
+            ManualSyncReason.RemoteHistoryConflict
+        } else {
+            ManualSyncReason.Failed
+        }
+
+private val WorkspaceSyncSummaryV2.manualSyncReason: ManualSyncReason
+    get() = WorkspacePublicationFailureV2.fromCode(safeErrorCode)?.manualSyncReason
+        ?: if (status == SyncCoordinatorStatusV2.BLOCKED) {
+            ManualSyncReason.Blocked
+        } else {
+            ManualSyncReason.Failed
+        }
 
 internal fun Throwable.safeRuntimeMessage(): String =
     (message ?: "System V3 sync setup failed safely.")

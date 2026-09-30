@@ -5426,6 +5426,11 @@ internal fun SyncIssueReason.localizedMessage(): String =
         SyncIssueReason.CheckpointInvalid -> stringResource(Res.string.settings_fb_sync_checkpoint_invalid)
         SyncIssueReason.RetryRequired -> stringResource(Res.string.settings_fb_sync_retry_required)
         SyncIssueReason.Blocked -> stringResource(Res.string.settings_fb_sync_blocked)
+        SyncIssueReason.MediaTransferPending -> stringResource(Res.string.settings_fb_sync_media_transfer_pending)
+        SyncIssueReason.MediaRateLimited -> stringResource(Res.string.settings_fb_sync_media_rate_limited)
+        SyncIssueReason.MediaStorageFull -> stringResource(Res.string.settings_fb_sync_media_storage_full)
+        SyncIssueReason.MediaUnavailable -> stringResource(Res.string.settings_fb_sync_media_unavailable)
+        SyncIssueReason.MediaPublicationFailed -> stringResource(Res.string.settings_fb_sync_media_publication_failed)
         SyncIssueReason.SyncFailed -> stringResource(Res.string.settings_fb_sync_failed)
         SyncIssueReason.WorkspaceSettingsReloadRequired ->
             stringResource(Res.string.settings_fb_pairing_settings_reload_failed)

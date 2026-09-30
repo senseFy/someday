@@ -10,12 +10,42 @@ import okio.Buffer
 import saien.someday.data.crypto.SodiumWorkspaceCrypto
 import saien.someday.domain.media.MAX_MEDIA_ASSET_ENCODED_BYTE_COUNT
 import saien.someday.domain.media.MediaAssetId
+import saien.someday.sync.causality.v2.WorkspacePublicationExceptionV2
+import saien.someday.sync.causality.v2.WorkspacePublicationFailureV2
 
 class SelfHostedMediaV3Test {
     private val crypto = SodiumWorkspaceCrypto()
     private val key = crypto.workspaceKeyFromBytes(ByteArray(32) { it.toByte() })
     private val cipher = SelfHostedMediaCipherV3(key, crypto)
     private val mediaId = MediaAssetId.fromCanonicalValue("0123456789abcdef".repeat(4))
+
+    @Test
+    fun uploadRejectionsRetainOnlyAllowlistedReasons() {
+        val errors = mapOf(
+            "media_quota_exceeded" to WorkspacePublicationFailureV2.STORAGE_FULL,
+            "immutable_media_mismatch" to WorkspacePublicationFailureV2.INTEGRITY,
+            "token=must-not-leak /private/photo.jpg" to WorkspacePublicationFailureV2.UNKNOWN,
+        )
+        errors.forEach { (error, expected) ->
+            val backing = InMemoryMediaTransportV3()
+            val transport = object : SelfHostedMediaTransportV3 by backing {
+                override fun putMediaObject(
+                    endpoint: String, accessToken: String, workspaceId: String, mediaId: String,
+                    prepared: SelfHostedPreparedMediaObjectV3, accountContext: SelfHostedAccountRequestContext,
+                ) = SelfHostedMediaPutResponseV3(false, error = error)
+            }
+            val failure = assertFailsWith<WorkspacePublicationExceptionV2> {
+                SelfHostedMediaServiceV3(transport, cipher).uploadSource(
+                    "https://sync.example", "token", WORKSPACE, mediaId, "image/png", 1, 1,
+                    1L, Buffer().writeByte(1), "photo.png",
+                )
+            }
+            assertEquals(expected, failure.failure)
+            assertEquals(expected.safeMessage, failure.message)
+            assertEquals(0, backing.puts)
+        }
+    }
+
 
     @Test
     fun frozenWireBoundMatchesTheClientAssetBound() {
@@ -170,7 +200,9 @@ internal class InMemoryMediaTransportV3 : SelfHostedMediaTransportV3 {
         ):
         SelfHostedMediaRemoteObjectV3 {
         gets++
-        return checkNotNull(objects[workspaceId to mediaId])
+        return objects[workspaceId to mediaId] ?: throw SelfHostedSyncHttpException(
+            404, "Media object is missing.", SelfHostedErrorCode.MEDIA_OBJECT_NOT_FOUND, true,
+        )
     }
 
     fun dropRemoteAsset(workspaceId: String, mediaId: String) {

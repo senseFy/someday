@@ -11,6 +11,7 @@ import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import okio.Buffer
@@ -35,8 +36,84 @@ import saien.someday.domain.settings.SelfHostedSessionCredentials
 import saien.someday.domain.settings.authorityBindingId
 import saien.someday.sync.AuthorityCoordinatedMediaAssetStore
 import saien.someday.sync.WorkspaceLifecycleCoordinator
+import saien.someday.sync.causality.v2.WorkspacePublicationExceptionV2
+import saien.someday.sync.causality.v2.WorkspacePublicationFailureV2
 
 class SystemV3MediaCoordinatorTest {
+    @Test
+    fun interruptedBatchRetainsCompletedProofAndResumesRemainingAssets() = withStore { fixture ->
+        val assets = (1..3).map { fixture.import(IMAGE_BYTES + it.toByte()) }.sortedBy { it.metadata.id.value }
+        val backing = InMemoryMediaTransportV3()
+        var interrupt = true
+        val transport = object : SelfHostedMediaTransportV3 by backing {
+            override fun putMediaObject(
+                endpoint: String, accessToken: String, workspaceId: String, mediaId: String,
+                prepared: SelfHostedPreparedMediaObjectV3, accountContext: SelfHostedAccountRequestContext,
+            ): SelfHostedMediaPutResponseV3 {
+                if (interrupt && mediaId == assets[1].metadata.id.value) {
+                    throw io.ktor.client.plugins.HttpRequestTimeoutException("https://private.example/token-secret", 60_000)
+                }
+                return backing.putMediaObject(endpoint, accessToken, workspaceId, mediaId, prepared, accountContext)
+            }
+        }
+        val coordinator = fixture.coordinator(transport)
+        val failure = assertFailsWith<WorkspacePublicationExceptionV2> {
+            coordinator.ensurePublished(assets.map { it.metadata.id }.toSet())
+        }
+        assertEquals(WorkspacePublicationFailureV2.TRANSFER_PENDING, failure.failure)
+        assertEquals(1, backing.puts)
+        assertNotNull(fixture.store.getAsset(assets[0].metadata.id)?.publishedObjectDigest)
+        assets.drop(1).forEach { assertNull(fixture.store.getAsset(it.metadata.id)?.publishedObjectDigest) }
+
+        interrupt = false
+        coordinator.ensurePublished(assets.map { it.metadata.id }.toSet())
+        assertEquals(3, backing.puts)
+        assets.forEach { assertNotNull(fixture.store.getAsset(it.metadata.id)?.publishedObjectDigest) }
+    }
+
+    @Test
+    fun missingConfirmationAfterPutIsRetryableAndDoesNotCommitProof() = withStore { fixture ->
+        val asset = fixture.import(IMAGE_BYTES)
+        val backing = InMemoryMediaTransportV3()
+        var hideConfirmation = true
+        val transport = object : SelfHostedMediaTransportV3 by backing {
+            override fun headMediaObject(
+                endpoint: String, accessToken: String, workspaceId: String, mediaId: String,
+                accountContext: SelfHostedAccountRequestContext,
+            ): SelfHostedMediaRemoteHeadV3? = if (hideConfirmation) null else
+                backing.headMediaObject(endpoint, accessToken, workspaceId, mediaId, accountContext)
+        }
+        val coordinator = fixture.coordinator(transport)
+        val failure = assertFailsWith<WorkspacePublicationExceptionV2> {
+            coordinator.ensurePublished(setOf(asset.metadata.id))
+        }
+        assertEquals(WorkspacePublicationFailureV2.TRANSFER_PENDING, failure.failure)
+        assertEquals(1, backing.puts)
+        assertNull(fixture.store.getAsset(asset.metadata.id)?.publishedObjectDigest)
+
+        hideConfirmation = false
+        coordinator.ensurePublished(setOf(asset.metadata.id))
+        assertNotNull(fixture.store.getAsset(asset.metadata.id)?.publishedObjectDigest)
+        assertEquals(1, backing.puts)
+    }
+
+    @Test
+    fun missingOriginalAndCorruptLocalOriginalHaveSafeUnavailableReasons() = withStore { fixture ->
+        val transport = InMemoryMediaTransportV3()
+        val missing = assertFailsWith<WorkspacePublicationExceptionV2> {
+            fixture.coordinator(transport).ensurePublished(setOf(MediaAssetId.fromCanonicalValue("a".repeat(64))))
+        }
+        assertEquals(WorkspacePublicationFailureV2.MISSING, missing.failure)
+        val asset = fixture.import(IMAGE_BYTES)
+        fixture.overwriteObject(asset.contentSha256, ByteArray(IMAGE_BYTES.size))
+        val corrupt = assertFailsWith<WorkspacePublicationExceptionV2> {
+            fixture.coordinator(transport).ensurePublished(setOf(asset.metadata.id))
+        }
+        assertEquals(WorkspacePublicationFailureV2.INTEGRITY, corrupt.failure)
+        assertEquals(0, transport.puts)
+        assertNull(fixture.store.getAsset(asset.metadata.id)?.publishedObjectDigest)
+    }
+
     @Test
     fun incarnationFailureFromGetNeverFallsThroughToPublishLocalBytes() = withStore { fixture ->
         val imported = fixture.import(IMAGE_BYTES)

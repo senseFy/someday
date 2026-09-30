@@ -566,7 +566,8 @@ internal fun runSystemV3OrderedSync(
 ): ManualSyncResult {
     try {
         mediaCoordinator.verifyActiveAuthorityBinding()
-    } catch (_: Exception) {
+    } catch (failure: Exception) {
+        if (failure is kotlinx.coroutines.CancellationException) throw failure
         return ManualSyncResult.failure(
             mode = SyncMode.SelfHosted,
             reason = ManualSyncReason.AuthorityMismatch,

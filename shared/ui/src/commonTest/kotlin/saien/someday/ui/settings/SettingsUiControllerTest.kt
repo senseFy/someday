@@ -759,6 +759,72 @@ class SettingsUiControllerTest {
     }
 
     @Test
+    fun mediaFailuresSurviveRestartAndRetryWithTheExistingConnection() = runBlocking {
+        val strings = SettingsUiStrings(
+            syncMediaTransferPending = "localized-media-transfer-pending",
+            syncMediaRateLimited = "localized-media-rate-limited",
+            syncMediaStorageFull = "localized-media-storage-full",
+            syncMediaUnavailable = "localized-media-unavailable",
+            syncMediaPublicationFailed = "localized-media-publication-failed",
+        )
+        val cases = listOf(
+            Triple(ManualSyncReason.MediaTransferPending, SyncIssueReason.MediaTransferPending, strings.syncMediaTransferPending),
+            Triple(ManualSyncReason.MediaRateLimited, SyncIssueReason.MediaRateLimited, strings.syncMediaRateLimited),
+            Triple(ManualSyncReason.MediaStorageFull, SyncIssueReason.MediaStorageFull, strings.syncMediaStorageFull),
+            Triple(ManualSyncReason.MediaUnavailable, SyncIssueReason.MediaUnavailable, strings.syncMediaUnavailable),
+            Triple(ManualSyncReason.MediaPublicationFailed, SyncIssueReason.MediaPublicationFailed, strings.syncMediaPublicationFailed),
+        )
+        for ((reason, issue, message) in cases) {
+            val original = connectedSettings()
+            var persisted = original
+            val controller = SettingsUiController(
+                loadSettings = { persisted },
+                initialSettings = persisted,
+                persistSettings = { updated -> updated.also { persisted = it } },
+                manualSyncRunner = {
+                    ManualSyncResult.failure(
+                        SyncMode.SelfHosted, reason, diagnosticMessage = "must-not-leak-media-diagnostic",
+                    )
+                },
+                uiStrings = strings,
+                backgroundDispatcher = Dispatchers.Unconfined,
+            )
+
+            assertFalse(controller.runUserSync(), reason.name)
+            assertEquals(issue, controller.state.sync.issue?.reason)
+            assertEquals(message, controller.state.feedbackMessage)
+            assertEquals(SyncIssueAction.RetrySync, controller.state.sync.issue?.action)
+            assertEquals("sync:${reason.name}", persisted.syncConfiguration.lastError)
+
+            var retryCalls = 0
+            val restarted = SettingsUiController(
+                loadSettings = { persisted },
+                initialSettings = persisted,
+                persistSettings = { updated -> updated.also { persisted = it } },
+                selfHostedSessionCredentialStore = FakeSelfHostedSessionCredentialStore(testCredentials()),
+                manualSyncRunner = {
+                    retryCalls += 1
+                    ManualSyncResult.success(SyncMode.SelfHosted, 1, 0, 0)
+                },
+                uiStrings = strings,
+                backgroundDispatcher = Dispatchers.Unconfined,
+            )
+            restarted.refresh()
+
+            assertEquals(issue, restarted.state.sync.issue?.reason)
+            assertEquals(SyncIssueAction.RetrySync, restarted.state.sync.issue?.action)
+            assertEquals(SyncAccountFormMode.BoundSession, restarted.state.sync.accountFormMode())
+            assertTrue(restarted.recoverSyncIssue(), reason.name)
+            assertEquals(1, retryCalls)
+            assertNull(restarted.state.sync.issue)
+            assertNull(persisted.syncConfiguration.lastError)
+            assertEquals(original.activeDeviceId, persisted.activeDeviceId)
+            assertEquals(original.syncConfiguration.selfHostedSession, persisted.syncConfiguration.selfHostedSession)
+            assertEquals(original.syncConfiguration.selfHostedEndpoint, persisted.syncConfiguration.selfHostedEndpoint)
+        }
+    }
+
+    @Test
     fun alreadyRunningIsTransientAndPreservesTheExistingRecoveryIssue() = runBlocking {
         var persistenceCalls = 0
         val controller = SettingsUiController(

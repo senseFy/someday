@@ -12,6 +12,8 @@ import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import saien.someday.domain.settings.INITIAL_ACCOUNT_INCARNATION
+import saien.someday.sync.causality.v2.WorkspacePublicationExceptionV2
+import saien.someday.sync.causality.v2.WorkspacePublicationFailureV2
 
 /** The same wire assertions run through the actual Ktor and JDK network stacks. */
 class SelfHostedAccountTransportTest {
@@ -39,6 +41,30 @@ class SelfHostedAccountTransportTest {
         assertFalse(f.putMedia().stored)
         f.respond(409, """{"error":"workspace_incarnation_retired"}""")
         assertEquals(SelfHostedProtocolFailureReason.MISSING_ERROR_HEADER, assertFailsWith<SelfHostedProtocolException> { f.putMedia() }.reason)
+    }
+
+    @Test fun mediaRequestFailuresRemainRetryableAcrossRealHttpTransports() = transports { f ->
+        val cases = listOf(
+            Triple(429, "rate_limited", WorkspacePublicationFailureV2.RATE_LIMITED),
+            Triple(503, "account_busy", WorkspacePublicationFailureV2.TRANSFER_PENDING),
+        )
+        for ((status, error, expected) in cases) {
+            f.respond(status, """{"error":"$error"}""", error = error)
+            val failure = assertFailsWith<WorkspacePublicationExceptionV2> {
+                mediaPublicationRequest { f.putMedia() }
+            }
+            assertEquals(expected, failure.failure)
+            assertNull(failure.cause)
+            assertFalse(failure.toString().contains("access-secret"))
+
+            f.respond(201, """{"stored":true}""")
+            assertTrue(mediaPublicationRequest { f.putMedia() }.stored)
+        }
+        f.respond(409, """{"error":"workspace_incarnation_retired"}""", error = "workspace_incarnation_retired")
+        val accountFailure = assertFailsWith<SelfHostedSyncHttpException> {
+            mediaPublicationRequest { f.putMedia() }
+        }
+        assertEquals(SelfHostedErrorCode.WORKSPACE_INCARNATION_RETIRED, accountFailure.errorCode)
     }
 
     @Test fun resetReplayUsesItsPersistedExpectedIncarnationAndChecksReceiptIdentity() = transports { f ->

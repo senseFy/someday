@@ -382,6 +382,11 @@
     <string name="settings_fb_sync_already_running">同期はすでに進行中です。</string>
     <string name="settings_fb_sync_authority_mismatch">サインイン中のアカウントまたはデバイスがこのワークスペースと一致しません。</string>
     <string name="settings_fb_sync_blocked">ワークスペースの問題が解決されるまで同期はブロックされます。</string>
+    <string name="settings_fb_sync_media_transfer_pending">画像の同期が完了していません。この端末のデータは保持されています。接続を確認して再試行してください。</string>
+    <string name="settings_fb_sync_media_rate_limited">リクエストが多すぎます。しばらく待ってから画像の同期を再試行してください。</string>
+    <string name="settings_fb_sync_media_storage_full">メディアの保存容量が不足しています。サーバー管理者に容量の追加を依頼してから再試行してください。</string>
+    <string name="settings_fb_sync_media_unavailable">画像が見つからないか、検証に失敗しました。この端末のデータを保持し、元の画像を確認してください。</string>
+    <string name="settings_fb_sync_media_publication_failed">画像の同期が完了していません。再試行しても失敗する場合は、サーバーの保守担当者に連絡してください。</string>
     <string name="settings_fb_sync_checkpoint_invalid">このデバイスの同期チェックポイントは無効です。ワークスペースを修復する前にローカルデータをエクスポートしてください。</string>
     <string name="settings_fb_sync_completed">同期が完了しました。</string>
     <string name="settings_fb_sync_configuration_changed">同期設定が変更されました。セルフホストアカウントを確認して再試行してください。</string>

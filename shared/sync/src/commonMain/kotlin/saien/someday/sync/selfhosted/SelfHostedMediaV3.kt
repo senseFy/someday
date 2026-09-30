@@ -1,5 +1,6 @@
 package saien.someday.sync.selfhosted
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
@@ -17,6 +18,8 @@ import saien.someday.domain.media.MAX_MEDIA_ASSET_PIXEL_COUNT
 import saien.someday.domain.media.MediaAssetId
 import saien.someday.domain.media.isSafeOriginalFileName
 import saien.someday.sync.StrictJsonV2
+import saien.someday.sync.causality.v2.WorkspacePublicationExceptionV2
+import saien.someday.sync.causality.v2.WorkspacePublicationFailureV2
 
 const val SYSTEM_V3_CONTRACT_ID: String = "someday-system-v3"
 const val SYSTEM_V3_MEDIA_CONTRACT_ID: String = "someday-system-v3-media-v1"
@@ -393,27 +396,37 @@ class SelfHostedMediaServiceV3(
             originalFileName,
         )
         beforeRequest()
-        transport.systemV3Capabilities(endpoint, accessToken, accountContext).also(SelfHostedSystemV3CapabilitiesResponse::validate)
+        mediaPublicationRequest { transport.systemV3Capabilities(endpoint, accessToken, accountContext) }
+            .also(SelfHostedSystemV3CapabilitiesResponse::validate)
         beforeRequest()
-        val existing = transport.headMediaObject(endpoint, accessToken, workspaceId, mediaId.value, accountContext)
+        val existing = mediaPublicationRequest {
+            transport.headMediaObject(endpoint, accessToken, workspaceId, mediaId.value, accountContext)
+        }
         if (existing != null) {
-            require(existing.ciphertextBytes == prepared.encryptedBytes.size &&
-                existing.ciphertextSha256 == prepared.encryptedSha256
-            ) { "Existing immutable media object differs from the deterministic local ciphertext." }
+            if (existing.ciphertextBytes != prepared.encryptedBytes.size ||
+                existing.ciphertextSha256 != prepared.encryptedSha256
+            ) throw WorkspacePublicationExceptionV2(WorkspacePublicationFailureV2.INTEGRITY)
             return SelfHostedMediaSourceUploadResultV3(
                 prepared.encryptedSha256,
                 SelfHostedMediaUploadSummaryV3(uploadedObjects = 0, reusedObjects = 1),
             )
         }
         beforeRequest()
-        val result = transport.putMediaObject(endpoint, accessToken, workspaceId, mediaId.value, prepared, accountContext)
-        require(result.stored) { result.error ?: "Media object upload was rejected." }
+        val result = mediaPublicationRequest {
+            transport.putMediaObject(endpoint, accessToken, workspaceId, mediaId.value, prepared, accountContext)
+        }
+        if (!result.stored) throw WorkspacePublicationExceptionV2(when (result.error) {
+            "media_quota_exceeded" -> WorkspacePublicationFailureV2.STORAGE_FULL
+            "immutable_media_mismatch" -> WorkspacePublicationFailureV2.INTEGRITY
+            else -> WorkspacePublicationFailureV2.UNKNOWN
+        })
         beforeRequest()
-        val confirmed = transport.headMediaObject(endpoint, accessToken, workspaceId, mediaId.value, accountContext)
-            ?: error("Uploaded media object is not remotely reachable.")
-        require(confirmed.ciphertextBytes == prepared.encryptedBytes.size &&
-            confirmed.ciphertextSha256 == prepared.encryptedSha256
-        ) { "Uploaded immutable media object does not match the deterministic ciphertext." }
+        val confirmed = mediaPublicationRequest {
+            transport.headMediaObject(endpoint, accessToken, workspaceId, mediaId.value, accountContext)
+        } ?: throw WorkspacePublicationExceptionV2(WorkspacePublicationFailureV2.TRANSFER_PENDING)
+        if (confirmed.ciphertextBytes != prepared.encryptedBytes.size ||
+            confirmed.ciphertextSha256 != prepared.encryptedSha256
+        ) throw WorkspacePublicationExceptionV2(WorkspacePublicationFailureV2.INTEGRITY)
         return SelfHostedMediaSourceUploadResultV3(
             prepared.encryptedSha256,
             SelfHostedMediaUploadSummaryV3(
@@ -431,9 +444,12 @@ class SelfHostedMediaServiceV3(
     ): SelfHostedMediaRemoteHeadV3? {
         requireSystemV3WorkspaceId(workspaceId)
         beforeRequest()
-        transport.systemV3Capabilities(endpoint, accessToken, accountContext).also(SelfHostedSystemV3CapabilitiesResponse::validate)
+        mediaPublicationRequest { transport.systemV3Capabilities(endpoint, accessToken, accountContext) }
+            .also(SelfHostedSystemV3CapabilitiesResponse::validate)
         beforeRequest()
-        return transport.headMediaObject(endpoint, accessToken, workspaceId, mediaId.value, accountContext)
+        return mediaPublicationRequest {
+            transport.headMediaObject(endpoint, accessToken, workspaceId, mediaId.value, accountContext)
+        }
     }
 
     fun fetchObject(
@@ -444,11 +460,19 @@ class SelfHostedMediaServiceV3(
     ): SelfHostedDecryptedMediaObjectV3 {
         requireSystemV3WorkspaceId(workspaceId)
         beforeRequest()
-        transport.systemV3Capabilities(endpoint, accessToken, accountContext).also(SelfHostedSystemV3CapabilitiesResponse::validate)
+        mediaPublicationRequest { transport.systemV3Capabilities(endpoint, accessToken, accountContext) }
+            .also(SelfHostedSystemV3CapabilitiesResponse::validate)
         beforeRequest()
-        val remote = transport.getMediaObject(endpoint, accessToken, workspaceId, mediaId.value, accountContext)
-        return cipher.decrypt(workspaceId, mediaId, remote.bytes).getOrThrow().also {
-            require(it.encryptedSha256 == remote.ciphertextSha256)
+        val remote = mediaPublicationRequest {
+            transport.getMediaObject(endpoint, accessToken, workspaceId, mediaId.value, accountContext)
+        }
+        return cipher.decrypt(workspaceId, mediaId, remote.bytes).getOrElse {
+            if (it is CancellationException) throw it
+            throw WorkspacePublicationExceptionV2(WorkspacePublicationFailureV2.INTEGRITY)
+        }.also {
+            if (it.encryptedSha256 != remote.ciphertextSha256) {
+                throw WorkspacePublicationExceptionV2(WorkspacePublicationFailureV2.INTEGRITY)
+            }
         }
     }
 }

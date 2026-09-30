@@ -1,12 +1,15 @@
 package saien.someday.sync.selfhosted
 
+import kotlinx.coroutines.CancellationException
 import okio.Buffer
 import saien.someday.data.crypto.WorkspaceMasterKey
 import saien.someday.data.media.LocalMediaAsset
 import saien.someday.data.media.LocalMediaAssetStore
 import saien.someday.data.media.MediaAssetIdentityConflictException
 import saien.someday.data.media.MediaAssetImportRequest
+import saien.someday.data.media.MediaAssetInspectionException
 import saien.someday.data.media.MediaAssetIntegrityException
+import saien.someday.data.media.MediaAssetNotFoundException
 import saien.someday.data.media.MediaAssetVerificationResult
 import saien.someday.domain.media.MediaAssetId
 import saien.someday.domain.settings.SelfHostedSessionCredentialStore
@@ -14,6 +17,8 @@ import saien.someday.domain.settings.SelfHostedSessionCredentials
 import saien.someday.domain.settings.authorityBindingId
 import saien.someday.sync.AuthorityCoordinatedMediaAssetStore
 import saien.someday.sync.WorkspaceLifecycleCoordinator
+import saien.someday.sync.causality.v2.WorkspacePublicationExceptionV2
+import saien.someday.sync.causality.v2.WorkspacePublicationFailureV2
 
 data class SystemV3MediaPublicationSummary(
     val publishedAssets: Int,
@@ -77,7 +82,19 @@ class SystemV3MediaCoordinator(
     internal fun ensurePublishedWithinWorkspaceLifecycle(assetIds: Set<MediaAssetId>) {
         if (assetIds.isEmpty()) return
         val connection = connectedService()
-        assetIds.sortedBy { it.value }.forEach { ensurePublished(it, connection) }
+        try {
+            assetIds.sortedBy { it.value }.forEach { ensurePublished(it, connection) }
+        } catch (failure: Exception) {
+            // Keep the existing account guard informed before reducing errors to safe publication categories.
+            if (failure is CancellationException) throw failure
+            activeWorkspaceSessionGuard.recordAccountFailure(connection.credentials, failure)
+            when (failure) {
+                is MediaAssetNotFoundException -> throw WorkspacePublicationExceptionV2(WorkspacePublicationFailureV2.MISSING)
+                is MediaAssetIntegrityException, is MediaAssetIdentityConflictException, is MediaAssetInspectionException ->
+                    throw WorkspacePublicationExceptionV2(WorkspacePublicationFailureV2.INTEGRITY)
+                else -> throw failure
+            }
+        }
     }
 
     fun materialize(assetId: MediaAssetId): SystemV3MediaMaterialization =
@@ -115,8 +132,8 @@ class SystemV3MediaCoordinator(
                 assetId,
             )
             if (head != null) {
-                require(head.ciphertextSha256 == local.publishedObjectDigest) {
-                    "The immutable remote media object differs from local publication proof."
+                if (head.ciphertextSha256 != local.publishedObjectDigest) {
+                    throw WorkspacePublicationExceptionV2(WorkspacePublicationFailureV2.INTEGRITY)
                 }
                 return
             }
@@ -152,12 +169,12 @@ class SystemV3MediaCoordinator(
             return
         }
         val failure = checkNotNull(fetched.exceptionOrNull())
+        if (failure is CancellationException) throw failure
         if (activeWorkspaceSessionGuard.recordAccountFailure(connection.credentials, failure) ||
-            failure is SelfHostedProtocolException ||
-            failure is saien.someday.data.account.AccountNetworkBlockedException ||
-            (failure is SelfHostedSyncHttpException && failure.status != 404)
+            failure !is SelfHostedSyncHttpException || failure.status != 404
         ) throw failure
-        val verified = local?.let(::requireVerifiedLocal) ?: throw failure
+        val verified = local?.let(::requireVerifiedLocal)
+            ?: throw WorkspacePublicationExceptionV2(WorkspacePublicationFailureV2.MISSING)
         publishLocalAsset(verified, connection)
     }
 
@@ -289,7 +306,7 @@ class SystemV3MediaCoordinator(
         when (val verification = localStore.verifyAsset(asset.metadata.id)) {
             is MediaAssetVerificationResult.Verified -> verification.asset
             is MediaAssetVerificationResult.Missing ->
-                throw MediaAssetIntegrityException("A referenced media asset file is missing.")
+                throw WorkspacePublicationExceptionV2(WorkspacePublicationFailureV2.MISSING)
             is MediaAssetVerificationResult.Corrupt ->
                 throw MediaAssetIntegrityException("A referenced media asset file is corrupt.")
         }

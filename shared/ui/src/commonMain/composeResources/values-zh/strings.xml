@@ -382,6 +382,11 @@
     <string name="settings_fb_sync_already_running">已有同步正在进行。</string>
     <string name="settings_fb_sync_authority_mismatch">登录的账户或设备与此工作区不匹配。</string>
     <string name="settings_fb_sync_blocked">同步已阻塞，请先解决工作区问题。</string>
+    <string name="settings_fb_sync_media_transfer_pending">图片同步尚未完成，本机内容已保留。请检查网络后重试。</string>
+    <string name="settings_fb_sync_media_rate_limited">请求过于频繁，请稍后重试图片同步。</string>
+    <string name="settings_fb_sync_media_storage_full">媒体存储空间不足。请联系服务器管理员增加额度后重试。</string>
+    <string name="settings_fb_sync_media_unavailable">图片缺失或未通过校验。请保留本机数据并检查原图。</string>
+    <string name="settings_fb_sync_media_publication_failed">图片同步尚未完成，请重试；若持续失败，请联系服务维护者。</string>
     <string name="settings_fb_sync_checkpoint_invalid">此设备的同步检查点无效。修复工作区前，请先导出本地数据。</string>
     <string name="settings_fb_sync_completed">同步完成。</string>
     <string name="settings_fb_sync_configuration_changed">同步设置已更改。请检查自建服务账户后重试。</string>

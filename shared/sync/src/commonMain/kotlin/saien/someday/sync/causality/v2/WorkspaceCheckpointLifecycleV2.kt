@@ -11,6 +11,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import saien.someday.data.crypto.WorkspaceMasterKey
 import saien.someday.data.local.SqlDelightLocalDataRepository
+import kotlin.time.Clock
 import kotlin.time.Instant
 
 data class WorkspaceCheckpointSourceHeadV2(
@@ -783,6 +784,7 @@ class WorkspaceCheckpointPublisherV2(
     }
 
     fun publish(prepared: PreparedWorkspaceEpochCheckpointV2): WorkspaceCheckpointPublishResultV2 {
+        val started = Clock.System.now()
         val descriptor = prepared.descriptor
         if (remote.remoteProfile != prepared.remoteProfile) {
             return WorkspaceCheckpointPublishResultV2.Rejected("remote_profile_mismatch", "Checkpoint targets another remote profile.")
@@ -790,9 +792,22 @@ class WorkspaceCheckpointPublisherV2(
         runCatching {
             beforeEntityPublication(prepared.entities.map { it.version })
         }.getOrElse {
+            val failure = it.publicationFailureV2()
+            localMutationBarrier {
+                val run = protocolStore.startRun(remote.remoteProfile, descriptor.syncEpochId, started)
+                protocolStore.finishRun(
+                    run.runId,
+                    if (failure.retryable) SyncRunStatusV2.FAILED else SyncRunStatusV2.BLOCKED,
+                    SyncRunCountersV2(),
+                    Clock.System.now(),
+                    descriptor.syncEpochId,
+                    failure.safeCode,
+                    failure.safeMessage,
+                )
+            }
             return WorkspaceCheckpointPublishResultV2.Rejected(
-                "entity_publication_prerequisite_failed",
-                "A referenced media asset is not fully published for this workspace authority.",
+                failure.safeCode,
+                failure.safeMessage,
             )
         }
         when (val chunkResult = publishChunks(descriptor, prepared.chunks)) {

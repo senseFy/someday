@@ -2,14 +2,15 @@
 
 package saien.someday.sync.causality.v2
 
+import kotlinx.coroutines.CancellationException
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
 import saien.someday.data.crypto.WorkspaceMasterKey
 import saien.someday.data.local.SqlDelightLocalDataRepository
 import saien.someday.sync.WorkspaceLifecycleCoordinator
 import kotlin.time.Clock
 import kotlin.time.Instant
-import kotlinx.serialization.Serializable
-import kotlinx.serialization.encodeToString
-import kotlinx.serialization.json.Json
 
 enum class SyncCoordinatorStatusV2 {
     SUCCESS,
@@ -369,6 +370,22 @@ class WorkspaceSyncCoordinatorV2(
             ) }
             counts.summary(SyncCoordinatorStatusV2.SUCCESS, remote.remoteProfile, descriptor.syncEpochId)
         } catch (failure: Exception) {
+            if (failure is CancellationException) {
+                try {
+                    localMutation { protocolStore.finishRun(
+                        run.runId,
+                        SyncRunStatusV2.FAILED,
+                        counts.toStored(),
+                        clock(),
+                        epochId = protocolStore.loadActiveEpoch(remote.remoteProfile)?.descriptor?.syncEpochId,
+                        safeErrorCode = "sync_cancelled",
+                        safeErrorMessage = "Sync was cancelled.",
+                    ) }
+                } catch (_: Exception) {
+                    // Diagnostic persistence must not replace the original cancellation.
+                }
+                throw failure
+            }
             val message = (failure.message ?: "Workspace sync failed safely.").safeSyncMessageV2()
             localMutation { protocolStore.finishRun(
                 run.runId,
@@ -817,8 +834,8 @@ class WorkspaceSyncCoordinatorV2(
                 if (publications.isEmpty()) return@publicationBatch
                 val batch = publications.map { it.pending }
                 runCatching { beforeEntityPublication(publications.map { it.version }) }.getOrElse {
-                    return "entity_publication_prerequisite_failed" to
-                        "A referenced media asset is not fully published for this workspace authority."
+                    val failure = it.publicationFailureV2()
+                    return failure.safeCode to failure.safeMessage
                 }
                 val objects = batch.map { pendingValue ->
                     epoch.cipher.decodeJson(pendingValue.encodedOuter).getOrElse {
@@ -962,6 +979,7 @@ class WorkspaceSyncCoordinatorV2(
         message: String,
     ): WorkspaceSyncSummaryV2 {
         val safe = message.safeSyncMessageV2()
+        val retryable = WorkspacePublicationFailureV2.fromCode(code)?.retryable == true
         epochId?.let { id ->
             runCatching {
                 val descriptor = protocolStore.loadEpoch(remote.remoteProfile, id)?.descriptor
@@ -975,14 +993,17 @@ class WorkspaceSyncCoordinatorV2(
         }
         localMutation { protocolStore.finishRun(
             runId,
-            SyncRunStatusV2.BLOCKED,
+            if (retryable) SyncRunStatusV2.FAILED else SyncRunStatusV2.BLOCKED,
             counts.toStored(),
             clock(),
             epochId = epochId,
             safeErrorCode = code,
             safeErrorMessage = safe,
         ) }
-        return counts.summary(SyncCoordinatorStatusV2.BLOCKED, remote.remoteProfile, epochId, code, safe)
+        return counts.summary(
+            if (retryable) SyncCoordinatorStatusV2.FAILED else SyncCoordinatorStatusV2.BLOCKED,
+            remote.remoteProfile, epochId, code, safe,
+        )
     }
 
     private companion object {

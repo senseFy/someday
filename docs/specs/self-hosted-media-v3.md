@@ -135,6 +135,14 @@ The proof is valid only for that exact account and workspace. Before an entity
 batch or checkpoint is published, every referenced media ID must have a
 verified remote object or a verified local original that can be uploaded.
 
+Publication failures preserve completed media proofs and unacknowledged entity
+outbox entries. Transport interruptions, timeouts, server failures and rate limits
+are retryable failures; missing originals, integrity mismatches and an explicit
+quota rejection require distinct guidance. Both incremental and checkpoint
+publication record fixed, content-free diagnostic codes; unknown failures retain
+`entity_publication_prerequisite_failed`. They do not mark a healthy epoch as
+permanently blocked. Cancellation propagates without becoming a media failure.
+
 Downloads authenticate and decrypt the envelope, compare every declared
 identity field, validate the original image format and bounds, and only then
 atomically promote bytes into app-private storage.

@@ -594,6 +594,11 @@ enum class ManualSyncReason {
     RemoteHistoryConflict,
     CheckpointInvalid,
     RetryRequired,
+    MediaTransferPending,
+    MediaRateLimited,
+    MediaStorageFull,
+    MediaUnavailable,
+    MediaPublicationFailed,
     Blocked,
     Failed,
 }

@@ -9,6 +9,7 @@ import saien.someday.data.local.db.SomedayDatabase
 import saien.someday.data.settings.SqlDelightClientSettingsRepository
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -47,6 +48,38 @@ class WorkspaceCheckpointPublisherV2Test {
             assertTrue(inspectedVersions > 0)
             assertNull(remote.loadEpochPointer())
             assertTrue(!remote.hasCheckpointDraftForTest(prepared.checkpoint.descriptor.syncEpochId))
+            val protocolStore = SqlDelightSyncProtocolStoreV2(local.database)
+            WorkspacePublicationFailureV2.entries.forEach { failure ->
+                val interrupted = assertIs<WorkspaceCheckpointPublishResultV2.Rejected>(
+                    WorkspaceCheckpointPublisherV2(
+                        local, remote,
+                        beforeEntityPublication = { throw WorkspacePublicationExceptionV2(failure) },
+                    ).publish(prepared.checkpoint),
+                )
+                assertEquals(failure.safeCode, interrupted.safeErrorCode)
+                assertEquals(failure.safeMessage, interrupted.safeMessage)
+                val recorded = protocolStore.loadRuns(remote.remoteProfile).first { it.safeErrorCode == failure.safeCode }
+                assertEquals(
+                    if (failure.retryable) SyncRunStatusV2.FAILED else SyncRunStatusV2.BLOCKED,
+                    recorded.status,
+                )
+                assertEquals(failure.safeMessage, recorded.safeErrorMessage)
+                assertEquals(
+                    SyncEpochHealthV2.HEALTHY,
+                    protocolStore.loadEpoch(remote.remoteProfile, prepared.checkpoint.descriptor.syncEpochId)?.health,
+                )
+                assertNull(remote.loadEpochPointer())
+                assertTrue(!remote.hasCheckpointDraftForTest(prepared.checkpoint.descriptor.syncEpochId))
+            }
+            assertFailsWith<kotlinx.coroutines.CancellationException> {
+                WorkspaceCheckpointPublisherV2(
+                    local, remote,
+                    beforeEntityPublication = { throw kotlinx.coroutines.CancellationException("cancelled") },
+                ).publish(prepared.checkpoint)
+            }
+            assertIs<WorkspaceCheckpointPublishResultV2.Published>(
+                WorkspaceCheckpointPublisherV2(local, remote, {}).publish(prepared.checkpoint),
+            )
         }
 
     private fun withFixture(

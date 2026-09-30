@@ -382,6 +382,11 @@
     <string name="settings_fb_sync_already_running">A sync is already in progress.</string>
     <string name="settings_fb_sync_authority_mismatch">The signed-in account or device does not match this workspace.</string>
     <string name="settings_fb_sync_blocked">Sync is blocked until the workspace issue is resolved.</string>
+    <string name="settings_fb_sync_media_transfer_pending">Image sync is incomplete. Local content is preserved. Check your connection and try again.</string>
+    <string name="settings_fb_sync_media_rate_limited">Too many requests. Wait a moment, then retry image sync.</string>
+    <string name="settings_fb_sync_media_storage_full">Media storage is full. Ask the server administrator to increase the quota, then retry.</string>
+    <string name="settings_fb_sync_media_unavailable">An image is missing or failed verification. Keep this device’s data and check the original images.</string>
+    <string name="settings_fb_sync_media_publication_failed">Image sync is incomplete. Try again; if it keeps failing, contact the server maintainer.</string>
     <string name="settings_fb_sync_checkpoint_invalid">This device's sync checkpoint is invalid. Export local data before repairing the workspace.</string>
     <string name="settings_fb_sync_completed">Sync complete.</string>
     <string name="settings_fb_sync_configuration_changed">Sync settings changed. Review the self-hosted account and try again.</string>

@@ -382,6 +382,11 @@
     <string name="settings_fb_sync_already_running">동기화가 이미 진행 중입니다.</string>
     <string name="settings_fb_sync_authority_mismatch">로그인한 계정 또는 기기가 이 작업 공간과 일치하지 않습니다.</string>
     <string name="settings_fb_sync_blocked">작업 공간 문제가 해결될 때까지 동기화가 차단됩니다.</string>
+    <string name="settings_fb_sync_media_transfer_pending">이미지 동기화가 완료되지 않았습니다. 이 기기의 데이터는 보존되어 있습니다. 네트워크를 확인한 후 다시 시도하세요.</string>
+    <string name="settings_fb_sync_media_rate_limited">요청이 너무 많습니다. 잠시 후 이미지 동기화를 다시 시도하세요.</string>
+    <string name="settings_fb_sync_media_storage_full">미디어 저장 공간이 부족합니다. 서버 관리자에게 용량 증설을 요청한 후 다시 시도하세요.</string>
+    <string name="settings_fb_sync_media_unavailable">이미지가 없거나 검증에 실패했습니다. 이 기기의 데이터를 보존하고 원본 이미지를 확인하세요.</string>
+    <string name="settings_fb_sync_media_publication_failed">이미지 동기화가 완료되지 않았습니다. 다시 시도하고, 계속 실패하면 서버 유지관리 담당자에게 문의하세요.</string>
     <string name="settings_fb_sync_checkpoint_invalid">이 기기의 동기화 체크포인트가 유효하지 않습니다. 작업 공간을 복구하기 전에 로컬 데이터를 내보내세요.</string>
     <string name="settings_fb_sync_completed">동기화가 완료되었습니다.</string>
     <string name="settings_fb_sync_configuration_changed">동기화 설정이 변경되었습니다. 셀프호스트 계정을 확인하고 다시 시도하세요.</string>

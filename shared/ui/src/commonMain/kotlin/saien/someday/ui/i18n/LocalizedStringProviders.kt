@@ -200,6 +200,11 @@ fun rememberSettingsUiStrings(): SettingsUiStrings {
     val syncRemoteHistoryConflict = stringResource(Res.string.settings_fb_sync_remote_history_conflict)
     val syncRetryRequired = stringResource(Res.string.settings_fb_sync_retry_required)
     val syncBlocked = stringResource(Res.string.settings_fb_sync_blocked)
+    val syncMediaTransferPending = stringResource(Res.string.settings_fb_sync_media_transfer_pending)
+    val syncMediaRateLimited = stringResource(Res.string.settings_fb_sync_media_rate_limited)
+    val syncMediaStorageFull = stringResource(Res.string.settings_fb_sync_media_storage_full)
+    val syncMediaUnavailable = stringResource(Res.string.settings_fb_sync_media_unavailable)
+    val syncMediaPublicationFailed = stringResource(Res.string.settings_fb_sync_media_publication_failed)
     val syncCheckpointInvalid = stringResource(Res.string.settings_fb_sync_checkpoint_invalid)
     val syncFailed = stringResource(Res.string.settings_fb_sync_failed)
     val exportPrepared = stringResource(Res.string.settings_fb_export_prepared)
@@ -296,6 +301,11 @@ fun rememberSettingsUiStrings(): SettingsUiStrings {
         syncRemoteHistoryConflict = syncRemoteHistoryConflict,
         syncRetryRequired = syncRetryRequired,
         syncBlocked = syncBlocked,
+        syncMediaTransferPending = syncMediaTransferPending,
+        syncMediaRateLimited = syncMediaRateLimited,
+        syncMediaStorageFull = syncMediaStorageFull,
+        syncMediaUnavailable = syncMediaUnavailable,
+        syncMediaPublicationFailed = syncMediaPublicationFailed,
         syncCheckpointInvalid = syncCheckpointInvalid,
         syncFailed = syncFailed,
         exportPrepared = exportPrepared,

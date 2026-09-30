@@ -39,6 +39,8 @@ import org.jetbrains.skia.Image
 import saien.someday.domain.settings.AppLanguage
 import saien.someday.domain.settings.ClientSettings
 import saien.someday.domain.settings.ClientTheme
+import saien.someday.domain.settings.ManualSyncResult
+import saien.someday.domain.settings.ManualSyncRunner
 import saien.someday.domain.settings.SelfHostedSessionSummary
 import saien.someday.domain.settings.SyncConfiguration
 import saien.someday.domain.settings.SyncMode
@@ -101,6 +103,31 @@ class SyncSettingsDesktopRenderTest {
     }
 
     @Test
+    fun mediaTransferFailureOffersRetryAndClearsAfterSuccessfulSync() = runDesktopComposeUiTest(width = 320, height = 640) {
+        var syncCalls = 0
+        render(
+            language = AppLanguage.Chinese,
+            fontScale = 1.5f,
+            lastError = "sync:MediaTransferPending",
+            manualSyncRunner = ManualSyncRunner {
+                syncCalls += 1
+                ManualSyncResult.success(SyncMode.SelfHosted, 1, 0, 0)
+            },
+        )
+        val message = "图片同步尚未完成，本机内容已保留。请检查网络后重试。"
+        onNodeWithText(message).performScrollTo().assertIsDisplayed()
+        onNodeWithText("同步已阻塞，请先解决工作区问题。").assertDoesNotExist()
+        onNodeWithText("重新登录").assertDoesNotExist()
+        onNodeWithText("重试").performScrollTo().assertIsEnabled().performClick()
+        waitForIdle()
+
+        assertEquals(1, syncCalls)
+        onNodeWithText(message).assertDoesNotExist()
+        onNodeWithText("重试").assertDoesNotExist()
+        onNodeWithText("立即同步").assertIsEnabled()
+    }
+
+    @Test
     fun pendingResetWithMissingCredentialsKeepsOrdinaryLoginHiddenAndControlLoginReachable() {
         for (scenario in listOf("committed", "unknown", "reset-required")) {
             runDesktopComposeUiTest(width = 320, height = 640) {
@@ -153,6 +180,10 @@ class SyncSettingsDesktopRenderTest {
         resetScenario: String = "ready",
         signedIn: Boolean = true,
         missingAccountHint: Boolean = false,
+        lastError: String? = null,
+        manualSyncRunner: ManualSyncRunner = ManualSyncRunner {
+            ManualSyncResult.success(SyncMode.SelfHosted, 0, 0, 0)
+        },
         manager: DesktopRenderAccountResetManager = DesktopRenderAccountResetManager(resetScenario),
     ) {
         applyAppLanguageTag(language.languageTag)
@@ -162,6 +193,7 @@ class SyncSettingsDesktopRenderTest {
             syncConfiguration = SyncConfiguration(
                 mode = if (signedIn) SyncMode.SelfHosted else SyncMode.Off,
                 selfHostedEndpoint = if (missingAccountHint) null else "https://sync.example.test",
+                lastError = lastError,
                 selfHostedSession = SelfHostedSessionSummary(
                     loggedIn = signedIn,
                     userEmail = if (missingAccountHint) null else "owner@example.test",
@@ -175,6 +207,7 @@ class SyncSettingsDesktopRenderTest {
             initialSettings = settings,
             loadSettings = { settings },
             accountDataResetManager = manager,
+            manualSyncRunner = manualSyncRunner,
             backgroundDispatcher = Dispatchers.Unconfined,
         )
         setContent {
@@ -185,7 +218,7 @@ class SyncSettingsDesktopRenderTest {
                         Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp)) {
                             val state = controller.state
                             SyncSettingsContent(
-                                state = state.copy(sync = state.sync.copy(issue = issue)),
+                                state = state.copy(sync = state.sync.copy(issue = issue ?: state.sync.issue)),
                                 controller = controller,
                                 workspacePairingScanner = UnavailableWorkspacePairingScanner,
                                 actionScope = rememberCoroutineScope(),
