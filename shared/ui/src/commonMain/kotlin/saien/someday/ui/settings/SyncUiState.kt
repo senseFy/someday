@@ -65,6 +65,8 @@ enum class SyncIssueReason {
     SignInRequired,
     SecureSessionUnavailable,
     SetupFailed,
+    AccountResetRequired,
+    AccountDataChanged,
     ConfigurationChanged,
     SyncUnavailable,
     AuthorityMismatch,
@@ -94,6 +96,8 @@ data class SyncIssueUi(
             SyncIssueReason.SyncFailed,
             SyncIssueReason.WorkspaceSettingsReloadRequired,
             -> SyncIssueAction.RetrySync
+            SyncIssueReason.AccountResetRequired,
+            SyncIssueReason.AccountDataChanged,
             SyncIssueReason.RemoteHistoryConflict,
             SyncIssueReason.CheckpointInvalid,
             SyncIssueReason.SyncUnavailable,
@@ -109,6 +113,10 @@ data class SyncUiState(
     val recovery: WorkspaceRecoveryUiState = WorkspaceRecoveryUiState(),
     val accountReset: AccountResetUiState = AccountResetUiState(),
 ) {
+    val needsAccountDataResolution: Boolean
+        get() = accountReset.blocksSync || issue?.reason in setOf(
+            SyncIssueReason.AccountResetRequired, SyncIssueReason.AccountDataChanged,
+        )
     val syncing: Boolean get() = operation == SyncUiOperation.Syncing
     val busy: Boolean get() = operation != null || accountReset.busy
     val pairingAvailable: Boolean
@@ -154,6 +162,13 @@ internal enum class SyncAccountFormMode(
         allowManualReauthentication = true,
         initiallyVisible = false,
     ),
+    AccountResetPending(
+        serverReadOnly = true,
+        emailReadOnly = true,
+        allowCreateAccount = false,
+        allowManualReauthentication = false,
+        initiallyVisible = false,
+    ),
     SessionUnavailable(
         serverReadOnly = true,
         emailReadOnly = true,
@@ -171,7 +186,9 @@ internal enum class SyncAccountFormMode(
 }
 
 internal fun SyncUiState.accountFormMode(): SyncAccountFormMode =
-    if (issue?.action == SyncIssueAction.ReloadSession) {
+    if (needsAccountDataResolution) {
+        SyncAccountFormMode.AccountResetPending
+    } else if (issue?.action == SyncIssueAction.ReloadSession) {
         SyncAccountFormMode.SessionUnavailable
     } else {
         when (val currentConnection = connection) {

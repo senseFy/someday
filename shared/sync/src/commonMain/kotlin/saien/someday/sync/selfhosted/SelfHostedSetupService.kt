@@ -1,5 +1,6 @@
 package saien.someday.sync.selfhosted
 
+import saien.someday.data.account.AccountNetworkBlockedException
 import saien.someday.domain.settings.SelfHostedSessionCredentialStore
 import saien.someday.domain.settings.SelfHostedSetupClient
 import saien.someday.domain.settings.SelfHostedSetupInput
@@ -21,6 +22,7 @@ class SelfHostedSetupService(
         runCatching {
             val sanitized = input.sanitized()
             workspaceLifecycleCoordinator.exclusive {
+                activeWorkspaceSessionGuard.requireOrdinarySetupAllowed()
                 val requirement = activeWorkspaceSessionGuard.currentRequirement()
                 if (requirement != null) {
                     if (sanitized.createAccount) {
@@ -114,6 +116,9 @@ class SelfHostedSetupService(
                 )
             }
         }.getOrElse { failure ->
+            if (failure is AccountNetworkBlockedException) {
+                return@getOrElse SelfHostedSetupResult.failure(SelfHostedSetupReason.AccountResetRequired)
+            }
             if (failure.indicatesRetiredAccountIncarnation()) {
                 return@getOrElse SelfHostedSetupResult.failure(SelfHostedSetupReason.AccountIncarnationMismatch)
             }

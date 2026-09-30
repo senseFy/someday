@@ -467,6 +467,7 @@ enum class SelfHostedSetupReason {
     EndpointMismatch,
     AuthorityMismatch,
     AccountIncarnationMismatch,
+    AccountResetRequired,
     DeviceRevoked,
     Unavailable,
     Failed,

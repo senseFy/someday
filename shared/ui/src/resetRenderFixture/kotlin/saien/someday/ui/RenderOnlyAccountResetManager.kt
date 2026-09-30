@@ -19,6 +19,7 @@ internal class RenderOnlyAccountResetManager(scenario: String) : AccountDataRese
     private val target = "30000000-0000-0000-0000-000000000003"
     private val initialPhase = when (scenario) {
         "ready" -> AccountDataResetPhase.Ready
+        "unavailable" -> AccountDataResetPhase.Unavailable
         "unknown", "offline" -> AccountDataResetPhase.OutcomeUnknown
         "committed", "local-failure" -> AccountDataResetPhase.RemoteCommittedLocalPending
         "reset-required" -> AccountDataResetPhase.ResetRequired
@@ -35,7 +36,7 @@ internal class RenderOnlyAccountResetManager(scenario: String) : AccountDataRese
     private var snapshot = AccountDataResetSnapshot(
         phase = initialPhase, review = review, endpoint = endpoint, accountEmail = email,
         operationId = review.operationId, offlineEditing = scenario == "offline",
-        productReadOnly = initialPhase != AccountDataResetPhase.Ready && scenario != "offline",
+        productReadOnly = initialPhase !in listOf(AccountDataResetPhase.Ready, AccountDataResetPhase.Unavailable) && scenario != "offline",
         resetAvailable = initialPhase == AccountDataResetPhase.Ready, canExport = true,
         canReplaceLocal = initialPhase in listOf(AccountDataResetPhase.RemoteCommittedLocalPending, AccountDataResetPhase.ResetRequired),
         issue = AccountDataResetIssue.LocalFailure.takeIf { scenario == "local-failure" },
@@ -44,7 +45,7 @@ internal class RenderOnlyAccountResetManager(scenario: String) : AccountDataRese
     override fun load() = snapshot
     override fun refresh() = result()
     override fun reconcile(review: AccountDataResetReview) = result()
-    override fun reauthenticate(review: AccountDataResetReview, password: String) = result()
+    override fun reauthenticate(review: AccountDataResetReview, password: String, email: String) = result()
     override fun submit(review: AccountDataResetReview, password: String): AccountDataResetActionResult {
         snapshot = snapshot.copy(phase = AccountDataResetPhase.OutcomeUnknown, resetAvailable = false,
             productReadOnly = true, operationId = operation, review = review.copy(operationId = operation))

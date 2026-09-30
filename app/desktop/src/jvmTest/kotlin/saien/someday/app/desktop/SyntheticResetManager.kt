@@ -44,7 +44,7 @@ internal class SyntheticResetManager(scenario: String) : AccountDataResetManager
     override fun load() = snapshot
     override fun refresh() = result()
     override fun reconcile(review: AccountDataResetReview) = result()
-    override fun reauthenticate(review: AccountDataResetReview, password: String) = result()
+    override fun reauthenticate(review: AccountDataResetReview, password: String, email: String) = result()
     override fun submit(review: AccountDataResetReview, password: String): AccountDataResetActionResult {
         snapshot = snapshot.copy(phase = AccountDataResetPhase.OutcomeUnknown, resetAvailable = false,
             productReadOnly = true, operationId = operation, review = review.copy(operationId = operation))

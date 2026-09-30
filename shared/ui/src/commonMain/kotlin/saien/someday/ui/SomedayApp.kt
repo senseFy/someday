@@ -346,6 +346,7 @@ fun SomedayApp(
     workspacePreferencesConflictResolver: WorkspacePreferencesConflictResolver? = null,
     onAppliedSettingsChanged: (ClientSettings) -> Unit = {},
     onLocalExport: () -> SettingsExportSummary = { SettingsExportSummary.unavailable() },
+    localExportRunner: saien.someday.ui.settings.LocalExportRunner? = null,
     dayOneImportRunner: DayOneImportRunner = DayOneImportRunner { onResult ->
         onResult(SettingsImportSummary(SettingsImportOutcome.Unavailable))
     },
@@ -438,6 +439,7 @@ fun SomedayApp(
             accountDataResetManager,
             workspaceProductAccess,
             automaticSyncEligible,
+            localExportRunner,
             loadSettings,
         ) {
             startupTrace?.invoke("SomedayApp.settingsController.start")
@@ -448,6 +450,7 @@ fun SomedayApp(
                 persistSettings = onSettingsChanged,
                 workspacePreferencesConflictResolver = workspacePreferencesConflictResolver,
                 exportProvider = onLocalExport,
+                localExportRunner = localExportRunner,
                 dayOneImportRunner = dayOneImportRunner,
                 onDataRestored = {
                     uiCoroutineScope.launch {
@@ -4792,8 +4795,10 @@ internal fun SyncSettingsContent(
         is SyncConnectionUi.Connected -> connection.endpoint
         is SyncConnectionUi.LocalOnly -> connection.configuredEndpoint
         is SyncConnectionUi.Unavailable -> connection.configuredEndpoint
-    }
-    val accountEmail = connected?.accountEmail ?: unavailable?.accountEmail
+    }?.takeIf { it.isNotBlank() } ?: state.sync.accountReset.snapshot?.endpoint
+    val accountEmail = (connected?.accountEmail ?: unavailable?.accountEmail)?.takeIf { it.isNotBlank() }
+        ?: state.sync.accountReset.snapshot?.accountEmail
+    val needsAccountDataResolution = state.sync.needsAccountDataResolution
     val deviceLabel = connected?.deviceLabel ?: unavailable?.deviceLabel
     val accountFormMode = state.sync.accountFormMode()
     var connectionFormVisible by remember {
@@ -4807,6 +4812,9 @@ internal fun SyncSettingsContent(
     }
     var selfHostedPassword by remember { mutableStateOf("") }
     var connectionSwitchConfirmationVisible by remember { mutableStateOf(false) }
+    var accountMenuExpanded by remember { mutableStateOf(false) }
+    val issueAction = state.sync.issue?.action
+    val canSwitchConnection = !configuredEndpoint.isNullOrBlank() || savedAccount
 
     LaunchedEffect(accountFormMode) {
         when {
@@ -4834,39 +4842,139 @@ internal fun SyncSettingsContent(
         }
     }
 
-    SettingsSection(title = stringResource(Res.string.common_status)) {
-        SettingsRow(
-            icon = if (signedIn) Lucide.Cloud else Lucide.Server,
-            title = when {
-                state.sync.syncing -> stringResource(Res.string.sync_status_syncing)
-                unavailable != null || state.sync.issue?.action == SyncIssueAction.ReloadSession ->
-                    stringResource(Res.string.sync_status_unavailable)
-                signedIn -> stringResource(Res.string.common_signed_in)
-                else -> stringResource(Res.string.common_not_configured)
-            },
-            subtitle = accountEmail ?: configuredEndpoint,
-        )
-        if (savedAccount) {
-            HorizontalDivider()
-            StatusLine(
-                stringResource(Res.string.common_server),
-                configuredEndpoint.orEmpty(),
-            )
-            StatusLine(stringResource(Res.string.common_device), deviceLabel.orEmpty())
-        }
-        state.sync.issue?.let { issue ->
-            StatusLine(
-                stringResource(Res.string.sync_last_issue),
-                issue.reason.localizedMessage(),
-            )
-        }
-        val issueAction = state.sync.issue?.action
-        if (savedAccount || issueAction == SyncIssueAction.ReloadSession) {
-            HorizontalDivider()
+    SettingsSection(title = stringResource(Res.string.common_account)) {
+        Column(
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+            modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp),
+        ) {
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalAlignment = Alignment.Top,
+            ) {
+                Column(
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Icon(
+                            imageVector = if (signedIn) Lucide.Cloud else Lucide.Server,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(20.dp),
+                        )
+                        val healthySession = signedIn && state.sync.issue == null && !state.sync.accountReset.blocksSync
+                        Surface(
+                            shape = RoundedCornerShape(50),
+                            color = if (healthySession) {
+                                MaterialTheme.colorScheme.primary.copy(alpha = 0.08f)
+                            } else {
+                                MaterialTheme.colorScheme.surfaceContainerHighest
+                            },
+                            contentColor = if (healthySession) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            },
+                        ) {
+                            Text(
+                                text = when {
+                                    needsAccountDataResolution -> stringResource(Res.string.sync_status_account_reset_pending)
+                                    state.sync.syncing -> stringResource(Res.string.sync_status_syncing)
+                                    unavailable != null || issueAction == SyncIssueAction.ReloadSession ->
+                                        stringResource(Res.string.sync_status_unavailable)
+                                    issueAction == SyncIssueAction.Reauthenticate ->
+                                        stringResource(Res.string.sync_status_reauthentication_required)
+                                    signedIn -> stringResource(Res.string.common_signed_in)
+                                    else -> stringResource(Res.string.common_not_configured)
+                                },
+                                style = MaterialTheme.typography.labelMedium,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
+                                    .semantics { liveRegion = LiveRegionMode.Polite },
+                            )
+                        }
+                    }
+                    if (!connectionFormVisible || accountFormMode.emailReadOnly) {
+                        accountEmail?.takeIf { it.isNotBlank() }?.let { email ->
+                            Text(email, style = MaterialTheme.typography.titleMedium)
+                        }
+                    }
+                }
+                if (!needsAccountDataResolution && (accountFormMode.allowManualReauthentication || canSwitchConnection)) {
+                    Box {
+                        IconButton(
+                            onClick = { accountMenuExpanded = true },
+                            enabled = !state.sync.busy,
+                        ) {
+                            Icon(Lucide.Ellipsis, contentDescription = stringResource(Res.string.common_more))
+                        }
+                        DropdownMenu(
+                            expanded = accountMenuExpanded,
+                            onDismissRequest = { accountMenuExpanded = false },
+                        ) {
+                            if (accountFormMode.allowManualReauthentication && issueAction != SyncIssueAction.Reauthenticate) {
+                                DropdownMenuItem(
+                                    text = { Text(stringResource(Res.string.sync_reauthenticate)) },
+                                    enabled = !state.sync.busy,
+                                    onClick = {
+                                        accountMenuExpanded = false
+                                        selfHostedPassword = ""
+                                        connectionFormVisible = true
+                                    },
+                                )
+                            }
+                            if (canSwitchConnection) {
+                                DropdownMenuItem(
+                                    text = { Text(stringResource(Res.string.connection_switch_action)) },
+                                    enabled = !state.sync.busy,
+                                    onClick = {
+                                        accountMenuExpanded = false
+                                        connectionSwitchConfirmationVisible = true
+                                    },
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+            configuredEndpoint?.takeIf { it.isNotBlank() }?.let { endpoint ->
+                Text(endpoint, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            deviceLabel?.takeIf { it.isNotBlank() }?.let { device ->
+                Text(
+                    text = "${stringResource(Res.string.common_device)} · $device",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            if (needsAccountDataResolution) {
+                Text(
+                    text = if (state.sync.issue?.reason == SyncIssueReason.AccountDataChanged) {
+                        stringResource(Res.string.settings_fb_selfhosted_account_data_changed)
+                    } else {
+                        stringResource(Res.string.account_reset_resume_required)
+                    },
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            } else {
+                state.sync.issue?.let { issue ->
+                    Text(
+                        text = issue.reason.localizedMessage(),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
+                    )
+                }
+            }
             if (
-                (connected != null && state.sync.issue == null) ||
-                issueAction == SyncIssueAction.RetrySync ||
-                issueAction == SyncIssueAction.ReloadSession
+                !needsAccountDataResolution && !connectionFormVisible &&
+                (savedAccount || issueAction == SyncIssueAction.ReloadSession) &&
+                ((connected != null && state.sync.issue == null) ||
+                    issueAction == SyncIssueAction.RetrySync ||
+                    issueAction == SyncIssueAction.ReloadSession)
             ) {
                 val retrying = issueAction != null
                 val actionBusy = if (issueAction == SyncIssueAction.ReloadSession) {
@@ -4874,49 +4982,33 @@ internal fun SyncSettingsContent(
                 } else {
                     state.sync.operation == SyncUiOperation.Syncing
                 }
-                SettingsActionRow(
-                    icon = Lucide.Cloud,
-                    title = if (retrying) stringResource(Res.string.sync_retry) else stringResource(Res.string.sync_now),
-                    subtitle = if (state.sync.syncing) stringResource(Res.string.sync_in_progress) else null,
-                    actionText = if (retrying) stringResource(Res.string.sync_retry) else stringResource(Res.string.common_sync),
-                    busy = actionBusy,
+                Button(
                     enabled = !state.sync.busy && !state.sync.accountReset.blocksSync,
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
                     onClick = {
                         actionScope.launch {
                             if (retrying) controller.recoverSyncIssue() else controller.runUserSync()
                         }
                     },
-                )
-            }
-            if (accountFormMode.allowManualReauthentication) {
-                TextButton(
-                    onClick = {
-                        connectionFormVisible = !connectionFormVisible
-                        if (!connectionFormVisible) selfHostedPassword = ""
-                    },
-                    enabled = !state.sync.busy,
                 ) {
-                    Text(
-                        if (connectionFormVisible) {
-                            stringResource(Res.string.common_cancel)
-                        } else {
-                            stringResource(Res.string.sync_reauthenticate)
-                        },
+                    ActionButtonLabel(
+                        icon = Lucide.RefreshCw,
+                        text = if (retrying) stringResource(Res.string.sync_retry) else stringResource(Res.string.sync_now),
+                        busy = actionBusy,
                     )
                 }
+            } else if (!needsAccountDataResolution && issueAction == SyncIssueAction.Reauthenticate && !connectionFormVisible) {
+                Button(
+                    onClick = {
+                        selfHostedPassword = ""
+                        connectionFormVisible = true
+                    },
+                    enabled = !state.sync.busy,
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                ) {
+                    Text(stringResource(Res.string.sync_reauthenticate))
+                }
             }
-        }
-        if (!configuredEndpoint.isNullOrBlank() || savedAccount) {
-            HorizontalDivider()
-            SettingsActionRow(
-                icon = Lucide.Server,
-                title = stringResource(Res.string.connection_switch_action),
-                subtitle = configuredEndpoint,
-                actionText = stringResource(Res.string.connection_switch_dialog_confirm),
-                busy = state.sync.operation == SyncUiOperation.SwitchingConnection,
-                enabled = !state.sync.busy,
-                onClick = { connectionSwitchConfirmationVisible = true },
-            )
         }
     }
 
@@ -4955,26 +5047,28 @@ internal fun SyncSettingsContent(
         )
     }
 
-    if (connectionFormVisible) {
-        SettingsSection(title = stringResource(Res.string.common_account)) {
-            OutlinedTextField(
-                value = selfHostedEndpoint,
-                onValueChange = { selfHostedEndpoint = it },
-                label = { Text(stringResource(Res.string.common_server_url)) },
-                enabled = !state.sync.busy,
-                readOnly = accountFormMode.serverReadOnly,
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
-            )
-            OutlinedTextField(
-                value = selfHostedEmail,
-                onValueChange = { selfHostedEmail = it },
-                label = { Text(stringResource(Res.string.common_email)) },
-                enabled = !state.sync.busy,
-                readOnly = accountFormMode.emailReadOnly,
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
-            )
+    if (connectionFormVisible && !needsAccountDataResolution) {
+        SettingsSection(title = stringResource(Res.string.selfhosted_sign_in)) {
+            if (!accountFormMode.serverReadOnly) {
+                OutlinedTextField(
+                    value = selfHostedEndpoint,
+                    onValueChange = { selfHostedEndpoint = it },
+                    label = { Text(stringResource(Res.string.common_server_url)) },
+                    enabled = !state.sync.busy,
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+            if (!accountFormMode.emailReadOnly) {
+                OutlinedTextField(
+                    value = selfHostedEmail,
+                    onValueChange = { selfHostedEmail = it },
+                    label = { Text(stringResource(Res.string.common_email)) },
+                    enabled = !state.sync.busy,
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
             OutlinedTextField(
                 value = selfHostedPassword,
                 onValueChange = { selfHostedPassword = it },
@@ -4988,6 +5082,7 @@ internal fun SyncSettingsContent(
             Button(
                 onClick = { connect(createAccount = false) },
                 enabled = !state.sync.busy,
+                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
             ) {
                 ActionButtonLabel(
                     icon = Lucide.Server,
@@ -4998,6 +5093,17 @@ internal fun SyncSettingsContent(
                     },
                     busy = state.sync.operation == SyncUiOperation.Authenticating,
                 )
+            }
+            if (accountFormMode.allowManualReauthentication) {
+                TextButton(
+                    onClick = {
+                        selfHostedPassword = ""
+                        connectionFormVisible = false
+                    },
+                    enabled = !state.sync.busy,
+                ) {
+                    Text(stringResource(Res.string.common_cancel))
+                }
             }
             if (accountFormMode.allowCreateAccount) {
                 TextButton(
@@ -5305,11 +5411,13 @@ private val secretInputKeyboardOptions = KeyboardOptions(
 )
 
 @Composable
-private fun SyncIssueReason.localizedMessage(): String =
+internal fun SyncIssueReason.localizedMessage(): String =
     when (this) {
         SyncIssueReason.SignInRequired -> stringResource(Res.string.settings_fb_sign_in_before_sync)
         SyncIssueReason.SecureSessionUnavailable -> stringResource(Res.string.sync_secure_session_unavailable)
         SyncIssueReason.SetupFailed -> stringResource(Res.string.settings_fb_selfhosted_setup_failed)
+        SyncIssueReason.AccountResetRequired -> stringResource(Res.string.account_reset_resume_required)
+        SyncIssueReason.AccountDataChanged -> stringResource(Res.string.settings_fb_selfhosted_account_data_changed)
         SyncIssueReason.ConfigurationChanged -> stringResource(Res.string.settings_fb_sync_configuration_changed)
         SyncIssueReason.SyncUnavailable -> stringResource(Res.string.settings_fb_sync_unavailable)
         SyncIssueReason.AuthorityMismatch -> stringResource(Res.string.settings_fb_sync_authority_mismatch)
@@ -5777,8 +5885,11 @@ private fun ExportSettingsContent(
                 if (!exportRunning) {
                     exportRunning = true
                     coroutineScope.launch {
-                        controller.runLocalExport()
-                        exportRunning = false
+                        try {
+                            controller.runLocalExport()
+                        } finally {
+                            exportRunning = false
+                        }
                     }
                 }
             },

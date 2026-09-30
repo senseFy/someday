@@ -83,12 +83,14 @@ class SettingsFirstAuthorityBindingTest {
             review = review, productReadOnly = true, canReplaceLocal = true)
         fixture.controller.loadAccountResetState()
 
-        assertTrue(fixture.controller.replaceAccountWorkspace(review, AccountDataReplacementMode.Fresh, true))
+        // Replacement installs its authority before the controller's first sync.
         fixture.runner = { completed() }
+        assertTrue(fixture.controller.replaceAccountWorkspace(review, AccountDataReplacementMode.Fresh, true))
+        assertEquals(3, fixture.restored)
         assertTrue(fixture.controller.runUserSync())
 
         assertEquals("replacement", fixture.access.identity.workspaceId)
-        assertEquals(3, fixture.restored)
+        assertEquals(4, fixture.restored)
         assertEquals("Sync complete.", fixture.controller.state.feedbackMessage)
         assertNull(fixture.controller.state.sync.operation)
         assertNull(fixture.stored.syncConfiguration.lastError)
@@ -182,7 +184,7 @@ class SettingsFirstAuthorityBindingTest {
             override fun load() = resetSnapshot
             override fun refresh() = error("Unexpected refresh")
             override fun submit(review: AccountDataResetReview, password: String) = error("Unexpected submit")
-            override fun reauthenticate(review: AccountDataResetReview, password: String) = error("Unexpected login")
+            override fun reauthenticate(review: AccountDataResetReview, password: String, email: String) = error("Unexpected login")
             override fun reconcile(review: AccountDataResetReview) = error("Unexpected reconcile")
             override fun keepOffline(review: AccountDataResetReview) = error("Unexpected offline action")
             override fun replaceLocal(review: AccountDataResetReview, mode: AccountDataReplacementMode,

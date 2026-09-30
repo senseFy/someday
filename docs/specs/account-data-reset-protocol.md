@@ -192,10 +192,11 @@ be reused only for the immediate ordinary login within that call. Control-only
 credentials stay in memory; checking receipts or learning a new incarnation
 never registers the writer or enables old content traffic. Restart or dismissal
 drops memory credentials and confirmation reviews, preserving durable intent.
-When secure credentials are missing, the blocked-copy UI retains the existing
-non-secret account email hint with signed-in state cleared, so ordinary control
-login remains reachable. That hint never authorizes content access; successful
-login must still return the exact captured account ID.
+When credentials or connection hints are missing, the blocked-copy UI offers
+control login with an editable email hint. Login must return the captured account
+ID; it neither registers a device nor enables content access. Authentication
+precedes local replacement confirmation. Reset availability affects only a new
+reset, not reconciliation or rejoining after a committed reset.
 
 The local decision is separate: export/keep editing offline, or explicitly
 discard all local data and create a fresh workspace, pair, or recover. Export
@@ -209,7 +210,12 @@ installation writer. All three replacement modes use the existing key-staging
 and SQLite transaction, including every old DAG generation, projection, protocol
 row, media record, new authority, and intent/gate reconciliation. Pre-commit
 failure preserves the old copy; unreferenced aliases/files are cleaned after
-commit. The platform service graph is retained.
+commit. The platform service graph is retained. Confirmed re-enrollment updates
+the secure session and its settings while the old copy remains gated. After
+replacement, clients reconcile session/recovery state and attempt initial sync;
+a later network failure offers sync retry without repeating local replacement.
+The first device publishes its new workspace before creating a new recovery
+code; other devices join using that workspace's new invitation or recovery code.
 
 Product mutations, including notes, media import, local/Day One import and
 synced preferences, check the persistent gate inside the shared short product

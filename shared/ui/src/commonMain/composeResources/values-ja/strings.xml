@@ -373,7 +373,8 @@
     <string name="settings_fb_selfhosted_bound_session_renewed">このデバイスのワークスペースバインド済みセッションを更新しました。</string>
     <string name="settings_fb_selfhosted_endpoint_mismatch">このワークスペースにバインド済みのセルフホストサーバーを使用してください。</string>
     <string name="settings_fb_selfhosted_ready">セルフホストのアカウントとデバイスの準備ができました。</string>
-    <string name="settings_fb_selfhosted_setup_failed">セルフホスト設定は安全に失敗しました。</string>
+    <string name="settings_fb_selfhosted_account_data_changed">サーバーのアカウントデータが変更されました。再接続する前に「端末のコピーを確認」を開いてください。</string>
+    <string name="settings_fb_selfhosted_setup_failed">ログインできませんでした。アカウント情報と接続を確認して、もう一度お試しください。</string>
     <string name="settings_fb_connection_switch_ready">別のサーバーまたはアカウントに接続できます。</string>
     <string name="settings_fb_connection_switch_failed">現在の接続を安全に解除できませんでした。</string>
     <string name="settings_fb_settings_save_failed">設定の保存に失敗: %1$s</string>
@@ -419,6 +420,8 @@
     <string name="sync_reauthenticate">もう一度ログイン</string>
     <string name="sync_create_account">アカウントを作成</string>
     <string name="sync_secure_session_unavailable">保存済みのサインイン情報を一時的に利用できません。同期する前に再試行してください。</string>
+    <string name="sync_status_account_reset_pending">端末のコピーを確認してください</string>
+    <string name="sync_status_reauthentication_required">再ログインが必要</string>
     <string name="sync_status_unavailable">サインインを利用できません</string>
     <string name="sync_status_syncing">同期中…</string>
     <string name="sync_connecting">安全に接続しています…</string>
@@ -497,6 +500,10 @@
 
     <!-- Account data reset: logical reset and separate local replacement. -->
     <string name="account_reset_danger_zone">危険な操作</string>
+    <string name="account_reset_resume_title">端末のコピーを確認</string>
+    <string name="account_reset_resume_required">「端末のコピーを確認」でアカウントの状態と次の操作を確認してください。</string>
+    <string name="account_reset_summary">サーバーデータをリセットし、端末のコピーを保持</string>
+    <string name="account_reset_details">次の操作を確認</string>
     <string name="account_reset_title">アカウントデータをリセット</string>
     <string name="account_reset_scope_warning">このアカウントのサーバー上の全ワークスペースを直ちにリセットし、すべてのデバイスを切断します。この端末のコピーは、別途置き換えを選ぶまで保持されます。</string>
     <string name="account_reset_irreversible_warning">パスワードを知っている人はすぐにリセットできます。取り消しや猶予期間はありません。</string>
@@ -519,7 +526,7 @@
     <string name="account_reset_offline_warning">端末での編集のみを許可します。リモートのリクエストの取り消し、サーバーデータの復元、リセット失敗の確認にはなりません。再接続には結果の確認と、このコピーを破棄する新たな同意が必要です。</string>
     <string name="account_reset_offline_title">オフライン編集中・サーバー接続は停止中</string>
     <string name="account_reset_committed_title">サーバーのリセット完了・端末のコピーは保持</string>
-    <string name="account_reset_committed_body">再度ログインして、この端末の設定方法を選んでください。置き換えを明確に確認するまで、この端末の内容は破棄されません。</string>
+    <string name="account_reset_committed_body">この端末で続行する方法を選んでください。置き換えを明確に確認するまで、現在の内容は保持されます。</string>
     <string name="account_reset_changed_title">アカウントのデータ状態が変わりました</string>
     <string name="account_reset_changed_body">このワークスペースはこのアカウントの別のデータ状態に属するため、現在のアカウントにアップロードできません。置き換える前に書き出すか、端末のコピーをオフラインで保持できます。</string>
     <string name="account_reset_authenticate">アカウント復旧のためログイン</string>
@@ -528,14 +535,14 @@
     <string name="account_reset_fresh">空のワークスペースから始める</string>
     <string name="account_reset_pair">別のデバイスとペアリング</string>
     <string name="account_reset_recover">復旧コードを使う</string>
-    <string name="account_reset_pairing_code">現在のデバイスのペアリングコード</string>
-    <string name="account_reset_recovery_code">現在のワークスペースの復旧コード</string>
+    <string name="account_reset_pairing_code">接続済みの別の端末の新しいペアリングトークン</string>
+    <string name="account_reset_recovery_code">リセット後に設定した復元コード</string>
     <string name="account_reset_discard_consent">この端末の現在のワークスペースを統合せずに破棄することに同意します。</string>
     <string name="account_reset_replace">ローカルワークスペースの置き換えを確認</string>
     <string name="account_reset_local_failure">ローカル設定が完了していません。以前のローカルコピーは保持されています。設定を再試行するか、オフラインで保持してください。</string>
-    <string name="account_reset_ready">この端末は現在のアカウントで使用できます。新しいワークスペースには新しい復旧コードを設定してください。</string>
-    <string name="account_reset_unavailable">現在このサーバーではリセットを利用できません。以前の結果が不明なリクエストは、引き続き確認が必要です。</string>
-    <string name="account_reset_retained_media">以前のリセットで保持されたメディアがあるため、再度リセットできません。運営者による検証済みのクリーンアップが必要です。保存ポリシーによっては、再リセットが無期限にできない場合があります。</string>
+    <string name="account_reset_ready">この端末のワークスペースを置き換えました。</string>
+    <string name="account_reset_unavailable">現在このサーバーではリセットを利用できません。</string>
+    <string name="account_reset_retained_media">前回のリセット後のデータ保持または削除の検証が完了していません。次のリセットのみが制限され、この端末の設定は続行できます。保持ポリシーによっては再リセットが無期限に制限される場合があります。</string>
     <string name="account_reset_sign_in_required">このアカウントの操作を確認または続行するには、再度ログインしてください。</string>
     <string name="account_reset_wrong_password">アカウントのパスワードが正しくありません。自動再試行は行っていません。</string>
     <string name="account_reset_busy">アカウントは処理中です。しばらくしてから再試行してください。</string>
@@ -544,4 +551,22 @@
     <string name="account_reset_local_consent_required">続行する前に、この端末の現在のコピーを破棄することを確認してください。</string>
     <string name="account_reset_refresh">アカウントの状態を更新</string>
     <string name="account_reset_readonly_note">このコピーは読み取り専用です。同期設定でアカウントの状態を確認するか、オフライン編集を選択してください。</string>
+    <string name="account_reset_back">戻る</string>
+    <string name="account_reset_authenticating">アカウントを確認中…</string>
+    <string name="account_reset_replacing">この端末のワークスペースを置き換え中…</string>
+    <string name="account_reset_replacement_help">最初の端末では空のワークスペースを作成します。他の端末は新しいペアリングトークンまたは復元コードで参加できます。</string>
+    <string name="account_reset_fresh_help">空のワークスペースを作成してこのアカウントと同期し、新しい復元コードを設定します。</string>
+    <string name="account_reset_pair_help">リセット後に接続済みの別の端末から新しいトークンを取得してください。古いトークンではリセット前のデータを復元できません。</string>
+    <string name="account_reset_recover_help">リセット後に設定した復元コードを使用してください。古いコードではリセット前のデータを復元できません。</string>
+    <string name="account_reset_account_mismatch">このメールアドレスは別のアカウントのものです。リセット対象のアカウントのメールアドレスを入力してください。</string>
+    <string name="account_reset_invalid_secret">ペアリングトークンまたは復元コードが正しくありません。確認して再試行してください。</string>
+    <string name="account_reset_invitation_unavailable">ペアリング招待が見つからないか、有効期限が切れています。接続済みの端末で新しい招待を作成してください。</string>
+    <string name="account_reset_invitation_used">このペアリング招待は使用済みです。接続済みの端末で新しい招待を作成してください。</string>
+    <string name="account_reset_no_recovery">現在のアカウントデータには復元コードが設定されていません。空のワークスペースで始めるか、接続済みの端末とペアリングしてください。</string>
+    <string name="account_reset_network_error">サーバーに接続できません。接続を確認して、この手順を再試行してください。</string>
+    <string name="account_reset_context_changed">アカウントまたはローカルコピーが変更されました。戻って現在の状態を確認してください。</string>
+    <string name="account_reset_sync_pending">ローカルワークスペースは置き換えられましたが、同期は完了していません。同期を再試行してください。</string>
+    <string name="account_reset_device_revoked">この端末は取り消されています。再ログインでは有効に戻せません。サーバー管理者に連絡してください。</string>
+    <string name="account_reset_rate_limited">リクエストが多すぎます。しばらく待ってから再試行してください。</string>
+    <string name="account_reset_protocol_error">サーバーの応答を検証できません。クライアントとサーバーのバージョンを確認するか、運営者に連絡してください。</string>
 </resources>

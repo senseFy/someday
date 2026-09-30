@@ -87,6 +87,7 @@ class SettingsUiController(
     private val persistSettings: (ClientSettings) -> ClientSettings = { it },
     private val workspacePreferencesConflictResolver: WorkspacePreferencesConflictResolver? = null,
     private val exportProvider: () -> SettingsExportSummary = { SettingsExportSummary.unavailable() },
+    private val localExportRunner: LocalExportRunner? = null,
     private val dayOneImportRunner: DayOneImportRunner = DayOneImportRunner { onResult ->
         onResult(SettingsImportSummary(outcome = SettingsImportOutcome.Unavailable))
     },
@@ -214,9 +215,9 @@ class SettingsUiController(
         return runAccountResetAction(AccountResetUiOperation.Submitting) { it.submit(review, password) }
     }
 
-    suspend fun reauthenticateAccountReset(review: AccountDataResetReview, password: String): Boolean {
-        if (password.isBlank()) return false
-        return runAccountResetAction(AccountResetUiOperation.Authenticating) { it.reauthenticate(review, password) }
+    suspend fun reauthenticateAccountReset(review: AccountDataResetReview, password: String, email: String = review.accountEmail): Boolean {
+        if (password.isBlank() || email.isBlank()) return false
+        return runAccountResetAction(AccountResetUiOperation.Authenticating) { it.reauthenticate(review, password, email.trim()) }
     }
 
     suspend fun reconcileAccountReset(review: AccountDataResetReview): Boolean =
@@ -230,7 +231,9 @@ class SettingsUiController(
             state = buildState(state.settings, state.exportSummary, uiStrings.accountReset.localConsentRequired, SettingsFeedbackSeverity.Warning)
             return false
         }
-        return runAccountResetAction(AccountResetUiOperation.Replacing) { it.replaceLocal(review, mode, true, secret, password) }
+        val replaced = runAccountResetAction(AccountResetUiOperation.Replacing) { it.replaceLocal(review, mode, true, secret, password) }
+        loadAccountResetState()
+        return replaced
     }
 
     suspend fun cancelAccountResetReview() {
@@ -277,12 +280,25 @@ class SettingsUiController(
         val previousSnapshot = currentAccountResetSnapshot
         try {
             val completion = withContext(backgroundDispatcher) {
+                val capturedWorkspace = if (operation == AccountResetUiOperation.Authenticating || operation == AccountResetUiOperation.Replacing) {
+                    workspaceProductAccess.capture()
+                } else null
                 val result = try { action(manager) } catch (cancelled: CancellationException) { throw cancelled } catch (_: Exception) {
                     val snapshot = runCatching { manager.load() }.getOrNull() ?: previousSnapshot ?: AccountDataResetSnapshot()
                     AccountDataResetActionResult(snapshot, false, issue = AccountDataResetIssue.LocalFailure)
                 }
-                val settings = if (result.localReplaced) runCatching { loadSettings() }.getOrNull() else null
-                Triple(result, settings, if (result.localReplaced) workspaceProductAccess.capture() else null)
+                val workspace = if (result.localReplaced) workspaceProductAccess.capture() else capturedWorkspace
+                val settings = workspace?.let {
+                    runCatching { workspaceProductAccess.read(it) { loadSettings() } }.getOrNull()
+                }
+                val sessionAccess = if (operation == AccountResetUiOperation.Replacing && workspace != null) {
+                    runCatching {
+                        workspaceProductAccess.read(workspace) {
+                            if (selfHostedSessionCredentialStore.load() == null) SecureSessionAccess.Missing else SecureSessionAccess.Available
+                        }
+                    }.getOrDefault(SecureSessionAccess.Unavailable)
+                } else null
+                AccountResetCompletion(result, settings, workspace, sessionAccess)
             }
             // An offline exit supersedes every older HTTP completion, including its
             // loading state. The durable manager independently invalidates its attempt.
@@ -293,21 +309,37 @@ class SettingsUiController(
                 loadAccountResetState()
                 return false
             }
-            val result = completion.first
+            if (completion.workspace?.let { !workspaceProductAccess.isCurrent(it) } == true) {
+                loadAccountResetState()
+                return false
+            }
+            val result = completion.result
             currentAccountResetSnapshot = result.snapshot.copy(issue = result.issue)
+            completion.sessionAccess?.let { secureSessionAccess = it }
             if (result.localReplaced) {
-                currentSettingsWorkspace = completion.third
+                currentSettingsWorkspace = completion.workspace
                 currentWorkspacePairingInvitation = null
-                currentWorkspaceRecovery = WorkspaceRecoveryUiState(syncGate = WorkspaceRecoverySyncGate.Pending)
-                currentSyncIssue = if (completion.second == null) SyncIssueUi(SyncIssueReason.WorkspaceSettingsReloadRequired) else null
+                currentWorkspaceRecovery = WorkspaceRecoveryUiState(
+                    availability = if (workspaceRecoveryManager == null) WorkspaceRecoveryUiAvailability.NotConfigured else WorkspaceRecoveryUiAvailability.Unknown,
+                    syncGate = if (workspaceRecoveryManager == null) WorkspaceRecoverySyncGate.Allowed else WorkspaceRecoverySyncGate.Pending,
+                )
+                currentSyncIssue = when {
+                    completion.settings == null -> SyncIssueUi(SyncIssueReason.WorkspaceSettingsReloadRequired)
+                    secureSessionAccess == SecureSessionAccess.Unavailable -> SyncIssueUi(SyncIssueReason.SecureSessionUnavailable)
+                    secureSessionAccess == SecureSessionAccess.Missing -> SyncIssueUi(SyncIssueReason.SignInRequired)
+                    else -> null
+                }
             }
             state = buildState(
-                settings = completion.second ?: if (result.localReplaced) state.settings.safeWorkspaceReplacementFallback() else state.settings,
+                settings = completion.settings ?: if (result.localReplaced) state.settings.safeWorkspaceReplacementFallback() else state.settings,
                 exportSummary = if (result.localReplaced) null else state.exportSummary,
                 feedbackMessage = result.issue?.message(uiStrings.accountReset),
                 feedbackSeverity = if (result.success) SettingsFeedbackSeverity.Success else SettingsFeedbackSeverity.Warning,
             )
-            if (result.localReplaced) onDataRestored()
+            if (result.localReplaced) {
+                onDataRestored()
+                if (completion.settings != null && currentSyncIssue == null) finishAccountWorkspaceReplacement()
+            }
             return result.success
         } finally {
             if (activeAccountResetAction === actionIdentity) activeAccountResetAction = null
@@ -316,6 +348,33 @@ class SettingsUiController(
                 currentAccountResetOperation = null
                 publishCurrentState()
             }
+        }
+    }
+
+    /** Local replacement is committed; a later network failure must only offer sync retry. */
+    private suspend fun finishAccountWorkspaceReplacement() = withSettingsMutation {
+        if (state.sync.connection !is SyncConnectionUi.Connected) return@withSettingsMutation
+        val replacementWorkspace = currentSettingsWorkspace
+        currentSyncOperation = SyncUiOperation.CheckingRecovery
+        publishCurrentState()
+        try {
+            refreshWorkspaceRecoveryStatusLocked(showFeedback = false)
+            if (replacementWorkspace != null && !workspaceProductAccess.isCurrent(replacementWorkspace)) {
+                throw CancellationException("The local workspace changed.")
+            }
+            if (currentWorkspaceRecovery.blocksSync) {
+                currentSyncIssue = SyncIssueUi(SyncIssueReason.RetryRequired)
+                state = buildState(state.settings, state.exportSummary, uiStrings.recoveryStatusUnavailable, SettingsFeedbackSeverity.Warning)
+                return@withSettingsMutation
+            }
+            currentSyncOperation = SyncUiOperation.Syncing
+            publishCurrentState()
+            val syncResult = executeSyncRunner()
+            completeSync(syncResult, showFeedback = true)
+            if (syncResult.success || syncResult.hasVisibleSyncChanges) onDataRestored()
+        } finally {
+            currentSyncOperation = null
+            publishCurrentState()
         }
     }
 
@@ -345,7 +404,7 @@ class SettingsUiController(
         // A durable account gate needs the last account hint for control-only
         // sign-in even when secure credentials disappeared between launches.
         loadAccountResetState()
-        val preserveResetAccountHint = state.sync.accountReset.blocksSync
+        val preserveResetAccountHint = state.sync.needsAccountDataResolution
         val previousSettings = state.settings
         val previousConfiguration = previousSettings.syncConfiguration
         val credentialsResult = runCatching {
@@ -379,6 +438,7 @@ class SettingsUiController(
                         }
                         when {
                             credentials == null &&
+                                currentSyncIssue?.reason !in setOf(SyncIssueReason.AccountResetRequired, SyncIssueReason.AccountDataChanged) &&
                                 (
                                     previousConfiguration.selfHostedSession.loggedIn ||
                                         !previousConfiguration.selfHostedEndpoint.isNullOrBlank()
@@ -757,6 +817,15 @@ class SettingsUiController(
         password: String,
         createAccount: Boolean,
     ): Boolean {
+        if (state.sync.needsAccountDataResolution) {
+            state = buildState(
+                settings = state.settings,
+                exportSummary = state.exportSummary,
+                feedbackMessage = uiStrings.accountReset.resumeRequired,
+                feedbackSeverity = SettingsFeedbackSeverity.Warning,
+            )
+            return false
+        }
         val currentSession = state.settings.syncConfiguration.selfHostedSession
         val sanitized = SelfHostedSetupInput(
             endpoint = endpoint,
@@ -810,7 +879,11 @@ class SettingsUiController(
                         SelfHostedSetupReason.EndpointMismatch,
                     )
                 if (!rejectedReplacement) {
-                    currentSyncIssue = SyncIssueUi(SyncIssueReason.SetupFailed)
+                    currentSyncIssue = SyncIssueUi(when (result.status.reason) {
+                        SelfHostedSetupReason.AccountResetRequired -> SyncIssueReason.AccountResetRequired
+                        SelfHostedSetupReason.AccountIncarnationMismatch -> SyncIssueReason.AccountDataChanged
+                        else -> SyncIssueReason.SetupFailed
+                    })
                 }
                 // Failed account/device replacement must not damage the previously
                 // bound endpoint or its usable session summary.
@@ -828,6 +901,11 @@ class SettingsUiController(
                     successMessage = displayMessage,
                     successSeverity = SettingsFeedbackSeverity.Error,
                 )
+                if (result.status.reason in setOf(
+                        SelfHostedSetupReason.AccountResetRequired, SelfHostedSetupReason.AccountIncarnationMismatch,
+                    )) {
+                    loadAccountResetState()
+                }
                 false
             } else {
                 val session = checkNotNull(result.session)
@@ -1117,17 +1195,20 @@ class SettingsUiController(
     suspend fun runLocalExport(): Boolean = runExclusiveSyncLifecycle(false) {
         val captured = currentSettingsWorkspace ?: withContext(backgroundDispatcher) { workspaceProductAccess.capture() }
         if (!workspaceProductAccess.isCurrent(captured)) throw CancellationException("The local workspace changed.")
-        runCatching {
-            withContext(backgroundDispatcher) {
+        val result = runCatching {
+            localExportRunner?.export() ?: withContext(backgroundDispatcher) {
                 if (!workspaceProductAccess.isCurrent(captured)) throw CancellationException("The local workspace changed.")
-                // The provider takes the lifecycle lock before its product read lock. Do not
-                // invert that order by wrapping this call in workspaceProductAccess.read.
-                exportProvider()
-            }.also {
-                if (!workspaceProductAccess.isCurrent(captured)) throw CancellationException("The local workspace changed.")
+                // The provider owns lifecycle/read locking; never invert those boundaries.
+                LocalExportResult.Saved(exportProvider())
             }
-        }.fold(
-            onSuccess = { summary ->
+        }.getOrElse { failure ->
+            failure.rethrowCancellation()
+            LocalExportResult.Failed
+        }
+        if (!workspaceProductAccess.isCurrent(captured)) throw CancellationException("The local workspace changed.")
+        when (result) {
+            is LocalExportResult.Saved -> {
+                val summary = result.summary
                 state = buildState(
                     settings = state.settings,
                     exportSummary = summary,
@@ -1139,19 +1220,21 @@ class SettingsUiController(
                     feedbackSeverity = SettingsFeedbackSeverity.Success,
                 )
                 true
-            },
-            onFailure = { failure ->
-                failure.rethrowCancellation()
-                if (!workspaceProductAccess.isCurrent(captured)) throw CancellationException("The local workspace changed.")
+            }
+            LocalExportResult.Cancelled -> {
+                state = buildState(state.settings, state.exportSummary)
+                false
+            }
+            LocalExportResult.Failed -> {
                 state = buildState(
                     settings = state.settings,
                     exportSummary = state.exportSummary,
-                    feedbackMessage = formatUiString(uiStrings.exportFailed, failure.message ?: uiStrings.unknownError),
+                    feedbackMessage = formatUiString(uiStrings.exportFailed, uiStrings.unknownError),
                     feedbackSeverity = SettingsFeedbackSeverity.Error,
                 )
                 false
-            },
-        )
+            }
+        }
     }
 
     fun startDayOneImport(): Boolean {
@@ -1613,8 +1696,9 @@ class SettingsUiController(
             SelfHostedSetupReason.AuthorityInvalid -> uiStrings.selfHostedAuthorityInvalid
             SelfHostedSetupReason.EndpointMismatch -> uiStrings.selfHostedEndpointMismatch
             SelfHostedSetupReason.Unavailable -> uiStrings.selfHostedSetupUnavailable
+            SelfHostedSetupReason.AccountResetRequired -> uiStrings.accountReset.resumeRequired
+            SelfHostedSetupReason.AccountIncarnationMismatch -> uiStrings.selfHostedAccountDataChanged
             SelfHostedSetupReason.AuthorityMismatch,
-            SelfHostedSetupReason.AccountIncarnationMismatch,
             SelfHostedSetupReason.DeviceRevoked,
             SelfHostedSetupReason.Failed,
             -> uiStrings.selfHostedSetupFailed
@@ -1661,6 +1745,8 @@ class SettingsUiController(
             SyncIssueReason.SignInRequired -> uiStrings.signInBeforeSync
             SyncIssueReason.SecureSessionUnavailable -> uiStrings.secureSessionUnavailable
             SyncIssueReason.SetupFailed -> uiStrings.selfHostedSetupFailed
+            SyncIssueReason.AccountResetRequired -> uiStrings.accountReset.resumeRequired
+            SyncIssueReason.AccountDataChanged -> uiStrings.selfHostedAccountDataChanged
             SyncIssueReason.ConfigurationChanged -> uiStrings.syncConfigurationChanged
             SyncIssueReason.SyncUnavailable -> uiStrings.syncUnavailable
             SyncIssueReason.AuthorityMismatch -> uiStrings.syncAuthorityMismatch
@@ -1903,6 +1989,13 @@ private enum class SecureSessionAccess {
     Unavailable,
 }
 
+private data class AccountResetCompletion(
+    val result: AccountDataResetActionResult,
+    val settings: ClientSettings?,
+    val workspace: WorkspaceProductSnapshot?,
+    val sessionAccess: SecureSessionAccess?,
+)
+
 private data class SyncCompletion(
     val success: Boolean = false,
     val refreshProductData: Boolean = false,
@@ -1950,7 +2043,11 @@ private fun syncIssueFromLastError(lastError: String?): SyncIssueUi? {
         ?.takeIf(String::isNotBlank)
         ?: return null
     val reason = if (lastError.startsWith("setup:")) {
-        SyncIssueReason.SetupFailed
+        when (marker) {
+            SelfHostedSetupReason.AccountResetRequired.name -> SyncIssueReason.AccountResetRequired
+            SelfHostedSetupReason.AccountIncarnationMismatch.name -> SyncIssueReason.AccountDataChanged
+            else -> SyncIssueReason.SetupFailed
+        }
     } else {
         when (marker) {
             ManualSyncReason.AuthorityMismatch.name -> SyncIssueReason.AuthorityMismatch

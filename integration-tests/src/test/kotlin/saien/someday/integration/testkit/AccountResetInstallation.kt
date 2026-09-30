@@ -4,6 +4,7 @@ import java.io.ByteArrayInputStream
 import java.nio.file.Files
 import java.util.UUID
 import javax.imageio.ImageIO
+import kotlinx.coroutines.Dispatchers
 import okio.Path.Companion.toPath
 import saien.someday.data.crypto.InMemorySecureWorkspaceKeyStore
 import saien.someday.data.crypto.SecureStorageAliasGenerator
@@ -20,6 +21,8 @@ import saien.someday.data.media.LocalMediaAssetStore
 import saien.someday.data.media.MediaAssetDecodeValidator
 import saien.someday.data.settings.SqlDelightClientSettingsRepository
 import saien.someday.domain.settings.ClientSettings
+import saien.someday.domain.settings.ManualSyncResult
+import saien.someday.domain.settings.ManualSyncRunner
 import saien.someday.domain.settings.SelfHostedSessionSummary
 import saien.someday.domain.settings.SelfHostedSetupInput
 import saien.someday.domain.settings.SyncConfiguration
@@ -29,6 +32,7 @@ import saien.someday.sync.selfhosted.SelfHostedAccountResetManager
 import saien.someday.sync.selfhosted.SelfHostedSetupService
 import saien.someday.sync.selfhosted.SelfHostedWorkspacePairingService
 import saien.someday.sync.selfhosted.SelfHostedWorkspaceRecoveryService
+import saien.someday.ui.settings.SettingsUiController
 
 /**
  * A real file-backed client installation. restart() closes JDBC and recreates every
@@ -51,6 +55,13 @@ internal class AccountResetInstallation(
     fun restart() {
         process.close()
         process = ClientProcess(firstRun = false)
+    }
+
+    /** Simulates losing secure credentials and connection hints while retaining the local copy and durable gate. */
+    fun loseCredentialsAndConnectionHintsThenRestart() {
+        sessionStore.clearAll()
+        process.clearConnectionHints()
+        restart()
     }
 
     inner class ClientProcess(firstRun: Boolean) : AutoCloseable {
@@ -140,6 +151,34 @@ internal class AccountResetInstallation(
             recovery,
             { keys.unlockedKeyOrNull() != null },
         )
+        val controllerSyncResults = mutableListOf<ManualSyncResult>()
+
+        /** Uses the same controller ports as the app, including its real post-replacement sync. */
+        fun settingsController(): SettingsUiController = SettingsUiController(
+            initialSettings = services.settingsRepository.load(),
+            loadSettings = services.settingsRepository::load,
+            persistSettings = services.settingsRepository::save,
+            selfHostedSessionCredentialStore = sessionStore,
+            selfHostedDeviceName = label,
+            selfHostedDevicePlatform = "desktop",
+            manualSyncRunner = ManualSyncRunner {
+                services.manualSyncRunner.run().also(controllerSyncResults::add)
+            },
+            automaticSyncEligible = services.automaticSyncEligible,
+            workspacePairingInvitationCreator = pairing,
+            workspacePairingInvitationJoiner = pairing,
+            workspacePairingInvitationCanceller = pairing,
+            workspaceRecoveryManager = recovery,
+            accountDataResetManager = reset,
+            workspaceProductAccess = services.workspaceProductAccess,
+            backgroundDispatcher = Dispatchers.Default,
+        )
+
+        fun clearConnectionHints() {
+            // Deliberately use the underlying settings store to simulate persistence loss,
+            // rather than a user edit through the blocked product data plane.
+            settings.saveLocalSnapshot(settings.load().copy(syncConfiguration = SyncConfiguration()))
+        }
 
         fun connect(createAccount: Boolean) {
             updateSettings(null)

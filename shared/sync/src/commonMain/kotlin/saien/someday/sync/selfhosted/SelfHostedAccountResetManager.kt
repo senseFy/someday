@@ -32,7 +32,9 @@ class SelfHostedAccountResetManager(
     // All memory below is protected by the existing short product boundary.
     private val reviews = mutableListOf<AccountDataResetReview>()
     private var controlCredentials: SelfHostedSessionCredentials? = null
+    private val rejectedAuthentications = linkedSetOf<Pair<String, String>>()
     private var observed: Pair<String, SelfHostedAccountDataStateResponse>? = null
+    private var observedAuthentication: Pair<String, String>? = null
     private var issue: AccountDataResetIssue? = null
     private var busy = false
     private var replacementDecision: Any? = null
@@ -60,9 +62,10 @@ class SelfHostedAccountResetManager(
                 (pending?.operationId ?: Uuid.random().toString()) to (pending?.expectedIncarnation ?: review.targetIncarnation)
             }
         }
+        val authenticated = credentials(review)
         val outcome = try {
             reset.submit(operation.first, password, operation.second,
-                review.authorityBindingId, review.localCopy(), credentials(review))
+                review.authorityBindingId, review.localCopy(), authenticated)
         } catch (failure: Exception) {
             if (failure is CancellationException || failure is SelfHostedProtocolException || failure is ResetWorkflowFailure) throw failure
             fail(AccountDataResetIssue.LocalFailure)
@@ -84,17 +87,21 @@ class SelfHostedAccountResetManager(
             }
             is SelfHostedAccountResetResult.OutcomeUnknown -> result(false)
             is SelfHostedAccountResetResult.Rejected -> {
-                lifecycle.productAccess { issue = classify(outcome.errorCode) }
+                lifecycle.productAccess {
+                    rejectAuthentication(authenticated, outcome.errorCode)
+                    issue = classify(outcome.errorCode)
+                }
                 result(false)
             }
         }
     }
 
-    override fun reauthenticate(review: AccountDataResetReview, password: String): AccountDataResetActionResult = operate {
-        loginForControl(review, password)
+    override fun reauthenticate(review: AccountDataResetReview, password: String, email: String): AccountDataResetActionResult = operate {
+        loginForControl(review, password, email)
         val pending = lifecycle.productAccess { states.loadIntent() }
         if (pending != null && pending.receiptIncarnation == null) {
-            reset.reconcile(pending.operationId, credentials(review))
+            val authenticated = credentials(review)
+            withAuthentication(authenticated) { reset.reconcile(pending.operationId, authenticated) }
         }
         observe(review, credentials(review))
         result(true)
@@ -104,7 +111,8 @@ class SelfHostedAccountResetManager(
         lifecycle.productAccess { validate(review) }
         val pending = states.loadIntent() ?: fail(AccountDataResetIssue.ContextChanged)
         check(pending.operationId == review.operationId)
-        val outcome = reset.reconcile(pending.operationId, credentials(review))
+        val authenticated = credentials(review)
+        val outcome = withAuthentication(authenticated) { reset.reconcile(pending.operationId, authenticated) }
         observe(review, credentials(review))
         result(outcome is SelfHostedAccountResetResult.Committed)
     }
@@ -132,6 +140,9 @@ class SelfHostedAccountResetManager(
     ): AccountDataResetActionResult = operate {
         if (!discardConfirmed) fail(AccountDataResetIssue.ConfirmationRequired)
         if (mode != AccountDataReplacementMode.Fresh && secret.isBlank()) fail(AccountDataResetIssue.InvalidSecret)
+        if (!password.isNullOrEmpty()) loginForControl(review, password)
+        val auth = credentials(review)
+        if (auth.accountIncarnation != review.targetIncarnation) fail(AccountDataResetIssue.SignInRequired)
         val decision = lifecycle.exclusive {
             lifecycle.productAccess {
                 validate(review)
@@ -142,8 +153,6 @@ class SelfHostedAccountResetManager(
                 Any().also { replacementDecision = it }
             }
         }
-        if (!password.isNullOrEmpty()) loginForControl(review, password)
-        val auth = credentials(review)
         val current = observe(review, auth)
         if (current.accountIncarnation != review.targetIncarnation || auth.accountIncarnation != review.targetIncarnation) {
             fail(AccountDataResetIssue.ContextChanged)
@@ -155,9 +164,11 @@ class SelfHostedAccountResetManager(
                 states.recordRejoinConsent(authority.endpoint, authority.authenticatedUserId, review.workspaceId,
                     review.localIncarnation, review.targetIncarnation)
             }
-            val device = transport.registerDevice(review.endpoint, auth.accessToken,
-                SelfHostedDeviceRegistrationRequest(review.writerDeviceId, deviceName, platform),
-                SelfHostedAccountRequestContext(review.targetIncarnation, true))
+            val device = withAuthentication(auth) {
+                transport.registerDevice(review.endpoint, auth.accessToken,
+                    SelfHostedDeviceRegistrationRequest(review.writerDeviceId, deviceName, platform),
+                    SelfHostedAccountRequestContext(review.targetIncarnation, true))
+            }
             if (device.device.revoked) fail(AccountDataResetIssue.DeviceRevoked)
             if (device.device.id != review.writerDeviceId || device.accountProtocolVersion != 1 ||
                 device.accountIncarnation != review.targetIncarnation) fail(AccountDataResetIssue.ProtocolError)
@@ -167,9 +178,24 @@ class SelfHostedAccountResetManager(
                 requireDecision(review, decision)
                 // The durable gate was written first. Secure storage failure can
                 // never expose old data through the newly enrolled device.
-                sessionStore.saveForAuthority(review.authorityBindingId, enrolled)
-                sessionStore.save(enrolled)
+                try {
+                    sessionStore.saveForAuthority(review.authorityBindingId, enrolled)
+                    sessionStore.save(enrolled)
+                    val currentSettings = settingsRepository.load()
+                    settingsRepository.saveLocalSnapshot(currentSettings.copy(
+                        activeDeviceId = enrolled.deviceId,
+                        syncConfiguration = currentSettings.syncConfiguration.copy(
+                            mode = SyncMode.SelfHosted,
+                            selfHostedEndpoint = enrolled.endpoint,
+                            selfHostedSession = enrolled.toSummary(),
+                        ),
+                    ))
+                } catch (failure: Exception) {
+                    if (failure is CancellationException) throw failure
+                    fail(AccountDataResetIssue.ReplacementFailed)
+                }
                 controlCredentials = null
+                rejectedAuthentications.removeAll { it.first == review.authorityBindingId }
             }
         }
         val replaced = when (mode) {
@@ -179,6 +205,10 @@ class SelfHostedAccountResetManager(
                 val joined = pairing.joinWithToken(secret, replaceExistingWorkspace = true)
                 if (!joined.success) fail(when (joined.reason) {
                     WorkspacePairingReason.InvalidToken -> AccountDataResetIssue.InvalidSecret
+                    WorkspacePairingReason.InvitationNotFound, WorkspacePairingReason.InvitationExpired,
+                    WorkspacePairingReason.InvitationUnavailable -> AccountDataResetIssue.InvitationUnavailable
+                    WorkspacePairingReason.InvitationAlreadyUsed -> AccountDataResetIssue.InvitationAlreadyUsed
+                    WorkspacePairingReason.SessionRequired -> AccountDataResetIssue.SignInRequired
                     WorkspacePairingReason.AuthorityMismatch -> AccountDataResetIssue.ContextChanged
                     else -> AccountDataResetIssue.ReplacementFailed
                 })
@@ -190,6 +220,7 @@ class SelfHostedAccountResetManager(
                 if (!restored.success) fail(when (restored.reason) {
                     WorkspaceRecoveryReason.InvalidCodeFormat, WorkspaceRecoveryReason.DecryptionFailed -> AccountDataResetIssue.InvalidSecret
                     WorkspaceRecoveryReason.NotConfigured -> AccountDataResetIssue.NoRecoveryEnvelope
+                    WorkspaceRecoveryReason.SessionRequired -> AccountDataResetIssue.SignInRequired
                     WorkspaceRecoveryReason.AuthorityMismatch -> AccountDataResetIssue.ContextChanged
                     else -> AccountDataResetIssue.ReplacementFailed
                 })
@@ -232,11 +263,13 @@ class SelfHostedAccountResetManager(
         true
     }
 
-    private fun loginForControl(review: AccountDataResetReview, password: String) {
+    private fun loginForControl(review: AccountDataResetReview, password: String, email: String = review.accountEmail) {
         lifecycle.productAccess { validate(review) }
         if (password.isEmpty()) fail(AccountDataResetIssue.WrongPassword)
+        val normalizedEmail = email.trim().lowercase()
+        if (normalizedEmail.isBlank()) fail(AccountDataResetIssue.SignInRequired)
         val auth = try {
-            transport.login(review.endpoint, SelfHostedAuthRequest(review.accountEmail, password),
+            transport.login(review.endpoint, SelfHostedAuthRequest(normalizedEmail, password),
                 SelfHostedAccountRequestContext(review.localIncarnation, true))
         } catch (failure: SelfHostedSyncHttpException) {
             // This review already identifies a previously authenticated account, unlike an
@@ -244,8 +277,10 @@ class SelfHostedAccountResetManager(
             if (failure.protocol1) states.markProtocol1(review.endpoint, review.authority().authenticatedUserId)
             throw failure
         }
-        if (auth.user.id != review.authority().authenticatedUserId || auth.accountProtocolVersion != 1 ||
-            auth.accountIncarnation == null || !isCanonicalAccountIncarnation(auth.accountIncarnation)) {
+        if (auth.user.id != review.authority().authenticatedUserId) fail(AccountDataResetIssue.AccountMismatch)
+        if (auth.accountProtocolVersion != 1 ||
+            auth.accountIncarnation == null || !isCanonicalAccountIncarnation(auth.accountIncarnation) ||
+            auth.user.email.isBlank()) {
             fail(AccountDataResetIssue.ProtocolError)
         }
         val credentials = SelfHostedSessionCredentials(review.endpoint, auth.user.id, auth.user.email,
@@ -253,24 +288,63 @@ class SelfHostedAccountResetManager(
         lifecycle.productAccess {
             validate(review)
             discovery.recordIssuance(credentials)
+            // Account recovery may have no secure session or remembered email. Retain only
+            // server-verified display hints; this login never makes a content session ready.
+            val current = settingsRepository.load()
+            settingsRepository.saveLocalSnapshot(current.copy(syncConfiguration = current.syncConfiguration.copy(
+                selfHostedEndpoint = review.endpoint,
+                selfHostedSession = current.syncConfiguration.selfHostedSession.copy(userEmail = auth.user.email),
+            )))
             controlCredentials = credentials
+            rejectedAuthentications.removeAll { it.first == review.authorityBindingId }
         }
     }
 
     private fun credentials(review: AccountDataResetReview): SelfHostedSessionCredentials = lifecycle.productAccess {
         validate(review)
-        controlCredentials?.takeIf { it.authorityBindingId == review.authorityBindingId }
-            ?: sessionStore.load()?.takeIf { it.authorityBindingId == review.authorityBindingId }
-            ?: sessionStore.loadForAuthority(review.authorityBindingId)
-            ?: fail(AccountDataResetIssue.SignInRequired)
+        availableCredentials(review.authorityBindingId) ?: fail(AccountDataResetIssue.SignInRequired)
+    }
+
+    private fun availableCredentials(authorityId: String): SelfHostedSessionCredentials? =
+        sequence {
+            yield(controlCredentials)
+            yield(sessionStore.load())
+            yield(sessionStore.loadForAuthority(authorityId))
+        }
+            .filterNotNull().firstOrNull {
+                it.authorityBindingId == authorityId && (authorityId to it.accessToken) !in rejectedAuthentications
+            }
+
+    private fun rejectAuthentication(credentials: SelfHostedSessionCredentials, code: SelfHostedErrorCode?) {
+        if (code in setOf(SelfHostedErrorCode.UNAUTHORIZED, SelfHostedErrorCode.ACCOUNT_SESSION_STALE)) {
+            val rejected = credentials.authorityBindingId to credentials.accessToken
+            rejectedAuthentications.remove(rejected)
+            rejectedAuthentications.add(rejected)
+            if (controlCredentials?.let { it.authorityBindingId to it.accessToken } == rejected) controlCredentials = null
+            if (rejectedAuthentications.size > MAX_REJECTED_AUTHENTICATIONS) {
+                // Keep rejected tokens still present in either secure-store slot excluded.
+                val currentCandidates = listOfNotNull(controlCredentials, sessionStore.load(),
+                    sessionStore.loadForAuthority(credentials.authorityBindingId))
+                    .map { it.authorityBindingId to it.accessToken }.toSet()
+                rejectedAuthentications.remove(rejectedAuthentications.first { it != rejected && it !in currentCandidates })
+            }
+        }
+    }
+
+    private fun <T> withAuthentication(credentials: SelfHostedSessionCredentials, block: () -> T): T = try {
+        block()
+    } catch (failure: SelfHostedSyncHttpException) {
+        lifecycle.productAccess { rejectAuthentication(credentials, failure.errorCode) }
+        throw failure
     }
 
     private fun observe(review: AccountDataResetReview, credentials: SelfHostedSessionCredentials): SelfHostedAccountDataStateResponse {
-        val remote = discovery.discover(credentials) as? SelfHostedAccountDiscoveryResult.Protocol1
+        val remote = withAuthentication(credentials) { discovery.discover(credentials) } as? SelfHostedAccountDiscoveryResult.Protocol1
             ?: fail(AccountDataResetIssue.UnsupportedServer)
         lifecycle.productAccess {
             validate(review)
             observed = review.authorityBindingId to remote.state
+            observedAuthentication = credentials.authorityBindingId to credentials.accessToken
             if (review.localAuthorityBindingId != null && remote.state.accountIncarnation != review.localIncarnation) {
                 val authority = review.authority()
                 states.markResetRequired(authority.endpoint, authority.authenticatedUserId, review.workspaceId, review.localIncarnation)
@@ -312,15 +386,22 @@ class SelfHostedAccountResetManager(
             ?: copy.authorityBindingId ?: selected?.authorityBindingId ?: return AccountDataResetSnapshot()
         val authority = parseSelfHostedAuthorityBindingId(authorityId) ?: return AccountDataResetSnapshot()
         val stored = selected?.takeIf { it.authorityBindingId == authorityId } ?: sessionStore.loadForAuthority(authorityId)
-        val auth = controlCredentials?.takeIf { it.authorityBindingId == authorityId } ?: stored
-        val email = auth?.userEmail ?: settingsRepository.load().syncConfiguration.selfHostedSession.userEmail
-            ?: return AccountDataResetSnapshot(issue = AccountDataResetIssue.SignInRequired)
+        val auth = availableCredentials(authorityId)
+        // Email is a recoverable login hint, never the identity or admission decision. The
+        // durable authority/intent must keep offering reconciliation after credentials and
+        // connection hints are lost, including an unbound first-run workspace.
+        val email = auth?.userEmail ?: stored?.userEmail ?: settingsRepository.load().syncConfiguration.selfHostedSession.userEmail.orEmpty()
         if (copy.authorityBindingId != null && auth != null && auth.accountIncarnation != copy.accountIncarnation) {
             states.markResetRequired(authority.endpoint, authority.authenticatedUserId, copy.workspaceId, copy.accountIncarnation)
         }
         val gate = states.loadGate(authority.endpoint, authority.authenticatedUserId, copy.workspaceId)
         val remote = observed?.takeIf { it.first == authorityId }?.second
-        val target = remote?.accountIncarnation ?: pending?.receiptIncarnation ?: auth?.accountIncarnation ?: copy.accountIncarnation
+        val target = remote?.accountIncarnation?.takeUnless {
+            pending?.receiptIncarnation != null && it == pending.expectedIncarnation
+        } ?: pending?.receiptIncarnation ?: auth?.accountIncarnation ?: copy.accountIncarnation
+        val requiresAuthentication = auth == null || auth.accountIncarnation != target ||
+            (pending == null && gate != null && auth.accountIncarnation == copy.accountIncarnation &&
+                observedAuthentication != (auth.authorityBindingId to auth.accessToken))
         val template = AccountDataResetReview("", authorityId, authority.endpoint, email, copy.workspaceId, copy.writerDeviceId,
             copy.accountIncarnation, copy.authorityBindingId, target, pending?.operationId)
         val review = reviews.lastOrNull()?.takeIf { it.copy(id = "") == template } ?: template.copy(id = Uuid.random().toString()).also {
@@ -334,7 +415,6 @@ class SelfHostedAccountResetManager(
             else -> AccountDataResetPhase.Ready
         }
         val availabilityIssue = when {
-            auth == null -> AccountDataResetIssue.SignInRequired
             remote == null -> null
             remote.resetAvailable -> null
             remote.resetUnavailableReason == "retired_media_pending" -> AccountDataResetIssue.RetiredMediaPending
@@ -342,10 +422,10 @@ class SelfHostedAccountResetManager(
         }
         return AccountDataResetSnapshot(phase, review, authority.endpoint, email, pending?.operationId,
             gate?.offlineEditing == true, gate?.productReadOnly == true,
-            remote?.resetAvailable == true && pending == null && gate == null,
+            !requiresAuthentication && remote?.resetAvailable == true && pending == null && gate == null,
             runCatching(canExportProvider).getOrDefault(false),
-            gate != null && (pending == null || pending.receiptIncarnation != null) && remote != null,
-            issue ?: availabilityIssue)
+            !requiresAuthentication && gate != null && (pending == null || pending.receiptIncarnation != null) && remote != null,
+            issue, requiresAuthentication, availabilityIssue)
     }
 
     private fun operate(block: () -> AccountDataResetActionResult): AccountDataResetActionResult {
@@ -401,5 +481,8 @@ class SelfHostedAccountResetManager(
         SelfHostedErrorCode.ACCOUNT_RESET_UNAVAILABLE -> AccountDataResetIssue.DeploymentNotReady
         SelfHostedErrorCode.ACCOUNT_PROTOCOL_UPGRADE_REQUIRED -> AccountDataResetIssue.UnsupportedServer
         else -> AccountDataResetIssue.NetworkError
+    }
+    private companion object {
+        const val MAX_REJECTED_AUTHENTICATIONS = 16
     }
 }

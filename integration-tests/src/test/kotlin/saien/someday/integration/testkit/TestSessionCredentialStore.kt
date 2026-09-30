@@ -31,4 +31,9 @@ internal class TestSessionCredentialStore : SelfHostedSessionCredentialStore {
         byAuthority.remove(authorityBindingId)
         if (current?.authorityBindingId == authorityBindingId) current = null
     }
+
+    fun clearAll() {
+        current = null
+        byAuthority.clear()
+    }
 }

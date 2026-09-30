@@ -2,12 +2,15 @@
 
 package saien.someday.integration
 
+import java.awt.image.BufferedImage
+import java.io.ByteArrayOutputStream
 import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.util.Base64
 import java.util.UUID
+import javax.imageio.ImageIO
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
@@ -18,6 +21,7 @@ import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlin.time.Instant
+import kotlinx.coroutines.runBlocking
 import okio.Buffer
 import okio.buffer
 import saien.someday.data.account.AccountNetworkBlockedException
@@ -29,6 +33,7 @@ import saien.someday.domain.settings.AccountDataResetIssue
 import saien.someday.domain.settings.AccountDataResetPhase
 import saien.someday.domain.settings.INITIAL_ACCOUNT_INCARNATION
 import saien.someday.domain.settings.SelfHostedSessionCredentials
+import saien.someday.domain.settings.SyncMode
 import saien.someday.domain.workspace.WorkspaceProductReadOnlyException
 import saien.someday.integration.testkit.AccountResetInstallation
 import saien.someday.integration.testkit.AccountResetJourneyTransport
@@ -39,9 +44,120 @@ import saien.someday.sync.selfhosted.SELF_HOSTED_ERROR_CODE_HEADER
 import saien.someday.sync.selfhosted.SelfHostedErrorCode
 import saien.someday.sync.selfhosted.SelfHostedSyncHttpException
 import saien.someday.sync.selfhosted.accountRequestContext
+import saien.someday.ui.i18n.AccountResetUiStrings
+import saien.someday.ui.settings.SettingsUiController
+import saien.someday.ui.settings.SyncConnectionUi
+import saien.someday.ui.settings.WorkspaceRecoveryUiAvailability
 
 /** Requires an isolated real server with SOMEDAY_ACCOUNT_RESET_ENABLED=true. No mocked responses. */
 class AccountResetJourneyTest {
+    @Test
+    fun restartedControllersFinishFreshPairAndRecoveryWithoutCredentialsHintsOrForegroundRefresh() = runBlocking {
+        val endpoint = requiredEnvironment("SOMEDAY_E2E_ENDPOINT")
+        val uri = URI.create(endpoint)
+        require(uri.scheme == "http" && uri.host in setOf("localhost", "127.0.0.1", "::1", "[::1]") && uri.port > 0) {
+            "The destructive controller journey requires an explicit loopback HTTP test server."
+        }
+        val account = account("reset-controller")
+        AccountResetInstallation(endpoint, account, AccountResetJourneyTransport.jdk(), "controller-leader").use { leader ->
+            AccountResetInstallation(endpoint, account, AccountResetJourneyTransport.ktor(), "controller-pair").use { pairPeer ->
+                AccountResetInstallation(endpoint, account, AccountResetJourneyTransport.jdk(), "controller-recover").use { recoveryPeer ->
+                    leader.process.connect(true)
+                    pairPeer.process.connect(false)
+                    recoveryPeer.process.connect(false)
+                    val oldContent = publishTextAndImage(leader, "before controller reset")
+                    for (peer in listOf(pairPeer, recoveryPeer)) {
+                        join(peer, leader)
+                        sync(peer)
+                        assertTextAndImage(peer, oldContent)
+                    }
+                    val oldWorkspace = assertNotNull(leader.process.keys.workspaceIdOrNull())
+                    val oldRecovery = assertNotNull(leader.process.recovery.prepareCode().recoveryCode)
+                        .revealForUserConfirmation()
+                    assertTrue(leader.process.recovery.confirmPreparedCode(oldRecovery).success)
+
+                    val originalController = leader.process.settingsController()
+                    originalController.refresh()
+                    assertTrue(originalController.refreshAccountReset())
+                    assertTrue(originalController.state.sync.accountReset.snapshot?.resetAvailable == true)
+                    assertTrue(originalController.submitAccountReset(
+                        assertNotNull(originalController.state.sync.accountReset.snapshot?.review),
+                        account.password,
+                        AccountResetUiStrings().confirmationPhrase,
+                    ))
+                    assertEquals(AccountDataResetPhase.RemoteCommittedLocalPending,
+                        originalController.state.sync.accountReset.snapshot?.phase)
+                    for (peer in listOf(pairPeer, recoveryPeer)) {
+                        assertFalse(peer.process.services.manualSyncRunner.run().success)
+                        assertEquals(AccountDataResetPhase.ResetRequired, peer.process.reset.load().phase)
+                    }
+                    for (device in listOf(leader, pairPeer, recoveryPeer)) {
+                        device.loseCredentialsAndConnectionHintsThenRestart()
+                        assertNull(device.sessionStore.load())
+                        val settings = device.process.services.settingsRepository.load().syncConfiguration
+                        assertEquals(SyncMode.Off, settings.mode)
+                        assertFalse(settings.selfHostedSession.loggedIn)
+                        assertTrue(settings.selfHostedSession.userEmail.isNullOrBlank())
+                        assertTrue(settings.selfHostedEndpoint.isNullOrBlank())
+                    }
+
+                    // There is intentionally no controller.refresh(), foreground event, or
+                    // manual sync after reopening. Each replacement must finish its own setup.
+                    val leaderController = authenticateBlockedController(leader, oldContent)
+                    assertTrue(leaderController.replaceAccountWorkspace(
+                        assertNotNull(leaderController.state.sync.accountReset.snapshot?.review),
+                        AccountDataReplacementMode.Fresh,
+                        discardConfirmed = true,
+                    ), leaderController.state.sync.accountReset.snapshot?.issue?.name)
+                    assertCompletedControllerReplacement(leader, leaderController, oldContent)
+                    assertNotEquals(oldWorkspace, leader.process.keys.workspaceIdOrNull())
+                    assertEquals(1, leader.process.controllerSyncResults.size, "Fresh replacement itself performs its first sync.")
+                    assertEquals(WorkspaceRecoveryUiAvailability.NotConfigured, leaderController.state.sync.recovery.availability)
+
+                    assertTrue(leaderController.prepareWorkspaceRecoveryCode(), leaderController.state.feedbackMessage)
+                    val newRecovery = assertNotNull(leaderController.state.sync.recovery.preparedCode).value
+                    assertFalse(newRecovery == oldRecovery, "A fresh workspace must have a new recovery code.")
+                    assertTrue(leaderController.confirmWorkspaceRecoveryCode(newRecovery), leaderController.state.feedbackMessage)
+                    assertEquals(WorkspaceRecoveryUiAvailability.Configured, leaderController.state.sync.recovery.availability)
+                    val newContent = publishTextAndImageAutomatically(leader, leaderController, "after controller reset")
+                    assertTrue(leaderController.createWorkspacePairingInvitation(), leaderController.state.feedbackMessage)
+                    val invitation = assertNotNull(leaderController.state.sync.invitation).manualToken
+
+                    for ((peer, mode, secret) in listOf(
+                        Triple(pairPeer, AccountDataReplacementMode.Pair, invitation),
+                        Triple(recoveryPeer, AccountDataReplacementMode.Recover, newRecovery),
+                    )) {
+                        val controller = authenticateBlockedController(peer, oldContent)
+                        val registrations = peer.transport.registrations
+                        assertFalse(controller.replaceAccountWorkspace(
+                            assertNotNull(controller.state.sync.accountReset.snapshot?.review), mode,
+                            discardConfirmed = false, secret = secret,
+                        ))
+                        assertEquals(registrations, peer.transport.registrations)
+                        assertNotNull(peer.process.services.notesRepository.getNoteDetails(oldContent.noteId))
+                        assertTrue(controller.replaceAccountWorkspace(
+                            assertNotNull(controller.state.sync.accountReset.snapshot?.review), mode,
+                            discardConfirmed = true, secret = secret,
+                        ), controller.state.sync.accountReset.snapshot?.issue?.name)
+                        assertCompletedControllerReplacement(peer, controller, oldContent)
+                        assertEquals(1, peer.process.controllerSyncResults.size, "$mode replacement itself downloads the current workspace.")
+                        assertEquals(leader.process.keys.workspaceIdOrNull(), peer.process.keys.workspaceIdOrNull())
+                        assertEquals(leader.sessionStore.load()?.accountIncarnation, peer.sessionStore.load()?.accountIncarnation)
+                        assertTrue(peer.process.services.mediaCoordinator.materialize(newContent.assetId).downloaded,
+                            "$mode must retrieve the new image from real HTTP, not reuse pre-reset bytes.")
+                        assertTextAndImage(peer, newContent)
+                        assertTrue(controller.runAutomaticSync(), controller.state.feedbackMessage)
+
+                        val notebook = peer.process.services.notesRepository.createNotebook("$mode automatic write")
+                        assertTrue(controller.runAutomaticSync(), controller.state.feedbackMessage)
+                        assertTrue(leaderController.runAutomaticSync(), leaderController.state.feedbackMessage)
+                        assertTrue(leader.process.services.notesRepository.listNotebooks().any { it.id == notebook.id })
+                    }
+                }
+            }
+        }
+    }
+
     @Test
     fun twoRealTransportsKeepRetiredDataOutUntilSeparateLocalConsentAndPreserveControlAccount() {
         val endpoint = requiredEnvironment("SOMEDAY_E2E_ENDPOINT")
@@ -300,6 +416,73 @@ class AccountResetJourneyTest {
         return Content(note.id, asset, title)
     }
 
+    private suspend fun authenticateBlockedController(
+        device: AccountResetInstallation,
+        oldContent: Content,
+    ): SettingsUiController {
+        val controller = device.process.settingsController()
+        controller.loadAccountResetState()
+        assertTrue(controller.state.sync.accountReset.blocksSync)
+        assertTrue(controller.state.sync.accountReset.snapshot?.requiresAuthentication == true)
+        val review = assertNotNull(controller.state.sync.accountReset.snapshot?.review)
+        assertTrue(review.accountEmail.isBlank(), "The recovery form must work without a remembered email.")
+        val registrations = device.transport.registrations
+        assertTrue(controller.reauthenticateAccountReset(review, device.account.password, device.account.email),
+            controller.state.sync.accountReset.snapshot?.issue?.name)
+        assertEquals(registrations, device.transport.registrations, "Control login cannot register or discard a device.")
+        assertNull(device.sessionStore.load(), "Control-only credentials must not become a content session.")
+        assertTrue(controller.state.sync.accountReset.blocksSync)
+        assertFalse(controller.state.sync.accountReset.snapshot?.requiresAuthentication == true)
+        assertNotNull(device.process.services.notesRepository.getNoteDetails(oldContent.noteId))
+        assertTrue(device.process.controllerSyncResults.isEmpty())
+        return controller
+    }
+
+    private fun assertCompletedControllerReplacement(
+        device: AccountResetInstallation,
+        controller: SettingsUiController,
+        oldContent: Content,
+    ) {
+        assertEquals(AccountDataResetPhase.LocalReady, controller.state.sync.accountReset.snapshot?.phase)
+        assertNull(controller.state.sync.accountReset.snapshot?.issue)
+        assertEquals(AccountDataResetIssue.RetiredMediaPending, controller.state.sync.accountReset.snapshot?.resetUnavailableIssue)
+        assertTrue(controller.state.sync.connection is SyncConnectionUi.Connected)
+        assertEquals(SyncMode.SelfHosted, controller.state.settings.syncConfiguration.mode)
+        assertTrue(controller.state.settings.syncConfiguration.selfHostedSession.loggedIn)
+        assertFalse(controller.state.sync.accountReset.blocksSync)
+        assertFalse(controller.state.sync.recovery.blocksSync)
+        assertNull(controller.state.sync.issue)
+        assertTrue(device.process.controllerSyncResults.isNotEmpty(), "A local replacement alone is not a completed sync journey.")
+        assertTrue(device.process.controllerSyncResults.last().success, device.process.controllerSyncResults.last().reason.name)
+        assertTrue(controller.canRunAutomaticSync())
+        assertTrue(device.process.services.automaticSyncEligible())
+        assertEquals(device.writerId, device.sessionStore.load()?.deviceId)
+        assertNull(device.process.services.notesRepository.getNoteDetails(oldContent.noteId))
+    }
+
+    private suspend fun publishTextAndImageAutomatically(
+        device: AccountResetInstallation,
+        controller: SettingsUiController,
+        title: String,
+    ): Content {
+        val notebook = device.process.services.notesRepository.createNotebook(title)
+        assertTrue(controller.runAutomaticSync(), controller.state.feedbackMessage)
+        val imported = device.process.services.localMediaAssetStore.importAsset(
+            Buffer().write(NEW_PNG),
+            MediaAssetImportRequest(mediaType = "image/png", originalFileName = "synthetic.png"),
+        )
+        val asset = imported.asset.metadata.id
+        val note = device.process.services.notesRepository.createNote(NoteInput(
+            notebookId = notebook.id,
+            title = title,
+            markdownBody = "New workspace test text\n\n![synthetic](someday-asset://${asset.value})",
+            createdAt = CREATED_AT,
+            timeZoneId = "UTC",
+        ))
+        assertTrue(controller.runAutomaticSync(), controller.state.feedbackMessage)
+        return Content(note.id, asset, title, NEW_PNG)
+    }
+
     private fun assertTextAndImage(device: AccountResetInstallation, content: Content) {
         val note = assertNotNull(device.process.services.notesRepository.getNoteDetails(content.noteId))
         assertEquals(content.title, note.title)
@@ -308,7 +491,7 @@ class AccountResetJourneyTest {
             assertTrue(device.process.services.mediaCoordinator.materialize(content.assetId).downloaded)
         }
         assertContentEquals(
-            PNG,
+            content.imageBytes,
             device.process.services.localMediaAssetStore.openSource(content.assetId).buffer().use { it.readByteArray() },
         )
     }
@@ -360,12 +543,18 @@ class AccountResetJourneyTest {
         return TestAccount("$prefix-$unique@example.com", "Reset-acceptance-$unique")
     }
 
-    private data class Content(val noteId: String, val assetId: MediaAssetId, val title: String)
+    private data class Content(val noteId: String, val assetId: MediaAssetId, val title: String, val imageBytes: ByteArray = PNG)
 
     private companion object {
         val CREATED_AT = Instant.parse("2026-09-29T04:00:00Z")
         val PNG: ByteArray = Base64.getDecoder().decode(
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
         )
+        val NEW_PNG: ByteArray = ByteArrayOutputStream().use { output ->
+            val image = BufferedImage(2, 2, BufferedImage.TYPE_INT_RGB)
+            image.setRGB(0, 0, 0x336699)
+            check(ImageIO.write(image, "png", output))
+            output.toByteArray()
+        }
     }
 }

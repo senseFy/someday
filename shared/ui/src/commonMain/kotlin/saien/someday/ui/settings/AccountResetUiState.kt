@@ -25,14 +25,21 @@ internal fun AccountDataResetIssue.message(strings: AccountResetUiStrings): Stri
     AccountDataResetIssue.Unavailable, AccountDataResetIssue.UnsupportedServer,
     AccountDataResetIssue.DeploymentNotReady -> strings.unavailable
     AccountDataResetIssue.RetiredMediaPending -> strings.retainedMedia
-    AccountDataResetIssue.SignInRequired, AccountDataResetIssue.DeviceRevoked -> strings.signInRequired
+    AccountDataResetIssue.SignInRequired -> strings.signInRequired
+    AccountDataResetIssue.DeviceRevoked -> strings.deviceRevoked
     AccountDataResetIssue.WrongPassword -> strings.wrongPassword
-    AccountDataResetIssue.Busy, AccountDataResetIssue.RateLimited -> strings.busy
+    AccountDataResetIssue.Busy -> strings.busy
+    AccountDataResetIssue.RateLimited -> strings.rateLimited
     AccountDataResetIssue.LocalFailure -> strings.failed
     AccountDataResetIssue.ReplacementFailed -> strings.localFailure
     AccountDataResetIssue.ConfirmationRequired -> strings.localConsentRequired
-    AccountDataResetIssue.InvalidSecret -> strings.failed
-    AccountDataResetIssue.NoRecoveryEnvelope, AccountDataResetIssue.Conflict,
-    AccountDataResetIssue.ProtocolError, AccountDataResetIssue.NetworkError,
-    AccountDataResetIssue.ContextChanged -> strings.failed
+    AccountDataResetIssue.AccountMismatch -> strings.accountMismatch
+    AccountDataResetIssue.InvalidSecret -> strings.invalidSecret
+    AccountDataResetIssue.InvitationUnavailable -> strings.invitationUnavailable
+    AccountDataResetIssue.InvitationAlreadyUsed -> strings.invitationUsed
+    AccountDataResetIssue.NoRecoveryEnvelope -> strings.noRecovery
+    AccountDataResetIssue.NetworkError -> strings.networkError
+    AccountDataResetIssue.ContextChanged -> strings.contextChanged
+    AccountDataResetIssue.Conflict -> strings.contextChanged
+    AccountDataResetIssue.ProtocolError -> strings.protocolError
 }

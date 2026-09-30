@@ -373,7 +373,8 @@
     <string name="settings_fb_selfhosted_bound_session_renewed">已为此设备续期工作区绑定的会话。</string>
     <string name="settings_fb_selfhosted_endpoint_mismatch">请使用已绑定到此工作区的自建服务器。</string>
     <string name="settings_fb_selfhosted_ready">自建服务账户和设备已就绪。</string>
-    <string name="settings_fb_selfhosted_setup_failed">自建服务设置安全失败。</string>
+    <string name="settings_fb_selfhosted_account_data_changed">服务器上的账号数据已变化。请先“处理本机副本”，再重新连接。</string>
+    <string name="settings_fb_selfhosted_setup_failed">登录未完成。请检查账号信息和网络连接后重试。</string>
     <string name="settings_fb_connection_switch_ready">现在可以连接其他服务器或账户。</string>
     <string name="settings_fb_connection_switch_failed">无法安全解除当前连接。</string>
     <string name="settings_fb_settings_save_failed">设置保存失败：%1$s</string>
@@ -419,6 +420,8 @@
     <string name="sync_reauthenticate">重新登录</string>
     <string name="sync_create_account">创建账户</string>
     <string name="sync_secure_session_unavailable">已保存的登录状态暂时不可用。请先重试，再进行同步。</string>
+    <string name="sync_status_account_reset_pending">本机副本待处理</string>
+    <string name="sync_status_reauthentication_required">需要重新登录</string>
     <string name="sync_status_unavailable">登录状态不可用</string>
     <string name="sync_status_syncing">正在同步...</string>
     <string name="sync_connecting">正在安全连接...</string>
@@ -497,6 +500,10 @@
 
     <!-- Account data reset: logical reset and separate local replacement. -->
     <string name="account_reset_danger_zone">危险操作</string>
+    <string name="account_reset_resume_title">处理本机副本</string>
+    <string name="account_reset_resume_required">请在“处理本机副本”中核对账号状态，并选择下一步。</string>
+    <string name="account_reset_summary">重置服务器数据，保留本机副本</string>
+    <string name="account_reset_details">查看处理方式</string>
     <string name="account_reset_title">重置账号数据</string>
     <string name="account_reset_scope_warning">此操作会立即重置该账号在服务器上的所有工作区，并断开所有设备。本机副本会保留，直到你另行选择替换。</string>
     <string name="account_reset_irreversible_warning">持有账号密码的人即可立即重置。此操作无法撤销，也没有冷静期。</string>
@@ -519,7 +526,7 @@
     <string name="account_reset_offline_warning">这只允许本机编辑，不会取消远程请求、恢复服务器数据，也不代表重置失败。重新连接前仍需核对结果，并重新确认是否丢弃此副本。</string>
     <string name="account_reset_offline_title">正在离线编辑；服务器访问仍暂停</string>
     <string name="account_reset_committed_title">服务器重置已完成；本机副本仍保留</string>
-    <string name="account_reset_committed_body">请重新登录，并选择如何设置此设备。明确确认替换前，不会丢弃此设备上的内容。</string>
+    <string name="account_reset_committed_body">请选择如何继续使用此设备。明确确认替换前，本机内容会保留。</string>
     <string name="account_reset_changed_title">账号的数据状态已变化</string>
     <string name="account_reset_changed_body">此工作区与账号当前的数据状态不一致，无法上传到当前账号。选择替换前，可先导出或保留本机副本离线编辑。</string>
     <string name="account_reset_authenticate">登录以继续处理账号</string>
@@ -528,14 +535,14 @@
     <string name="account_reset_fresh">从空工作区开始</string>
     <string name="account_reset_pair">与其他设备配对</string>
     <string name="account_reset_recover">使用恢复码</string>
-    <string name="account_reset_pairing_code">当前设备提供的配对口令</string>
-    <string name="account_reset_recovery_code">当前工作区的恢复码</string>
+    <string name="account_reset_pairing_code">另一台已连接设备的新配对口令</string>
+    <string name="account_reset_recovery_code">重置后设置的恢复码</string>
     <string name="account_reset_discard_consent">我同意丢弃此设备的当前工作区，且不合并数据。</string>
     <string name="account_reset_replace">确认替换本机工作区</string>
     <string name="account_reset_local_failure">本地设置未完成，原有本地副本仍被保留。请重试设置，或保留副本并继续离线。</string>
-    <string name="account_reset_ready">此设备已可用于当前账号。若创建了全新工作区，请重新设置恢复码。</string>
-    <string name="account_reset_unavailable">当前服务器暂时无法重置。此前结果未明的请求仍需继续核对。</string>
-    <string name="account_reset_retained_media">上次重置保留的媒体数据阻止再次重置。需由运营方完成经验证的清理；某些存储保留策略可能无限期阻止再次重置。</string>
+    <string name="account_reset_ready">本机工作区已替换。</string>
+    <string name="account_reset_unavailable">当前服务器暂时无法重置。</string>
+    <string name="account_reset_retained_media">上次重置的数据保留或清理验证尚未完成，仅影响再次重置，不妨碍继续处理此设备。某些保留策略可能无限期阻止再次重置。</string>
     <string name="account_reset_sign_in_required">请重新登录，以核对或继续此次账号操作。</string>
     <string name="account_reset_wrong_password">账号密码不正确，未自动重试。</string>
     <string name="account_reset_busy">账号正忙，请稍后重试。</string>
@@ -544,4 +551,22 @@
     <string name="account_reset_local_consent_required">继续前，请确认丢弃当前这份本机副本。</string>
     <string name="account_reset_refresh">刷新账号状态</string>
     <string name="account_reset_readonly_note">此副本暂为只读。请在同步设置中核对账号状态，或选择继续离线编辑。</string>
+    <string name="account_reset_back">返回</string>
+    <string name="account_reset_authenticating">正在验证账号…</string>
+    <string name="account_reset_replacing">正在替换本机工作区…</string>
+    <string name="account_reset_replacement_help">第一台设备可从空工作区开始；其他设备用新的配对口令或恢复码加入。</string>
+    <string name="account_reset_fresh_help">创建空工作区并同步到此账号，然后设置新的恢复码。</string>
+    <string name="account_reset_pair_help">请使用另一台已在重置后连接的设备提供的新口令。旧口令不能恢复重置前的数据。</string>
+    <string name="account_reset_recover_help">请使用重置后设置的恢复码。旧恢复码不能恢复重置前的数据。</string>
+    <string name="account_reset_account_mismatch">此邮箱属于另一个账号。请输入正在处理重置的账号邮箱。</string>
+    <string name="account_reset_invalid_secret">配对口令或恢复码不正确，请检查后重试。</string>
+    <string name="account_reset_invitation_unavailable">配对邀请不存在或已过期。请在已连接的设备上重新创建。</string>
+    <string name="account_reset_invitation_used">配对邀请已被使用。请在已连接的设备上重新创建。</string>
+    <string name="account_reset_no_recovery">当前账号数据尚未设置恢复码。请从空工作区开始，或与已连接的设备配对。</string>
+    <string name="account_reset_network_error">无法连接服务器。请检查网络后重试此步骤。</string>
+    <string name="account_reset_context_changed">账号或本机副本已变化。请返回核对当前状态，再继续操作。</string>
+    <string name="account_reset_sync_pending">本机工作区已替换，同步尚未完成。请重试同步。</string>
+    <string name="account_reset_device_revoked">此设备已被撤销，重新登录无法重新启用。请联系服务器管理员。</string>
+    <string name="account_reset_rate_limited">请求过于频繁，请稍后再试。</string>
+    <string name="account_reset_protocol_error">无法验证服务器响应。请检查客户端与服务器版本，或联系运营方。</string>
 </resources>

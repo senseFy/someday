@@ -130,6 +130,12 @@ fun MainViewController(): UIViewController {
                 clientRepositories = clientRepositories,
             )
         }
+        val localExportRunner = remember(clientRepositories) {
+            IosLocalExportRunner(
+                rootControllerProvider = { rootController },
+                prepareExport = clientRepositories::prepareLocalDataExport,
+            )
+        }
         val workspacePairingScanner = remember {
             IosWorkspacePairingScanner(rootControllerProvider = { rootController })
         }
@@ -190,7 +196,7 @@ fun MainViewController(): UIViewController {
             onSettingsChanged = clientRepositories.settingsRepository::save,
             workspacePreferencesConflictResolver =
                 clientRepositories.settingsRepository as? WorkspacePreferencesConflictResolver,
-            onLocalExport = clientRepositories::exportLocalDataSummary,
+            localExportRunner = localExportRunner,
             dayOneImportRunner = dayOneImportRunner,
             mediaUiPorts = mediaUiPorts,
             selfHostedSetupClient = clientRepositories.selfHostedSetupClient,

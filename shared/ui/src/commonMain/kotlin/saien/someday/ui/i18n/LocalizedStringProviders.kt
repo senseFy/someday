@@ -178,6 +178,7 @@ fun rememberSettingsUiStrings(): SettingsUiStrings {
     val selfHostedEndpointMismatch = stringResource(Res.string.settings_fb_selfhosted_endpoint_mismatch)
     val selfHostedSetupUnavailable = stringResource(Res.string.stub_selfhosted_signin)
     val selfHostedSetupFailed = stringResource(Res.string.settings_fb_selfhosted_setup_failed)
+    val selfHostedAccountDataChanged = stringResource(Res.string.settings_fb_selfhosted_account_data_changed)
     val selfHostedConnectionSwitchReady = stringResource(Res.string.settings_fb_connection_switch_ready)
     val selfHostedConnectionSwitchFailed = stringResource(Res.string.settings_fb_connection_switch_failed)
     val selfHostedEndpointRequired = stringResource(Res.string.val_selfhosted_endpoint_required)
@@ -273,6 +274,7 @@ fun rememberSettingsUiStrings(): SettingsUiStrings {
         selfHostedEndpointMismatch = selfHostedEndpointMismatch,
         selfHostedSetupUnavailable = selfHostedSetupUnavailable,
         selfHostedSetupFailed = selfHostedSetupFailed,
+        selfHostedAccountDataChanged = selfHostedAccountDataChanged,
         selfHostedConnectionSwitchReady = selfHostedConnectionSwitchReady,
         selfHostedConnectionSwitchFailed = selfHostedConnectionSwitchFailed,
         selfHostedEndpointRequired = selfHostedEndpointRequired,

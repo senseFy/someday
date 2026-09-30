@@ -47,14 +47,9 @@ import saien.someday.sync.selfhosted.WorkspaceBoundSessionCredentialStore
 import saien.someday.ui.settings.SettingsExportSummary
 import saien.someday.ui.settings.SettingsImportOutcome
 import saien.someday.ui.settings.SettingsImportSummary
-import platform.Foundation.NSFileManager
 import platform.Foundation.NSHomeDirectory
-import platform.Foundation.NSString
-import platform.Foundation.NSUTF8StringEncoding
 import platform.Foundation.NSUUID
 import platform.Foundation.NSUserDefaults
-import platform.Foundation.create
-import platform.Foundation.writeToFile
 import okio.Path.Companion.toPath
 
 class IosClientRepositories(
@@ -90,31 +85,19 @@ class IosClientRepositories(
         }
     }
 
-    fun exportLocalDataSummary(): SettingsExportSummary {
+    internal fun prepareLocalDataExport(): IosPreparedLocalExport {
         val document = localDataExporter.exportDocument()
-        val exportDirectory = "${NSHomeDirectory()}/Documents/Someday Exports"
-        NSFileManager.defaultManager.createDirectoryAtPath(
-            path = exportDirectory,
-            withIntermediateDirectories = true,
-            attributes = null,
-            error = null,
-        )
-        val filePath = "$exportDirectory/someday-export-${document.exportedAt.toExportFileStamp()}.json"
-        val saved = NSString.create(string = localDataExporter.encodeDocument(document)).writeToFile(
-            path = filePath,
-            atomically = true,
-            encoding = NSUTF8StringEncoding,
-            error = null,
-        )
-        require(saved) { "iOS could not save the local export." }
-        return SettingsExportSummary(
-            formatName = "${document.format}+json",
-            notebookCount = document.notebooks.size,
-            noteCount = document.notes.size,
-            excludedSensitiveFields = document.excludedSensitiveFields,
-            includesMediaBytes = document.includesMediaBytes,
-            assetReferencesMayBeUnresolved = document.assetReferencesMayBeUnresolved,
-            destinationLabel = filePath,
+        return prepareIosLocalExport(
+            fileName = "someday-export-${document.exportedAt.toExportFileStamp()}.json",
+            json = localDataExporter.encodeDocument(document),
+            summary = SettingsExportSummary(
+                formatName = "${document.format}+json",
+                notebookCount = document.notebooks.size,
+                noteCount = document.notes.size,
+                excludedSensitiveFields = document.excludedSensitiveFields,
+                includesMediaBytes = document.includesMediaBytes,
+                assetReferencesMayBeUnresolved = document.assetReferencesMayBeUnresolved,
+            ),
         )
     }
 

@@ -1,6 +1,7 @@
 package saien.someday.sync
 
 import saien.someday.data.account.SqlDelightAccountStateRepository
+import saien.someday.data.account.AccountNetworkBlockedException
 import saien.someday.data.account.AccountResetIntentState
 import saien.someday.data.account.AccountStateMutationBoundary
 import saien.someday.data.crypto.WorkspaceMasterKey
@@ -176,6 +177,14 @@ fun createSystemV3ClientServices(
         workspaceProductAccess = workspaceProductAccess,
     )
     val activeWorkspaceSessionGuard = ActiveWorkspaceSessionGuard(
+        requireSetupAccess = {
+            // An unbound first-run workspace can also own a reset intent. Check before
+            // password login/device enrollment, even when secure credentials are missing.
+            accountStates.loadIntent()?.let { intent ->
+                accountStates.requireNetworkAllowed(intent.endpoint, intent.userId, intent.originalWorkspaceId)
+            }
+            localAccountGate()?.let { throw AccountNetworkBlockedException(it) }
+        },
         requireNetworkAccess = { credentials, workspaceId ->
             accountStates.requireNetworkAllowed(credentials.endpoint, credentials.userId, workspaceId)
         },

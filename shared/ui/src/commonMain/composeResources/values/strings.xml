@@ -373,7 +373,8 @@
     <string name="settings_fb_selfhosted_bound_session_renewed">The workspace-bound session was renewed for this device.</string>
     <string name="settings_fb_selfhosted_endpoint_mismatch">Use the self-hosted server already bound to this workspace.</string>
     <string name="settings_fb_selfhosted_ready">Self-hosted account and device are ready.</string>
-    <string name="settings_fb_selfhosted_setup_failed">Self-hosted setup failed safely.</string>
+    <string name="settings_fb_selfhosted_account_data_changed">The server’s account data has changed. Open “Review local copy” before reconnecting.</string>
+    <string name="settings_fb_selfhosted_setup_failed">Could not sign in. Check your account details and connection, then try again.</string>
     <string name="settings_fb_connection_switch_ready">Ready to connect to a different server or account.</string>
     <string name="settings_fb_connection_switch_failed">The current connection could not be released safely.</string>
     <string name="settings_fb_settings_save_failed">Settings save failed: %1$s</string>
@@ -419,6 +420,8 @@
     <string name="sync_reauthenticate">Sign in again</string>
     <string name="sync_create_account">Create account</string>
     <string name="sync_secure_session_unavailable">The saved sign-in is temporarily unavailable. Retry before syncing.</string>
+    <string name="sync_status_account_reset_pending">Local copy needs review</string>
+    <string name="sync_status_reauthentication_required">Sign-in required</string>
     <string name="sync_status_unavailable">Sign-in unavailable</string>
     <string name="sync_status_syncing">Syncing...</string>
     <string name="sync_connecting">Connecting securely...</string>
@@ -497,6 +500,10 @@
 
     <!-- Account data reset: logical reset and separate local replacement. -->
     <string name="account_reset_danger_zone">Danger zone</string>
+    <string name="account_reset_resume_title">Review local copy</string>
+    <string name="account_reset_resume_required">Open “Review local copy” to check the account and choose the next step.</string>
+    <string name="account_reset_summary">Reset server data and keep your local copy</string>
+    <string name="account_reset_details">Review next steps</string>
     <string name="account_reset_title">Reset account data</string>
     <string name="account_reset_scope_warning">This immediately resets every server workspace in this account and disconnects all devices. Your local copy is kept until you separately choose to replace it.</string>
     <string name="account_reset_irreversible_warning">Anyone with your password can reset this account immediately. There is no undo or cooling-off period.</string>
@@ -519,7 +526,7 @@
     <string name="account_reset_offline_warning">This allows local edits only. It does not cancel the remote request, restore server data, or prove the reset failed. Reconnecting will require checking the outcome and fresh consent before discarding this copy.</string>
     <string name="account_reset_offline_title">Editing offline; server access remains blocked</string>
     <string name="account_reset_committed_title">Server reset complete; local copy kept</string>
-    <string name="account_reset_committed_body">Sign in again and choose how to set up this device. Nothing on this device is discarded until you explicitly confirm replacement.</string>
+    <string name="account_reset_committed_body">Choose how to continue on this device. Its current content is kept until you explicitly confirm replacement.</string>
     <string name="account_reset_changed_title">This account’s data state changed</string>
     <string name="account_reset_changed_body">This workspace belongs to a different account data state. It cannot upload to the current account. Export or keep this copy offline before choosing a replacement.</string>
     <string name="account_reset_authenticate">Sign in for account recovery</string>
@@ -528,14 +535,14 @@
     <string name="account_reset_fresh">Start with an empty workspace</string>
     <string name="account_reset_pair">Pair with another device</string>
     <string name="account_reset_recover">Use a recovery code</string>
-    <string name="account_reset_pairing_code">Pairing token from a current device</string>
-    <string name="account_reset_recovery_code">Recovery code for the current workspace</string>
+    <string name="account_reset_pairing_code">New pairing token from another connected device</string>
+    <string name="account_reset_recovery_code">Recovery code created after the reset</string>
     <string name="account_reset_discard_consent">I agree to discard this device’s current workspace without merging.</string>
     <string name="account_reset_replace">Confirm local replacement</string>
     <string name="account_reset_local_failure">Local setup did not finish. The previous local copy is kept. Retry setup or keep it offline.</string>
-    <string name="account_reset_ready">This device is ready for the current account. Set up a new recovery code for a fresh workspace.</string>
-    <string name="account_reset_unavailable">Reset is unavailable on this server right now. Any earlier unresolved request still needs reconciliation.</string>
-    <string name="account_reset_retained_media">A previous reset’s retained media prevents another reset. The operator must finish certified cleanup; some storage retention policies may prevent further resets indefinitely.</string>
+    <string name="account_reset_ready">This device’s workspace has been replaced.</string>
+    <string name="account_reset_unavailable">Reset is currently unavailable on this server.</string>
+    <string name="account_reset_retained_media">Data retention or cleanup verification from the previous reset is not complete. This only prevents another reset; you can still finish setting up this device. Some retention policies may prevent further resets indefinitely.</string>
     <string name="account_reset_sign_in_required">Sign in again to check or continue this account operation.</string>
     <string name="account_reset_wrong_password">The account password is incorrect. No automatic retry was sent.</string>
     <string name="account_reset_busy">The account is busy. Try again shortly.</string>
@@ -544,4 +551,22 @@
     <string name="account_reset_local_consent_required">Confirm discarding this exact local copy before continuing.</string>
     <string name="account_reset_refresh">Refresh account status</string>
     <string name="account_reset_readonly_note">This copy is read-only. Open Sync settings to check the account or keep editing offline.</string>
+    <string name="account_reset_back">Back</string>
+    <string name="account_reset_authenticating">Verifying account…</string>
+    <string name="account_reset_replacing">Replacing this device’s workspace…</string>
+    <string name="account_reset_replacement_help">For the first device, start empty. Other devices can join it with a new pairing token or recovery code.</string>
+    <string name="account_reset_fresh_help">Create an empty workspace and sync it to this account. Then set up a new recovery code.</string>
+    <string name="account_reset_pair_help">Use a new token from another device already connected after the reset. Old tokens cannot restore pre-reset data.</string>
+    <string name="account_reset_recover_help">Use a recovery code set up after the reset. An old code cannot restore pre-reset data.</string>
+    <string name="account_reset_account_mismatch">This email belongs to a different account. Enter the email for the account being reset.</string>
+    <string name="account_reset_invalid_secret">The pairing token or recovery code is invalid. Check it and try again.</string>
+    <string name="account_reset_invitation_unavailable">This pairing invitation is missing or expired. Create a new one on the connected device.</string>
+    <string name="account_reset_invitation_used">This pairing invitation was already used. Create a new one on the connected device.</string>
+    <string name="account_reset_no_recovery">No recovery code is set up for the current account data. Start empty or pair with a connected device.</string>
+    <string name="account_reset_network_error">Could not reach the server. Check your connection and retry this step.</string>
+    <string name="account_reset_context_changed">The account or local copy changed. Go back and review the current state before continuing.</string>
+    <string name="account_reset_sync_pending">The local workspace was replaced, but syncing is not finished. Retry sync below.</string>
+    <string name="account_reset_device_revoked">This device has been revoked. Signing in again cannot reactivate it. Contact the server administrator.</string>
+    <string name="account_reset_rate_limited">Too many requests. Wait a little before trying again.</string>
+    <string name="account_reset_protocol_error">The server response could not be verified. Check the client and server versions or contact the operator.</string>
 </resources>

@@ -22,11 +22,445 @@ import saien.someday.data.media.DecodedMediaAsset
 import saien.someday.data.media.LocalMediaAssetStore
 import saien.someday.data.media.MediaAssetDecodeValidator
 import saien.someday.data.settings.SqlDelightClientSettingsRepository
+import saien.someday.data.settings.ClientSettingsRepository
 import saien.someday.domain.settings.*
 import saien.someday.domain.workspace.WorkspaceProductReadOnlyException
 import saien.someday.sync.createSystemV3ClientServices
+import saien.someday.sync.SystemV3ClientServices
 
 class SelfHostedAccountResetManagerTest {
+    @Test fun everyReplacementModePromotesTheEnrolledSessionAfterControlOnlyRecovery() {
+        for (mode in AccountDataReplacementMode.entries) fixture(bound = false) { f ->
+            val committed = f.manager.submit(f.review(), PASSWORD)
+            assertNull(committed.issue)
+            assertEquals(AccountDataResetIssue.RetiredMediaPending, committed.snapshot.resetUnavailableIssue)
+            val original = f.keys.workspaceIdOrNull()
+            withTargetWorkspace(f) { targetWorkspace, _, invitation, recoveryCode ->
+                f.forgetSessionAndHints()
+                f.manager = f.newManager()
+                if (mode == AccountDataReplacementMode.Fresh) f.transport.deploymentReady = false
+                val authenticated = f.manager.reauthenticate(assertNotNull(f.manager.load().review), PASSWORD, EMAIL)
+                assertTrue(authenticated.success, authenticated.issue.toString())
+                assertNull(authenticated.issue)
+                assertEquals(if (mode == AccountDataReplacementMode.Fresh) AccountDataResetIssue.DeploymentNotReady else AccountDataResetIssue.RetiredMediaPending,
+                    authenticated.snapshot.resetUnavailableIssue)
+                assertFalse(authenticated.snapshot.requiresAuthentication)
+                assertEquals(SyncMode.Off, f.settings.load().syncConfiguration.mode)
+                assertFalse(f.settings.load().syncConfiguration.selfHostedSession.loggedIn)
+                assertNull(f.store.load())
+                val secret = when (mode) {
+                    AccountDataReplacementMode.Fresh -> ""
+                    AccountDataReplacementMode.Pair -> invitation
+                    AccountDataReplacementMode.Recover -> recoveryCode
+                }
+
+                val replaced = f.manager.replaceLocal(assertNotNull(authenticated.snapshot.review), mode, true, secret)
+
+                assertTrue(replaced.success, "$mode: ${replaced.issue}")
+                assertTrue(replaced.localReplaced)
+                assertNull(replaced.issue)
+                assertEquals(SyncMode.SelfHosted, f.settings.load().syncConfiguration.mode)
+                assertEquals(assertNotNull(f.store.load()).toSummary(), f.settings.load().syncConfiguration.selfHostedSession)
+                assertNotEquals(original, f.keys.workspaceIdOrNull())
+                if (mode != AccountDataReplacementMode.Fresh) assertEquals(targetWorkspace, f.keys.workspaceIdOrNull())
+                assertEquals(NEXT, f.services.activeWorkspaceSessionGuard.currentRequirement()?.accountIncarnation)
+                assertNull(f.services.accountStateRepository.loadIntent())
+                assertFalse(replaced.snapshot.requiresAuthentication)
+            }
+        }
+    }
+
+    @Test fun closingOrExpiringControlAuthenticationCannotOfferReplacementOrFreezeAnOfflineCopy() = fixture { f ->
+        f.manager.submit(f.review(), PASSWORD)
+        f.manager.keepOffline(f.review())
+        f.manager.cancel()
+        val closed = f.manager.load()
+        assertTrue(closed.requiresAuthentication)
+        assertFalse(closed.canReplaceLocal)
+        assertTrue(closed.offlineEditing)
+        val rejected = f.manager.replaceLocal(assertNotNull(closed.review), AccountDataReplacementMode.Fresh, true)
+        assertEquals(AccountDataResetIssue.SignInRequired, rejected.issue)
+        assertTrue(rejected.snapshot.offlineEditing)
+        assertEquals(0, f.transport.registrations)
+        assertNull(f.services.accountStateRepository.loadIntent()?.consentTargetIncarnation)
+
+        val authenticated = f.manager.reauthenticate(assertNotNull(rejected.snapshot.review), PASSWORD)
+        assertFalse(authenticated.snapshot.requiresAuthentication)
+        assertTrue(authenticated.snapshot.canReplaceLocal)
+        f.transport.beforeDiscovery = { throw SelfHostedSyncHttpException(401, "Expired", SelfHostedErrorCode.UNAUTHORIZED, true) }
+        val expired = f.manager.refresh()
+        assertEquals(AccountDataResetIssue.SignInRequired, expired.issue)
+        assertTrue(expired.snapshot.requiresAuthentication)
+        assertFalse(expired.snapshot.canReplaceLocal)
+        f.transport.beforeDiscovery = {}
+        val stillBlocked = f.manager.replaceLocal(assertNotNull(expired.snapshot.review), AccountDataReplacementMode.Fresh, true)
+        assertEquals(AccountDataResetIssue.SignInRequired, stillBlocked.issue)
+        assertTrue(stillBlocked.snapshot.offlineEditing)
+        assertTrue(f.manager.reauthenticate(assertNotNull(stillBlocked.snapshot.review), PASSWORD).success)
+        assertEquals(0, f.transport.registrations)
+    }
+
+    @Test fun rejectedSelectedAndAuthorityCredentialsDoNotAlternateForever() {
+        for (errorCode in listOf(SelfHostedErrorCode.UNAUTHORIZED, SelfHostedErrorCode.ACCOUNT_SESSION_STALE)) fixture(bound = false) { f ->
+            f.transport.loseResetResponse = true
+            f.manager.submit(f.review(), PASSWORD)
+            val pending = f.services.accountStateRepository.loadIntent()
+            val original = f.keys.workspaceIdOrNull()
+            val saved = assertNotNull(f.store.load())
+            // A secure-store write can succeed for one slot and fail for the other.
+            f.store.save(saved.copy(accessToken = "expired-selected"))
+            var authorityCredentials = saved.copy(accessToken = "expired-authority")
+            val splitStore = object : SelfHostedSessionCredentialStore by f.store {
+                override fun loadForAuthority(authorityBindingId: String) =
+                    authorityCredentials.takeIf { it.authorityBindingId == authorityBindingId }
+            }
+            f.transport.authenticationFailureCode = errorCode
+            f.manager = f.newManager(managerSessionStore = splitStore)
+
+            val first = f.manager.reconcile(assertNotNull(f.manager.load().review))
+            assertEquals(AccountDataResetIssue.SignInRequired, first.issue)
+            assertFalse(first.snapshot.requiresAuthentication, "The other credential has not yet been rejected.")
+            val second = f.manager.reconcile(assertNotNull(first.snapshot.review))
+            assertEquals(AccountDataResetIssue.SignInRequired, second.issue)
+            assertTrue(second.snapshot.requiresAuthentication, "Both rejected tokens must stay excluded.")
+            assertFalse(second.snapshot.canReplaceLocal)
+            assertEquals(2, f.transport.receiptRequests)
+            // Rotation of the other slot must not evict the still-selected rejected token.
+            repeat(24) { index ->
+                authorityCredentials = saved.copy(accessToken = "expired-authority-$index")
+                val rotated = f.manager.reconcile(assertNotNull(f.manager.load().review))
+                assertTrue(rotated.snapshot.requiresAuthentication)
+            }
+            assertEquals(26, f.transport.receiptRequests)
+            val blocked = f.manager.reconcile(assertNotNull(second.snapshot.review))
+            assertEquals(AccountDataResetIssue.SignInRequired, blocked.issue)
+            assertEquals(26, f.transport.receiptRequests, "Known rejected tokens must not reach HTTP again.")
+            assertEquals(pending, f.services.accountStateRepository.loadIntent())
+            assertEquals(original, f.keys.workspaceIdOrNull())
+
+            val authenticated = f.manager.reauthenticate(assertNotNull(blocked.snapshot.review), PASSWORD)
+            assertTrue(authenticated.success, authenticated.issue.toString())
+            assertFalse(authenticated.snapshot.requiresAuthentication)
+            assertEquals(AccountDataResetPhase.RemoteCommittedLocalPending, authenticated.snapshot.phase)
+            assertTrue(authenticated.snapshot.canReplaceLocal)
+            assertEquals(0, f.transport.registrations)
+            assertNull(f.services.accountStateRepository.loadIntent()?.consentTargetIncarnation)
+            assertEquals(original, f.keys.workspaceIdOrNull())
+            assertTrue(f.services.notesRepository.listNotebooks().any { it.title == "original" })
+        }
+    }
+
+    @Test fun failedEnrolledSessionSettingsWriteKeepsTheCopyAndCanRetryWithFreshConsent() = fixture(bound = false) { f ->
+        f.manager.submit(f.review(), PASSWORD)
+        f.forgetSessionAndHints()
+        var failSessionSettings = true
+        val failingSettings = object : ClientSettingsRepository by f.settings {
+            override fun saveLocalSnapshot(settings: ClientSettings): ClientSettings {
+                if (failSessionSettings && settings.syncConfiguration.selfHostedSession.loggedIn) error("Synthetic settings failure")
+                return f.settings.saveLocalSnapshot(settings)
+            }
+        }
+        f.manager = f.newManager(managerSettings = failingSettings)
+        val original = f.keys.workspaceIdOrNull()
+        val authenticated = f.manager.reauthenticate(assertNotNull(f.manager.load().review), PASSWORD, EMAIL)
+        val failed = f.manager.replaceLocal(assertNotNull(authenticated.snapshot.review), AccountDataReplacementMode.Fresh, true)
+        assertEquals(AccountDataResetIssue.ReplacementFailed, failed.issue)
+        assertEquals(original, f.keys.workspaceIdOrNull())
+        assertTrue(failed.snapshot.productReadOnly)
+        assertNotNull(f.services.accountStateRepository.loadIntent())
+        assertTrue(f.services.notesRepository.listNotebooks().any { it.title == "original" })
+        assertEquals(SyncMode.Off, f.settings.load().syncConfiguration.mode)
+        assertEquals(NEXT, f.store.load()?.accountIncarnation)
+        failSessionSettings = false
+        val reauthenticated = f.manager.reauthenticate(assertNotNull(failed.snapshot.review), PASSWORD)
+        assertTrue(reauthenticated.success, reauthenticated.issue.toString())
+        assertTrue(reauthenticated.snapshot.productReadOnly)
+        assertEquals(original, f.keys.workspaceIdOrNull())
+        assertEquals(SyncMode.Off, f.settings.load().syncConfiguration.mode)
+        assertTrue(f.services.notesRepository.listNotebooks().any { it.title == "original" })
+        assertFalse(f.manager.replaceLocal(assertNotNull(reauthenticated.snapshot.review), AccountDataReplacementMode.Fresh, false).success)
+        val retried = f.manager.replaceLocal(assertNotNull(f.manager.load().review), AccountDataReplacementMode.Fresh, true)
+        assertTrue(retried.success, retried.issue.toString())
+        assertEquals(SyncMode.SelfHosted, f.settings.load().syncConfiguration.mode)
+        assertTrue(f.settings.load().syncConfiguration.selfHostedSession.loggedIn)
+        assertNotEquals(original, f.keys.workspaceIdOrNull())
+    }
+
+    @Test fun pairingFailureExplainsExpiredMissingOrUsedInvitationWithoutDiscardingLocalData() {
+        for ((code, expected) in listOf(
+            SelfHostedErrorCode.EXPIRED to AccountDataResetIssue.InvitationUnavailable,
+            SelfHostedErrorCode.NOT_FOUND to AccountDataResetIssue.InvitationUnavailable,
+            SelfHostedErrorCode.PAIRING_CONFLICT to AccountDataResetIssue.InvitationAlreadyUsed,
+        )) fixture { f ->
+            f.manager.submit(f.review(), PASSWORD)
+            val original = f.keys.workspaceIdOrNull()
+            withTargetWorkspace(f) { _, _, invitation, _ ->
+                f.transport.claimFailure = code
+                val result = f.manager.replaceLocal(f.review(), AccountDataReplacementMode.Pair, true, invitation)
+                assertEquals(expected, result.issue)
+                assertEquals(original, f.keys.workspaceIdOrNull())
+                assertTrue(f.services.notesRepository.listNotebooks().any { it.title == "original" })
+            }
+        }
+    }
+
+    @Test fun missingRecoveryAndInvalidCodeAndRevokedDeviceHaveDistinctActionableResults() = fixture { f ->
+        f.manager.submit(f.review(), PASSWORD)
+        val original = f.keys.workspaceIdOrNull()
+        withTargetWorkspace(f) { _, _, _, recoveryCode ->
+            val invalid = f.manager.replaceLocal(f.review(), AccountDataReplacementMode.Recover, true, "invalid")
+            assertEquals(AccountDataResetIssue.InvalidSecret, invalid.issue)
+            f.transport.recoveryEnvelope = null
+            val missing = f.manager.replaceLocal(f.review(), AccountDataReplacementMode.Recover, true, recoveryCode)
+            assertEquals(AccountDataResetIssue.NoRecoveryEnvelope, missing.issue)
+            f.transport.registerDeviceRevoked = true
+            val revoked = f.manager.replaceLocal(f.review(), AccountDataReplacementMode.Fresh, true)
+            assertEquals(AccountDataResetIssue.DeviceRevoked, revoked.issue)
+            assertEquals(original, f.keys.workspaceIdOrNull())
+            assertTrue(f.services.notesRepository.listNotebooks().any { it.title == "original" })
+        }
+    }
+
+    @Test fun committedUnboundCopyWithoutSessionOrHintsCanRecoverWithItsDurableAccountIdentity() = fixture(bound = false) { f ->
+        f.manager.submit(f.review(), PASSWORD)
+        val originalWorkspace = f.keys.workspaceIdOrNull()
+        val originalKey = f.keys.unlockedKeyOrNull()!!.fingerprint
+        val intent = assertNotNull(f.services.accountStateRepository.loadIntent())
+        f.forgetSessionAndHints()
+        val beforeSettings = f.settings.load()
+        f.manager = f.newManager(f.newServices())
+
+        val reopened = f.manager.load()
+        val review = assertNotNull(reopened.review)
+        assertEquals(AccountDataResetPhase.RemoteCommittedLocalPending, reopened.phase)
+        assertEquals(intent.operationId, reopened.operationId)
+        assertEquals(ENDPOINT, reopened.endpoint)
+        assertEquals("", review.accountEmail)
+        assertEquals(selfHostedAuthorityBindingId(ENDPOINT, USER), review.authorityBindingId)
+        assertNull(review.localAuthorityBindingId)
+        assertEquals(NEXT, review.targetIncarnation)
+        assertTrue(reopened.productReadOnly)
+        assertTrue(reopened.canExport)
+        assertFalse(reopened.canReplaceLocal)
+        assertTrue(reopened.requiresAuthentication)
+        assertNull(reopened.issue)
+        assertFailsWith<WorkspaceProductReadOnlyException> { f.services.notesRepository.createNotebook("still frozen") }
+
+        val authenticated = f.manager.reauthenticate(review, PASSWORD, "  ${EMAIL.uppercase()}  ")
+        assertTrue(authenticated.success, authenticated.issue.toString())
+        assertEquals(EMAIL, f.transport.lastLoginEmail)
+        assertEquals(EMAIL, authenticated.snapshot.review?.accountEmail)
+        assertNotEquals(review.id, authenticated.snapshot.review?.id)
+        assertEquals(AccountDataResetPhase.RemoteCommittedLocalPending, authenticated.snapshot.phase)
+        assertTrue(authenticated.snapshot.productReadOnly)
+        assertTrue(authenticated.snapshot.canReplaceLocal)
+        assertEquals(0, f.transport.registrations)
+        assertNull(f.store.load())
+        assertNull(f.store.loadForAuthority(review.authorityBindingId))
+        assertEquals(originalWorkspace, f.keys.workspaceIdOrNull())
+        assertEquals(originalKey, f.keys.unlockedKeyOrNull()!!.fingerprint)
+        assertEquals(intent, f.services.accountStateRepository.loadIntent())
+        assertTrue(f.services.notesRepository.listNotebooks().any { it.title == "original" })
+        assertEquals(beforeSettings.copy(syncConfiguration = beforeSettings.syncConfiguration.copy(
+            selfHostedEndpoint = ENDPOINT,
+            selfHostedSession = beforeSettings.syncConfiguration.selfHostedSession.copy(userEmail = EMAIL),
+        )), f.settings.load())
+
+        val refused = f.manager.replaceLocal(assertNotNull(authenticated.snapshot.review), AccountDataReplacementMode.Fresh, false)
+        assertEquals(AccountDataResetIssue.ConfirmationRequired, refused.issue)
+        assertEquals(0, f.transport.registrations)
+        assertNull(f.services.accountStateRepository.loadIntent()?.consentTargetIncarnation)
+        val staleReview = assertNotNull(refused.snapshot.review)
+        f.manager.cancel()
+        val loginCalls = f.transport.logins
+        assertEquals(AccountDataResetIssue.ContextChanged, f.manager.reauthenticate(staleReview, PASSWORD, EMAIL).issue)
+        assertEquals(loginCalls, f.transport.logins)
+        f.manager = f.newManager(f.newServices())
+        assertEquals(EMAIL, f.manager.load().review?.accountEmail)
+        assertEquals(AccountDataResetPhase.RemoteCommittedLocalPending, f.manager.load().phase)
+        assertNull(f.store.load())
+    }
+
+    @Test fun unknownOutcomeWithoutSessionOrHintsKeepsItsLocalProtectionAndCanReconcile() {
+        for (offline in listOf(false, true)) fixture(bound = false) { f ->
+            f.transport.loseResetResponse = true
+            val unknown = f.manager.submit(f.review(), PASSWORD)
+            if (offline) assertTrue(f.manager.keepOffline(assertNotNull(unknown.snapshot.review)).success)
+            f.forgetSessionAndHints()
+            f.manager = f.newManager(f.newServices())
+            val reopened = f.manager.load()
+            assertEquals(AccountDataResetPhase.OutcomeUnknown, reopened.phase)
+            assertEquals(offline, reopened.offlineEditing)
+            assertEquals(!offline, reopened.productReadOnly)
+            assertTrue(reopened.canExport)
+            assertFalse(reopened.canReplaceLocal)
+            assertEquals("", reopened.review?.accountEmail)
+            assertFailsWith<AccountNetworkBlockedException> {
+                f.services.accountStateRepository.requireNetworkAllowed(ENDPOINT, USER, f.keys.workspaceIdOrNull()!!)
+            }
+            if (!offline) assertFailsWith<WorkspaceProductReadOnlyException> { f.services.notesRepository.createNotebook("frozen") }
+
+            val authenticated = f.manager.reauthenticate(assertNotNull(reopened.review), PASSWORD, EMAIL)
+            assertTrue(authenticated.success, authenticated.issue.toString())
+            assertEquals(AccountDataResetPhase.RemoteCommittedLocalPending, authenticated.snapshot.phase)
+            assertEquals(offline, authenticated.snapshot.offlineEditing)
+            assertEquals(!offline, authenticated.snapshot.productReadOnly)
+            assertNull(f.services.accountStateRepository.loadIntent()?.consentTargetIncarnation)
+            assertNull(f.store.load())
+            assertEquals(0, f.transport.registrations)
+            assertTrue(f.services.notesRepository.listNotebooks().any { it.title == "original" })
+        }
+    }
+
+    @Test fun mismatchedOrInvalidControlIdentityDoesNotPersistAccountHintsOrCredentials() {
+        val invalidResponses: List<(SelfHostedAuthTokensResponse) -> SelfHostedAuthTokensResponse> = listOf(
+            { it.copy(user = SelfHostedUserResponse("99999999-9999-4999-8999-999999999999", "other@example.invalid")) },
+            { it.copy(accountProtocolVersion = null) },
+            { it.copy(accountIncarnation = null) },
+            { it.copy(accountIncarnation = "invalid") },
+        )
+        for ((index, invalidResponse) in invalidResponses.withIndex()) fixture(bound = false) { f ->
+            f.manager.submit(f.review(), PASSWORD)
+            f.forgetSessionAndHints()
+            f.manager = f.newManager(f.newServices())
+            val originalIntent = f.services.accountStateRepository.loadIntent()
+            val originalSettings = f.settings.load()
+            val review = assertNotNull(f.manager.load().review)
+            f.transport.loginResponseTransform = invalidResponse
+
+            val rejected = f.manager.reauthenticate(review, PASSWORD, "other@example.invalid")
+
+            assertFalse(rejected.success)
+            assertEquals(if (index == 0) AccountDataResetIssue.AccountMismatch else AccountDataResetIssue.ProtocolError, rejected.issue)
+            assertEquals(AccountDataResetPhase.RemoteCommittedLocalPending, rejected.snapshot.phase)
+            assertTrue(rejected.snapshot.productReadOnly)
+            assertEquals("", rejected.snapshot.review?.accountEmail)
+            assertEquals(originalSettings, f.settings.load())
+            assertEquals(originalIntent, f.services.accountStateRepository.loadIntent())
+            assertNull(f.store.load())
+            assertNull(f.store.loadForAuthority(review.authorityBindingId))
+            assertEquals(0, f.transport.registrations)
+            assertEquals(AccountDataResetIssue.SignInRequired, f.manager.refresh().issue)
+        }
+    }
+
+    @Test fun retiredWorkspaceGateWithoutIntentSessionOrHintsStillRequiresLocalConsent() = fixture { f ->
+        f.transport.current = NEXT
+        f.services.activeWorkspaceSessionGuard.markCurrentIncarnationMismatch()
+        f.forgetSessionAndHints()
+        f.manager = f.newManager(f.newServices())
+        val reopened = f.manager.load()
+        assertEquals(AccountDataResetPhase.ResetRequired, reopened.phase)
+        assertTrue(reopened.productReadOnly)
+        assertTrue(reopened.canExport)
+        assertNull(reopened.operationId)
+        assertEquals("", reopened.review?.accountEmail)
+        assertFailsWith<WorkspaceProductReadOnlyException> { f.services.notesRepository.createNotebook("retired") }
+
+        val authenticated = f.manager.reauthenticate(assertNotNull(reopened.review), PASSWORD, EMAIL)
+        assertTrue(authenticated.success, authenticated.issue.toString())
+        assertEquals(AccountDataResetPhase.ResetRequired, authenticated.snapshot.phase)
+        assertTrue(authenticated.snapshot.productReadOnly)
+        assertTrue(authenticated.snapshot.canReplaceLocal)
+        assertEquals(NEXT, authenticated.snapshot.review?.targetIncarnation)
+        assertNull(f.services.accountStateRepository.loadIntent())
+        assertNull(f.store.load())
+        assertEquals(0, f.transport.registrations)
+        val refused = f.manager.replaceLocal(assertNotNull(authenticated.snapshot.review), AccountDataReplacementMode.Fresh, false)
+        assertEquals(AccountDataResetIssue.ConfirmationRequired, refused.issue)
+        assertTrue(f.services.notesRepository.listNotebooks().any { it.title == "original" })
+    }
+
+    @Test fun authenticatedSameIncarnationObservationCanResolveAPersistedGateWithExplicitConsent() = fixture { f ->
+        f.services.activeWorkspaceSessionGuard.markCurrentIncarnationMismatch()
+        f.manager = f.newManager(f.newServices())
+        val reopened = f.manager.load()
+        val original = f.keys.workspaceIdOrNull()
+        assertEquals(AccountDataResetPhase.ResetRequired, reopened.phase)
+        assertTrue(reopened.requiresAuthentication)
+        assertFalse(reopened.canReplaceLocal)
+
+        val authenticated = f.manager.reauthenticate(assertNotNull(reopened.review), PASSWORD)
+        assertTrue(authenticated.success, authenticated.issue.toString())
+        assertEquals(G0, authenticated.snapshot.review?.targetIncarnation)
+        assertFalse(authenticated.snapshot.requiresAuthentication)
+        assertTrue(authenticated.snapshot.canReplaceLocal)
+        assertTrue(authenticated.snapshot.productReadOnly)
+        assertFalse(f.manager.replaceLocal(assertNotNull(authenticated.snapshot.review), AccountDataReplacementMode.Fresh, false).success)
+        assertEquals(original, f.keys.workspaceIdOrNull())
+        assertTrue(f.services.notesRepository.listNotebooks().any { it.title == "original" })
+        val replaced = f.manager.replaceLocal(assertNotNull(f.manager.load().review), AccountDataReplacementMode.Fresh, true)
+        assertTrue(replaced.success, replaced.issue.toString())
+        assertTrue(replaced.localReplaced)
+        assertNotEquals(original, f.keys.workspaceIdOrNull())
+        assertNull(f.services.accountStateRepository.loadGate(ENDPOINT, USER, original!!))
+    }
+
+    @Test fun ordinaryLoginCannotEnrollAnUnboundCopyUntilResetReplacementIsConfirmed() = fixture(bound = false) { f ->
+        assertNull(f.services.activeWorkspaceSessionGuard.currentRequirement())
+        val originalWorkspace = f.keys.workspaceIdOrNull()
+        val committed = f.manager.submit(f.review(), PASSWORD)
+        assertEquals(AccountDataResetPhase.RemoteCommittedLocalPending, committed.snapshot.phase)
+        val intent = f.services.accountStateRepository.loadIntent()
+        val previousCredentials = f.store.load()
+        val loginCalls = f.transport.logins
+        val setup = f.newSetupService()
+        val input = SelfHostedSetupInput(ENDPOINT, EMAIL, PASSWORD, "Test", "desktop", false)
+
+        val refused = setup.setup(input)
+
+        assertEquals(SelfHostedSetupReason.AccountResetRequired, refused.status.reason)
+        assertFalse(refused.success)
+        assertEquals(loginCalls, f.transport.logins)
+        assertEquals(0, f.transport.registrations)
+        assertEquals(previousCredentials, f.store.load())
+        assertEquals(intent, f.services.accountStateRepository.loadIntent())
+        assertEquals(originalWorkspace, f.keys.workspaceIdOrNull())
+
+        // Control authentication remains available after restart and never enrolls a device.
+        f.manager = f.newManager()
+        val authenticated = f.manager.reauthenticate(assertNotNull(f.manager.load().review), PASSWORD)
+        assertTrue(authenticated.success)
+        assertEquals(0, f.transport.registrations)
+        val unconfirmed = f.manager.replaceLocal(assertNotNull(authenticated.snapshot.review), AccountDataReplacementMode.Fresh, false)
+        assertFalse(unconfirmed.success)
+        assertEquals(0, f.transport.registrations)
+        val replaced = f.manager.replaceLocal(assertNotNull(unconfirmed.snapshot.review), AccountDataReplacementMode.Fresh, true)
+        assertTrue(replaced.success, replaced.issue.toString())
+        assertNull(f.services.accountStateRepository.loadIntent())
+        assertNotEquals(originalWorkspace, f.keys.workspaceIdOrNull())
+        assertTrue(setup.setup(input).success, "Ordinary login works again after explicit local replacement.")
+        assertEquals(2, f.transport.registrations)
+    }
+
+    @Test fun unknownResetOutcomeBlocksOrdinarySetupEvenWithoutSavedCredentials() = fixture(bound = false) { f ->
+        f.transport.loseResetResponse = true
+        val unknown = f.manager.submit(f.review(), PASSWORD)
+        assertEquals(AccountDataResetPhase.OutcomeUnknown, unknown.snapshot.phase)
+        val intent = f.services.accountStateRepository.loadIntent()
+        val authority = assertNotNull(f.store.load()).authorityBindingId
+        f.store.clearAuthority(authority)
+        f.store.clear()
+        val loginCalls = f.transport.logins
+
+        val refused = f.newSetupService().setup(SelfHostedSetupInput(ENDPOINT, EMAIL, PASSWORD, "Test", "desktop", false))
+
+        assertEquals(SelfHostedSetupReason.AccountResetRequired, refused.status.reason)
+        assertEquals(loginCalls, f.transport.logins)
+        assertEquals(0, f.transport.registrations)
+        assertNull(f.store.load())
+        assertEquals(intent, f.services.accountStateRepository.loadIntent())
+    }
+
+    @Test fun observedAccountMismatchBlocksOrdinarySetupBeforeRemoteAuthentication() = fixture { f ->
+        f.services.activeWorkspaceSessionGuard.markCurrentIncarnationMismatch()
+        assertNull(f.services.accountStateRepository.loadIntent())
+        val refused = f.newSetupService().setup(SelfHostedSetupInput(ENDPOINT, EMAIL, PASSWORD, "Test", "desktop", false))
+        assertEquals(SelfHostedSetupReason.AccountResetRequired, refused.status.reason)
+        assertEquals(0, f.transport.logins)
+        assertEquals(0, f.transport.registrations)
+    }
+
     @Test fun verifiedMismatchPersistsItsGateEvenWhenTheBoundCredentialIsMissing() = fixture { f ->
         f.store.clear()
         f.services.activeWorkspaceSessionGuard.markCurrentIncarnationMismatch()
@@ -384,12 +818,12 @@ class SelfHostedAccountResetManagerTest {
         } finally { driver.close() }
     }
 
-    private fun fixture(block: (Fixture) -> Unit) {
-        val f = Fixture()
+    private fun fixture(bound: Boolean = true, block: (Fixture) -> Unit) {
+        val f = Fixture(bound)
         try { block(f) } finally { f.transport.close(); f.driver.close(); f.root.toFile().deleteRecursively() }
     }
 
-    private class Fixture {
+    private class Fixture(bound: Boolean = true) {
         val root = Files.createTempDirectory("someday-reset-workflow-")
         val driver = createSomedayJdbcDriver("jdbc:sqlite:${root.resolve("local.db")}")
         val database = SomedayDatabase(driver)
@@ -405,13 +839,16 @@ class SelfHostedAccountResetManagerTest {
                     selfHostedSession = store.load()!!.toSummary())))
             keys.createFirstRunWorkspace("Test", "desktop")
         }
-        val services = createSystemV3ClientServices(local, settings, keys::unlockedKeyOrNull, keys::workspaceIdOrNull,
+        fun newServices() = createSystemV3ClientServices(local, settings, keys::unlockedKeyOrNull, keys::workspaceIdOrNull,
             LocalMediaAssetStore(database, root.resolve("media").toString().toPath(), decodeValidator = MediaAssetDecodeValidator { DecodedMediaAsset(1, 1) }),
             transport, transport, transport, store)
+        val services = newServices()
         init {
-            services.workspaceLifecycleCoordinator.productAccess {
-                check(services.bindFreshWorkspaceAfterAccountReset(keys.unlockedKeyOrNull()!!, keys.workspaceIdOrNull()!!,
-                    WorkspaceJoinAuthorityCapture(store.load()!!.authorityBindingId, DEVICE, G0)))
+            if (bound) {
+                services.workspaceLifecycleCoordinator.productAccess {
+                    check(services.bindFreshWorkspaceAfterAccountReset(keys.unlockedKeyOrNull()!!, keys.workspaceIdOrNull()!!,
+                        WorkspaceJoinAuthorityCapture(store.load()!!.authorityBindingId, DEVICE, G0)))
+                }
             }
             services.notesRepository.createNotebook("original")
         }
@@ -431,13 +868,24 @@ class SelfHostedAccountResetManagerTest {
             services.workspaceLifecycleCoordinator, services.activeWorkspaceSessionGuard,
             services.workspacePairingInviterReady, { keys.unlockedKeyOrNull()?.fingerprint })
         var manager = newManager()
-        fun newManager() = SelfHostedAccountResetManager(services, store, transport, settings, keys::workspaceIdOrNull,
+        fun newSetupService() = SelfHostedSetupService(transport, store, services.activeWorkspaceSessionGuard,
+            services.workspaceLifecycleCoordinator, { DEVICE })
+        fun newManager(clientServices: SystemV3ClientServices = services, managerSettings: ClientSettingsRepository = settings,
+            managerSessionStore: SelfHostedSessionCredentialStore = store) = SelfHostedAccountResetManager(clientServices, managerSessionStore, transport, managerSettings, keys::workspaceIdOrNull,
             { DEVICE }, "Test", "desktop", { before, after ->
                 keys.replaceWithFreshWorkspace("Test", "desktop", before) { key, workspace ->
                     after(key, workspace)
                     check(!failReplacement) { "Synthetic local commit failure" }
                 }
             }, pairing, recovery, canExportProvider = { keys.unlockedKeyOrNull() != null })
+        fun forgetSessionAndHints() {
+            store.clearAuthority(selfHostedAuthorityBindingId(ENDPOINT, USER))
+            store.clear()
+            val current = settings.load()
+            settings.saveLocalSnapshot(current.copy(syncConfiguration = SyncConfiguration(
+                mode = SyncMode.Off, lastError = "setup:AccountResetRequired",
+            )))
+        }
         fun review(): AccountDataResetReview {
             val refreshed = manager.refresh()
             return assertNotNull(refreshed.snapshot.review)
@@ -448,33 +896,42 @@ class SelfHostedAccountResetManagerTest {
         SelfHostedSyncTransport by delegate, SelfHostedSyncTransportV2 by delegate, SelfHostedMediaTransportV3 by delegate,
         SelfHostedAccountControlTransport, SelfHostedWorkspaceRecoveryTransport {
         val invitations = MemorySelfHostedPairingTransport()
-        private var recoveryEnvelope: SelfHostedWorkspaceRecoveryEnvelopeResponse? = null
+        var recoveryEnvelope: SelfHostedWorkspaceRecoveryEnvelopeResponse? = null
+        var claimFailure: SelfHostedErrorCode? = null
+        var registerDeviceRevoked = false
+        var deploymentReady = true
         var current = G0
         var registrations = 0
+        var receiptRequests = 0
+        var authenticationFailureCode = SelfHostedErrorCode.ACCOUNT_SESSION_STALE
         var logins = 0
+        var lastLoginEmail: String? = null
+        var loginResponseTransform: (SelfHostedAuthTokensResponse) -> SelfHostedAuthTokensResponse = { it }
         var loseResetResponse = false
         var committed: SelfHostedAccountResetReceiptResponse? = null
         var beforeDiscovery: () -> Unit = {}
         fun close() = delegate.close()
         override fun login(endpoint: String, request: SelfHostedAuthRequest, accountContext: SelfHostedAccountRequestContext): SelfHostedAuthTokensResponse {
             logins++
+            lastLoginEmail = request.email
             if (request.password != PASSWORD) throw SelfHostedSyncHttpException(401, "Rejected", SelfHostedErrorCode.INVALID_CREDENTIALS, true)
-            return SelfHostedAuthTokensResponse(current, "refresh", 60, SelfHostedUserResponse(USER, EMAIL), current, 1)
+            return loginResponseTransform(SelfHostedAuthTokensResponse(current, "refresh", 60, SelfHostedUserResponse(USER, EMAIL), current, 1))
         }
         override fun registerDevice(endpoint: String, accessToken: String, request: SelfHostedDeviceRegistrationRequest, accountContext: SelfHostedAccountRequestContext): SelfHostedDeviceRegistrationResponse {
             requireCurrent(accessToken)
             check(accountContext.accountIncarnation == current && request.deviceId == DEVICE)
             registrations++
-            return SelfHostedDeviceRegistrationResponse(SelfHostedDeviceResponse(DEVICE, "Test", "desktop", false), current, "refresh", 60, current, 1)
+            return SelfHostedDeviceRegistrationResponse(SelfHostedDeviceResponse(DEVICE, "Test", "desktop", registerDeviceRevoked), current, "refresh", 60, current, 1)
         }
         override fun discoverAccountData(endpoint: String, accessToken: String, accountContext: SelfHostedAccountRequestContext): SelfHostedAccountDiscoveryResult {
             beforeDiscovery()
             requireCurrent(accessToken)
-            return SelfHostedAccountDiscoveryResult.Protocol1(SelfHostedAccountDataStateResponse(1, current, current == G0,
-                if (current == G0) null else "retired_media_pending"))
+            return SelfHostedAccountDiscoveryResult.Protocol1(SelfHostedAccountDataStateResponse(1, current, deploymentReady && current == G0,
+                if (!deploymentReady) "deployment_not_ready" else if (current == G0) null else "retired_media_pending"))
         }
         override fun accountMe(endpoint: String, accessToken: String, accountContext: SelfHostedAccountRequestContext) = SelfHostedAccountMeResponse(USER, EMAIL, null, listOf("auth"))
         override fun getAccountResetReceipt(endpoint: String, accessToken: String, operationId: String, accountContext: SelfHostedAccountRequestContext): SelfHostedAccountResetReceiptResponse? {
+            receiptRequests++
             requireCurrent(accessToken)
             return committed?.takeIf { it.operationId == operationId }
         }
@@ -497,6 +954,7 @@ class SelfHostedAccountResetManagerTest {
             request: SelfHostedPairingInviteClaimRequest, accountContext: SelfHostedAccountRequestContext): SelfHostedPairingInviteClaimResponse {
             requireCurrent(accessToken)
             check(accountContext.accountIncarnation == current)
+            claimFailure?.let { throw SelfHostedSyncHttpException(if (it == SelfHostedErrorCode.EXPIRED) 410 else if (it == SelfHostedErrorCode.NOT_FOUND) 404 else 409, "Synthetic invite rejection", it, true) }
             return invitations.claimPairingInvite(endpoint, accessToken, inviteId, request, accountContext)
         }
         override fun completePairingInvite(endpoint: String, accessToken: String, inviteId: String,
@@ -521,7 +979,7 @@ class SelfHostedAccountResetManagerTest {
                 .also { recoveryEnvelope = it }
         }
         private fun requireCurrent(token: String) {
-            if (token != current) throw SelfHostedSyncHttpException(401, "Stale", SelfHostedErrorCode.ACCOUNT_SESSION_STALE, true)
+            if (token != current) throw SelfHostedSyncHttpException(401, "Stale", authenticationFailureCode, true)
         }
     }
 

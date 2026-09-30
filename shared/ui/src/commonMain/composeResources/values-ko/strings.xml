@@ -373,7 +373,8 @@
     <string name="settings_fb_selfhosted_bound_session_renewed">이 기기의 작업 공간 연결 세션을 갱신했습니다.</string>
     <string name="settings_fb_selfhosted_endpoint_mismatch">이 작업 공간에 이미 연결된 셀프호스트 서버를 사용하세요.</string>
     <string name="settings_fb_selfhosted_ready">셀프호스트 계정과 기기가 준비되었습니다.</string>
-    <string name="settings_fb_selfhosted_setup_failed">셀프호스트 설정이 안전하게 실패했습니다.</string>
+    <string name="settings_fb_selfhosted_account_data_changed">서버의 계정 데이터가 변경되었습니다. 다시 연결하기 전에 “기기 사본 처리”를 여세요.</string>
+    <string name="settings_fb_selfhosted_setup_failed">로그인하지 못했습니다. 계정 정보와 연결을 확인한 후 다시 시도하세요.</string>
     <string name="settings_fb_connection_switch_ready">이제 다른 서버 또는 계정에 연결할 수 있습니다.</string>
     <string name="settings_fb_connection_switch_failed">현재 연결을 안전하게 해제하지 못했습니다.</string>
     <string name="settings_fb_settings_save_failed">설정 저장 실패: %1$s</string>
@@ -419,6 +420,8 @@
     <string name="sync_reauthenticate">다시 로그인</string>
     <string name="sync_create_account">계정 만들기</string>
     <string name="sync_secure_session_unavailable">저장된 로그인 정보를 일시적으로 사용할 수 없습니다. 동기화하기 전에 다시 시도하세요.</string>
+    <string name="sync_status_account_reset_pending">기기 사본 확인 필요</string>
+    <string name="sync_status_reauthentication_required">다시 로그인 필요</string>
     <string name="sync_status_unavailable">로그인을 사용할 수 없음</string>
     <string name="sync_status_syncing">동기화 중…</string>
     <string name="sync_connecting">안전하게 연결하는 중…</string>
@@ -497,6 +500,10 @@
 
     <!-- Account data reset: logical reset and separate local replacement. -->
     <string name="account_reset_danger_zone">위험한 작업</string>
+    <string name="account_reset_resume_title">기기 사본 처리</string>
+    <string name="account_reset_resume_required">“기기 사본 처리”에서 계정 상태를 확인하고 다음 단계를 선택하세요.</string>
+    <string name="account_reset_summary">서버 데이터를 초기화하고 로컬 사본 유지</string>
+    <string name="account_reset_details">다음 단계 확인</string>
     <string name="account_reset_title">계정 데이터 초기화</string>
     <string name="account_reset_scope_warning">이 계정의 서버에 있는 모든 작업 공간이 즉시 초기화되고 모든 기기의 연결이 해제됩니다. 이 기기의 사본은 별도로 교체하기로 선택할 때까지 유지됩니다.</string>
     <string name="account_reset_irreversible_warning">비밀번호를 아는 사람은 누구나 즉시 초기화할 수 있습니다. 실행 취소나 유예 기간은 없습니다.</string>
@@ -519,7 +526,7 @@
     <string name="account_reset_offline_warning">로컬 편집만 허용합니다. 원격 요청을 취소하거나 서버 데이터를 복원하지 않으며 초기화 실패를 의미하지도 않습니다. 다시 연결하려면 결과를 확인하고 이 사본 삭제에 새로 동의해야 합니다.</string>
     <string name="account_reset_offline_title">오프라인 편집 중 · 서버 접근 차단됨</string>
     <string name="account_reset_committed_title">서버 초기화 완료 · 로컬 사본 유지됨</string>
-    <string name="account_reset_committed_body">다시 로그인하고 이 기기를 설정할 방법을 선택하세요. 교체를 명시적으로 확인하기 전에는 기기의 콘텐츠를 삭제하지 않습니다.</string>
+    <string name="account_reset_committed_body">이 기기에서 계속할 방법을 선택하세요. 교체를 명확히 확인할 때까지 현재 내용이 보관됩니다.</string>
     <string name="account_reset_changed_title">계정 데이터 상태가 변경되었습니다</string>
     <string name="account_reset_changed_body">이 작업 공간은 다른 계정 데이터 상태에 속하므로 현재 계정으로 업로드할 수 없습니다. 교체하기 전에 내보내거나 로컬 사본을 오프라인으로 유지하세요.</string>
     <string name="account_reset_authenticate">계정 복구를 위해 로그인</string>
@@ -528,14 +535,14 @@
     <string name="account_reset_fresh">빈 작업 공간으로 시작</string>
     <string name="account_reset_pair">다른 기기와 페어링</string>
     <string name="account_reset_recover">복구 코드 사용</string>
-    <string name="account_reset_pairing_code">현재 기기의 페어링 코드</string>
-    <string name="account_reset_recovery_code">현재 작업 공간의 복구 코드</string>
+    <string name="account_reset_pairing_code">연결된 다른 기기의 새 페어링 토큰</string>
+    <string name="account_reset_recovery_code">초기화 후 설정한 복구 코드</string>
     <string name="account_reset_discard_consent">이 기기의 현재 작업 공간을 병합하지 않고 삭제하는 데 동의합니다.</string>
     <string name="account_reset_replace">로컬 작업 공간 교체 확인</string>
     <string name="account_reset_local_failure">로컬 설정이 완료되지 않았습니다. 이전 로컬 사본은 보관됩니다. 설정을 다시 시도하거나 오프라인으로 보관하세요.</string>
-    <string name="account_reset_ready">이 기기는 현재 계정에서 사용할 준비가 되었습니다. 새 작업 공간을 만든 경우 새 복구 코드를 설정하세요.</string>
-    <string name="account_reset_unavailable">현재 이 서버에서는 초기화를 사용할 수 없습니다. 이전에 결과가 확인되지 않은 요청은 계속 확인해야 합니다.</string>
-    <string name="account_reset_retained_media">이전 초기화에서 보존된 미디어로 인해 다시 초기화할 수 없습니다. 운영자가 검증된 정리를 완료해야 하며, 저장소 보존 정책에 따라 추가 초기화가 무기한 제한될 수 있습니다.</string>
+    <string name="account_reset_ready">이 기기의 작업 공간이 교체되었습니다.</string>
+    <string name="account_reset_unavailable">현재 이 서버에서는 초기화를 사용할 수 없습니다.</string>
+    <string name="account_reset_retained_media">이전 초기화 후 데이터 보관 또는 정리 검증이 완료되지 않았습니다. 추가 초기화만 제한되며 이 기기 설정은 계속할 수 있습니다. 일부 보관 정책은 추가 초기화를 무기한 제한할 수 있습니다.</string>
     <string name="account_reset_sign_in_required">이 계정 작업을 확인하거나 계속하려면 다시 로그인하세요.</string>
     <string name="account_reset_wrong_password">계정 비밀번호가 올바르지 않습니다. 자동으로 다시 요청하지 않았습니다.</string>
     <string name="account_reset_busy">계정이 사용 중입니다. 잠시 후 다시 시도하세요.</string>
@@ -544,4 +551,22 @@
     <string name="account_reset_local_consent_required">계속하려면 현재 로컬 사본을 삭제하는 데 동의하세요.</string>
     <string name="account_reset_refresh">계정 상태 새로 고침</string>
     <string name="account_reset_readonly_note">이 사본은 읽기 전용입니다. 동기화 설정에서 계정 상태를 확인하거나 오프라인 편집을 선택하세요.</string>
+    <string name="account_reset_back">뒤로</string>
+    <string name="account_reset_authenticating">계정 확인 중…</string>
+    <string name="account_reset_replacing">이 기기의 작업 공간 교체 중…</string>
+    <string name="account_reset_replacement_help">첫 기기는 빈 작업 공간으로 시작하세요. 다른 기기는 새 페어링 토큰이나 복구 코드로 연결할 수 있습니다.</string>
+    <string name="account_reset_fresh_help">빈 작업 공간을 만들어 이 계정과 동기화한 후 새 복구 코드를 설정하세요.</string>
+    <string name="account_reset_pair_help">초기화 후 연결된 다른 기기에서 새 토큰을 받으세요. 이전 토큰으로 초기화 전 데이터를 복원할 수 없습니다.</string>
+    <string name="account_reset_recover_help">초기화 후 설정한 복구 코드를 사용하세요. 이전 코드로 초기화 전 데이터를 복원할 수 없습니다.</string>
+    <string name="account_reset_account_mismatch">다른 계정의 이메일입니다. 초기화를 처리 중인 계정의 이메일을 입력하세요.</string>
+    <string name="account_reset_invalid_secret">페어링 토큰 또는 복구 코드가 올바르지 않습니다. 확인 후 다시 시도하세요.</string>
+    <string name="account_reset_invitation_unavailable">페어링 초대가 없거나 만료되었습니다. 연결된 기기에서 새 초대를 만드세요.</string>
+    <string name="account_reset_invitation_used">이미 사용한 페어링 초대입니다. 연결된 기기에서 새 초대를 만드세요.</string>
+    <string name="account_reset_no_recovery">현재 계정 데이터에 복구 코드가 설정되어 있지 않습니다. 빈 작업 공간으로 시작하거나 연결된 기기와 페어링하세요.</string>
+    <string name="account_reset_network_error">서버에 연결할 수 없습니다. 연결을 확인하고 이 단계를 다시 시도하세요.</string>
+    <string name="account_reset_context_changed">계정 또는 로컬 사본이 변경되었습니다. 뒤로 돌아가 현재 상태를 확인한 후 계속하세요.</string>
+    <string name="account_reset_sync_pending">로컬 작업 공간이 교체되었지만 동기화가 완료되지 않았습니다. 동기화를 다시 시도하세요.</string>
+    <string name="account_reset_device_revoked">이 기기의 권한이 취소되었습니다. 다시 로그인해도 활성화되지 않습니다. 서버 관리자에게 문의하세요.</string>
+    <string name="account_reset_rate_limited">요청이 너무 많습니다. 잠시 후 다시 시도하세요.</string>
+    <string name="account_reset_protocol_error">서버 응답을 검증할 수 없습니다. 클라이언트와 서버 버전을 확인하거나 운영자에게 문의하세요.</string>
 </resources>

@@ -37,9 +37,13 @@ class ActiveWorkspaceSessionGuard(
     private val revalidateReplacement: (SelfHostedSessionCredentials) -> Unit = {},
     private val requireReplacementAllowed: (SelfHostedSessionCredentials) -> Unit = {},
     private val replacementWorkspaceProvider: () -> Pair<String, String>? = { null },
+    private val requireSetupAccess: () -> Unit = {},
     private val requirementProvider: () -> ActiveWorkspaceSessionRequirement?,
 ) {
     fun currentRequirement(): ActiveWorkspaceSessionRequirement? = requirementProvider()
+
+    /** Ordinary setup must not enroll a device while a local reset decision is pending. */
+    fun requireOrdinarySetupAllowed() = requireSetupAccess()
 
     fun capturePreviousWorkspace(): Pair<String, String>? = currentRequirement()?.let {
         it.workspaceId to it.accountIncarnation

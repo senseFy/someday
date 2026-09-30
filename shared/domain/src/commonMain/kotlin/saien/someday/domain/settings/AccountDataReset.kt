@@ -34,6 +34,7 @@ enum class AccountDataResetIssue {
     SignInRequired, WrongPassword, DeviceRevoked, Busy, RateLimited, Conflict,
     ProtocolError, NetworkError, LocalFailure, ContextChanged, ReplacementFailed,
     ConfirmationRequired, InvalidSecret, NoRecoveryEnvelope,
+    AccountMismatch, InvitationUnavailable, InvitationAlreadyUsed,
 }
 
 enum class AccountDataReplacementMode { Fresh, Pair, Recover }
@@ -63,7 +64,12 @@ data class AccountDataResetSnapshot(
     val resetAvailable: Boolean = false,
     val canExport: Boolean = false,
     val canReplaceLocal: Boolean = false,
+    /** Failure of the current step; availability of a future reset is separate. */
     val issue: AccountDataResetIssue? = null,
+    /** Authenticate before offering a new local-discard confirmation. */
+    val requiresAuthentication: Boolean = false,
+    /** Explains why another remote reset cannot start; never blocks local recovery. */
+    val resetUnavailableIssue: AccountDataResetIssue? = null,
 )
 
 data class AccountDataResetActionResult(
@@ -83,7 +89,7 @@ interface AccountDataResetManager {
     fun load(): AccountDataResetSnapshot
     fun refresh(): AccountDataResetActionResult
     fun submit(review: AccountDataResetReview, password: String): AccountDataResetActionResult
-    fun reauthenticate(review: AccountDataResetReview, password: String): AccountDataResetActionResult
+    fun reauthenticate(review: AccountDataResetReview, password: String, email: String = review.accountEmail): AccountDataResetActionResult
     fun reconcile(review: AccountDataResetReview): AccountDataResetActionResult
     fun keepOffline(review: AccountDataResetReview): AccountDataResetActionResult
     fun replaceLocal(
@@ -102,7 +108,7 @@ object UnavailableAccountDataResetManager : AccountDataResetManager {
     private fun unavailable() = AccountDataResetActionResult(load(), false, issue = AccountDataResetIssue.Unavailable)
     override fun refresh() = unavailable()
     override fun submit(review: AccountDataResetReview, password: String) = unavailable()
-    override fun reauthenticate(review: AccountDataResetReview, password: String) = unavailable()
+    override fun reauthenticate(review: AccountDataResetReview, password: String, email: String) = unavailable()
     override fun reconcile(review: AccountDataResetReview) = unavailable()
     override fun keepOffline(review: AccountDataResetReview) = unavailable()
     override fun replaceLocal(review: AccountDataResetReview, mode: AccountDataReplacementMode, discardConfirmed: Boolean, secret: String, password: String?) = unavailable()

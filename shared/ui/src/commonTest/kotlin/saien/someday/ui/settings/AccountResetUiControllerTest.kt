@@ -62,6 +62,154 @@ class AccountResetUiControllerTest {
         }
     }
 
+    @Test fun missingEmailControlLoginAdoptsVerifiedHintsEvenWhenLaterDiscoveryFails() = runBlocking {
+        for (discoveryFailed in listOf(false, true)) {
+            val captured = REVIEW.copy(accountEmail = "")
+            var saved = ClientSettings(syncConfiguration = SyncConfiguration(lastError = "setup:AccountResetRequired"))
+            val manager = FakeResetManager().apply {
+                snapshot = snapshot.copy(phase = AccountDataResetPhase.RemoteCommittedLocalPending,
+                    review = captured, accountEmail = "", productReadOnly = true, resetAvailable = false)
+                onAuthenticate = {
+                    saved = saved.copy(syncConfiguration = saved.syncConfiguration.copy(
+                        selfHostedEndpoint = REVIEW.endpoint,
+                        selfHostedSession = saved.syncConfiguration.selfHostedSession.copy(userEmail = "verified@example.test"),
+                    ))
+                    snapshot = snapshot.copy(accountEmail = "verified@example.test", review = REVIEW)
+                    if (discoveryFailed) nextIssue = AccountDataResetIssue.NetworkError
+                }
+            }
+            var restored = 0
+            val controller = SettingsUiController(initialSettings = saved, loadSettings = { saved },
+                persistSettings = { saved = it; it }, accountDataResetManager = manager,
+                onDataRestored = { restored++ }, backgroundDispatcher = Dispatchers.Unconfined)
+            controller.loadAccountResetState()
+            assertFalse(controller.reauthenticateAccountReset(captured, "password"))
+            assertNull(manager.authenticatedReview)
+
+            assertEquals(!discoveryFailed, controller.reauthenticateAccountReset(captured, "password", "  entered@example.test  "))
+
+            assertEquals(captured, manager.authenticatedReview)
+            assertEquals("entered@example.test", manager.authenticationEmail)
+            assertEquals("verified@example.test", controller.state.settings.syncConfiguration.selfHostedSession.userEmail)
+            assertEquals(REVIEW.endpoint, controller.state.settings.syncConfiguration.selfHostedEndpoint)
+            assertFalse(controller.state.settings.syncConfiguration.selfHostedSession.loggedIn)
+            assertEquals(0, restored)
+            assertEquals(0, manager.replacements)
+            assertTrue(controller.selectLanguage(AppLanguage.Chinese))
+            assertEquals("verified@example.test", saved.syncConfiguration.selfHostedSession.userEmail)
+            assertEquals(REVIEW.endpoint, saved.syncConfiguration.selfHostedEndpoint)
+        }
+    }
+
+    @Test fun authenticationCompletionForReplacedWorkspaceCannotAdoptItsSettings() = runBlocking {
+        var identity = WorkspaceProductSnapshot("original", INITIAL_ACCOUNT_INCARNATION, null, "writer")
+        val access = object : WorkspaceProductAccess {
+            override fun capture() = identity
+            override fun isCurrent(snapshot: WorkspaceProductSnapshot) = snapshot == identity
+            override fun <T> read(snapshot: WorkspaceProductSnapshot, block: () -> T): T {
+                if (!isCurrent(snapshot)) throw WorkspaceProductChangedException()
+                return block()
+            }
+            override fun <T> mutate(snapshot: WorkspaceProductSnapshot?, block: () -> T): T = error("Control login is not a product mutation")
+        }
+        val manager = FakeResetManager().apply {
+            onAuthenticate = { identity = identity.copy(workspaceId = "replacement", localRevision = 1) }
+        }
+        val controller = SettingsUiController(loadSettings = { ClientSettings(theme = ClientTheme.Dark) },
+            accountDataResetManager = manager, workspaceProductAccess = access, backgroundDispatcher = Dispatchers.Unconfined)
+
+        assertFalse(controller.reauthenticateAccountReset(REVIEW, "password"))
+
+        assertEquals(ClientTheme.System, controller.state.settings.theme)
+        assertEquals(0, manager.replacements)
+    }
+
+    @Test fun typedResetStatePreservesAccountHintWhenManagerSnapshotIsUnavailable() = runBlocking {
+        var saved = ClientSettings(syncConfiguration = SyncConfiguration(
+            selfHostedEndpoint = REVIEW.endpoint,
+            selfHostedSession = SelfHostedSessionSummary(loggedIn = true, userEmail = REVIEW.accountEmail),
+            lastError = "setup:AccountResetRequired",
+        ))
+        val manager = FakeResetManager().apply { snapshot = AccountDataResetSnapshot(issue = AccountDataResetIssue.SignInRequired) }
+        val controller = SettingsUiController(initialSettings = saved, loadSettings = { saved },
+            persistSettings = { saved = it; it }, accountDataResetManager = manager, backgroundDispatcher = Dispatchers.Unconfined)
+
+        controller.refresh()
+
+        assertEquals(REVIEW.endpoint, saved.syncConfiguration.selfHostedEndpoint)
+        assertEquals(REVIEW.accountEmail, saved.syncConfiguration.selfHostedSession.userEmail)
+        assertFalse(saved.syncConfiguration.selfHostedSession.loggedIn)
+        assertTrue(controller.state.sync.needsAccountDataResolution)
+    }
+
+    @Test fun ordinaryLoginAndRegistrationCannotBypassPendingResetHandling() = runBlocking {
+        for (phase in listOf(AccountDataResetPhase.OutcomeUnknown, AccountDataResetPhase.RemoteCommittedLocalPending, AccountDataResetPhase.ResetRequired)) {
+            val manager = FakeResetManager().apply {
+                snapshot = snapshot.copy(phase = phase, productReadOnly = true, resetAvailable = false)
+            }
+            var setupCalls = 0
+            val strings = SettingsUiStrings(accountReset = AccountResetUiStrings(resumeRequired = "resume-reset-handling"))
+            val controller = SettingsUiController(loadSettings = { ClientSettings() }, accountDataResetManager = manager,
+                selfHostedSetupClient = SelfHostedSetupClient { setupCalls++; error("Ordinary setup must not run") },
+                uiStrings = strings, backgroundDispatcher = Dispatchers.Unconfined)
+            controller.loadAccountResetState()
+
+            for (createAccount in listOf(false, true)) {
+                assertFalse(controller.setupSelfHosted(REVIEW.endpoint, REVIEW.accountEmail, "password", createAccount))
+            }
+
+            assertEquals(0, setupCalls)
+            assertEquals("resume-reset-handling", controller.state.feedbackMessage)
+            assertEquals(SyncAccountFormMode.AccountResetPending, controller.state.sync.accountFormMode())
+            assertFalse(controller.state.sync.accountFormMode().initiallyVisible)
+            assertFalse(controller.state.sync.accountFormMode().allowManualReauthentication)
+            assertTrue(controller.reauthenticateAccountReset(REVIEW, "password"))
+            assertEquals(0, manager.replacements)
+        }
+    }
+
+    @Test fun setupResetFailuresReloadTheSnapshotAndKeepTheirMeaningAfterRestart() = runBlocking {
+        for (reason in listOf(SelfHostedSetupReason.AccountResetRequired, SelfHostedSetupReason.AccountIncarnationMismatch)) {
+            var saved = ClientSettings(syncConfiguration = SyncConfiguration(
+                selfHostedEndpoint = REVIEW.endpoint,
+                selfHostedSession = SelfHostedSessionSummary(userEmail = REVIEW.accountEmail),
+            ))
+            val manager = FakeResetManager()
+            val expectedIssue = if (reason == SelfHostedSetupReason.AccountResetRequired) {
+                SyncIssueReason.AccountResetRequired
+            } else SyncIssueReason.AccountDataChanged
+            val expectedMessage = if (reason == SelfHostedSetupReason.AccountResetRequired) "resume-reset-handling" else "account-data-changed"
+            val strings = SettingsUiStrings(
+                accountReset = AccountResetUiStrings(resumeRequired = "resume-reset-handling"),
+                selfHostedAccountDataChanged = "account-data-changed",
+            )
+            val controller = SettingsUiController(initialSettings = saved, loadSettings = { saved },
+                persistSettings = { saved = it; it }, accountDataResetManager = manager,
+                selfHostedSetupClient = SelfHostedSetupClient {
+                    manager.snapshot = manager.snapshot.copy(phase = AccountDataResetPhase.ResetRequired,
+                        productReadOnly = true, resetAvailable = false)
+                    SelfHostedSetupResult.failure(reason)
+                }, uiStrings = strings, backgroundDispatcher = Dispatchers.Unconfined)
+            controller.loadAccountResetState()
+            val loadsBefore = manager.calls
+
+            assertFalse(controller.setupSelfHosted(REVIEW.endpoint, REVIEW.accountEmail, "password", false))
+
+            assertEquals(loadsBefore + 1, manager.calls)
+            assertTrue(controller.state.sync.accountReset.blocksSync)
+            assertEquals(expectedIssue, controller.state.sync.issue?.reason)
+            assertNull(controller.state.sync.issue?.action)
+            assertEquals(expectedMessage, controller.state.feedbackMessage)
+            assertEquals("setup:${reason.name}", saved.syncConfiguration.lastError)
+            val restarted = SettingsUiController(initialSettings = saved, loadSettings = { saved },
+                persistSettings = { saved = it; it }, accountDataResetManager = manager,
+                backgroundDispatcher = Dispatchers.Unconfined)
+            restarted.refresh()
+            assertEquals(expectedIssue, restarted.state.sync.issue?.reason)
+            assertEquals(SyncAccountFormMode.AccountResetPending, restarted.state.sync.accountFormMode())
+        }
+    }
+
     @Test fun exactLocalizedPhraseAndPasswordAreRequiredBeforeSubmit() = runBlocking {
         val manager = FakeResetManager()
         val controller = controller(manager, strings = SettingsUiStrings(accountReset = AccountResetUiStrings(confirmationPhrase = "重置全部账号数据")))
@@ -321,6 +469,9 @@ class AccountResetUiControllerTest {
         var snapshot = AccountDataResetSnapshot(AccountDataResetPhase.Ready, REVIEW, REVIEW.endpoint, REVIEW.accountEmail, resetAvailable = true)
         var calls = 0; var submits = 0; var replacements = 0; var cancels = 0
         var submittedReview: AccountDataResetReview? = null
+        var authenticatedReview: AccountDataResetReview? = null
+        var authenticationEmail: String? = null
+        var onAuthenticate: (() -> Unit)? = null
         var nextIssue: AccountDataResetIssue? = null
         var throwOnRefresh = false
         var staleControlResult: AccountDataResetActionResult? = null
@@ -336,7 +487,10 @@ class AccountResetUiControllerTest {
         private fun result() = AccountDataResetActionResult(snapshot, nextIssue == null, issue = nextIssue)
         override fun refresh(): AccountDataResetActionResult { calls++; if (throwOnRefresh) error("secret-payload"); return controlResult() }
         override fun submit(review: AccountDataResetReview, password: String): AccountDataResetActionResult { calls++; submits++; submittedReview = review; return controlResult() }
-        override fun reauthenticate(review: AccountDataResetReview, password: String): AccountDataResetActionResult { calls++; return controlResult() }
+        override fun reauthenticate(review: AccountDataResetReview, password: String, email: String): AccountDataResetActionResult {
+            calls++; authenticatedReview = review; authenticationEmail = email; onAuthenticate?.invoke()
+            return controlResult()
+        }
         override fun reconcile(review: AccountDataResetReview): AccountDataResetActionResult { calls++; return controlResult() }
         override fun keepOffline(review: AccountDataResetReview): AccountDataResetActionResult {
             calls++
