@@ -713,7 +713,11 @@ expect_failure long-version run_release plan "$long_component.1.1"
 expect_failure missing-version run_release status
 expect_failure publish-command run_release publish "$VERSION"
 
-"$SCRIPT_DIR/server-release-interface-test.sh" >/dev/null
+MAKEFLAGS='-- SERVER_RELEASE_VERSION=9.9.9' \
+    MAKEOVERRIDES='SERVER_RELEASE_VERSION=9.9.9' \
+    SERVER_RELEASE_VERSION=9.9.9 \
+    _SOMEDAY_SERVER_RELEASE_VERSION_ARG=9.9.9 \
+    "$SCRIPT_DIR/server-release-interface-test.sh" >/dev/null
 "$SCRIPT_DIR/server-release-provider-scope-test.sh" >/dev/null
 "$SCRIPT_DIR/build-server-release-bundle-test.sh" >/dev/null
 "$SCRIPT_DIR/verify-public-history-test.sh" >/dev/null

@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Fixture invocations own their Make options and release version, including
+# when this suite runs inside `make server-release-rehearse`.
+unset MAKEFLAGS MFLAGS MAKEOVERRIDES MAKELEVEL
+unset SERVER_RELEASE_VERSION _SOMEDAY_SERVER_RELEASE_VERSION_ARG
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd -P)"
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/someday-server-release-interface.XXXXXX")"
