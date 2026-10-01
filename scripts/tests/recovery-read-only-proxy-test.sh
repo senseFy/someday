@@ -66,6 +66,13 @@ done
 [[ "$(curl --fail --silent "http://127.0.0.1:$PROXY_PORT/health")" == "healthy" ]]
 
 workspace="workspace-00000000000000000000000000000000"
+admission="http://127.0.0.1:$PROXY_PORT/workspace/admission?workspaceId=$workspace"
+# The static backend returns 404; only the exact GET route may reach it.
+[[ "$(curl --silent --output /dev/null --write-out '%{http_code}' "$admission")" == "404" ]]
+[[ "$(curl --silent --output /dev/null --write-out '%{http_code}' \
+    --request POST "$admission")" == "503" ]]
+[[ "$(curl --silent --output /dev/null --write-out '%{http_code}' \
+    "http://127.0.0.1:$PROXY_PORT/workspace/admission/extra")" == "503" ]]
 base="http://127.0.0.1:$PROXY_PORT/sync/v3/workspaces/$workspace/entities"
 [[ "$(curl --silent --output /dev/null --write-out '%{http_code}' \
     --request POST "$base/pull")" == "501" ]]

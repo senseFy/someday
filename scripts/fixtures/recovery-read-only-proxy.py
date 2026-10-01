@@ -14,7 +14,7 @@ READ_POST = re.compile(
     r"^/sync/v3/workspaces/[^/]+/entities/(checkpoint/fetch|pull|frontiers)$"
 )
 READ_GET = re.compile(
-    r"^(/health|/sync/v3/(capabilities|workspaces/[^/]+/entities/(epoch|status)|"
+    r"^(/health|/workspace/admission|/sync/v3/(capabilities|workspaces/[^/]+/entities/(epoch|status)|"
     r"workspaces/[^/]+/media/[^/]+))$"
 )
 MEDIA = re.compile(r"^/sync/v3/workspaces/[^/]+/media/[^/]+$")
