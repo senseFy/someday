@@ -29,6 +29,8 @@ import saien.someday.server.persistence.SystemV3MediaRepository
 import saien.someday.server.persistence.WorkspaceRecoveryEnvelopeInput
 import saien.someday.server.persistence.WorkspaceRecoveryEnvelopePutResult
 import saien.someday.server.persistence.WorkspaceRecoveryEnvelopeRepository
+import saien.someday.server.persistence.WorkspaceAdmissionRepository
+import saien.someday.server.persistence.WorkspaceAdmissionSnapshot
 
 class ServerRlsIsolationIntegrationTest {
     @get:Rule
@@ -107,6 +109,10 @@ class ServerRlsIsolationIntegrationTest {
             assertEquals("pointer-first-b", entityRepository.loadEpoch(firstRequest, WORKSPACE_B)?.metadata?.pointerDigest)
             assertEquals("pointer-second-a", entityRepository.loadEpoch(secondRequest, WORKSPACE_A)?.metadata?.pointerDigest)
 
+            val admissionRepository = WorkspaceAdmissionRepository(restrictedConfig)
+            assertEquals(WorkspaceAdmissionSnapshot(2, true, false), admissionRepository.discover(firstRequest, WORKSPACE_B))
+            assertEquals(WorkspaceAdmissionSnapshot(1, false, false), admissionRepository.discover(secondRequest, WORKSPACE_B))
+
             val recoveryRepository = WorkspaceRecoveryEnvelopeRepository(restrictedConfig)
             assertEquals(
                 1L,
@@ -135,6 +141,7 @@ class ServerRlsIsolationIntegrationTest {
             assertEquals(2L, rotatedRecovery.revision)
             assertEquals(WORKSPACE_B, rotatedRecovery.workspaceId)
             assertEquals(WORKSPACE_B, recoveryRepository.load(firstRequest)?.workspaceId)
+            assertEquals(WorkspaceAdmissionSnapshot(2, true, true), admissionRepository.discover(firstRequest, WORKSPACE_A))
 
             val mediaRepository = SystemV3MediaRepository(
                 restrictedConfig,

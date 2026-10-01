@@ -591,6 +591,8 @@ enum class ManualSyncReason {
     ProviderChanged,
     AuthorityMismatch,
     WorkspaceLocked,
+    WorkspaceJoinRequired,
+    WorkspaceAdmissionUnavailable,
     RemoteHistoryConflict,
     CheckpointInvalid,
     RetryRequired,

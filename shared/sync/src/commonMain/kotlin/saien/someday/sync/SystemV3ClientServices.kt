@@ -22,6 +22,7 @@ import saien.someday.domain.settings.ManualSyncReason
 import saien.someday.domain.settings.ManualSyncResult
 import saien.someday.domain.settings.ManualSyncRunner
 import saien.someday.domain.settings.WorkspaceJoinPackage
+import saien.someday.domain.settings.WorkspaceAdmissionManager
 import saien.someday.domain.settings.SelfHostedSessionCredentialStore
 import saien.someday.domain.settings.SyncMode
 import saien.someday.domain.settings.authorityBindingId
@@ -50,6 +51,8 @@ import saien.someday.sync.selfhosted.ActiveWorkspaceSessionRequirement
 import saien.someday.sync.selfhosted.SelfHostedAccountControlTransport
 import saien.someday.sync.selfhosted.SelfHostedAccountDiscoveryService
 import saien.someday.sync.selfhosted.SelfHostedAccountDiscoveryResult
+import saien.someday.sync.selfhosted.SelfHostedWorkspaceAdmissionService
+import saien.someday.sync.selfhosted.SelfHostedWorkspaceAdmissionTransport
 import saien.someday.sync.selfhosted.SelfHostedErrorCode
 import saien.someday.sync.selfhosted.SelfHostedSyncHttpException
 import saien.someday.sync.selfhosted.accountRequestContext
@@ -67,6 +70,8 @@ data class SystemV3ClientServices(
     val accountStateRepository: SqlDelightAccountStateRepository,
     val accountDiscoveryService: SelfHostedAccountDiscoveryService?,
     val accountResetService: SelfHostedAccountResetService?,
+    val workspaceAdmissionManager: WorkspaceAdmissionManager,
+    val workspaceInitialPublicationPrepared: () -> Boolean,
     val settingsRepository: ClientSettingsRepository,
     val manualSyncRunner: ManualSyncRunner,
     val automaticSyncEligible: () -> Boolean,
@@ -319,6 +324,26 @@ fun createSystemV3ClientServices(
         )
     }
 
+    val initialPublicationPrepared = { hasPreparedInitialWorkspacePublication(localRepository, protocolStore) }
+    val workspaceAdmission = SelfHostedWorkspaceAdmissionService(
+        transport = selfHostedTransport as? SelfHostedWorkspaceAdmissionTransport,
+        sessionStore = selfHostedSessionStore,
+        sessionExecutor = activeSelfHostedSessionExecutor,
+        workspaceLifecycleCoordinator = workspaceLifecycleCoordinator,
+        activeWorkspaceSessionGuard = activeWorkspaceSessionGuard,
+        workspaceIdProvider = workspaceIdProvider,
+        workspaceKeyAvailable = { workspaceKeyProvider() != null },
+        activeWorkspaceEstablished = {
+            val authority = protocolStore.loadLocalAuthority()
+            val epoch = protocolStore.loadAuthoritativeEpoch()
+            authority != null && epoch != null && epoch.lifecycle == SyncEpochLifecycleV2.ACTIVE &&
+                epoch.remoteProfile == SyncRemoteProfileV2.SELF_HOSTED.wireValue &&
+                epoch.authorityBindingId == authority.authorityBindingId &&
+                epoch.descriptor.syncEpochId == authority.epochId &&
+                epoch.descriptorDigest == authority.pointerDigest
+        },
+        initialPublicationPrepared = initialPublicationPrepared,
+    )
     val selfHostedRuntime = SyncV2RuntimeService(
         mode = SyncMode.SelfHosted,
         localRepository = localRepository,
@@ -329,6 +354,7 @@ fun createSystemV3ClientServices(
         },
         transportFactory = SyncRemoteTransportFactoryV2 { createSelfHostedRemoteV2() },
         workspaceLifecycleCoordinator = workspaceLifecycleCoordinator,
+        beforeSync = workspaceAdmission::syncFailureWithinWorkspaceLifecycle,
         beforeEntityPublication = { versions ->
             val mediaIds = versions.asSequence()
                 .mapNotNull { it.contentPayload as? NoteContentV2 }
@@ -428,6 +454,8 @@ fun createSystemV3ClientServices(
         accountStateRepository = accountStates,
         accountDiscoveryService = accountDiscovery,
         accountResetService = accountResetService,
+        workspaceAdmissionManager = workspaceAdmission,
+        workspaceInitialPublicationPrepared = initialPublicationPrepared,
         settingsRepository = v2Settings,
         manualSyncRunner = manual,
         automaticSyncEligible = {
@@ -504,6 +532,25 @@ fun createSystemV3ClientServices(
             }
         },
     )
+}
+
+internal fun hasPreparedInitialWorkspacePublication(
+    localRepository: SqlDelightLocalDataRepository,
+    protocolStore: SqlDelightSyncProtocolStoreV2,
+): Boolean {
+    val authority = protocolStore.loadLocalAuthority() ?: return false
+    val epochs = protocolStore.loadAllEpochs()
+    if (epochs.any { it.activatedAtEpochMilliseconds != null || it.lifecycle == SyncEpochLifecycleV2.ACTIVE }) return false
+    return epochs.any { epoch ->
+        epoch.lifecycle == SyncEpochLifecycleV2.PREPARING &&
+            epoch.remoteProfile == SyncRemoteProfileV2.SELF_HOSTED.wireValue &&
+            epoch.authorityBindingId == authority.authorityBindingId &&
+            epoch.descriptor.syncEpochId == authority.epochId &&
+            epoch.descriptorDigest == authority.pointerDigest &&
+            localRepository.database.somedayQueries.selectCheckpointSystemV2(
+                epoch.remoteProfile, epoch.descriptor.syncEpochId, epoch.descriptor.checkpointId,
+            ).executeAsOneOrNull()?.state == "preparing"
+    }
 }
 
 internal fun isAutomaticSyncEligible(protocolStore: SqlDelightSyncProtocolStoreV2): Boolean =

@@ -574,4 +574,17 @@
     <string name="account_reset_device_revoked">此设备已被撤销，重新登录无法重新启用。请联系服务器管理员。</string>
     <string name="account_reset_rate_limited">请求过于频繁，请稍后再试。</string>
     <string name="account_reset_protocol_error">无法验证服务器响应。请检查客户端与服务器版本，或联系运营方。</string>
+    <string name="workspace_admission_first_title">开始同步此工作区</string>
+    <string name="workspace_admission_first_body">开始同步本机内容，将其作为此账号的第一个工作区。</string>
+    <string name="workspace_admission_start">开始同步本机内容</string>
+    <string name="workspace_admission_join_title">加入已有工作区</string>
+    <string name="workspace_admission_join_body">此账号已有工作区。请先从已有设备配对，或使用该工作区的恢复码，再开始同步。</string>
+    <string name="workspace_admission_pairing_help">在已有笔记的设备上打开同步设置，创建配对邀请，然后在此输入配对码或扫描二维码。</string>
+    <string name="workspace_admission_no_recovery">此账号未设置恢复码，请从已有工作区的设备配对。确认替换前，本机内容会一直保留。</string>
+    <string name="workspace_admission_multiple_title">此账号有多个工作区</string>
+    <string name="workspace_admission_multiple_body">此设备只同步当前工作区，其他工作区独立保存，其中的笔记不会出现在这里。如需切换，请从要加入的设备配对。</string>
+    <string name="workspace_admission_check_title">核对账号工作区</string>
+    <string name="workspace_admission_check_body">开始同步前，需要核对此账号是否已有工作区。本机内容会保留。</string>
+    <string name="workspace_admission_unavailable_body">无法核对此账号的工作区。请检查网络及服务器版本是否支持此功能后重试，本机内容已保留。</string>
+    <string name="workspace_admission_retry">重新核对工作区</string>
 </resources>

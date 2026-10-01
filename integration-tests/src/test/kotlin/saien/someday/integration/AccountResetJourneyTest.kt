@@ -34,6 +34,7 @@ import saien.someday.domain.settings.AccountDataResetPhase
 import saien.someday.domain.settings.INITIAL_ACCOUNT_INCARNATION
 import saien.someday.domain.settings.SelfHostedSessionCredentials
 import saien.someday.domain.settings.SyncMode
+import saien.someday.domain.settings.WorkspaceAdmissionState
 import saien.someday.domain.workspace.WorkspaceProductReadOnlyException
 import saien.someday.integration.testkit.AccountResetInstallation
 import saien.someday.integration.testkit.AccountResetJourneyTransport
@@ -451,6 +452,8 @@ class AccountResetJourneyTest {
         assertTrue(controller.state.settings.syncConfiguration.selfHostedSession.loggedIn)
         assertFalse(controller.state.sync.accountReset.blocksSync)
         assertFalse(controller.state.sync.recovery.blocksSync)
+        assertEquals(WorkspaceAdmissionState.Ready, controller.state.sync.admission.state)
+        assertEquals(1, controller.state.sync.admission.initializedWorkspaceCount)
         assertNull(controller.state.sync.issue)
         assertTrue(device.process.controllerSyncResults.isNotEmpty(), "A local replacement alone is not a completed sync journey.")
         assertTrue(device.process.controllerSyncResults.last().success, device.process.controllerSyncResults.last().reason.name)

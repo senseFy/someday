@@ -43,6 +43,9 @@ import saien.someday.domain.settings.UnavailableSelfHostedSessionCredentialStore
 import saien.someday.domain.settings.WorkspaceJoinResult
 import saien.someday.domain.settings.WorkspacePreferencesConflictResolver
 import saien.someday.domain.settings.WorkspacePairingInvitation
+import saien.someday.domain.settings.WorkspaceAdmissionManager
+import saien.someday.domain.settings.WorkspaceAdmissionState
+import saien.someday.domain.settings.WorkspaceAdmissionStatus
 import saien.someday.domain.settings.WorkspacePairingInvitationCanceller
 import saien.someday.domain.settings.WorkspacePairingInvitationCreator
 import saien.someday.domain.settings.WorkspacePairingInvitationJoiner
@@ -121,6 +124,7 @@ class SettingsUiController(
             WorkspaceJoinResult.failure(WorkspacePairingReason.Unavailable)
         },
     private val workspaceRecoveryManager: WorkspaceRecoveryManager? = null,
+    private val workspaceAdmissionManager: WorkspaceAdmissionManager? = null,
     private val accountDataResetManager: AccountDataResetManager? = null,
     private val workspaceProductAccess: WorkspaceProductAccess = UnrestrictedWorkspaceProductAccess,
     private val onThisDayNotificationScheduler: OnThisDayNotificationScheduler =
@@ -136,6 +140,12 @@ class SettingsUiController(
     private var selfHostedDeviceName = selfHostedDeviceName
 
     private var currentWorkspacePairingInvitation: WorkspacePairingInvitationUi? = null
+    private var currentWorkspaceAdmission = initialWorkspaceAdmission()
+
+    private fun initialWorkspaceAdmission() = WorkspaceAdmissionStatus(
+        if (workspaceAdmissionManager == null) WorkspaceAdmissionState.Ready else WorkspaceAdmissionState.Pending,
+    )
+
     private var currentWorkspaceRecovery = WorkspaceRecoveryUiState(
         availability = if (workspaceRecoveryManager == null) {
             WorkspaceRecoveryUiAvailability.NotConfigured
@@ -319,6 +329,7 @@ class SettingsUiController(
             if (result.localReplaced) {
                 currentSettingsWorkspace = completion.workspace
                 currentWorkspacePairingInvitation = null
+                currentWorkspaceAdmission = initialWorkspaceAdmission()
                 currentWorkspaceRecovery = WorkspaceRecoveryUiState(
                     availability = if (workspaceRecoveryManager == null) WorkspaceRecoveryUiAvailability.NotConfigured else WorkspaceRecoveryUiAvailability.Unknown,
                     syncGate = if (workspaceRecoveryManager == null) WorkspaceRecoverySyncGate.Allowed else WorkspaceRecoverySyncGate.Pending,
@@ -359,12 +370,16 @@ class SettingsUiController(
         publishCurrentState()
         try {
             refreshWorkspaceRecoveryStatusLocked(showFeedback = false)
+            refreshWorkspaceAdmissionLocked()
             if (replacementWorkspace != null && !workspaceProductAccess.isCurrent(replacementWorkspace)) {
                 throw CancellationException("The local workspace changed.")
             }
-            if (currentWorkspaceRecovery.blocksSync) {
+            if (currentWorkspaceRecovery.blocksSync || currentWorkspaceAdmission.state !in setOf(
+                    WorkspaceAdmissionState.Ready, WorkspaceAdmissionState.FirstWorkspace,
+                )) {
                 currentSyncIssue = SyncIssueUi(SyncIssueReason.RetryRequired)
-                state = buildState(state.settings, state.exportSummary, uiStrings.recoveryStatusUnavailable, SettingsFeedbackSeverity.Warning)
+                state = buildState(state.settings, state.exportSummary,
+                    admissionBlockingMessage() ?: uiStrings.recoveryStatusUnavailable, SettingsFeedbackSeverity.Warning)
                 return@withSettingsMutation
             }
             currentSyncOperation = SyncUiOperation.Syncing
@@ -392,6 +407,56 @@ class SettingsUiController(
                 publishCurrentState()
             }
         }
+
+    suspend fun retryWorkspaceAdmission(): Boolean = runExclusiveSyncLifecycle(false) {
+        if (workspaceAdmissionManager == null || currentSyncOperation != null ||
+            state.sync.connection !is SyncConnectionUi.Connected || state.sync.accountReset.blocksSync
+        ) return@runExclusiveSyncLifecycle false
+        currentSyncOperation = SyncUiOperation.CheckingWorkspace
+        publishCurrentState()
+        try {
+            refreshWorkspaceAdmissionLocked()
+            refreshWorkspaceRecoveryStatusLocked(showFeedback = false)
+            currentWorkspaceAdmission.state !in setOf(WorkspaceAdmissionState.Pending, WorkspaceAdmissionState.Unavailable)
+        } finally {
+            currentSyncOperation = null
+            publishCurrentState()
+        }
+    }
+
+    private suspend fun refreshWorkspaceAdmissionLocked() {
+        val manager = workspaceAdmissionManager ?: return
+        val expectedWorkspace = currentSettingsWorkspace
+        val status = try {
+            withContext(backgroundDispatcher) { manager.status() }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Throwable) {
+            WorkspaceAdmissionStatus(WorkspaceAdmissionState.Unavailable)
+        }
+        if (expectedWorkspace != null && !workspaceProductAccess.isCurrent(expectedWorkspace)) {
+            throw CancellationException("The local workspace changed.")
+        }
+        currentWorkspaceAdmission = status
+        // Discovery can persist an account-incarnation gate without throwing to the UI.
+        loadAccountResetState()
+        if (status.state == WorkspaceAdmissionState.JoinRequired && !state.sync.accountReset.blocksSync) {
+            // A rejected first publication may have just discovered another workspace.
+            // Re-read recovery so a code configured by that device is usable here.
+            refreshWorkspaceRecoveryStatusLocked(showFeedback = false)
+        }
+        if (currentSyncIssue?.reason in setOf(SyncIssueReason.WorkspaceJoinRequired, SyncIssueReason.WorkspaceAdmissionUnavailable)) {
+            currentSyncIssue = null
+        }
+        publishCurrentState()
+    }
+
+    private fun admissionBlockingMessage(allowFirstWorkspace: Boolean = false): String? = when (currentWorkspaceAdmission.state) {
+        WorkspaceAdmissionState.Ready -> null
+        WorkspaceAdmissionState.FirstWorkspace -> if (allowFirstWorkspace) null else uiStrings.workspaceFirstRequired
+        WorkspaceAdmissionState.JoinRequired -> uiStrings.workspaceJoinRequired
+        WorkspaceAdmissionState.Pending, WorkspaceAdmissionState.Unavailable -> uiStrings.workspaceAdmissionUnavailable
+    }
 
     private suspend fun refreshLocked() {
         val previousIdentity = currentSettingsWorkspace
@@ -491,6 +556,7 @@ class SettingsUiController(
         loadAccountResetState()
         if (state.sync.connection is SyncConnectionUi.Connected && !state.sync.accountReset.blocksSync) {
             refreshWorkspaceRecoveryStatusLocked(showFeedback = false)
+            refreshWorkspaceAdmissionLocked()
         }
         rescheduleOnThisDayNotifications()
     }
@@ -769,6 +835,7 @@ class SettingsUiController(
             }
 
             currentWorkspacePairingInvitation = null
+            currentWorkspaceAdmission = initialWorkspaceAdmission()
             discardPendingWorkspaceRecoveryCodeLocked()
             currentWorkspaceRecovery = WorkspaceRecoveryUiState(
                 availability = if (workspaceRecoveryManager == null) {
@@ -930,6 +997,7 @@ class SettingsUiController(
                     publishCurrentState()
                 } else {
                     refreshWorkspaceRecoveryStatusLocked(showFeedback = false)
+                    refreshWorkspaceAdmissionLocked()
                 }
                 persisted
             }
@@ -945,6 +1013,7 @@ class SettingsUiController(
     private fun canStartSync(): Boolean =
         currentSyncOperation == null && currentAccountResetOperation == null && !state.sync.accountReset.blocksSync &&
             state.sync.connection is SyncConnectionUi.Connected &&
+            currentWorkspaceAdmission.state == WorkspaceAdmissionState.Ready &&
             !currentWorkspaceRecovery.blocksSync &&
             (currentSyncIssue == null || currentSyncIssue?.action == SyncIssueAction.RetrySync)
 
@@ -997,14 +1066,16 @@ class SettingsUiController(
         currentWorkspaceRecovery = currentWorkspaceRecovery.copy(preparedCode = null, failureMessage = null)
     }
 
-    private fun beginSync(showFeedback: Boolean): Boolean {
+    private fun beginSync(showFeedback: Boolean, allowFirstWorkspace: Boolean = false): Boolean {
         if (currentSyncOperation != null) return false
         val connected = state.sync.connection is SyncConnectionUi.Connected
         val blockingIssue = currentSyncIssue
             ?.takeUnless { it.action == SyncIssueAction.RetrySync }
+        val admissionMessage = admissionBlockingMessage(allowFirstWorkspace)
         val blockingMessage = when {
             state.sync.accountReset.blocksSync -> uiStrings.accountReset.changedBody
             !connected -> uiStrings.signInBeforeSync
+            admissionMessage != null -> admissionMessage
             currentWorkspaceRecovery.availability == WorkspaceRecoveryUiAvailability.RecoveryAvailable ->
                 uiStrings.recoveryRequiredBeforeSync
             currentWorkspaceRecovery.blocksSync -> uiStrings.recoveryStatusUnavailable
@@ -1099,10 +1170,13 @@ class SettingsUiController(
         if (result.reason == ManualSyncReason.RemoteHistoryConflict && workspaceRecoveryManager != null) {
             refreshWorkspaceRecoveryStatusLocked(showFeedback = false)
         }
+        refreshWorkspaceAdmissionLocked()
         return result.success && persistenceFailure == null
     }
 
     suspend fun runUserSync(): Boolean = runSync(userInitiated = true)
+
+    suspend fun startFirstWorkspaceSync(): Boolean = runSync(userInitiated = true, allowFirstWorkspace = true)
 
     suspend fun runAutomaticSync(): Boolean = runSync(userInitiated = false)
 
@@ -1131,9 +1205,9 @@ class SettingsUiController(
             -> false
         }
 
-    private suspend fun runSync(userInitiated: Boolean): Boolean {
+    private suspend fun runSync(userInitiated: Boolean, allowFirstWorkspace: Boolean = false): Boolean {
         val completion = runExclusiveSyncLifecycle(SyncCompletion()) {
-            runSyncLocked(userInitiated)
+            runSyncLocked(userInitiated, allowFirstWorkspace)
         }
         if (completion.refreshProductData) {
             onDataRestored()
@@ -1141,9 +1215,12 @@ class SettingsUiController(
         return completion.success
     }
 
-    private suspend fun runSyncLocked(userInitiated: Boolean): SyncCompletion {
+    private suspend fun runSyncLocked(userInitiated: Boolean, allowFirstWorkspace: Boolean): SyncCompletion {
         if (!userInitiated && !canStartSync()) return SyncCompletion()
         if (!userInitiated && !preflightAutomaticSync()) return SyncCompletion()
+        if (state.sync.connection is SyncConnectionUi.Connected && !state.sync.accountReset.blocksSync) {
+            refreshWorkspaceAdmissionLocked()
+        }
         if (userInitiated &&
             state.sync.connection is SyncConnectionUi.Connected &&
             currentWorkspaceRecovery.blocksSync &&
@@ -1151,7 +1228,7 @@ class SettingsUiController(
         ) {
             refreshWorkspaceRecoveryStatusLocked(showFeedback = false)
         }
-        if (!beginSync(showFeedback = userInitiated)) return SyncCompletion()
+        if (!beginSync(showFeedback = userInitiated, allowFirstWorkspace = allowFirstWorkspace)) return SyncCompletion()
         return try {
             val result = executeSyncRunner()
             val shouldShowFeedback = userInitiated || !result.success
@@ -1293,6 +1370,7 @@ class SettingsUiController(
     private suspend fun prepareWorkspaceRecoveryCodeLocked(): Boolean {
         val manager = workspaceRecoveryManager ?: return false
         if (state.sync.connection !is SyncConnectionUi.Connected ||
+            currentWorkspaceAdmission.state != WorkspaceAdmissionState.Ready ||
             currentWorkspaceRecovery.availability !in setOf(
                 WorkspaceRecoveryUiAvailability.NotConfigured,
                 WorkspaceRecoveryUiAvailability.Configured,
@@ -1452,7 +1530,7 @@ class SettingsUiController(
                 syncGate = WorkspaceRecoverySyncGate.Allowed,
             )
             val replacementSettings = runCatching {
-                loadCurrentWorkspaceSettings()
+                loadCurrentWorkspaceSettings(adoptCommittedReplacement = true)
             }.getOrElse { failure ->
                 failure.rethrowCancellation()
                 currentSyncIssue = SyncIssueUi(SyncIssueReason.WorkspaceSettingsReloadRequired)
@@ -1471,7 +1549,8 @@ class SettingsUiController(
                 feedbackSeverity = SettingsFeedbackSeverity.Success,
             )
             refreshWorkspaceRecoveryStatusLocked(showFeedback = false)
-            if (currentWorkspaceRecovery.blocksSync) {
+            refreshWorkspaceAdmissionLocked()
+            if (currentWorkspaceRecovery.blocksSync || currentWorkspaceAdmission.state != WorkspaceAdmissionState.Ready) {
                 return WorkspaceJoinCompletion(joined = true, refreshProductData = true)
             }
             currentSyncOperation = SyncUiOperation.Syncing
@@ -1489,7 +1568,7 @@ class SettingsUiController(
         runExclusiveSyncLifecycle(false) { createWorkspacePairingInvitationLocked() }
 
     private suspend fun createWorkspacePairingInvitationLocked(): Boolean {
-        if (!canUseWorkspacePairing()) return false
+        if (!canUseWorkspacePairing() || currentWorkspaceAdmission.state != WorkspaceAdmissionState.Ready) return false
         if (currentSyncOperation != null) return false
         currentSyncOperation = SyncUiOperation.CreatingInvitation
         publishCurrentState()
@@ -1618,7 +1697,7 @@ class SettingsUiController(
                 discardPendingWorkspaceRecoveryCodeLocked()
                 currentSyncIssue = null
                 val replacementSettings = runCatching {
-                    loadCurrentWorkspaceSettings()
+                    loadCurrentWorkspaceSettings(adoptCommittedReplacement = true)
                 }.getOrElse { failure ->
                     failure.rethrowCancellation()
                     currentSyncIssue = SyncIssueUi(SyncIssueReason.WorkspaceSettingsReloadRequired)
@@ -1640,7 +1719,8 @@ class SettingsUiController(
                     feedbackSeverity = SettingsFeedbackSeverity.Success,
                 )
                 refreshWorkspaceRecoveryStatusLocked(showFeedback = false)
-                if (currentWorkspaceRecovery.blocksSync) {
+                refreshWorkspaceAdmissionLocked()
+                if (currentWorkspaceRecovery.blocksSync || currentWorkspaceAdmission.state != WorkspaceAdmissionState.Ready) {
                     return WorkspaceJoinCompletion(
                         joined = true,
                         refreshProductData = true,
@@ -1714,6 +1794,8 @@ class SettingsUiController(
             ManualSyncReason.ProviderChanged -> uiStrings.syncConfigurationChanged
             ManualSyncReason.AuthorityMismatch -> uiStrings.syncAuthorityMismatch
             ManualSyncReason.WorkspaceLocked -> uiStrings.syncWorkspaceLocked
+            ManualSyncReason.WorkspaceJoinRequired -> uiStrings.workspaceJoinRequired
+            ManualSyncReason.WorkspaceAdmissionUnavailable -> uiStrings.workspaceAdmissionUnavailable
             ManualSyncReason.RemoteHistoryConflict -> uiStrings.syncRemoteHistoryConflict
             ManualSyncReason.RetryRequired -> uiStrings.syncRetryRequired
             ManualSyncReason.Blocked -> uiStrings.syncBlocked
@@ -1730,6 +1812,8 @@ class SettingsUiController(
         when (reason) {
             ManualSyncReason.AuthorityMismatch -> SyncIssueReason.AuthorityMismatch
             ManualSyncReason.WorkspaceLocked -> SyncIssueReason.WorkspaceLocked
+            ManualSyncReason.WorkspaceJoinRequired -> SyncIssueReason.WorkspaceJoinRequired
+            ManualSyncReason.WorkspaceAdmissionUnavailable -> SyncIssueReason.WorkspaceAdmissionUnavailable
             ManualSyncReason.RemoteHistoryConflict -> SyncIssueReason.RemoteHistoryConflict
             ManualSyncReason.CheckpointInvalid -> SyncIssueReason.CheckpointInvalid
             ManualSyncReason.RetryRequired -> SyncIssueReason.RetryRequired
@@ -1761,6 +1845,8 @@ class SettingsUiController(
             SyncIssueReason.SyncUnavailable -> uiStrings.syncUnavailable
             SyncIssueReason.AuthorityMismatch -> uiStrings.syncAuthorityMismatch
             SyncIssueReason.WorkspaceLocked -> uiStrings.syncWorkspaceLocked
+            SyncIssueReason.WorkspaceJoinRequired -> uiStrings.workspaceJoinRequired
+            SyncIssueReason.WorkspaceAdmissionUnavailable -> uiStrings.workspaceAdmissionUnavailable
             SyncIssueReason.RemoteHistoryConflict -> uiStrings.syncRemoteHistoryConflict
             SyncIssueReason.CheckpointInvalid -> uiStrings.syncCheckpointInvalid
             SyncIssueReason.RetryRequired -> uiStrings.syncRetryRequired
@@ -1873,15 +1959,23 @@ class SettingsUiController(
         }
     }
 
-    private suspend fun loadCurrentWorkspaceSettings(): ClientSettings {
+    private suspend fun loadCurrentWorkspaceSettings(adoptCommittedReplacement: Boolean = false): ClientSettings {
         val loaded = withContext(backgroundDispatcher) {
             val identity = workspaceProductAccess.capture()
-            identity to workspaceProductAccess.read(identity) { loadSettings() }
+            identity to runCatching { workspaceProductAccess.read(identity) { loadSettings() } }
         }
         if (!workspaceProductAccess.isCurrent(loaded.first)) throw CancellationException("The local workspace changed.")
+        loaded.second.exceptionOrNull()?.rethrowCancellation()
+        if (adoptCommittedReplacement) {
+            // Pair/Recover has already committed this identity. A settings read failure
+            // must leave retries scoped to the joined workspace, never the discarded one.
+            currentSettingsWorkspace = loaded.first
+            mutationWorkspace = loaded.first
+        }
+        val settings = loaded.second.getOrThrow()
         currentSettingsWorkspace = loaded.first
         mutationWorkspace = loaded.first
-        return loaded.second
+        return settings
     }
 
     /** Called on the IO dispatcher; queued settings cannot overwrite a replacement workspace. */
@@ -1991,6 +2085,7 @@ class SettingsUiController(
                 issue = currentSyncIssue,
                 invitation = visibleInvitation,
                 recovery = currentWorkspaceRecovery,
+                admission = currentWorkspaceAdmission,
                 accountReset = AccountResetUiState(accountDataResetManager != null, currentAccountResetSnapshot, currentAccountResetOperation),
             ),
         )
@@ -2067,6 +2162,8 @@ private fun syncIssueFromLastError(lastError: String?): SyncIssueUi? {
         when (marker) {
             ManualSyncReason.AuthorityMismatch.name -> SyncIssueReason.AuthorityMismatch
             ManualSyncReason.WorkspaceLocked.name -> SyncIssueReason.WorkspaceLocked
+            ManualSyncReason.WorkspaceJoinRequired.name -> SyncIssueReason.WorkspaceJoinRequired
+            ManualSyncReason.WorkspaceAdmissionUnavailable.name -> SyncIssueReason.WorkspaceAdmissionUnavailable
             ManualSyncReason.RemoteHistoryConflict.name -> SyncIssueReason.RemoteHistoryConflict
             ManualSyncReason.CheckpointInvalid.name -> SyncIssueReason.CheckpointInvalid
             ManualSyncReason.RetryRequired.name -> SyncIssueReason.RetryRequired

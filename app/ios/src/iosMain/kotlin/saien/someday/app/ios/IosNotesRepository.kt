@@ -34,6 +34,7 @@ import saien.someday.domain.settings.WorkspacePairingInvitationCanceller
 import saien.someday.domain.settings.WorkspacePairingInvitationCreator
 import saien.someday.domain.settings.WorkspacePairingInvitationJoiner
 import saien.someday.domain.settings.WorkspaceRecoveryManager
+import saien.someday.domain.settings.WorkspaceAdmissionManager
 import saien.someday.sync.AuthorityCoordinatedMediaAssetStore
 import saien.someday.sync.createSystemV3ClientServices
 import saien.someday.sync.selfhosted.IosSelfHostedSyncTransport
@@ -64,6 +65,7 @@ class IosClientRepositories(
     val workspacePairingInvitationJoiner: WorkspacePairingInvitationJoiner,
     val workspacePairingInvitationCanceller: WorkspacePairingInvitationCanceller,
     val workspaceRecoveryManager: WorkspaceRecoveryManager,
+    val workspaceAdmissionManager: WorkspaceAdmissionManager,
     val accountDataResetManager: AccountDataResetManager,
     val workspaceProductAccess: WorkspaceProductAccess,
     val localMediaAssetStore: AuthorityCoordinatedMediaAssetStore,
@@ -192,6 +194,7 @@ private fun assembleIosClientRepositories(
         activeWorkspaceSessionGuard = systemV3Services.activeWorkspaceSessionGuard,
         workspaceRecoveryPublisherReady = systemV3Services.workspacePairingInviterReady,
         localWorkspaceKeyFingerprint = { workspaceKeys.unlockedOrUnlock()?.fingerprint },
+        provisionalWorkspaceReplacementAllowed = systemV3Services.workspaceInitialPublicationPrepared,
     )
     return IosClientRepositories(
         notesRepository = systemV3Services.notesRepository,
@@ -225,6 +228,7 @@ private fun assembleIosClientRepositories(
         workspacePairingInvitationJoiner = selfHostedPairingService,
         workspacePairingInvitationCanceller = selfHostedPairingService,
         workspaceRecoveryManager = selfHostedRecoveryService,
+        workspaceAdmissionManager = systemV3Services.workspaceAdmissionManager,
         accountDataResetManager = SelfHostedAccountResetManager(
             services = systemV3Services,
             sessionStore = selfHostedSessionCredentialStore,

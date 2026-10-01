@@ -25,6 +25,8 @@ import saien.someday.server.persistence.SyncV2Repository
 import saien.someday.server.persistence.WorkspaceRecoveryEnvelopeInput
 import saien.someday.server.persistence.WorkspaceRecoveryEnvelopePutResult
 import saien.someday.server.persistence.WorkspaceRecoveryEnvelopeRepository
+import saien.someday.server.persistence.WorkspaceAdmissionRepository
+import saien.someday.server.persistence.WorkspaceAdmissionSnapshot
 import saien.someday.server.support.ConcurrentStartGate
 import saien.someday.server.support.PostgresContractFixture
 import saien.someday.server.support.SyncV2ContractFixture
@@ -106,6 +108,64 @@ class SyncV2EpochContractIntegrationTest {
     }
 
     @Test
+    fun differentWorkspaceGenesisWithoutRecoveryHasExactlyOneWinner() = runBlocking {
+        val workspaces = listOf(WORKSPACE_ID, COMPETING_WORKSPACE_ID)
+        val candidates = workspaces.map { SyncV2ContractFixture.genesis(it) }
+        candidates.forEachIndexed { index, candidate ->
+            SyncV2ContractFixture.prepareGenesis(repository, identity, workspaces[index], candidate)
+        }
+        val discovery = WorkspaceAdmissionRepository(database.config)
+        assertEquals(WorkspaceAdmissionSnapshot(0, false, false), discovery.discover(identity.request, WORKSPACE_ID))
+        val startGate = ConcurrentStartGate(candidates.size)
+        val results = candidates.mapIndexed { index, candidate ->
+            async(Dispatchers.IO) {
+                startGate.awaitRelease()
+                repository.compareAndSetEpoch(
+                    identity.request, workspaces[index], null, candidate.metadata, candidate.pointerObjectJson,
+                )
+            }
+        }.awaitAll()
+
+        val winner = results.indexOfFirst { it is SyncV2PointerPublishRepositoryResult.Published }
+        assertTrue(winner >= 0)
+        assertEquals(1, results.count { it is SyncV2PointerPublishRepositoryResult.Published })
+        assertEquals(
+            listOf("workspace_join_required"),
+            results.filterIsInstance<SyncV2PointerPublishRepositoryResult.Rejected>().map { it.error },
+        )
+        assertEquals(
+            WorkspaceAdmissionSnapshot(1, true, false),
+            discovery.discover(identity.request, workspaces[winner]),
+        )
+        assertEquals(
+            WorkspaceAdmissionSnapshot(1, false, false),
+            discovery.discover(identity.request, workspaces[1 - winner]),
+        )
+        val otherAccount = database.seedIdentity("other-first-workspace")
+        assertEquals(WorkspaceAdmissionSnapshot(0, false, false), discovery.discover(otherAccount.request, WORKSPACE_ID))
+        SyncV2ContractFixture.initializeWorkspace(repository, otherAccount, WORKSPACE_ID, "other-first-workspace")
+        Unit
+    }
+
+    @Test
+    fun discoveryPreservesHistoricalWorkspacesWithoutChoosingAnAccountPrimary() {
+        val first = SyncV2ContractFixture.initializeWorkspace(repository, identity, WORKSPACE_ID, "historical-first")
+        val second = SyncV2ContractFixture.genesis("historical-second")
+        SyncV2ContractFixture.prepareGenesis(repository, identity, RECOVERY_WORKSPACE_ID, second)
+        seedHistoricalEpoch(RECOVERY_WORKSPACE_ID, second.metadata, second.pointerObjectJson)
+        val discovery = WorkspaceAdmissionRepository(database.config)
+        assertEquals(WorkspaceAdmissionSnapshot(2, true, false), discovery.discover(identity.request, WORKSPACE_ID))
+        assertEquals(WorkspaceAdmissionSnapshot(2, true, false), discovery.discover(identity.request, RECOVERY_WORKSPACE_ID))
+        assertEquals(WorkspaceAdmissionSnapshot(2, false, false), discovery.discover(identity.request, COMPETING_WORKSPACE_ID))
+        val replay = assertIs<SyncV2PointerPublishRepositoryResult.Published>(
+            repository.compareAndSetEpoch(identity.request, WORKSPACE_ID, null, first.metadata, first.pointerObjectJson),
+        )
+        assertTrue(replay.idempotentReplay)
+        WorkspaceRecoveryEnvelopeRepository(database.config).put(identity.request, recoveryInput())
+        assertEquals(WorkspaceAdmissionSnapshot(2, true, true), discovery.discover(identity.request, WORKSPACE_ID))
+    }
+
+    @Test
     fun genesisCasObservablyWaitsForTheWorkspaceAdvisoryLock() {
         val candidate = SyncV2ContractFixture.genesis("observable-workspace-lock")
         SyncV2ContractFixture.prepareGenesis(repository, identity, WORKSPACE_ID, candidate)
@@ -145,12 +205,9 @@ class SyncV2EpochContractIntegrationTest {
             WORKSPACE_ID,
             "existing-a",
         )
-        SyncV2ContractFixture.initializeWorkspace(
-            repository,
-            identity,
-            RECOVERY_WORKSPACE_ID,
-            "recovery-b",
-        )
+        val historicalRecovery = SyncV2ContractFixture.genesis("recovery-b")
+        SyncV2ContractFixture.prepareGenesis(repository, identity, RECOVERY_WORKSPACE_ID, historicalRecovery)
+        seedHistoricalEpoch(RECOVERY_WORKSPACE_ID, historicalRecovery.metadata, historicalRecovery.pointerObjectJson)
         val stored = assertIs<WorkspaceRecoveryEnvelopePutResult.Stored>(
             recoveryRepository.put(identity.request, recoveryInput()),
         )
@@ -318,6 +375,17 @@ class SyncV2EpochContractIntegrationTest {
         envelopeDigest = "A".repeat(43),
         expectedRevision = null,
     )
+
+    /** Represents authorities published by servers before first-workspace admission was enforced. */
+    private fun seedHistoricalEpoch(workspaceId: String, metadata: SyncV2EpochMetadataRecord, pointerObjectJson: String) {
+        DriverManager.getConnection(
+            database.config.databaseConnectionUrl, database.config.databaseUser, database.config.databasePassword,
+        ).use { connection ->
+            connection.autoCommit = false
+            insertEpoch(connection, identity, workspaceId, metadata, pointerObjectJson)
+            connection.commit()
+        }
+    }
 
     private fun insertRecoveryEnvelope(
         connection: Connection,

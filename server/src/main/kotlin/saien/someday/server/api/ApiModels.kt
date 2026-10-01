@@ -99,6 +99,14 @@ data class PairingInviteCompleteRequest(
 )
 
 @Serializable
+data class WorkspaceAdmissionResponse(
+    val protocolVersion: Int = 1,
+    val initializedWorkspaceCount: Int,
+    val localWorkspaceInitialized: Boolean,
+    val recoveryAvailable: Boolean,
+)
+
+@Serializable
 data class WorkspaceRecoveryEnvelopePutRequest(
     val workspaceId: String,
     val keyFingerprint: String,

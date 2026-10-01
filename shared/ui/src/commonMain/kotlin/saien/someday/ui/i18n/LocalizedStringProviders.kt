@@ -197,6 +197,9 @@ fun rememberSettingsUiStrings(): SettingsUiStrings {
     val syncConfigurationChanged = stringResource(Res.string.settings_fb_sync_configuration_changed)
     val syncAuthorityMismatch = stringResource(Res.string.settings_fb_sync_authority_mismatch)
     val syncWorkspaceLocked = stringResource(Res.string.settings_fb_sync_workspace_locked)
+    val workspaceFirstRequired = stringResource(Res.string.workspace_admission_first_body)
+    val workspaceJoinRequired = stringResource(Res.string.workspace_admission_join_body)
+    val workspaceAdmissionUnavailable = stringResource(Res.string.workspace_admission_unavailable_body)
     val syncRemoteHistoryConflict = stringResource(Res.string.settings_fb_sync_remote_history_conflict)
     val syncRetryRequired = stringResource(Res.string.settings_fb_sync_retry_required)
     val syncBlocked = stringResource(Res.string.settings_fb_sync_blocked)
@@ -298,6 +301,9 @@ fun rememberSettingsUiStrings(): SettingsUiStrings {
         syncConfigurationChanged = syncConfigurationChanged,
         syncAuthorityMismatch = syncAuthorityMismatch,
         syncWorkspaceLocked = syncWorkspaceLocked,
+        workspaceFirstRequired = workspaceFirstRequired,
+        workspaceJoinRequired = workspaceJoinRequired,
+        workspaceAdmissionUnavailable = workspaceAdmissionUnavailable,
         syncRemoteHistoryConflict = syncRemoteHistoryConflict,
         syncRetryRequired = syncRetryRequired,
         syncBlocked = syncBlocked,

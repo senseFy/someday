@@ -433,6 +433,12 @@ class SyncV2Repository(
         if (recoveryWorkspaceId != null && recoveryWorkspaceId != workspaceId) {
             return@transaction SyncV2PointerPublishRepositoryResult.Rejected("workspace_recovery_required")
         }
+        val admission = withAccountWorkspaceScope(connection, workspaceId) {
+            loadWorkspaceAdmission(connection, account, workspaceId)
+        }
+        if (admission.initializedWorkspaceCount > 0 && !admission.localWorkspaceInitialized) {
+            return@transaction SyncV2PointerPublishRepositoryResult.Rejected("workspace_join_required")
+        }
         if (!checkpointIsComplete(connection, userId, workspaceId, metadata)) {
             return@transaction SyncV2PointerPublishRepositoryResult.Rejected("checkpoint_incomplete")
         }
@@ -1003,17 +1009,25 @@ class SyncV2Repository(
         connection: Connection,
         userId: UUID,
         restoreWorkspaceId: String,
-    ): String? {
+    ): String? = withAccountWorkspaceScope(connection, restoreWorkspaceId) {
+        connection.prepareStatement(
+            "SELECT workspace_id FROM workspace_recovery_envelopes WHERE user_id = ?",
+        ).use { statement ->
+            statement.setObject(1, userId)
+            statement.executeQuery().use { result ->
+                if (result.next()) result.getString(1) else null
+            }
+        }
+    }
+
+    private fun <T> withAccountWorkspaceScope(
+        connection: Connection,
+        restoreWorkspaceId: String,
+        block: () -> T,
+    ): T {
         setWorkspaceScope(connection, "*", local = true)
         return try {
-            connection.prepareStatement(
-                "SELECT workspace_id FROM workspace_recovery_envelopes WHERE user_id = ?",
-            ).use { statement ->
-                statement.setObject(1, userId)
-                statement.executeQuery().use { result ->
-                    if (result.next()) result.getString(1) else null
-                }
-            }
+            block()
         } finally {
             setWorkspaceScope(connection, restoreWorkspaceId, local = true)
         }

@@ -574,4 +574,17 @@
     <string name="account_reset_device_revoked">이 기기의 권한이 취소되었습니다. 다시 로그인해도 활성화되지 않습니다. 서버 관리자에게 문의하세요.</string>
     <string name="account_reset_rate_limited">요청이 너무 많습니다. 잠시 후 다시 시도하세요.</string>
     <string name="account_reset_protocol_error">서버 응답을 검증할 수 없습니다. 클라이언트와 서버 버전을 확인하거나 운영자에게 문의하세요.</string>
+    <string name="workspace_admission_first_title">이 작업 공간 동기화 시작</string>
+    <string name="workspace_admission_first_body">이 기기의 내용을 동기화하여 계정의 첫 작업 공간을 만듭니다.</string>
+    <string name="workspace_admission_start">이 기기의 내용 동기화 시작</string>
+    <string name="workspace_admission_join_title">기존 작업 공간에 참여</string>
+    <string name="workspace_admission_join_body">이 계정에는 이미 작업 공간이 있습니다. 동기화 전에 기존 기기와 페어링하거나 해당 작업 공간의 복구 코드를 사용하세요.</string>
+    <string name="workspace_admission_pairing_help">노트가 있는 기기의 동기화 설정에서 페어링 초대를 만든 후, 여기에 코드를 입력하거나 QR 코드를 스캔하세요.</string>
+    <string name="workspace_admission_no_recovery">설정된 복구 코드가 없습니다. 작업 공간이 있는 기기와 페어링하세요. 교체를 확인하기 전까지 이 기기의 내용은 유지됩니다.</string>
+    <string name="workspace_admission_multiple_title">계정에 여러 작업 공간이 있음</string>
+    <string name="workspace_admission_multiple_body">이 기기는 현재 작업 공간만 동기화합니다. 다른 작업 공간은 별도로 보관되며 해당 노트는 여기에 표시되지 않습니다. 전환하려면 참여할 기기와 페어링하세요.</string>
+    <string name="workspace_admission_check_title">계정의 작업 공간 확인</string>
+    <string name="workspace_admission_check_body">동기화를 시작하기 전에 이 계정에 작업 공간이 있는지 확인합니다. 이 기기의 내용은 유지됩니다.</string>
+    <string name="workspace_admission_unavailable_body">계정의 작업 공간을 확인할 수 없습니다. 연결과 서버 버전의 기능 지원 여부를 확인한 후 다시 시도하세요. 이 기기의 내용은 유지되었습니다.</string>
+    <string name="workspace_admission_retry">작업 공간 다시 확인</string>
 </resources>

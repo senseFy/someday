@@ -34,6 +34,8 @@ class SyncV2RuntimeService(
     private val onPublishProgress: (WorkspaceCheckpointPublishProgressV2) -> Unit = {},
     /** Required product boundary; System V3 supplies its media reachability gate. */
     private val beforeEntityPublication: (List<WorkspaceEntityVersionV2>) -> Unit,
+    /** Product admission runs inside the same lifecycle lock, before any remote publication. */
+    private val beforeSync: () -> ManualSyncResult? = { null },
 ) : ManualSyncRunner {
     private val protocolStore = SqlDelightSyncProtocolStoreV2(localRepository.database)
     private val checkpointCleanup = WorkspaceCheckpointCleanupServiceV2(localRepository, protocolStore)
@@ -48,6 +50,7 @@ class SyncV2RuntimeService(
         if (configured.mode != mode) {
             return ManualSyncResult.failure(mode, ManualSyncReason.ProviderChanged)
         }
+        beforeSync()?.let { return it }
         val authority = protocolStore.loadAuthoritativeEpoch()
         if (authority != null && authority.remoteProfile != mode.remoteProfileV2()) {
             return ManualSyncResult.failure(
@@ -758,7 +761,9 @@ private sealed interface FirstEpochPublishAttemptV2 {
 
 private val FirstEpochPublishAttemptV2.Failed.manualSyncReason: ManualSyncReason
     get() = WorkspacePublicationFailureV2.fromCode(safeErrorCode)?.manualSyncReason
-        ?: if (safeErrorCode == "workspace_recovery_required") {
+        ?: if (safeErrorCode == "workspace_join_required") {
+            ManualSyncReason.WorkspaceJoinRequired
+        } else if (safeErrorCode == "workspace_recovery_required") {
             ManualSyncReason.RemoteHistoryConflict
         } else {
             ManualSyncReason.Failed

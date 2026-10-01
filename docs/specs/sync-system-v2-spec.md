@@ -106,8 +106,8 @@ entities or classifies semantic conflicts.
 ## 5. Initial checkpoint and publication
 
 One authenticated pointer selects the workspace's single generation. A fresh
-installation keeps its locally prepared checkpoint and offline mutations. On
-ordinary first connection:
+installation keeps its locally prepared checkpoint and offline mutations. After
+System V3 account admission permits first publication:
 
 - an empty remote workspace accepts that same generation by one
   compare-and-set; or

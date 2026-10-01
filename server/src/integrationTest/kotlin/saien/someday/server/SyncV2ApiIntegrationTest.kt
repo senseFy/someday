@@ -3,6 +3,9 @@
 package saien.someday.server
 
 import saien.someday.server.api.ErrorResponse
+import saien.someday.server.api.AuthRequest
+import saien.someday.server.api.AuthTokensResponse
+import saien.someday.server.api.WorkspaceAdmissionResponse
 import saien.someday.server.api.SyncV2CheckpointChunkRef
 import saien.someday.server.api.SyncV2CheckpointChunkRequest
 import saien.someday.server.api.SyncV2CheckpointCleanupResponse
@@ -42,7 +45,10 @@ import io.ktor.client.request.delete
 import io.ktor.client.request.get
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.HttpStatusCode
+import io.ktor.http.HttpHeaders
 import io.ktor.server.testing.testApplication
+import java.sql.DriverManager
+import java.util.UUID
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
@@ -57,6 +63,53 @@ class SyncV2ApiIntegrationTest {
 
     @BeforeTest fun setUp() = clearServerTables()
     @AfterTest fun tearDown() = clearServerTables()
+
+    @Test
+    fun workspaceAdmissionRequiresDeviceAuthenticationAndCountsOnlyPublishedAuthorities() = testApplication {
+        application { somedayServerModule() }
+        clearServerTables()
+        val route = "/workspace/admission?workspaceId=$WORKSPACE_ID"
+        assertEquals(HttpStatusCode.Unauthorized, client.get(route).status)
+        val registration = postJson(
+            "/auth/register", "", AuthRequest("admission-${System.nanoTime()}@example.com", "valid-password"),
+        )
+        val account = json.decodeFromString<AuthTokensResponse>(registration.body)
+        assertEquals(HttpStatusCode.Forbidden, client.get(route) { bearerAuth(account.accessToken) }.status)
+        val device = registerDevice(account.accessToken, "Admission", "android")
+        for (invalidQuery in listOf("", "?workspaceId=bad", "?workspaceId=$WORKSPACE_ID&workspaceId=$OTHER_WORKSPACE_ID")) {
+            assertEquals(
+                HttpStatusCode.BadRequest,
+                client.get("/workspace/admission$invalidQuery") { bearerAuth(device.accessToken) }.status,
+            )
+        }
+        val initial = client.get(route) { bearerAuth(device.accessToken) }
+        assertEquals(HttpStatusCode.OK, initial.status)
+        assertEquals("no-store", initial.headers[HttpHeaders.CacheControl])
+        assertEquals(WorkspaceAdmissionResponse(1, 0, false, false), json.decodeFromString<WorkspaceAdmissionResponse>(initial.bodyAsText()))
+
+        val first = checkpoint(device.device.id, previous = null)
+        uploadCheckpointObjects(device.accessToken, first)
+        val staging = client.get(route) { bearerAuth(device.accessToken) }
+        assertEquals(WorkspaceAdmissionResponse(1, 0, false, false), json.decodeFromString<WorkspaceAdmissionResponse>(staging.bodyAsText()))
+        assertEquals(HttpStatusCode.OK, compareAndSetEpoch(device.accessToken, first).status)
+        val initialized = client.get(route) { bearerAuth(device.accessToken) }
+        assertEquals(WorkspaceAdmissionResponse(1, 1, true, false), json.decodeFromString<WorkspaceAdmissionResponse>(initialized.bodyAsText()))
+
+        val secondDevice = registerDevice(account.accessToken, "Joining device", "ios")
+        val anotherWorkspace = client.get("/workspace/admission?workspaceId=$OTHER_WORKSPACE_ID") {
+            bearerAuth(secondDevice.accessToken)
+        }
+        assertEquals(WorkspaceAdmissionResponse(1, 1, false, false), json.decodeFromString<WorkspaceAdmissionResponse>(anotherWorkspace.bodyAsText()))
+        // The server enforces admission even when a client skips discovery; 409
+        // retains the existing route-specific body for strict older transports.
+        val competing = checkpoint(secondDevice.device.id, previous = null)
+        uploadCheckpointObjects(secondDevice.accessToken, competing, OTHER_WORKSPACE_ID)
+        val rejected = compareAndSetEpoch(secondDevice.accessToken, competing, OTHER_WORKSPACE_ID)
+        assertEquals(HttpStatusCode.Conflict, rejected.status)
+        val conflict = json.decodeFromString<SyncV2EpochCompareAndSetResponse>(rejected.body)
+        assertFalse(conflict.published)
+        assertEquals("workspace_join_required", conflict.error)
+    }
 
     @Test
     fun checkpointPushExactReplayPullAndSingleEpochGuardShareExactOpaqueContract() = testApplication {
@@ -372,7 +425,8 @@ class SyncV2ApiIntegrationTest {
         // test runs with the configured PostgreSQL superuser, so RLS cannot
         // hide a missing explicit workspace predicate in repository SQL.
         publishEpoch(account.accessToken, sharedIdentityEpoch, WORKSPACE_ID)
-        publishEpoch(account.accessToken, sharedIdentityEpoch, OTHER_WORKSPACE_ID)
+        uploadCheckpointObjects(account.accessToken, sharedIdentityEpoch, OTHER_WORKSPACE_ID)
+        seedHistoricalWorkspaceEpoch(account.device.id, WORKSPACE_ID, OTHER_WORKSPACE_ID)
 
         val first = client.get("/sync/v3/workspaces/$WORKSPACE_ID/entities/epoch") {
             bearerAuth(account.accessToken)
@@ -406,6 +460,10 @@ class SyncV2ApiIntegrationTest {
         )
         assertEquals(HttpStatusCode.OK, isolatedPull.status, isolatedPull.body)
         assertTrue(json.decodeFromString<SyncV2PullResponse>(isolatedPull.body).units.isEmpty())
+        val admission = client.get("/workspace/admission?workspaceId=$OTHER_WORKSPACE_ID") {
+            bearerAuth(account.accessToken)
+        }
+        assertEquals(WorkspaceAdmissionResponse(1, 2, true, false), json.decodeFromString<WorkspaceAdmissionResponse>(admission.bodyAsText()))
     }
 
     @Test
@@ -469,4 +527,50 @@ class SyncV2ApiIntegrationTest {
         assertEquals(HttpStatusCode.OK, healthyPull.status, healthyPull.body)
     }
 
+    /** Seed a pre-admission authority; new publication must go through the guarded CAS above. */
+    private fun seedHistoricalWorkspaceEpoch(deviceId: String, sourceWorkspaceId: String, targetWorkspaceId: String) {
+        val databaseUrl = System.getenv("SOMEDAY_DB_URL") ?: "jdbc:postgresql://127.0.0.1:54329/someday"
+        DriverManager.getConnection(
+            productionTestDatabaseConnectionUrl(databaseUrl),
+            System.getenv("SOMEDAY_DB_USER") ?: "someday",
+            System.getenv("SOMEDAY_DB_PASSWORD") ?: "someday",
+        ).use { connection ->
+            connection.autoCommit = false
+            val userId = connection.prepareStatement("SELECT user_id FROM someday_devices WHERE id = ?").use { statement ->
+                statement.setObject(1, UUID.fromString(deviceId))
+                statement.executeQuery().use { result ->
+                    check(result.next())
+                    result.getObject(1, UUID::class.java)
+                }
+            }
+            connection.prepareStatement("SELECT set_config('someday.user_id', ?, true)").use { statement ->
+                statement.setString(1, userId.toString())
+                statement.executeQuery().close()
+            }
+            connection.createStatement().use { statement ->
+                statement.executeQuery("SELECT set_config('someday.workspace_id', '*', true)").close()
+            }
+            connection.prepareStatement(
+                """
+                INSERT INTO someday_sync_v2_epochs (
+                    user_id, workspace_id, epoch_id, pointer_digest, pointer_object_json,
+                    contract_id, schema_set_version, semantic_protocol_version,
+                    minimum_writer_protocol_version, key_set_version, remote_profile,
+                    metadata_privacy_mode, supported_offline_window_seconds, checkpoint_id, checkpoint_digest
+                )
+                SELECT user_id, ?, epoch_id, pointer_digest, pointer_object_json,
+                       contract_id, schema_set_version, semantic_protocol_version,
+                       minimum_writer_protocol_version, key_set_version, remote_profile,
+                       metadata_privacy_mode, supported_offline_window_seconds, checkpoint_id, checkpoint_digest
+                FROM someday_sync_v2_epochs WHERE user_id = ? AND workspace_id = ?
+                """.trimIndent(),
+            ).use { statement ->
+                statement.setString(1, targetWorkspaceId)
+                statement.setObject(2, userId)
+                statement.setString(3, sourceWorkspaceId)
+                assertEquals(1, statement.executeUpdate())
+            }
+            connection.commit()
+        }
+    }
 }

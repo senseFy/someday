@@ -10,6 +10,7 @@ class IosSelfHostedSyncTransport(
         },
     ),
 ) : SelfHostedSyncTransport by delegate,
+    SelfHostedWorkspaceAdmissionTransport by delegate,
     SelfHostedWorkspaceRecoveryTransport by delegate,
     SelfHostedSyncTransportV2 by delegate,
     SelfHostedMediaTransportV3 by delegate,

@@ -1,6 +1,8 @@
 package saien.someday.ui.settings
 
 import saien.someday.domain.settings.WorkspaceRecoverySyncGate
+import saien.someday.domain.settings.WorkspaceAdmissionState
+import saien.someday.domain.settings.WorkspaceAdmissionStatus
 
 /** Product-facing connection state. Protocol and transport details stay below this boundary. */
 sealed interface SyncConnectionUi {
@@ -28,6 +30,7 @@ enum class SyncUiOperation {
     SwitchingConnection,
     ReloadingSession,
     CheckingRecovery,
+    CheckingWorkspace,
     Syncing,
     CreatingInvitation,
     CancellingInvitation,
@@ -71,6 +74,8 @@ enum class SyncIssueReason {
     SyncUnavailable,
     AuthorityMismatch,
     WorkspaceLocked,
+    WorkspaceJoinRequired,
+    WorkspaceAdmissionUnavailable,
     RemoteHistoryConflict,
     CheckpointInvalid,
     RetryRequired,
@@ -107,6 +112,8 @@ data class SyncIssueUi(
             SyncIssueReason.WorkspaceSettingsReloadRequired,
             -> SyncIssueAction.RetrySync
             SyncIssueReason.AccountResetRequired,
+            SyncIssueReason.WorkspaceJoinRequired,
+            SyncIssueReason.WorkspaceAdmissionUnavailable,
             SyncIssueReason.AccountDataChanged,
             SyncIssueReason.RemoteHistoryConflict,
             SyncIssueReason.CheckpointInvalid,
@@ -121,6 +128,7 @@ data class SyncUiState(
     val issue: SyncIssueUi? = null,
     val invitation: WorkspacePairingInvitationUi? = null,
     val recovery: WorkspaceRecoveryUiState = WorkspaceRecoveryUiState(),
+    val admission: WorkspaceAdmissionStatus = WorkspaceAdmissionStatus(WorkspaceAdmissionState.Ready),
     val accountReset: AccountResetUiState = AccountResetUiState(),
 ) {
     val needsAccountDataResolution: Boolean
@@ -129,10 +137,14 @@ data class SyncUiState(
         )
     val syncing: Boolean get() = operation == SyncUiOperation.Syncing
     val busy: Boolean get() = operation != null || accountReset.busy
+    val workspaceReady: Boolean get() = admission.state == WorkspaceAdmissionState.Ready
+    val joiningWorkspace: Boolean get() = admission.state == WorkspaceAdmissionState.JoinRequired
     val pairingAvailable: Boolean
         get() = !accountReset.blocksSync && connection is SyncConnectionUi.Connected && when (issue?.reason) {
             null,
             SyncIssueReason.WorkspaceLocked,
+            SyncIssueReason.WorkspaceJoinRequired,
+            SyncIssueReason.WorkspaceAdmissionUnavailable,
             SyncIssueReason.RemoteHistoryConflict,
             SyncIssueReason.CheckpointInvalid,
             SyncIssueReason.RetryRequired,

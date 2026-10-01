@@ -187,6 +187,7 @@ internal fun launchDesktopApp(
             workspacePairingInvitationJoiner = clientRepositories.workspacePairingInvitationJoiner,
             workspacePairingInvitationCanceller = clientRepositories.workspacePairingInvitationCanceller,
             workspaceRecoveryManager = clientRepositories.workspaceRecoveryManager,
+            workspaceAdmissionManager = clientRepositories.workspaceAdmissionManager,
             accountDataResetManager = accountDataResetManagerOverride ?: clientRepositories.accountDataResetManager,
             workspaceProductAccess = clientRepositories.workspaceProductAccess,
             pullToRefreshSyncEnabled = false,

@@ -14,15 +14,16 @@ import kotlin.time.Instant
 import okio.Buffer
 import saien.someday.data.media.MediaAssetImportRequest
 import saien.someday.domain.notes.NoteInput
+import saien.someday.domain.settings.ManualSyncReason
+import saien.someday.domain.settings.WorkspaceAdmissionState
 import saien.someday.domain.settings.WorkspacePairingReason
 import saien.someday.domain.settings.authorityBindingId
 import saien.someday.integration.testkit.RealSelfHostedFixture
 import saien.someday.integration.testkit.assertSuccessfulSync
-import saien.someday.integration.testkit.restoreKnownWorkspacePackage
 
 class SelfHostedPairingJourneyTest {
     @Test
-    fun confirmedReplacementDiscardsOldContentAndBootstrapsTargetWorkspace() {
+    fun secondInstallationMustJoinBeforePublishingAndConfirmationReplacesItsDraft() {
         RealSelfHostedFixture.create("pairing-journey").use { fixture ->
             val inviter = fixture.newDevice("desktop-inviter", "desktop")
             val joiner = fixture.newDevice("ios-joiner", "ios")
@@ -49,20 +50,24 @@ class SelfHostedPairingJourneyTest {
                     originalFileName = "discarded.png",
                 ),
             ).asset
-            val discardedPublishedNote = joiner.services.notesRepository.createNote(
+            val discardedLocalNote = joiner.services.notesRepository.createNote(
                 NoteInput(
                     notebookId = discardedNotebook.id,
-                    title = "Discarded published note",
+                    title = "Discarded local note",
                     markdownBody = "![discarded](someday-asset://${discardedImage.metadata.id.value})",
                     createdAt = CREATED_AT,
                     timeZoneId = "UTC",
                 ),
             )
-            joiner.assertSuccessfulSync()
-            val oldWorkspacePackage = assertNotNull(
-                joiner.workspaceJoinPackageProvider.createPackage().packageData,
-            )
-            val oldWorkspaceAccount = assertNotNull(joiner.sessionStore.load())
+            val admission = joiner.services.workspaceAdmissionManager.status()
+            assertEquals(WorkspaceAdmissionState.JoinRequired, admission.state)
+            assertEquals(1, admission.initializedWorkspaceCount)
+            assertFalse(admission.recoveryAvailable)
+            val blocked = joiner.services.manualSyncRunner.run()
+            assertEquals(ManualSyncReason.WorkspaceJoinRequired, blocked.reason)
+            assertNotNull(joiner.services.notesRepository.getNoteDetails(discardedLocalNote.id))
+            assertNotNull(joiner.services.localMediaAssetStore.getAsset(discardedImage.metadata.id))
+            assertNull(joiner.services.activeWorkspaceSessionGuard.currentRequirement())
             val discardedPendingNote = joiner.services.notesRepository.createNote(
                 NoteInput(
                     notebookId = discardedNotebook.id,
@@ -82,6 +87,13 @@ class SelfHostedPairingJourneyTest {
             )
             val invitation = assertNotNull(invitationResult.invitation)
 
+            val unconfirmed = joiner.pairing.joinWithToken(
+                invitation.revealManualToken(), replaceExistingWorkspace = false,
+            )
+            assertEquals(WorkspacePairingReason.ReplacementConfirmationRequired, unconfirmed.reason)
+            assertEquals(previousWorkspaceId, joiner.workspaceKeys.workspaceIdOrNull())
+            assertNotNull(joiner.services.notesRepository.getNoteDetails(discardedLocalNote.id))
+
             val joinResult = joiner.pairing.joinWithToken(
                 invitation.revealManualToken(),
                 replaceExistingWorkspace = true,
@@ -93,7 +105,7 @@ class SelfHostedPairingJourneyTest {
             assertEquals(assertNotNull(inviter.workspaceKeys.unlockedKeyOrNull()).fingerprint, joinedFingerprint)
             assertNotEquals(previousWorkspaceId, joinedWorkspaceId)
             assertNotEquals(previousFingerprint, joinedFingerprint)
-            assertNull(joiner.services.notesRepository.getNoteDetails(discardedPublishedNote.id))
+            assertNull(joiner.services.notesRepository.getNoteDetails(discardedLocalNote.id))
             assertNull(joiner.services.notesRepository.getNoteDetails(discardedPendingNote.id))
             assertNull(joiner.services.localMediaAssetStore.getAsset(discardedImage.metadata.id))
 
@@ -108,43 +120,7 @@ class SelfHostedPairingJourneyTest {
             assertEquals("Visible after pairing", received.title)
             assertEquals("Pairing bootstrap body", received.markdownBody)
             assertEquals(notebook.id, received.notebookId)
-
-            val oldWorkspaceReader = fixture.newDevice("desktop-old-workspace", "desktop")
-            oldWorkspaceReader.connect(createAccount = false)
-            val beforeRejectedReplacement = oldWorkspaceReader.workspaceKeys.workspaceIdOrNull()
-            val uncapturedJoin = oldWorkspaceReader.services.workspaceLifecycleCoordinator.exclusive {
-                oldWorkspaceReader.services.workspaceLifecycleCoordinator.productAccess {
-                    oldWorkspaceReader.workspaceJoiner.join(oldWorkspacePackage, replaceExistingWorkspace = true)
-                }
-            }
-            assertFalse(uncapturedJoin.success)
-            assertEquals(WorkspacePairingReason.ReplacementFailed, uncapturedJoin.reason)
-            assertEquals(beforeRejectedReplacement, oldWorkspaceReader.workspaceKeys.workspaceIdOrNull())
-            assertNull(oldWorkspaceReader.services.activeWorkspaceSessionGuard.currentRequirement())
-
-            val oldWorkspaceJoin = oldWorkspaceReader.restoreKnownWorkspacePackage(
-                packageData = oldWorkspacePackage,
-                sourceAuthorityBindingId = oldWorkspaceAccount.authorityBindingId,
-                sourceAccountIncarnation = oldWorkspaceAccount.accountIncarnation,
-            )
-            assertTrue(
-                oldWorkspaceJoin.success,
-                oldWorkspaceJoin.diagnosticMessage ?: oldWorkspaceJoin.reason.name,
-            )
-            val restoredBinding = assertNotNull(oldWorkspaceReader.services.activeWorkspaceSessionGuard.currentRequirement())
-            assertEquals(oldWorkspaceAccount.accountIncarnation, restoredBinding.accountIncarnation)
-            assertEquals(oldWorkspaceReader.deviceId, restoredBinding.localWriterDeviceId)
-            oldWorkspaceReader.assertSuccessfulSync()
-            assertNotNull(
-                oldWorkspaceReader.services.notesRepository.getNoteDetails(discardedPublishedNote.id),
-            )
-            assertNull(
-                oldWorkspaceReader.services.notesRepository.getNoteDetails(discardedPendingNote.id),
-            )
-            val oldImage = oldWorkspaceReader.services.mediaCoordinator.materialize(
-                discardedImage.metadata.id,
-            )
-            assertTrue(oldImage.downloaded)
+            assertEquals(WorkspaceAdmissionState.Ready, joiner.services.workspaceAdmissionManager.status().state)
         }
     }
 

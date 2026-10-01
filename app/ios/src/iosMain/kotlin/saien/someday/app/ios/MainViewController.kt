@@ -208,6 +208,7 @@ fun MainViewController(): UIViewController {
             workspacePairingInvitationJoiner = clientRepositories.workspacePairingInvitationJoiner,
             workspacePairingInvitationCanceller = clientRepositories.workspacePairingInvitationCanceller,
             workspaceRecoveryManager = clientRepositories.workspaceRecoveryManager,
+            workspaceAdmissionManager = clientRepositories.workspaceAdmissionManager,
             accountDataResetManager = clientRepositories.accountDataResetManager,
             workspaceProductAccess = clientRepositories.workspaceProductAccess,
             workspacePairingScanner = workspacePairingScanner,

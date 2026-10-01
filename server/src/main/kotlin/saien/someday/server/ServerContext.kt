@@ -14,6 +14,7 @@ import saien.someday.server.persistence.DatabaseMigrator
 import saien.someday.server.persistence.SyncV2Repository
 import saien.someday.server.persistence.SystemV3MediaRepository
 import saien.someday.server.persistence.WorkspaceRecoveryEnvelopeRepository
+import saien.someday.server.persistence.WorkspaceAdmissionRepository
 import java.time.Instant
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
@@ -34,6 +35,7 @@ class ServerContext(
     private val mediaBlobStoreLifecycle: AutoCloseable? = null,
     private val databaseConnectionPool: AutoCloseable = AutoCloseable {},
     val accountDataRepository: AccountDataRepository = AccountDataRepository(config),
+    val workspaceAdmissionRepository: WorkspaceAdmissionRepository = WorkspaceAdmissionRepository(config),
 ) : AutoCloseable {
     private val closed = AtomicBoolean(false)
 
@@ -99,6 +101,7 @@ class ServerContext(
                         config,
                         activeDatabaseConnectionPool,
                     ),
+                    workspaceAdmissionRepository = WorkspaceAdmissionRepository(config, activeDatabaseConnectionPool),
                     adminRepository = AdminRepository(config, startedAt, activeDatabaseConnectionPool),
                     accountDataRepository = AccountDataRepository(
                         config, activeDatabaseConnectionPool,

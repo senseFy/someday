@@ -19,6 +19,12 @@ import saien.someday.domain.settings.WorkspaceRecoveryState
 import saien.someday.domain.settings.WorkspaceRecoverySyncGate
 import saien.someday.domain.settings.authorityBindingId
 import saien.someday.sync.WorkspaceLifecycleCoordinator
+import saien.someday.sync.hasPreparedInitialWorkspacePublication
+import saien.someday.sync.causality.v2.InMemoryWorkspaceSyncRemoteV2
+import saien.someday.sync.causality.v2.SyncRemoteTransportFactoryV2
+import saien.someday.sync.causality.v2.SyncV2RuntimeService
+import saien.someday.sync.causality.v2.WorkspacePublicationExceptionV2
+import saien.someday.sync.causality.v2.WorkspacePublicationFailureV2
 import saien.someday.sync.causality.v2.SqlDelightSyncProtocolStoreV2
 import saien.someday.sync.causality.v2.SyncEpochPersistResultV2
 import saien.someday.sync.causality.v2.SyncRemoteProfileV2
@@ -34,6 +40,73 @@ import kotlin.test.assertIs
 import kotlin.test.assertTrue
 
 class SelfHostedWorkspaceRecoveryServiceTest {
+    @Test
+    fun preparedFirstPublicationCanRecoverAnotherWorkspaceOnlyAfterConfirmation() {
+        val owner = fixture()
+        val code = assertNotNull(owner.service.prepareCode().recoveryCode).revealForUserConfirmation()
+        assertTrue(owner.service.confirmPreparedCode(code).success)
+        val driver = createSomedayJdbcDriver("jdbc:sqlite::memory:")
+        try {
+            val database = SomedayDatabase(driver)
+            val local = SqlDelightLocalDataRepository(database, LOCAL_WRITER_DEVICE_ID)
+            val settings = SqlDelightClientSettingsRepository(local)
+            settings.saveLocalSnapshot(ClientSettings(activeDeviceId = LOCAL_WRITER_DEVICE_ID,
+                syncConfiguration = SyncConfiguration(mode = SyncMode.SelfHosted)))
+            val key = SodiumWorkspaceCrypto().workspaceKeyFromBytes(ByteArray(32) { (it + 31).toByte() })
+            ensureWorkspaceLocalDraftV2(local, settings, key)
+            val protocol = SqlDelightSyncProtocolStoreV2(database)
+            val remote = InMemoryWorkspaceSyncRemoteV2(bindingId = credentials().authorityBindingId)
+            fun runtime(failPublication: Boolean) = SyncV2RuntimeService(
+                mode = SyncMode.SelfHosted,
+                localRepository = local,
+                settingsRepository = settings,
+                workspaceKeyProvider = { key },
+                writerDeviceIdProvider = { LOCAL_WRITER_DEVICE_ID },
+                transportFactory = SyncRemoteTransportFactoryV2 { remote },
+                workspaceLifecycleCoordinator = WorkspaceLifecycleCoordinator(),
+                beforeEntityPublication = {
+                    if (failPublication) throw WorkspacePublicationExceptionV2(WorkspacePublicationFailureV2.TRANSFER_PENDING)
+                },
+            )
+            assertFalse(runtime(failPublication = true).run().success)
+            assertTrue(hasPreparedInitialWorkspacePublication(local, protocol))
+            val bindingBefore = protocol.loadLocalAuthority()
+            var joins = 0
+            val recovering = fixture(
+                transport = owner.transport,
+                sessionCredentials = credentials().copy(deviceId = LOCAL_WRITER_DEVICE_ID),
+                activeWorkspaceRequirementProvider = {
+                    resolveActiveWorkspaceSessionRequirement(protocol) { LOCAL_WORKSPACE_ID }
+                },
+                publisherReady = false,
+                localKeyFingerprintProvider = { key.fingerprint },
+                provisionalWorkspaceReplacementAllowed = { hasPreparedInitialWorkspacePublication(local, protocol) },
+                joiner = WorkspaceJoiner { _, _ ->
+                    joins++
+                    WorkspaceJoinResult.success(WorkspacePairingReason.Joined)
+                },
+            )
+            assertEquals(WorkspaceRecoveryState.RecoveryAvailable, recovering.service.status().state)
+            assertEquals(bindingBefore, protocol.loadLocalAuthority()) // Discovery never unbinds the draft.
+            assertEquals(WorkspaceRecoveryReason.ReplacementConfirmationRequired,
+                recovering.service.recover(code, replaceExistingWorkspace = false).reason)
+            assertEquals(0, joins)
+            assertTrue(recovering.service.recover(code, replaceExistingWorkspace = true).success)
+            assertEquals(1, joins)
+
+            // The fake joiner did not replace the database. Once this exact draft becomes
+            // ACTIVE, the same recovery manager must stop treating it as provisional.
+            assertTrue(runtime(failPublication = false).run().success)
+            assertFalse(hasPreparedInitialWorkspacePublication(local, protocol))
+            assertEquals(WorkspaceRecoveryReason.AuthorityMismatch, recovering.service.status().reason)
+            assertEquals(WorkspaceRecoveryReason.AuthorityMismatch,
+                recovering.service.recover(code, replaceExistingWorkspace = true).reason)
+            assertEquals(1, joins)
+        } finally {
+            driver.close()
+        }
+    }
+
     @Test
     fun typedIncarnationPutConflictPersistsGateAndPreservesPreparedEnvelope() {
         var persisted = 0
@@ -557,17 +630,19 @@ class SelfHostedWorkspaceRecoveryServiceTest {
 
     private fun fixture(
         transport: MemoryRecoveryTransport = MemoryRecoveryTransport(),
+        sessionCredentials: SelfHostedSessionCredentials = credentials(),
         requirement: ActiveWorkspaceSessionRequirement? = requirement(WORKSPACE_ID),
         activeWorkspaceRequirementProvider: () -> ActiveWorkspaceSessionRequirement? = { requirement },
         persistGate: (ActiveWorkspaceSessionRequirement) -> Unit = {},
         publisherReady: Boolean = true,
         localKeyFingerprint: String? = if (requirement == null) null else KEY_FINGERPRINT,
         localKeyFingerprintProvider: () -> String? = { localKeyFingerprint },
+        provisionalWorkspaceReplacementAllowed: () -> Boolean = { false },
         joiner: WorkspaceJoiner = WorkspaceJoiner { _, _ ->
             WorkspaceJoinResult.success(WorkspacePairingReason.Joined)
         },
     ): RecoveryFixture {
-        val credentials = credentials()
+        val credentials = sessionCredentials
         val store = MemorySessionStore(credentials)
         var packageRequests = 0
         var sequence = 0
@@ -602,6 +677,7 @@ class SelfHostedWorkspaceRecoveryServiceTest {
             activeWorkspaceSessionGuard = ActiveWorkspaceSessionGuard(persistIncarnationGate = persistGate, requirementProvider = activeWorkspaceRequirementProvider),
             workspaceRecoveryPublisherReady = { publisherReady },
             localWorkspaceKeyFingerprint = localKeyFingerprintProvider,
+            provisionalWorkspaceReplacementAllowed = provisionalWorkspaceReplacementAllowed,
         )
         return RecoveryFixture(service, transport) { packageRequests }
     }

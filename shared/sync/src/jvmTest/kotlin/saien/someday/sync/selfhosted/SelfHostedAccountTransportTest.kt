@@ -17,6 +17,29 @@ import saien.someday.sync.causality.v2.WorkspacePublicationFailureV2
 
 /** The same wire assertions run through the actual Ktor and JDK network stacks. */
 class SelfHostedAccountTransportTest {
+    @Test fun workspaceAdmissionIsStrictAndIndependentOfRecoveryConfiguration() = transports { f ->
+        val admission = f.auth as SelfHostedWorkspaceAdmissionTransport
+        fun load() = admission.workspaceAdmission(f.endpoint, "access-secret", WORKSPACE, KNOWN)
+        f.respond(200, """{"protocolVersion":1,"initializedWorkspaceCount":2,"localWorkspaceInitialized":false,"recoveryAvailable":false}""")
+        assertEquals(SelfHostedWorkspaceAdmissionResponse(1, 2, false, false), load())
+        assertEquals("/workspace/admission", f.requests.last().path)
+        assertEquals(INCARNATION, f.requests.last().incarnation)
+        for (body in listOf(
+            """{"protocolVersion":1,"initializedWorkspaceCount":0,"localWorkspaceInitialized":true,"recoveryAvailable":false}""",
+            """{"protocolVersion":1,"initializedWorkspaceCount":-1,"localWorkspaceInitialized":false,"recoveryAvailable":false}""",
+            """{"protocolVersion":2,"initializedWorkspaceCount":1,"localWorkspaceInitialized":false,"recoveryAvailable":false}""",
+            """{"protocolVersion":1,"initializedWorkspaceCount":1,"localWorkspaceInitialized":false}""",
+            """{"protocolVersion":1,"initializedWorkspaceCount":1,"localWorkspaceInitialized":false,"recoveryAvailable":false,"extra":true}""",
+        )) {
+            f.respond(200, body)
+            assertFailsWith<SelfHostedProtocolException> { load() }
+        }
+        f.respond(404, "")
+        assertNull(load()) // Missing discovery is not a zero-workspace response.
+        f.respond(409, """{"error":"account_incarnation_mismatch"}""", error = "account_incarnation_mismatch")
+        assertEquals(SelfHostedErrorCode.ACCOUNT_INCARNATION_MISMATCH, assertFailsWith<SelfHostedSyncHttpException> { load() }.errorCode)
+    }
+
     @Test fun errorHeadersPrecedeBusiness409DecodingAndRequestsKeepCapturedIncarnation() = transports { f ->
         f.respond(409, """{"error":"account_incarnation_mismatch"}""", error = "account_incarnation_mismatch")
         val failure = assertFailsWith<SelfHostedSyncHttpException> { f.push() }

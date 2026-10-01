@@ -9,6 +9,7 @@ import saien.someday.server.routes.deviceRoutes
 import saien.someday.server.routes.pairingRoutes
 import saien.someday.server.routes.systemV3Routes
 import saien.someday.server.routes.workspaceRecoveryEnvelopeRoutes
+import saien.someday.server.routes.workspaceAdmissionRoutes
 import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.Application
@@ -77,6 +78,7 @@ fun Application.somedayServerModule(context: ServerContext = ServerContext.creat
         deviceRoutes(context)
         pairingRoutes(context)
         workspaceRecoveryEnvelopeRoutes(context)
+        workspaceAdmissionRoutes(context)
         systemV3Routes(context)
         adminRoutes(context)
     }

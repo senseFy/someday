@@ -325,6 +325,7 @@ class MainActivity : ComponentActivity() {
                 workspacePairingInvitationJoiner = loaded.repositories.workspacePairingInvitationJoiner,
                 workspacePairingInvitationCanceller = loaded.repositories.workspacePairingInvitationCanceller,
                 workspaceRecoveryManager = loaded.repositories.workspaceRecoveryManager,
+                workspaceAdmissionManager = loaded.repositories.workspaceAdmissionManager,
                 accountDataResetManager = loaded.repositories.accountDataResetManager,
                 workspaceProductAccess = loaded.repositories.workspaceProductAccess,
                 workspacePairingScanner = workspacePairingScanner,

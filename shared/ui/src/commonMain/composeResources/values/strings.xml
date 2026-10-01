@@ -574,4 +574,17 @@
     <string name="account_reset_device_revoked">This device has been revoked. Signing in again cannot reactivate it. Contact the server administrator.</string>
     <string name="account_reset_rate_limited">Too many requests. Wait a little before trying again.</string>
     <string name="account_reset_protocol_error">The server response could not be verified. Check the client and server versions or contact the operator.</string>
+    <string name="workspace_admission_first_title">Start this workspace</string>
+    <string name="workspace_admission_first_body">Start syncing this device’s content to create the account’s first workspace.</string>
+    <string name="workspace_admission_start">Start syncing this device’s content</string>
+    <string name="workspace_admission_join_title">Join your workspace</string>
+    <string name="workspace_admission_join_body">This account already has a workspace. Pair with an existing device or use its recovery code before syncing.</string>
+    <string name="workspace_admission_pairing_help">On a device with your notes, open Sync settings and create a pairing invitation. Enter its token or scan its QR code here.</string>
+    <string name="workspace_admission_no_recovery">No recovery code is available. Pair with a device that has the workspace. Your local content stays here until you confirm a replacement.</string>
+    <string name="workspace_admission_multiple_title">Multiple workspaces in this account</string>
+    <string name="workspace_admission_multiple_body">This device only syncs its current workspace. Other workspaces are separate and their notes will not appear here. Pair with the device you want to join to switch workspaces.</string>
+    <string name="workspace_admission_check_title">Check the account’s workspace</string>
+    <string name="workspace_admission_check_body">Verify whether this account already has a workspace before starting sync. Local content is preserved.</string>
+    <string name="workspace_admission_unavailable_body">Could not verify this account’s workspace. Check your connection and whether the server version supports this feature, then try again. Local content is preserved.</string>
+    <string name="workspace_admission_retry">Check workspace again</string>
 </resources>

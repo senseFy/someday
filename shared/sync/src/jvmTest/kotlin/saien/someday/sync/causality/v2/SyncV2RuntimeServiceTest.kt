@@ -39,6 +39,62 @@ import kotlin.time.Instant
 
 class SyncV2RuntimeServiceTest {
     @Test
+    fun losingTheAccountFirstWorkspaceRacePreservesPreparedLocalContent() {
+        val remote = InMemoryWorkspaceSyncRemoteV2(SyncRemoteProfileV2.SELF_HOSTED.wireValue)
+        var pointerAttempts = 0
+        val rejected = object : WorkspaceSyncRemoteV2 by remote {
+            override fun compareAndSetEpochPointer(
+                descriptor: SyncEpochDescriptorV2,
+                expectedCurrentDigest: String?,
+                pointer: EncryptedWorkspaceObjectV2,
+            ): WorkspacePointerPublishResultV2 {
+                pointerAttempts++
+                return WorkspacePointerPublishResultV2.Rejected(
+                    "workspace_join_required", "Another workspace was initialized for this account.",
+                )
+            }
+        }
+        withRuntimeFixture(remote, WRITER_A) { fixture ->
+            ensureWorkspaceLocalDraftV2(fixture.localRepository, fixture.settings, WORKSPACE_KEY)
+            val notebook = fixture.notes(NOW).createNotebook("Keep offline edits")
+            val result = fixture.runtime(transportRemote = rejected).run()
+            assertEquals(ManualSyncReason.WorkspaceJoinRequired, result.reason)
+            assertNull(remote.loadEpochPointer())
+            assertNotNull(fixture.protocolStore.loadLocalAuthority())
+            assertTrue(fixture.protocolStore.loadAllEpochs().any { it.lifecycle == SyncEpochLifecycleV2.PREPARING })
+            assertTrue(fixture.notes(NOW).listNotebooks().any { it.id == notebook.id })
+            var mediaGateCalls = 0
+            val next = fixture.runtime(
+                transportRemote = rejected,
+                beforeEntityPublication = { mediaGateCalls++ },
+                beforeSync = { ManualSyncResult.failure(SyncMode.SelfHosted, ManualSyncReason.WorkspaceJoinRequired) },
+            ).run()
+            assertEquals(ManualSyncReason.WorkspaceJoinRequired, next.reason)
+            assertEquals(0, mediaGateCalls)
+            assertEquals(1, pointerAttempts)
+        }
+    }
+
+    @Test
+    fun workspaceAdmissionStopsPublicationAndPreservesTheLocalDraft() {
+        val remote = InMemoryWorkspaceSyncRemoteV2(SyncRemoteProfileV2.SELF_HOSTED.wireValue)
+        withRuntimeFixture(remote, WRITER_A) { fixture ->
+            ensureWorkspaceLocalDraftV2(fixture.localRepository, fixture.settings, WORKSPACE_KEY)
+            val notebook = fixture.notes(NOW).createNotebook("Offline notebook")
+            var mediaGateCalls = 0
+            val result = fixture.runtime(
+                beforeEntityPublication = { mediaGateCalls++ },
+                beforeSync = { ManualSyncResult.failure(SyncMode.SelfHosted, ManualSyncReason.WorkspaceJoinRequired) },
+            ).run()
+            assertEquals(ManualSyncReason.WorkspaceJoinRequired, result.reason)
+            assertEquals(0, mediaGateCalls)
+            assertNull(remote.loadEpochPointer())
+            assertNull(fixture.protocolStore.loadLocalAuthority())
+            assertTrue(fixture.notes(NOW).listNotebooks().any { it.id == notebook.id })
+        }
+    }
+
+    @Test
     fun mediaPrerequisiteReasonsSurviveInitializationAndIncrementalSync() {
         WorkspacePublicationFailureV2.entries.forEach { failure ->
             val remote = InMemoryWorkspaceSyncRemoteV2(SyncRemoteProfileV2.SELF_HOSTED.wireValue)
@@ -596,6 +652,7 @@ class SyncV2RuntimeServiceTest {
             clockValue: Instant = NOW,
             transportRemote: WorkspaceSyncRemoteV2 = remote,
             beforeEntityPublication: (List<WorkspaceEntityVersionV2>) -> Unit = {},
+            beforeSync: () -> ManualSyncResult? = { null },
         ): SyncV2RuntimeService = SyncV2RuntimeService(
             mode = SyncMode.SelfHosted,
             localRepository = localRepository,
@@ -606,6 +663,7 @@ class SyncV2RuntimeServiceTest {
             workspaceLifecycleCoordinator = workspaceLifecycleCoordinator,
             clock = { clockValue },
             beforeEntityPublication = beforeEntityPublication,
+            beforeSync = beforeSync,
         )
 
         fun localDataTransfer(

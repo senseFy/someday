@@ -27,6 +27,7 @@ import saien.someday.sync.selfhosted.SelfHostedV2EpochCompareAndSetResponse
 import saien.someday.sync.selfhosted.SelfHostedV2ImmutablePutResponse
 import saien.someday.sync.selfhosted.SelfHostedV2PushRequest
 import saien.someday.sync.selfhosted.SelfHostedV2PushResponse
+import saien.someday.sync.selfhosted.SelfHostedWorkspaceAdmissionTransport
 import saien.someday.sync.selfhosted.SelfHostedWorkspaceRecoveryTransport
 import saien.someday.sync.selfhosted.accountRequestContext
 
@@ -34,6 +35,7 @@ import saien.someday.sync.selfhosted.accountRequestContext
 internal class AccountResetJourneyTransport private constructor(
     private val delegate: SelfHostedSyncTransport,
 ) : SelfHostedSyncTransport by delegate,
+    SelfHostedWorkspaceAdmissionTransport by (delegate as SelfHostedWorkspaceAdmissionTransport),
     SelfHostedSyncTransportV2 by (delegate as SelfHostedSyncTransportV2),
     SelfHostedMediaTransportV3 by (delegate as SelfHostedMediaTransportV3),
     SelfHostedWorkspaceRecoveryTransport by (delegate as SelfHostedWorkspaceRecoveryTransport),

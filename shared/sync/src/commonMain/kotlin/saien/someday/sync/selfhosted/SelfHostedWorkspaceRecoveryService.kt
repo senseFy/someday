@@ -45,6 +45,8 @@ class SelfHostedWorkspaceRecoveryService(
     private val activeWorkspaceSessionGuard: ActiveWorkspaceSessionGuard,
     private val workspaceRecoveryPublisherReady: () -> Boolean,
     private val localWorkspaceKeyFingerprint: () -> String?,
+    /** True only for a verified, never-active first-publication checkpoint. */
+    private val provisionalWorkspaceReplacementAllowed: () -> Boolean = { false },
 ) : WorkspaceRecoveryManager {
     private var pendingSetup: PendingRecoverySetup? = null
 
@@ -135,6 +137,11 @@ class SelfHostedWorkspaceRecoveryService(
             )
         }
         if (requirement != null && requirement.workspaceId != remote.packageData.workspaceId) {
+            if (provisionalWorkspaceReplacementAllowed()) return WorkspaceRecoveryStatusResult.ready(
+                state = WorkspaceRecoveryState.RecoveryAvailable,
+                syncGate = WorkspaceRecoverySyncGate.RecoveryRequired,
+                reason = WorkspaceRecoveryReason.RecoveryAvailable,
+            )
             return WorkspaceRecoveryStatusResult.failure(
                 reason = WorkspaceRecoveryReason.AuthorityMismatch,
                 syncGate = localSyncGate,
@@ -291,10 +298,12 @@ class SelfHostedWorkspaceRecoveryService(
         val requirement = activeWorkspaceSessionGuard.currentRequirement()
         val localKeyFingerprint = localWorkspaceKeyFingerprint()
         val sameIncarnation = requirement?.accountIncarnation == session.accountIncarnation
-        if (requirement != null && sameIncarnation && requirement.workspaceId != remote.packageData.workspaceId) {
+        val replacingProvisional = requirement != null && sameIncarnation &&
+            requirement.workspaceId != remote.packageData.workspaceId && provisionalWorkspaceReplacementAllowed()
+        if (!replacingProvisional && requirement != null && sameIncarnation && requirement.workspaceId != remote.packageData.workspaceId) {
             return WorkspaceRecoveryRestoreResult.failure(WorkspaceRecoveryReason.AuthorityMismatch)
         }
-        if (requirement != null && sameIncarnation && localKeyFingerprint != null) {
+        if (!replacingProvisional && requirement != null && sameIncarnation && localKeyFingerprint != null) {
             return WorkspaceRecoveryRestoreResult.failure(
                 if (localKeyFingerprint == remote.packageData.keyFingerprint) {
                     WorkspaceRecoveryReason.RecoveryNotRequired

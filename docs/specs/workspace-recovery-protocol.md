@@ -162,9 +162,12 @@ response has exactly these values:
 ```
 
 A server version that predates this endpoint also answers GET with `404`, so a
-client cannot distinguish it from an account with no envelope. Ordinary sync
-remains compatible, but recovery setup PUT will fail until the server is
-upgraded.
+client cannot distinguish it from an account with no envelope. This response
+does not permit first publication: the separate
+[workspace admission check](sync-system-v3-spec.md#3-one-local-source-of-truth)
+still applies. Already active, verified local workspaces can continue ordinary
+sync; new publication requires an admission-capable server. Recovery setup PUT
+also requires the server to support this endpoint.
 
 PUT accepts the same identity and opaque fields plus `expectedRevision`:
 
@@ -292,8 +295,11 @@ existing workspace, account, and writer-device authority guards. A verified
 gate; the normal data-plane preflight remains authoritative.
 
 Recovery requires explicit confirmation that the installation's current local
-workspace and unsynchronized changes will be discarded without merging. The
-client then:
+workspace and unsynchronized changes will be discarded without merging. A
+verified first-publication checkpoint that has never been activated may be
+replaced this way after another workspace wins account admission. Status checks
+retain that provisional binding; established ACTIVE or BLOCKED workspaces keep
+their existing authority checks. The client then:
 
 1. checks the response digest, bounds, format, workspace id, and key
    fingerprint;

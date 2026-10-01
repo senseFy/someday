@@ -12,6 +12,7 @@ import saien.someday.sync.selfhosted.SelfHostedV2ImmutablePutResponse
 import saien.someday.sync.selfhosted.SelfHostedV2PushRequest
 import saien.someday.sync.selfhosted.SelfHostedV2PushResponse
 import saien.someday.sync.selfhosted.SelfHostedWorkspaceRecoveryTransport
+import saien.someday.sync.selfhosted.SelfHostedWorkspaceAdmissionTransport
 
 /**
  * Real transport with one explicit cross-plane observation point. The media
@@ -21,6 +22,7 @@ import saien.someday.sync.selfhosted.SelfHostedWorkspaceRecoveryTransport
 internal class ProbingSelfHostedTransport(
     private val delegate: JdkSelfHostedSyncTransport = JdkSelfHostedSyncTransport(),
 ) : SelfHostedSyncTransport by delegate,
+    SelfHostedWorkspaceAdmissionTransport by delegate,
     SelfHostedSyncTransportV2 by delegate,
     SelfHostedAccountControlTransport by delegate,
     SelfHostedWorkspaceRecoveryTransport by delegate,

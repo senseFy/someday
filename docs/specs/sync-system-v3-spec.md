@@ -30,6 +30,7 @@ The public API is rooted at:
 GET  /sync/v3/capabilities
 ...  /sync/v3/workspaces/{workspaceId}/entities
 ...  /sync/v3/workspaces/{workspaceId}/media
+GET  /workspace/admission?workspaceId={workspaceId}
 GET  /workspace/recovery-envelope
 PUT  /workspace/recovery-envelope
 ```
@@ -41,6 +42,9 @@ a server storage and authorization scope.
 The current clients expose one active local workspace. The protocol and server
 schema scope records by `(account, workspaceId)`, and account quotas apply
 across all workspaces in that account’s active incarnation.
+First publication is allowed only when that incarnation has no initialized
+workspace. Historical accounts with multiple initialized workspaces retain
+them; each device continues syncing its explicitly joined workspace.
 Server admission is defined by the [account incarnation contract](account-data-reset-protocol.md);
 server reset defaults off until compatible client rollout and operator opt-in. Separately, an account may have one
 current recovery envelope selecting one already initialized workspace. Older
@@ -135,18 +139,35 @@ and integrity checks are never bypassed to recover startup.
 
 Authentication alone does not decrypt or choose a workspace. An unbound local
 draft is not eligible for launch, foreground, or local-change automatic sync,
-so signing in cannot silently publish it as a new remote workspace. The user
-chooses one of three explicit operations:
+so signing in cannot silently publish it as a new remote workspace. After sign-in,
+the client checks workspace admission before offering synchronization:
 
-1. Manual Sync publishes the current local workspace. An empty remote pointer
-   accepts its prepared checkpoint with one compare-and-set and activates that
-   same local generation.
-2. Recover joins the account-current workspace with the user-held recovery code
-   after destructive confirmation. The code and opaque envelope authenticate
-   before any local data is removed.
-3. Pair joins an existing workspace after destructive confirmation. The
-   current local workspace is discarded without merging; the old server copy,
-   if any, is not deleted.
+1. If the account has no initialized workspace, an explicit **Start syncing
+   local content** action publishes the local draft. Ordinary refresh does not
+   start its first publication.
+2. If the account has initialized workspaces but this device has not joined one
+   with a usable key, it must Pair, or Recover when a recovery envelope is
+   available. Ordinary sync remains blocked until it joins. Both
+   replacement paths require explicit confirmation; the current local copy is
+   discarded without merging, and the old server copy is retained. Recovery
+   authenticates the code and envelope before removing local data.
+3. If this workspace is already initialized and its local key is usable, normal
+   sync is available. A verified, previously attempted first publication can
+   also retry when a fresh admission check confirms the account is still empty.
+   Historical multiple-workspace accounts show that this
+   device synchronizes only one independent copy; switching uses explicit Pair.
+
+The device-bound `sync` endpoint `GET /workspace/admission?workspaceId=…`
+returns a strict version-1 object containing `protocolVersion`,
+`initializedWorkspaceCount`, `localWorkspaceInitialized`, and `recoveryAvailable`,
+with `Cache-Control: no-store`. It counts initialized entity epochs in the
+authenticated account's active incarnation, excludes staged uploads, and exposes
+no other workspace identifiers or keys. Unavailable or unsupported discovery
+never means an empty account. Only an already ACTIVE local generation with a
+verified authority and usable key may continue when the endpoint is absent or
+temporarily unavailable (network failure, `429`, or `5xx`). Permission, account
+incarnation, and malformed-response failures remain blocking. An unjoined draft
+or provisional PREPARING generation must retry the check.
 
 Once a publication attempt, successful Recover, or successful Pair records an
 account authority on the local generation, automatic sync may run and retry
@@ -282,16 +303,21 @@ preflight still decides whether sync may publish.
 
 A recovery GET returning `404` is not a grant to publish a new workspace. The
 server serializes recovery-envelope PUT and first-epoch CAS under one
-account-scoped transaction lock. The CAS rereads the account-current recovery
-pointer while holding that lock and rejects a competing workspace with
-`workspace_recovery_required`, so a pointer published after the client's GET
-cannot be bypassed. Existing authoritative workspaces and exact epoch replays
+account-scoped transaction lock. While holding it, CAS checks the account-current
+recovery pointer (`workspace_recovery_required`) and other initialized workspaces
+in the active incarnation (`workspace_join_required`). These use the existing
+route-specific `409` rejection body. Only one of two simultaneous first
+publications to different workspaces can succeed, even without a recovery
+envelope. Existing authoritative workspaces and exact epoch replays
 remain valid even when the account-current recovery pointer selects another
 workspace. Both write paths pin PostgreSQL `READ COMMITTED` before their first
 RLS statement so a `REPEATABLE READ` database default cannot preserve a stale
-pre-lock snapshot. After this rejection, the client abandons its
-never-authoritative PREPARING epoch and its provisional local authority before
-refreshing recovery state; transient publication failures remain retryable.
+pre-lock snapshot. After `workspace_recovery_required`, the client abandons its
+never-authoritative PREPARING epoch and provisional local authority. Admission
+requiring a join preserves the local draft and offers Pair or Recover; a
+verified, never-activated publication attempt may be replaced through explicit
+recovery confirmation. Existing authoritative workspaces retain their recovery
+authority checks. Transient publication failures remain retryable.
 
 The authenticated `GET` and `PUT /workspace/recovery-envelope` routes require a
 non-revoked device `sync` token, are rate-limited, and return envelope state with

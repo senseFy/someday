@@ -133,6 +133,7 @@ internal class AccountResetInstallation(
             services.activeWorkspaceSessionGuard,
             services.workspacePairingInviterReady,
             { keys.unlockedKeyOrNull()?.fingerprint },
+            provisionalWorkspaceReplacementAllowed = services.workspaceInitialPublicationPrepared,
         )
         val reset = SelfHostedAccountResetManager(
             services,
@@ -165,6 +166,7 @@ internal class AccountResetInstallation(
                 services.manualSyncRunner.run().also(controllerSyncResults::add)
             },
             automaticSyncEligible = services.automaticSyncEligible,
+            workspaceAdmissionManager = services.workspaceAdmissionManager,
             workspacePairingInvitationCreator = pairing,
             workspacePairingInvitationJoiner = pairing,
             workspacePairingInvitationCanceller = pairing,

@@ -44,16 +44,79 @@ import saien.someday.domain.settings.ManualSyncRunner
 import saien.someday.domain.settings.SelfHostedSessionSummary
 import saien.someday.domain.settings.SyncConfiguration
 import saien.someday.domain.settings.SyncMode
+import saien.someday.domain.settings.WorkspaceAdmissionState
+import saien.someday.domain.settings.WorkspaceAdmissionStatus
+import saien.someday.domain.settings.WorkspaceRecoverySyncGate
 import saien.someday.ui.i18n.AppLocaleEnvironment
 import saien.someday.ui.i18n.applyAppLanguageTag
 import saien.someday.ui.settings.SettingsUiController
 import saien.someday.ui.settings.SyncIssueReason
 import saien.someday.ui.settings.SyncIssueUi
 import saien.someday.ui.settings.UnavailableWorkspacePairingScanner
+import saien.someday.ui.settings.WorkspaceRecoveryUiAvailability
+import saien.someday.ui.settings.WorkspaceRecoveryUiState
 
 class SyncSettingsDesktopRenderTest {
     @AfterTest
     fun restoreSystemLanguage() = applyAppLanguageTag(null)
+
+    @Test
+    fun secondDeviceWithoutRecoveryShowsJoiningAndTokenInputInsteadOfSync() = runDesktopComposeUiTest(width = 320, height = 640) {
+        render(language = AppLanguage.Chinese, fontScale = 1.5f,
+            admission = WorkspaceAdmissionStatus(WorkspaceAdmissionState.JoinRequired, 1))
+
+        onNodeWithText("立即同步").assertDoesNotExist()
+        onNodeWithText("开始同步本机内容").assertDoesNotExist()
+        onNodeWithText("创建邀请").assertDoesNotExist()
+        onNodeWithText("在已有笔记的设备上打开同步设置，创建配对邀请，然后在此输入配对码或扫描二维码。")
+            .performScrollTo().assertIsDisplayed()
+        onAllNodes(hasSetTextAction()).assertCountEquals(1)
+        capture("sync-page-join-required-zh")
+    }
+
+    @Test
+    fun firstWorkspaceUsesExplicitStartAndUnknownStatusOnlyOffersVerification() {
+        runDesktopComposeUiTest(width = 320, height = 640) {
+            render(language = AppLanguage.English, admission = WorkspaceAdmissionStatus(WorkspaceAdmissionState.FirstWorkspace, 0))
+            onNodeWithText("Sync now").assertDoesNotExist()
+            onNodeWithText("Start syncing this device’s content").performScrollTo().assertIsEnabled()
+            onAllNodes(hasSetTextAction()).assertCountEquals(0)
+        }
+        runDesktopComposeUiTest(width = 320, height = 640) {
+            render(language = AppLanguage.English, admission = WorkspaceAdmissionStatus(WorkspaceAdmissionState.Unavailable))
+            onNodeWithText("Sync now").assertDoesNotExist()
+            onNodeWithText("Start syncing this device’s content").assertDoesNotExist()
+            onNodeWithText("Check workspace again").performScrollTo().assertIsEnabled()
+        }
+    }
+
+    @Test
+    fun multipleWorkspacesPreserveCurrentSyncAndExplainThatOtherNotesAreSeparate() = runDesktopComposeUiTest(width = 320, height = 640) {
+        render(language = AppLanguage.English, admission = WorkspaceAdmissionStatus(WorkspaceAdmissionState.Ready, 2))
+        onNodeWithText("Sync now").assertIsEnabled()
+        onNodeWithText("Multiple workspaces in this account").performScrollTo().assertIsDisplayed()
+        onNodeWithText("This device only syncs its current workspace. Other workspaces are separate and their notes will not appear here. Pair with the device you want to join to switch workspaces.")
+            .performScrollTo().assertIsDisplayed()
+        capture("sync-page-multiple-workspaces-en")
+    }
+
+    @Test
+    fun recoveryGateNeverLeavesOrdinarySyncButtonVisible() = runDesktopComposeUiTest(width = 320, height = 640) {
+        render(language = AppLanguage.English,
+            recovery = WorkspaceRecoveryUiState(WorkspaceRecoveryUiAvailability.RecoveryAvailable, WorkspaceRecoverySyncGate.RecoveryRequired))
+        onNodeWithText("Sync now").assertDoesNotExist()
+    }
+
+    @Test
+    fun committedReplacementKeepsRetryVisibleUntilAdmissionAndSettingsCanReload() = runDesktopComposeUiTest(width = 320, height = 640) {
+        render(language = AppLanguage.English,
+            issue = SyncIssueUi(SyncIssueReason.WorkspaceSettingsReloadRequired),
+            admission = WorkspaceAdmissionStatus(WorkspaceAdmissionState.JoinRequired, 1),
+            recovery = WorkspaceRecoveryUiState(WorkspaceRecoveryUiAvailability.RecoveryAvailable, WorkspaceRecoverySyncGate.RecoveryRequired))
+
+        onNodeWithText("Sync now").assertDoesNotExist()
+        onNodeWithText("Retry").performScrollTo().assertIsEnabled()
+    }
 
     @Test
     fun narrowChinesePageKeepsHealthyAccountAndResetCompactAndAccountActionsInMenu() {
@@ -181,6 +244,8 @@ class SyncSettingsDesktopRenderTest {
         signedIn: Boolean = true,
         missingAccountHint: Boolean = false,
         lastError: String? = null,
+        admission: WorkspaceAdmissionStatus? = null,
+        recovery: WorkspaceRecoveryUiState? = null,
         manualSyncRunner: ManualSyncRunner = ManualSyncRunner {
             ManualSyncResult.success(SyncMode.SelfHosted, 0, 0, 0)
         },
@@ -218,7 +283,8 @@ class SyncSettingsDesktopRenderTest {
                         Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp)) {
                             val state = controller.state
                             SyncSettingsContent(
-                                state = state.copy(sync = state.sync.copy(issue = issue ?: state.sync.issue)),
+                                state = state.copy(sync = state.sync.copy(issue = issue ?: state.sync.issue,
+                                    admission = admission ?: state.sync.admission, recovery = recovery ?: state.sync.recovery)),
                                 controller = controller,
                                 workspacePairingScanner = UnavailableWorkspacePairingScanner,
                                 actionScope = rememberCoroutineScope(),

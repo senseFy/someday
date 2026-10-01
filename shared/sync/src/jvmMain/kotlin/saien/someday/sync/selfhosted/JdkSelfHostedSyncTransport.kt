@@ -26,6 +26,7 @@ class JdkSelfHostedSyncTransport(
         isLenient = false
     },
 ) : SelfHostedSyncTransport,
+    SelfHostedWorkspaceAdmissionTransport,
     SelfHostedWorkspaceRecoveryTransport,
     SelfHostedSyncTransportV2,
     SelfHostedMediaTransportV3,
@@ -363,6 +364,17 @@ class JdkSelfHostedSyncTransport(
             SYSTEM_V3_MEDIA_MAX_CIPHERTEXT_BYTES,
             accountContext = accountContext,
         )
+    }
+
+    override fun workspaceAdmission(endpoint: String, accessToken: String, workspaceId: String, accountContext: SelfHostedAccountRequestContext): SelfHostedWorkspaceAdmissionResponse? {
+        requireSystemV3WorkspaceId(workspaceId)
+        val response = exchange("GET", endpoint, "/workspace/admission?workspaceId=$workspaceId", accessToken, null, accountContext, maxBody = SELF_HOSTED_ACCOUNT_BODY_LIMIT)
+        if (response.status == 404 && response.errorHeaders == null) return null
+        return try {
+            decode(response, SelfHostedWorkspaceAdmissionResponse.serializer(), accountContext, limit = SELF_HOSTED_ACCOUNT_BODY_LIMIT).validated()
+        } catch (failure: SelfHostedSyncHttpException) {
+            if (failure.errorCode == SelfHostedErrorCode.NOT_FOUND) null else throw failure
+        }
     }
 
     override fun discoverAccountData(endpoint: String, accessToken: String, accountContext: SelfHostedAccountRequestContext): SelfHostedAccountDiscoveryResult {

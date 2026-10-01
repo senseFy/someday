@@ -233,6 +233,8 @@ import saien.someday.domain.settings.WorkspacePairingInvitationJoiner
 import saien.someday.domain.settings.WorkspacePairingInvitationResult
 import saien.someday.domain.settings.WorkspacePairingReason
 import saien.someday.domain.settings.WorkspaceRecoveryManager
+import saien.someday.domain.settings.WorkspaceAdmissionManager
+import saien.someday.domain.settings.WorkspaceAdmissionState
 import saien.someday.domain.settings.WorkspacePreferencesConflictResolver
 import saien.someday.domain.settings.WorkspacePreferencesSyncStatus
 import saien.someday.ui.designsystem.SomedayDesignDefaults
@@ -359,6 +361,7 @@ fun SomedayApp(
     workspacePairingInvitationJoiner: WorkspacePairingInvitationJoiner? = null,
     workspacePairingInvitationCanceller: WorkspacePairingInvitationCanceller? = null,
     workspaceRecoveryManager: WorkspaceRecoveryManager? = null,
+    workspaceAdmissionManager: WorkspaceAdmissionManager? = null,
     accountDataResetManager: AccountDataResetManager? = null,
     workspaceProductAccess: WorkspaceProductAccess = UnrestrictedWorkspaceProductAccess,
     workspacePairingScanner: WorkspacePairingScanner = UnavailableWorkspacePairingScanner,
@@ -436,6 +439,7 @@ fun SomedayApp(
             workspacePairingInvitationCanceller,
             selfHostedConnectionSwitcher,
             workspaceRecoveryManager,
+            workspaceAdmissionManager,
             accountDataResetManager,
             workspaceProductAccess,
             automaticSyncEligible,
@@ -492,6 +496,7 @@ fun SomedayApp(
                         WorkspaceJoinResult.failure(WorkspacePairingReason.Unavailable)
                     },
                 workspaceRecoveryManager = workspaceRecoveryManager,
+                workspaceAdmissionManager = workspaceAdmissionManager,
                 accountDataResetManager = accountDataResetManager,
                 workspaceProductAccess = workspaceProductAccess,
                 onThisDayNotificationScheduler = onThisDayNotificationScheduler,
@@ -4865,7 +4870,7 @@ internal fun SyncSettingsContent(
                             tint = MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.size(20.dp),
                         )
-                        val healthySession = signedIn && state.sync.issue == null && !state.sync.accountReset.blocksSync
+                        val healthySession = signedIn && state.sync.issue == null && !state.sync.accountReset.blocksSync && state.sync.workspaceReady
                         Surface(
                             shape = RoundedCornerShape(50),
                             color = if (healthySession) {
@@ -4882,6 +4887,7 @@ internal fun SyncSettingsContent(
                             Text(
                                 text = when {
                                     needsAccountDataResolution -> stringResource(Res.string.sync_status_account_reset_pending)
+                                    signedIn && state.sync.joiningWorkspace -> stringResource(Res.string.workspace_admission_join_title)
                                     state.sync.syncing -> stringResource(Res.string.sync_status_syncing)
                                     unavailable != null || issueAction == SyncIssueAction.ReloadSession ->
                                         stringResource(Res.string.sync_status_unavailable)
@@ -4971,6 +4977,9 @@ internal fun SyncSettingsContent(
             }
             if (
                 !needsAccountDataResolution && !connectionFormVisible &&
+                (state.sync.workspaceReady && !state.sync.recovery.blocksSync ||
+                    state.sync.issue?.reason == SyncIssueReason.WorkspaceSettingsReloadRequired ||
+                    issueAction == SyncIssueAction.ReloadSession) &&
                 (savedAccount || issueAction == SyncIssueAction.ReloadSession) &&
                 ((connected != null && state.sync.issue == null) ||
                     issueAction == SyncIssueAction.RetrySync ||
@@ -5129,9 +5138,13 @@ internal fun SyncSettingsContent(
         }
     }
 
-    AccountDataResetContent(state, controller, actionScope)
-
     if (signedIn && !state.sync.accountReset.blocksSync) {
+        WorkspaceAdmissionContent(state, controller, actionScope)
+    }
+
+    if (signedIn && !state.sync.accountReset.blocksSync &&
+        (state.sync.workspaceReady || state.sync.joiningWorkspace && state.sync.admission.recoveryAvailable)
+    ) {
         WorkspaceRecoveryContent(
             state = state,
             controller = controller,
@@ -5139,14 +5152,80 @@ internal fun SyncSettingsContent(
         )
     }
 
-    if (state.sync.pairingAvailable) {
+    if (state.sync.pairingAvailable && (state.sync.workspaceReady || state.sync.joiningWorkspace)) {
         WorkspacePairingContent(
             state = state,
             controller = controller,
-            readinessSubtitle = stringResource(Res.string.self_hosted_pairing_help),
+            readinessSubtitle = stringResource(if (state.sync.joiningWorkspace) {
+                Res.string.workspace_admission_pairing_help
+            } else {
+                Res.string.self_hosted_pairing_help
+            }),
             scanner = workspacePairingScanner,
             actionScope = actionScope,
         )
+    }
+
+    AccountDataResetContent(state, controller, actionScope)
+}
+
+@Composable
+private fun WorkspaceAdmissionContent(
+    state: SettingsUiState,
+    controller: SettingsUiController,
+    actionScope: CoroutineScope,
+) {
+    val admission = state.sync.admission
+    if (admission.state == WorkspaceAdmissionState.Ready && (admission.initializedWorkspaceCount ?: 0) <= 1) return
+    SettingsSection(title = stringResource(when (admission.state) {
+        WorkspaceAdmissionState.FirstWorkspace -> Res.string.workspace_admission_first_title
+        WorkspaceAdmissionState.JoinRequired -> Res.string.workspace_admission_join_title
+        WorkspaceAdmissionState.Ready -> Res.string.workspace_admission_multiple_title
+        WorkspaceAdmissionState.Pending, WorkspaceAdmissionState.Unavailable -> Res.string.workspace_admission_check_title
+    })) {
+        Column(Modifier.fillMaxWidth().padding(vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Text(
+                text = stringResource(when (admission.state) {
+                    WorkspaceAdmissionState.FirstWorkspace -> Res.string.workspace_admission_first_body
+                    WorkspaceAdmissionState.JoinRequired -> Res.string.workspace_admission_join_body
+                    WorkspaceAdmissionState.Ready -> Res.string.workspace_admission_multiple_body
+                    WorkspaceAdmissionState.Pending -> Res.string.workspace_admission_check_body
+                    WorkspaceAdmissionState.Unavailable -> Res.string.workspace_admission_unavailable_body
+                }),
+                style = MaterialTheme.typography.bodyMedium,
+                modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
+            )
+            when (admission.state) {
+                WorkspaceAdmissionState.FirstWorkspace -> Button(
+                    onClick = { actionScope.launch { controller.startFirstWorkspaceSync() } },
+                    enabled = !state.sync.busy,
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                ) {
+                    ActionButtonLabel(Lucide.Cloud, stringResource(Res.string.workspace_admission_start), state.sync.syncing)
+                }
+                WorkspaceAdmissionState.Pending, WorkspaceAdmissionState.Unavailable -> Button(
+                    onClick = { actionScope.launch { controller.retryWorkspaceAdmission() } },
+                    enabled = !state.sync.busy,
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                ) {
+                    ActionButtonLabel(Lucide.RefreshCw, stringResource(Res.string.workspace_admission_retry), state.sync.operation == SyncUiOperation.CheckingWorkspace)
+                }
+                WorkspaceAdmissionState.JoinRequired -> {
+                    if (!admission.recoveryAvailable) {
+                        Text(stringResource(Res.string.workspace_admission_no_recovery), style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    TextButton(
+                        onClick = { actionScope.launch { controller.retryWorkspaceAdmission() } },
+                        enabled = !state.sync.busy,
+                    ) {
+                        ActionButtonLabel(Lucide.RefreshCw, stringResource(Res.string.workspace_admission_retry),
+                            state.sync.operation == SyncUiOperation.CheckingWorkspace)
+                    }
+                }
+                WorkspaceAdmissionState.Ready -> Unit
+            }
+        }
     }
 }
 
@@ -5422,6 +5501,8 @@ internal fun SyncIssueReason.localizedMessage(): String =
         SyncIssueReason.SyncUnavailable -> stringResource(Res.string.settings_fb_sync_unavailable)
         SyncIssueReason.AuthorityMismatch -> stringResource(Res.string.settings_fb_sync_authority_mismatch)
         SyncIssueReason.WorkspaceLocked -> stringResource(Res.string.settings_fb_sync_workspace_locked)
+        SyncIssueReason.WorkspaceJoinRequired -> stringResource(Res.string.workspace_admission_join_body)
+        SyncIssueReason.WorkspaceAdmissionUnavailable -> stringResource(Res.string.workspace_admission_unavailable_body)
         SyncIssueReason.RemoteHistoryConflict -> stringResource(Res.string.settings_fb_sync_remote_history_conflict)
         SyncIssueReason.CheckpointInvalid -> stringResource(Res.string.settings_fb_sync_checkpoint_invalid)
         SyncIssueReason.RetryRequired -> stringResource(Res.string.settings_fb_sync_retry_required)
@@ -5558,9 +5639,12 @@ internal fun WorkspacePairingContent(
     scanner: WorkspacePairingScanner,
     actionScope: CoroutineScope,
 ) {
-    var selectedMode by remember {
+    val joiningWorkspace = state.sync.joiningWorkspace
+    var selectedMode by remember(joiningWorkspace) {
         mutableStateOf(
-            if (state.sync.invitation != null) {
+            if (joiningWorkspace) {
+                WorkspacePairingMode.JoinWithToken
+            } else if (state.sync.invitation != null) {
                 WorkspacePairingMode.ShowInvitation
             } else {
                 null
@@ -5627,7 +5711,7 @@ internal fun WorkspacePairingContent(
             horizontalArrangement = Arrangement.spacedBy(8.dp),
             modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
         ) {
-            CompactSettingsActionButton(
+            if (!joiningWorkspace) CompactSettingsActionButton(
                 text = stringResource(Res.string.pairing_create_invitation),
                 busy = state.sync.operation == SyncUiOperation.CreatingInvitation,
                 enabled = !actionRunning,

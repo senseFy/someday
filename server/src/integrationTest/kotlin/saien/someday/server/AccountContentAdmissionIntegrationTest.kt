@@ -35,6 +35,9 @@ import saien.someday.server.persistence.SystemV3MediaRepository
 import saien.someday.server.persistence.SystemV3MediaReadResult
 import saien.someday.server.persistence.WorkspaceRecoveryEnvelopeInput
 import saien.someday.server.persistence.WorkspaceRecoveryEnvelopeRepository
+import saien.someday.server.persistence.WorkspaceAdmissionRepository
+import saien.someday.server.persistence.WorkspaceAdmissionSnapshot
+import saien.someday.server.persistence.SyncV2PointerPublishRepositoryResult
 import saien.someday.server.support.ControllableMediaBlobStore
 import saien.someday.server.support.PostgresContractFixture
 import saien.someday.server.support.SyncV2ContractFixture
@@ -122,6 +125,41 @@ class AccountContentAdmissionIntegrationTest {
                 check(executor.awaitTermination(30, TimeUnit.SECONDS)) { "Media reader did not stop" }
             }
         }
+    }
+
+    @Test
+    fun newIncarnationCanPublishItsFirstWorkspaceWithoutCountingRetiredAuthorities() {
+        SyncV2ContractFixture.initializeWorkspace(entities, identity, OLD_WORKSPACE, "before-reset")
+        val recovery = WorkspaceRecoveryEnvelopeRepository(database.config)
+        recovery.put(identity.request, WorkspaceRecoveryEnvelopeInput(OLD_WORKSPACE, "a".repeat(32), "opaque", "A".repeat(43), null))
+        val current = advanceSyntheticAccount()
+        val discovery = WorkspaceAdmissionRepository(database.config)
+        assertEquals(WorkspaceAdmissionSnapshot(0, false, false), discovery.discover(current, NEW_WORKSPACE))
+        assertFailure(AccountError.WORKSPACE_INCARNATION_RETIRED) { discovery.discover(current, OLD_WORKSPACE) }
+        assertFailure(AccountError.ACCOUNT_SESSION_STALE) { discovery.discover(identity.request, NEW_WORKSPACE) }
+
+        // Actual reset removes the account-current recovery pointer. The deliberately
+        // retained pointer above proved discovery cannot treat a retired envelope as usable.
+        connection().use { connection ->
+            connection.autoCommit = false
+            connection.prepareStatement("SELECT set_config('someday.user_id', ?, true)").use { statement ->
+                statement.setString(1, identity.userId.toString())
+                statement.executeQuery().close()
+            }
+            connection.createStatement().use { it.executeQuery("SELECT set_config('someday.workspace_id', '*', true)").close() }
+            connection.prepareStatement("DELETE FROM workspace_recovery_envelopes WHERE user_id = ?").use { statement ->
+                statement.setObject(1, identity.userId)
+                statement.executeUpdate()
+            }
+            connection.commit()
+        }
+        val candidate = SyncV2ContractFixture.genesis("after-reset")
+        entities.putCheckpointChunk(current, NEW_WORKSPACE, candidate.chunk)
+        entities.putCheckpointManifest(current, NEW_WORKSPACE, candidate.manifest)
+        assertIs<SyncV2PointerPublishRepositoryResult.Published>(
+            entities.compareAndSetEpoch(current, NEW_WORKSPACE, null, candidate.metadata, candidate.pointerObjectJson),
+        )
+        assertEquals(WorkspaceAdmissionSnapshot(1, true, false), discovery.discover(current, NEW_WORKSPACE))
     }
 
     @Test

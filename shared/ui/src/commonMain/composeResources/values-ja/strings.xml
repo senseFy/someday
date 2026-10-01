@@ -574,4 +574,17 @@
     <string name="account_reset_device_revoked">この端末は取り消されています。再ログインでは有効に戻せません。サーバー管理者に連絡してください。</string>
     <string name="account_reset_rate_limited">リクエストが多すぎます。しばらく待ってから再試行してください。</string>
     <string name="account_reset_protocol_error">サーバーの応答を検証できません。クライアントとサーバーのバージョンを確認するか、運営者に連絡してください。</string>
+    <string name="workspace_admission_first_title">このワークスペースを同期</string>
+    <string name="workspace_admission_first_body">この端末の内容を同期して、アカウントの最初のワークスペースを作成します。</string>
+    <string name="workspace_admission_start">この端末の内容を同期する</string>
+    <string name="workspace_admission_join_title">既存のワークスペースに参加</string>
+    <string name="workspace_admission_join_body">このアカウントにはワークスペースがあります。同期する前に、既存の端末とペアリングするか、そのワークスペースの復元コードを使ってください。</string>
+    <string name="workspace_admission_pairing_help">ノートがある端末で同期設定を開き、ペアリングの招待を作成してください。そのコードを入力するか、QRコードをスキャンします。</string>
+    <string name="workspace_admission_no_recovery">復元コードは設定されていません。ワークスペースがある端末とペアリングしてください。置き換えを確認するまで、この端末の内容は保持されます。</string>
+    <string name="workspace_admission_multiple_title">複数のワークスペースがあります</string>
+    <string name="workspace_admission_multiple_body">この端末は現在のワークスペースのみ同期します。他のワークスペースは独立しており、そのノートはここには表示されません。切り替えるには、参加したい端末とペアリングしてください。</string>
+    <string name="workspace_admission_check_title">アカウントのワークスペースを確認</string>
+    <string name="workspace_admission_check_body">同期を始める前に、このアカウントにワークスペースがあるか確認します。この端末の内容は保持されます。</string>
+    <string name="workspace_admission_unavailable_body">ワークスペースを確認できませんでした。接続とサーバーの対応バージョンを確認して再試行してください。この端末の内容は保持されています。</string>
+    <string name="workspace_admission_retry">ワークスペースを再確認</string>
 </resources>
